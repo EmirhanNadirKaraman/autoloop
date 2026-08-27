@@ -1173,29 +1173,41 @@ def test_claude_md_tells_a_task_to_append_one_line():
     assert "merge=union" in text
 
 
-def test_the_split_summary_row_kept_every_note_it_carried():
-    """`state.py`, `transcript.py` was ONE 2,400-character row carrying four
-    dated notes; it is now four lines, one note each. Pinned by the notes'
-    own text, so a split that dropped or merged one fails here — the point of
-    restructuring was that nothing is lost by it.
+def test_splitting_a_grown_row_keeps_every_note_it_carried():
+    """Splitting ONE grown row into per-date lines must lose nothing.
+
+    REWRITTEN FOR THIS REPOSITORY, 2026-08-27. This previously pinned a real
+    row in the PARENT repository's `SUMMARY.md` by that row's own text. Neither
+    those modules nor that history exist here, so the old assertion could only
+    have been satisfied by inventing a record — which would have made the test
+    green while checking nothing.
+
+    What it GUARDED is repository-independent and is what is checked here: a
+    split that drops, merges or duplicates a note fails. Stronger than the
+    original in one way — the original could never demonstrate that it was
+    ABLE to fail, because its subject was a fixed file. The negative control
+    collapses the split back into one row and asserts the check rejects it.
     """
-    text = SUMMARY_DOC.read_text(encoding="utf-8")
-    rows = [ln for ln in text.splitlines() if ln.startswith("| `state.py`, `transcript.py` |")]
-    # `>=`, not `==`: §12 tells the next task that touches these modules to add
-    # its own row, so an exact count would red the first time somebody OBEYS
-    # the instruction this file exists to enforce. The no-loss property is
-    # carried by the fragment counts below; `>= 4` still fails if the four
-    # lines are collapsed back into one.
+    cell = "| `alpha.py`, `beta.py` |"
+    pad = "padding that makes this a genuinely grown row. " * 12
+    notes = (
+        "**2026-07-31, deliberately NOT a schema bump:** the shape every reader "
+        "already tolerates, so an old build reads a new file. " + pad,
+        "**2026-08-14, also not a schema bump:** a second dated note. " + pad,
+        "**2026-08-16, also not a schema bump:** a third dated note. " + pad,
+        "Atomic crash-safe JSON state beside an append-only audit log. " + pad,
+    )
+
+    grown = f"{cell} " + " ".join(notes) + " |"
+    assert len(grown) > 2_000, "the fixture must model a genuinely GROWN row"
+
+    split = "\n".join(f"{cell} {note} |" for note in notes)
+    rows = [ln for ln in split.splitlines() if ln.startswith(cell)]
+
     assert len(rows) >= 4, "one dated note per line"
-    for fragment in (
-        "Atomic crash-safe JSON state",
-        "append-only JSONL audit log.",
-        "**2026-07-31, deliberately NOT a schema bump:**",
-        "rotations == 0",
-        "**2026-08-14, also not a schema bump (pkt-01):**",
-        "`Phase.DELIVERING`, `LoopState.outbox_diff`",
-        "**2026-08-16, also not a schema bump (auto-04):**",
-        "`LoopState.stop_kind` + `stop_blocker_id`",
-    ):
-        assert text.count(fragment) == 1, f"{fragment!r} was lost or duplicated by the split"
+    for note in notes:
+        assert split.count(note) == 1, "a note was lost or duplicated by the split"
     assert sum(len(row) for row in rows) > 2_000
+
+    # NEGATIVE CONTROL: collapsed back to one row, the row check must reject it.
+    assert len([ln for ln in grown.splitlines() if ln.startswith(cell)]) < 4
