@@ -1290,6 +1290,32 @@ def _addresses_own_checkout(tree: ast.AST) -> bool:
     )
 
 
+def _glob_constrains(pattern: str) -> bool:
+    """Does `pattern` keep any literal character to match documents BY?
+
+    A glob made only of wildcards and separators — `"*"`, `"**"`, `"*/*"` —
+    matches every path in the repository. It says that its file sweeps SOME
+    directory and nothing whatever about which one, so it is not evidence that
+    the file reads a document; `_names_document` would otherwise let it name
+    every document there is.
+
+    MEASURED 2026-08-27, and this is not hypothetical. `dashboard.py:4026` calls
+    `audit_dir.glob("*")` to list AUDIT RUN directories. That bare `"*"` matched
+    `docs/SUMMARY.md`, `docs/TESTS.md` and `CLAUDE.md`, which made the module a
+    declared reader of every tracker; because it is imported across the suite,
+    the reverse-import closure over it then selected 72 of 93 test files on a
+    prose change that no test in 52 of them can observe. Requiring one literal
+    takes the same change to 20, and a runtime audit hook over all 52 recorded
+    zero opens of a real tracker.
+
+    The directory sweeps this branch exists for are UNAFFECTED: `"*.md"` keeps
+    `.md` and `"docs/AUDIT_*.md"` keeps both `docs/` and `.md`, so each still
+    names what it can reach. Only a pattern that discriminates nothing is
+    dropped.
+    """
+    return any(char not in "*?[]!-/" for char in pattern)
+
+
 def _names_document(strings: set[str], rel: str, name: str) -> bool:
     """Does one of `strings` name the document at `rel` (basename `name`)?
 
@@ -1314,6 +1340,7 @@ def _names_document(strings: set[str], rel: str, name: str) -> bool:
         return True
     return any(
         any(wild in text for wild in "*?[")
+        and _glob_constrains(text)
         and (fnmatch.fnmatchcase(rel, text) or fnmatch.fnmatchcase(name, text))
         for text in strings
     )
