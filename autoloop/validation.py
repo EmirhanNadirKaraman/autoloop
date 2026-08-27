@@ -86,6 +86,7 @@ route it through this function rather than growing a second policy there.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import os
 import re
 import subprocess
@@ -543,6 +544,17 @@ def run_validation_commands(
 # — both shapes are in there — never has to be decided, which is the point: a
 # rule that had to tell those apart is a rule that could get one wrong.
 #
+#   ^ CORRECTED BY select-02 (2026-08-27), and left standing because briefs
+#   quote it. The paragraph is accurate about what select-01 shipped and wrong
+#   about what this module now does: markdown is still not inert, but "the
+#   EXTENSION token alone makes each of them a seed" is no longer true, and the
+#   decision it congratulates itself on never having to make — reads the
+#   repository's own copy, or builds a fixture of the same name — is exactly
+#   the decision the next block makes, because declining to make it selected
+#   the whole suite on every round. `test_markdown_policy.py` is now NOT
+#   selected by a tracker change: it points `MarkdownPolicy` at a fixture it
+#   writes itself, so the tracker's bytes cannot reach it.
+#
 # WHAT THIS SAVES, STATED SO IT CANNOT BE OVER-READ — AND IT IS SMALL ON EXACTLY
 # THE ROUND IT WAS WRITTEN FOR. The brief for this change estimated ~10-15% of
 # round wall-clock, on the assumption that the root `tests/` command (the
@@ -569,6 +581,108 @@ def run_validation_commands(
 # tuned to make the markdown case look good would have to stop following the
 # import edge out of a production module that names the path, and that edge is
 # the only reason the rule is sound at all.
+#
+# A PROSE DOCS CHANGE MUST NOT SELECT THE WHOLE SUITE (select-02, 2026-08-27).
+#
+# select-01 made a narrowed round POSSIBLE. It did not make one HAPPEN, and the
+# paragraph above says why without drawing the conclusion: `CLAUDE.md` requires
+# every task to append a change note to the documentation trackers, so the
+# tracker-markdown round IS the normal round, and on it the token rule
+# attributed essentially everything.
+#
+# TWO SETS OF NUMBERS APPEAR BELOW AND THEY ARE FROM DIFFERENT REPOSITORIES.
+# The brief for this task measured the PRE-SPLIT repository — 95 test files
+# under `autoloop/tests`, a second root `tests/` tree of 24, 512 files in the
+# graph, three configured validation commands — and reported 81/95 and 7/24 for
+# `autoloop/validation.py` alone against 95/95 and 22/24 once the change note
+# was added, with `docs/TESTS.md` naming 198 of those 512 graph files. NONE of
+# that was re-measured here and none of it can be: this checkout was extracted
+# with `git filter-repo --path autoloop/` on 2026-08-27, has 93 test files and
+# 159 graph files, ships no root `tests/` tree and no `docs/AUTOLOOP.md`, and
+# configures two commands. What WAS measured here is the table further down,
+# and the one figure that carries the same argument in this checkout is that
+# every one of the six trackers attributed 93 of 93 test files under the token
+# rule — the whole suite, on the note every task is required to write.
+#
+# The mechanism is `_reference_tokens`, not the closure. A `.md` path resolves
+# to no module, so it falls to the reference-token rule — and its tokens are
+# `('.md', 'TESTS', 'TESTS.md', 'docs', 'docs/TESTS.md')`. The bare `docs` and
+# `.md` match any source that CITES a document in a docstring, which in a
+# repository whose modules document themselves by naming their docs is nearly
+# all of them — that is what put the whole suite behind one tracker, before the
+# closure ran at all.
+#
+# So attribution was fixed and the closure was not. For a prose document only:
+#
+#   * the tokens are dropped for an EXACT match on the path or the basename,
+#     plus a glob that matches either — a file that opens a document names it,
+#     a file that cites one embeds the name in a sentence, and a sweep
+#     (`rglob("*.md")`, `docs/AUDIT_*.md`) names none of them and is kept by
+#     the glob arm;
+#   * the match is taken off the AST's evaluated string constants, so a
+#     comment or a docstring — the mention this whole block is about — does
+#     not count; and
+#   * the file must be able to address the checkout it lives in (`__file__`).
+#     Nothing else in this package can open the changed document: production
+#     modules are handed a repo root, and every test that exercises one hands
+#     it a fixture. This is the conjunct that stops `tasks.TRACKER_PATHS` —
+#     six exact tracker literals in one of the most widely imported modules
+#     here — from selecting the suite through the closure.
+#
+# `.md` IS THE TEST, and `docs/` IS NOT. `docs/audit_charters.toml` is a
+# RUNTIME INPUT: the audit parses it and `test_audit_charters.py` asserts the
+# shipped bytes equal `DEFAULT_DOMAINS`. It keeps the token rule untouched, as
+# does every other unresolvable path. This is one carve-out, not a licence for
+# unresolvable paths to select less.
+#
+# WHAT DOES NOT CHANGE, because failing toward MORE is the whole design: the
+# closure still runs on whatever seeds this produces, so a module that reads a
+# document still drags in the tests that import it; an unreadable or
+# unparseable file is still a seed for every document; and a document nothing
+# reads is still attributed NOTHING and still widens the whole run. A prose
+# change that narrows is a prose change whose readers were found.
+#
+# WHAT IT ACTUALLY BOUGHT — the numbers measured HERE, on this tree, by calling
+# `select_validation_commands` against it (93 test files, 159 graph files;
+# `autoloop/tests` is the only suite, so the brief's second column has no
+# counterpart and is not reproduced):
+#
+#   changed paths                          before      after
+#   autoloop/validation.py alone           80/93       80/93
+#   + docs/TESTS.md, docs/SUMMARY.md       93/93       80/93
+#   val-04-shaped (4 modules + both)       93/93       80/93
+#   docs-only (all six trackers)           93/93       72/93
+#   docs/audit_charters.toml               93/93       93/93   (unchanged)
+#
+# The change note now costs the round it rides on NOTHING: every test that
+# reads a tracker is already reachable from the module that round changed.
+#
+# AND THE PART THAT IS NOT A HEADLINE, stated so it cannot be over-read: the
+# DOCS-ONLY row is 72, not a handful. `autoloop/dashboard.py` resolves its own
+# checkout and holds the bare code literal `"*"` (at least twice, around
+# `audit_dir.glob("*")`, scanning an audit-runs directory outside the graph),
+# and `"*"` matches any basename, so the glob arm seeds it and 72 tests reach
+# it. That is the conservative arm doing exactly what it is for — a sweep names
+# no document, and this cannot tell which directory is being swept — and
+# tightening it to "the pattern must end in the document's own extension" is
+# the obvious next step, deliberately NOT taken here: it would drop a
+# `docs_dir.glob("*")` reader silently, which is the failure direction this
+# whole section refuses.
+#
+# THE TWO GAPS THIS RULE HAS, both silent, both bounded, neither closed by the
+# empty-attribution backstop — which fires only on an EMPTY set, and each of
+# these leaves an INCOMPLETE one:
+#
+#   * a reader that BUILDS the document's name (`f"{stem}.md"`) rather than
+#     spelling it. Asserted absent from this checkout by
+#     `test_no_file_that_addresses_this_checkout_builds_a_document_name_dynamically`,
+#     which names the file and line of any that appears.
+#   * a reader that names the document exactly but resolves the checkout root
+#     through ANOTHER module rather than through its own `__file__`. It cannot
+#     arise here: `autoloop/tests/conftest.py` exports no root constant (it
+#     does `sys.path.insert` and nothing else, by an explicit requirement in
+#     its own docstring), and no other module in the package publishes one. If
+#     one is ever added, this conjunct is what has to move.
 #
 # A BOUND THAT USED TO APPLY HERE AND NO LONGER DOES, corrected rather than
 # deleted because the old sentence is quoted in briefs:
@@ -1105,6 +1219,164 @@ def _files_referencing(
     return {path: frozenset(found) for path, found in hits.items()}
 
 
+#: The extension that makes a changed path PROSE DOCUMENTATION rather than a
+#: machine-read input. Extension alone is enough to tell the two apart in this
+#: repository and the distinction is checked, not assumed: `docs/` holds
+#: `audit_charters.toml`, which `audit/executor.py` PARSES (config
+#: `[repo].audit_charters_file`) and whose shipped bytes
+#: `test_audit_charters.py` asserts against `DEFAULT_DOMAINS` — a change there
+#: really does change behaviour, and it keeps the general
+#: `_reference_tokens` treatment because it is not a `.md`. Living under
+#: `docs/` is NOT the test, and neither is being one of
+#: `tasks.TRACKER_PATHS`: `CLAUDE.md` at the root is prose too, and a rule
+#: keyed on a list of tracker paths would silently treat the next prose file
+#: added beside them as machine input.
+_PROSE_DOC_SUFFIX = ".md"
+
+
+def _is_prose_document(rel: str) -> bool:
+    """Is `rel` a document written for a HUMAN reader?
+
+    Case-sensitive, and that is the safe direction: a `README.MD` is not
+    recognised, falls to `_reference_tokens`, and therefore selects MORE.
+    """
+    return PurePosixPath(rel).suffix == _PROSE_DOC_SUFFIX
+
+
+def _code_strings(tree: ast.AST) -> set[str]:
+    """Every string constant the module EVALUATES, minus its prose.
+
+    Comments never reach the AST at all, so they need no handling. A docstring
+    — module, class, function, or a free-floating string block between
+    statements — is an `Expr` whose value is the constant, and is dropped: that
+    is the file TALKING ABOUT a document, which is exactly the mention this
+    scan must stop counting as a dependency.
+
+    An f-string is `JoinedStr` and its literal pieces are `Constant`s under it,
+    so `f"docs/{name}.md"` contributes `"docs/"` and `".md"` and matches no
+    document exactly. That is a known gap, not an oversight — see
+    `_files_reading_documents`.
+    """
+    prose = {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    }
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in prose
+    }
+
+
+def _addresses_own_checkout(tree: ast.AST) -> bool:
+    """Can this module reach the checkout it is PART OF, unaided?
+
+    `__file__` is the only way a file in this repository resolves its own
+    checkout root; every production module is handed a repo root instead
+    (`GitGateway(repo, ...)`, `MarkdownPolicy(repo)`, `load_charter_domains(repo,
+    ...)`), and every test that exercises one points it at a fixture it wrote
+    itself. So a module WITHOUT `__file__` cannot open the changed document —
+    it can only hold its path, which is what `tasks.TRACKER_PATHS` and
+    `note_merge.NOTE_TRACKERS` do.
+
+    Read off the AST rather than the text so a docstring mentioning the name
+    does not count, matching `_code_strings`.
+    """
+    return any(
+        isinstance(node, ast.Name) and node.id == "__file__" for node in ast.walk(tree)
+    )
+
+
+def _names_document(strings: set[str], rel: str, name: str) -> bool:
+    """Does one of `strings` name the document at `rel` (basename `name`)?
+
+    EQUALITY, not containment, and that is the load-bearing half of this rule.
+    A file that opens a document names it exactly — `"docs/TESTS.md"`,
+    `REPO_ROOT / "docs" / "SUMMARY.md"`. A file that merely cites one embeds
+    the name in a sentence, and a sentence can live in a string as easily as in
+    a docstring: `cli.py` and `config.py` both raise errors reading "see
+    docs/SECURITY.md S31", and containment would make a `docs/SECURITY.md`
+    round seed two of the most widely imported modules in the package — the
+    whole suite, through the closure, on one of the four trackers every task
+    writes.
+
+    A glob is matched rather than compared, because a directory sweep names no
+    document: `dashboard.py`'s `"docs/AUDIT_*.md"` and an `rglob("*.md")` both
+    read a file they never spell out, and dropping the extension token (which
+    is what stops `.md` attributing the checkout) would otherwise lose them.
+    `fnmatchcase` rather than `fnmatch`: the latter normalizes case per
+    platform, which would make a selection depend on which machine ran it.
+    """
+    if rel in strings or name in strings:
+        return True
+    return any(
+        any(wild in text for wild in "*?[")
+        and (fnmatch.fnmatchcase(rel, text) or fnmatch.fnmatchcase(name, text))
+        for text in strings
+    )
+
+
+def _files_reading_documents(
+    root: Path, files: Sequence[str], documents: Sequence[str]
+) -> dict[str, frozenset[str]]:
+    """`{changed prose document: every graph file that READS it}`.
+
+    The narrow carve-out select-02 exists for, and the reason it is a carve-out
+    rather than a tightening of `_reference_tokens`: a `.md` path's tokens
+    include the bare strings `docs` and `.md`, which — measured 2026-08-27 —
+    made 198 of 512 graph files a seed for `docs/TESTS.md`, 99 of them test
+    files, because every module that cites a tracker in a docstring was counted
+    as depending on it. A change to prose changes only BYTES, and bytes reach a
+    test only through a file that OPENS them, so two conditions replace the
+    token scan for these paths and nothing else:
+
+    * the file NAMES the document in code (`_code_strings`, `_names_document`)
+      — not in a comment, not in a docstring, not inside a sentence; and
+    * the file can address the checkout it lives in (`_addresses_own_checkout`).
+
+    Everything downstream is unchanged: the result is closed over the same
+    reverse-import edges as any other seed, so a module that reads a document
+    still drags in the tests that import it, and a document nothing reads is
+    attributed nothing and widens the whole run exactly as before.
+
+    **A file this cannot read or cannot parse is a seed for EVERY document, not
+    for none** — the same fail-open `_files_referencing` refuses, closed the
+    same way and for the same reason. Leaning on `build_import_graph` having
+    marked the same file `opaque` would make correctness rest on a race between
+    two walks of the same tree. `ValueError` is in the tuple because
+    `UnicodeDecodeError` (a binary file named `.py`) is one, and `SyntaxError`
+    because this parses where `_files_referencing` only reads.
+
+    KNOWN GAP, stated because the empty-attribution backstop does NOT catch it:
+    a reader that builds the document's name dynamically (`f"{stem}.md"`,
+    `"/".join(parts)`) names it in no constant and is missed, and the set is
+    then incomplete rather than empty, so nothing widens. It is bounded by the
+    condition being conjunctive with `__file__` — the shape has to occur in a
+    file that resolves its own checkout — and by
+    `test_every_test_that_reads_a_shipped_document_is_selected` reading the
+    population off the checkout rather than off a list.
+    """
+    hits: dict[str, set[str]] = {rel: set() for rel in documents}
+    names = {rel: PurePosixPath(rel).name for rel in documents}
+    for rel in files:
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            for found in hits.values():
+                found.add(rel)
+            continue
+        if not _addresses_own_checkout(tree):
+            continue
+        strings = _code_strings(tree)
+        for document, found in hits.items():
+            if _names_document(strings, document, names[document]):
+                found.add(rel)
+    return {rel: frozenset(found) for rel, found in hits.items()}
+
+
 def _listed(paths: Sequence[str], limit: int = _EVIDENCE_MAX_CONSIDERED) -> str:
     """`paths` as evidence text, bounded — it reaches `state.last_validation`."""
     shown = ", ".join(paths[:limit])
@@ -1229,8 +1501,13 @@ class TestSelection:
             "either — it is attributed its OWN conservative set, every "
             "repository file whose source names that path, its basename, its "
             "stem, its extension or any directory above it, closed over the "
-            "same import edges, while a path that can be attributed nothing at "
-            f"all still widens the whole run.{self._path_accounting()}"
+            "same import edges — except a PROSE DOCUMENT (`.md`), whose tokens "
+            "(`docs`, `.md`) name the whole checkout: it is attributed the "
+            "files that READ it, naming it exactly in evaluated code rather "
+            "than in a comment or docstring and able to address this checkout, "
+            "closed over the same edges. A path that can be attributed nothing "
+            "at all still widens the whole run."
+            f"{self._path_accounting()}"
             f"{dropped} {PRECOMMIT_EVIDENCE} To widen, "
             "either OPERATOR lever (a `plan` directive can set neither): "
             '`[audit] test_selection = "full"` in the loop config, which takes '
@@ -1414,10 +1691,16 @@ def select_validation_commands(
       It is given a conservative set of its own (`_reference_tokens` /
       `_files_referencing`: every repository file whose source names it, closed
       over the same import edges) and the result is UNIONED with reachability
-      from the resolved paths. Only a path that can be attributed nothing goes
-      back to the full suite, and `reason` then names that path. See the
-      "one unresolvable path must not veto the whole selection" block above for
-      the measurement that forced this and the argument that it is safe.
+      from the resolved paths. A changed PROSE DOCUMENT is the single exception
+      to the token half of that rule and is attributed by
+      `_files_reading_documents` instead — the files that read it rather than
+      the files that mention it — for the reason measured in the "a prose docs
+      change must not select the whole suite" block above. The closure, the
+      union and the widening are identical either way. Only a path that can be
+      attributed nothing goes back to the full suite, and `reason` then names
+      that path. See the "one unresolvable path must not veto the whole
+      selection" block above for the measurement that forced this and the
+      argument that it is safe.
     * **A pytest command none of the selected files live under**: the command is
       dropped, named in `skipped`, and disclosed by `evidence()`.
     """
@@ -1494,15 +1777,26 @@ def select_validation_commands(
     # Everything else unresolved gets a set of its OWN rather than vetoing the
     # paths that resolved. One scan of the checkout serves the whole diff, and
     # an all-Python diff pays for no scan at all.
-    references = (
-        _files_referencing(
-            repo_root,
-            sorted(graph.files),
-            {path: _reference_tokens(path) for path in unresolved},
+    #
+    # TWO scans, because a prose document is attributed by a different rule
+    # (`_files_reading_documents`) from every other unresolvable path
+    # (`_reference_tokens` / `_files_referencing`, untouched). Each scan runs
+    # only when the diff holds a path of its kind, so a diff of one kind still
+    # pays for exactly one pass over the checkout.
+    graph_files = sorted(graph.files)
+    documents = tuple(path for path in unresolved if _is_prose_document(path))
+    referenced = tuple(path for path in unresolved if not _is_prose_document(path))
+    references: dict[str, frozenset[str]] = {}
+    if referenced:
+        references.update(
+            _files_referencing(
+                repo_root,
+                graph_files,
+                {path: _reference_tokens(path) for path in referenced},
+            )
         )
-        if unresolved
-        else {}
-    )
+    if documents:
+        references.update(_files_reading_documents(repo_root, graph_files, documents))
     attributed: list[tuple[str, int]] = []
     attributed_tests: set[str] = set()
     unattributed: list[str] = []
@@ -1526,9 +1820,9 @@ def select_validation_commands(
     if unattributed:
         return full(
             f"{len(unattributed)} changed path(s) are not Python modules the "
-            "import graph resolves AND no repository file names them, so no "
-            "conservative test set can be attributed to them: "
-            f"{_listed(tuple(unattributed))}",
+            "import graph resolves AND no repository file names them (reads "
+            "them, for a prose document), so no conservative test set can be "
+            f"attributed to them: {_listed(tuple(unattributed))}",
             total,
             resolved=resolved,
             attributed=tuple(attributed),
