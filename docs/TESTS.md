@@ -26,3 +26,4 @@ fixture repositories instead; `test_audit_charters.py` already shows the shape.
 | Date | Task | Note |
 |---|---|---|
 | 2026-08-27 | split | extracted from language-app with git filter-repo, 414 commits of history preserved; this tracker seeded here. |
+| 2026-08-27 | select-02 | new `autoloop/tests/test_prose_doc_selection.py` pins the prose-document carve-out in test selection: `test_docs_merge.py` still runs on a docs-only round, `docs/audit_charters.toml` selects exactly what the untouched reference-token rule selects, a newly added doc-reading test is picked up with no list edited, and a document nothing reads still widens. `test_test_selection.py`'s "every test naming a tracker runs on a tracker change" claim is reversed there and corrected in place. |
