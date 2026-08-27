@@ -1,0 +1,15 @@
+# DELIBERATELY RULE-FREE. This file is kept, empty of rules, so that the next
+# person reaching for `merge=union` on the change-note trackers finds out here
+# that it was tried, measured and removed on 2026-08-19 — the same day.
+#
+# Two independent reasons it does not work, both observed rather than argued:
+#
+#   1. It never reports a conflict AT ALL on a file it is attached to, because
+#      git cannot scope a merge attribute to a region. Genuine prose conflicts
+#      elsewhere in the file were silently concatenated instead of surfacing.
+#   2. It resolves per LINE, so a grown row was duplicated rather than merged.
+#
+# The replacement is a real resolver that understands the append-only section:
+# `autoloop/note_merge.py`, demonstrated by `autoloop/tests/test_docs_merge.py`,
+# which merges real branches through the production path rather than asserting
+# about it. Adding any rule here is a decision that needs its own review.

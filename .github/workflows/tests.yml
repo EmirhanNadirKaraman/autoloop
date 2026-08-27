@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main, autoloop/mainline]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff check . (repo root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned: ruff's rule set shifts between releases, so an unpinned ruff
+      # reports differently here than it does locally. Keep in step with the
+      # version developers run.
+      - run: pip install ruff==0.14.1
+      - run: ruff check .
+
+  tests:
+    name: pytest autoloop/tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pytest-xdist
+      # `-p no:cacheprovider` is not tidiness: pytest writes
+      # .pytest_cache/v/cache/lastfailed the moment a test FAILS, which the
+      # loop's own post-commit gate reports as validation having MUTATED the
+      # worker tree.
+      - run: python3 -m pytest autoloop/tests -q -n auto -p no:cacheprovider
