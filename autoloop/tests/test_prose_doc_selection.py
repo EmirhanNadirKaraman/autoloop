@@ -68,6 +68,7 @@ from autoloop.validation import (
     _code_strings,
     _files_reading_documents,
     _files_referencing,
+    _glob_constrains,
     _is_prose_document,
     _is_test_file,
     _names_document,
@@ -638,3 +639,58 @@ def test_the_change_note_round_no_longer_selects_the_whole_suite():
     assert from_the_note <= reachable_from_readers, sorted(
         from_the_note - reachable_from_readers
     )
+
+
+# ---------------------------------------------------------------------------
+# A glob that discriminates nothing is not a document name.
+# ---------------------------------------------------------------------------
+
+
+def test_a_glob_of_only_wildcards_names_no_document():
+    """`"*"` matches every path, so it is evidence about no document at all.
+
+    The carve-out above matches a glob rather than comparing it, because a
+    directory sweep reads files it never spells out. That branch has to know
+    the difference between a sweep that CAN reach documents and one that merely
+    happens to contain a wildcard.
+    """
+    for pattern in ("*", "**", "*/*", "**/*"):
+        assert not _glob_constrains(pattern), pattern
+        assert not _names_document({pattern}, "docs/SUMMARY.md", "SUMMARY.md")
+
+    # ...and every sweep this branch exists for still names what it reaches.
+    for pattern in ("*.md", "docs/*.md", "docs/AUDIT_*.md"):
+        assert _glob_constrains(pattern), pattern
+    assert _names_document({"*.md"}, "docs/SUMMARY.md", "SUMMARY.md")
+    assert _names_document({"docs/AUDIT_*.md"}, "docs/AUDIT_2026.md", "AUDIT_2026.md")
+    assert not _names_document({"docs/AUDIT_*.md"}, "docs/SUMMARY.md", "SUMMARY.md")
+
+
+def test_dashboard_is_not_a_reader_of_the_trackers_it_never_opens():
+    """The measured case, pinned against the module that produced it.
+
+    `dashboard.py` calls `audit_dir.glob("*")` to list AUDIT RUN directories.
+    The only documentary path it evaluates is `docs/AUDIT_*.md`, which is the
+    audit-report glob and matches no tracker. Before `_glob_constrains`, that
+    bare `"*"` matched every tracker and made this module a declared reader of
+    all six; because it is imported across the suite, the closure over it then
+    selected 72 of 93 test files on a change to prose no test can observe.
+
+    Asserted on the SHIPPED module rather than a fixture: the defect was a
+    property of this checkout's real source, and a fixture would have passed
+    throughout.
+    """
+    dashboard = REPO_ROOT / "autoloop" / "dashboard.py"
+    strings = _code_strings(ast.parse(dashboard.read_text(encoding="utf-8")))
+    assert "*" in strings, (
+        "dashboard.py no longer evaluates a bare '*'; this test still passes "
+        "but has stopped pinning the case it was written for"
+    )
+    for rel in TRACKER_PATHS:
+        assert not _names_document(strings, rel, Path(rel).name), rel
+
+    readers = _files_reading_documents(
+        REPO_ROOT, sorted(build_import_graph(REPO_ROOT).files), list(TRACKER_PATHS)
+    )
+    for rel, found in readers.items():
+        assert "autoloop/dashboard.py" not in found, (rel, sorted(found))
