@@ -26,10 +26,19 @@ full-suite, which fired on 146 of 154 rounds because the documentation trackers
 are edited by design on every round. The fallback is now per-path: an
 unresolvable path is attributed its own conservative set from repository content
 references, the whole run widens only when a SPECIFIC path can be attributed
-nothing, and the reason names that path. The soundness claim those tests carry
-is the one that matters — no test that names a tracker is ever skipped on a
-tracker change — and it is asserted against the REAL repository over the whole
-population, not against a fixture that would only prove the fixture.
+nothing, and the reason names that path.
+
+The soundness claim those tests carried was "no test that NAMES a tracker is
+ever skipped on a tracker change", and select-02 (2026-08-27) replaced it: the
+tokens a `.md` path produces include the bare strings `docs` and `.md`, so that
+claim was satisfied by attributing essentially the whole checkout, and the
+narrowing never fired on a real round. A prose document is now attributed the
+files that READ it. The tests for that carve-out — and for the three things it
+had to keep true, `test_docs_merge.py` on a docs-only round,
+`docs/audit_charters.toml` unchanged, and nothing to drift — live in
+`test_prose_doc_selection.py`. What stays here is the general rule that carve-out
+is an exception to, asserted against the REAL repository over the whole
+population rather than against a fixture that would only prove the fixture.
 
 A third block, at the bottom, pins BOTH PHASES. A loop round validates twice —
 once inside `ImplementExecutor` before the commit, once against the committed
@@ -506,7 +515,10 @@ def test_a_non_python_change_runs_the_full_suite(repo):
     `docs/NOTES.md` and the run widens exactly as it always did. This test is
     left byte-identical on purpose — the local fallback is a narrowing of WHEN
     the full-suite rule fires, not a replacement for it, and a rule that had to
-    rewrite this assertion would be the other thing.
+    rewrite this assertion would be the other thing. It survived select-02
+    (2026-08-27) unchanged too, which moved a `.md` path off the token rule
+    entirely: no file here READS the document either, so the answer is the same
+    one by the new route.
     """
     chosen = selection(repo, ["pkg/publisher.py", "docs/NOTES.md"])
 
@@ -534,20 +546,27 @@ def test_a_changed_path_absent_from_the_tree_runs_the_full_suite(repo):
 
 
 def attribution_repo(root: Path) -> Path:
-    """`scaffold` plus ONE test file that names the markdown file by hand.
+    """`scaffold` plus ONE test file that READS the markdown file.
 
     Nothing else in `scaffold` contains `docs`, `.md`, `NOTES` or `NOTES.md`
     (see `test_a_non_python_change_runs_the_full_suite`), so this single file is
     the entire reference set for `docs/NOTES.md` and every count below is
     exact rather than approximate.
+
+    It resolves the checkout from `__file__` and names the document exactly,
+    which since select-02 (2026-08-27) is what a `.md` path is attributed on:
+    naming it in a docstring, or naming only `docs` or `.md`, no longer counts.
+    Both halves matter to the counts below, and both are pinned on their own in
+    `test_prose_doc_selection.py`.
     """
     scaffold(root)
     write(
         root,
         "suite/test_reads_notes.py",
-        'from pathlib import Path\n\n\n'
+        'from pathlib import Path\n\n'
+        'ROOT = Path(__file__).resolve().parents[1]\n\n\n'
         'def test_notes():\n'
-        '    assert Path("docs/NOTES.md").name\n',
+        '    assert (ROOT / "docs/NOTES.md").is_file()\n',
     )
     return root
 
@@ -620,21 +639,32 @@ def test_a_documentation_only_round_narrows_instead_of_widening(tmp_path):
     assert chosen.selected == ("suite/test_reads_notes.py",)
 
 
-def test_a_module_that_names_the_path_drags_in_the_tests_that_import_it(tmp_path):
+def test_a_module_that_reads_the_path_drags_in_the_tests_that_import_it(tmp_path):
     """Why attribution is CLOSED over import edges instead of stopping at tests.
 
     `suite/test_via_module.py` never says `docs`, `.md` or `NOTES` — its only
-    route to the changed file runs through a production module that holds the
-    path. A rule that selected only test files naming the path would skip it,
-    and it is the shape a test of a config/tracker READER always has.
+    route to the changed file runs through a production module that READS the
+    document out of its own checkout. A rule that selected only test files
+    naming the path would skip it, and it is the shape a test of a
+    config/tracker reader always has.
+
+    select-02 narrowed which files are SEEDS; it did not touch the closure, and
+    this is the test that says so. `pkg/notes.py` resolves the document from
+    `__file__`, so it can actually open it — which is the distinction the
+    companion test below draws against a module that merely HOLDS the path.
     """
     root = tmp_path / "indirect"
     scaffold(root)
-    write(root, "pkg/notes.py", 'PATH = "docs/NOTES.md"\n')
+    write(
+        root,
+        "pkg/notes.py",
+        "from pathlib import Path\n\n"
+        'TEXT = (Path(__file__).resolve().parents[1] / "docs/NOTES.md").read_text()\n',
+    )
     write(
         root,
         "suite/test_via_module.py",
-        "from pkg.notes import PATH\n\n\ndef test_path():\n    assert PATH\n",
+        "from pkg.notes import TEXT\n\n\ndef test_path():\n    assert TEXT\n",
     )
 
     chosen = select_validation_commands(COMMANDS, ["docs/NOTES.md"], root)
@@ -838,27 +868,35 @@ def test_a_module_plus_tracker_markdown_narrows_in_the_real_repository():
     assert "autoloop/tests/test_merge_sweep.py" in chosen.selected
 
 
-def test_every_test_naming_a_tracker_still_runs_on_a_tracker_change():
-    """The soundness claim, over the whole population rather than a sample.
+def test_a_test_that_only_names_a_tracker_no_longer_runs_on_a_tracker_change():
+    """CORRECTED BY select-02 (2026-08-27), and kept rather than deleted,
+    because the property it used to assert is the one that made this feature
+    inert and a reader of either round is owed the reversal in one place.
 
-    The brief for select-01 named ~34 test files under `autoloop/tests/` that
-    reference a tracker filename and warned that a rule treating markdown as
-    inert would skip real coverage — `test_markdown_policy.py` exists to assert
-    on markdown handling. This asserts the opposite property directly: not one
-    of them is missing from a tracker change's selection. Whether a given file
-    reads the repository's own copy or builds its own fixture of the same name
-    is never decided, and does not need to be: naming the file is enough.
+    It asserted that not one of the ~34 test files under `autoloop/tests/`
+    naming a tracker filename was missing from a tracker change's selection,
+    on the argument that "naming the file is enough" and that a rule which had
+    to tell a reader from a fixture-builder could get one wrong. Both halves
+    were true and the conclusion was still wrong: there are ~100 test files
+    here, that population is most of them, and since `CLAUDE.md` requires a
+    change note on every task the tracker round IS the normal round — so
+    select-01's narrowing never once fired on one.
 
-    The last assertion is what stops the rest being vacuous. This round also
-    changes `autoloop/merge_sweep.py`, so a file could in principle be selected
-    by ordinary reachability rather than by the markdown at all —
-    `test_markdown_policy.py` is NOT reachable from that module (it imports
-    `autoloop.audit.markdown` and `autoloop.errors`, neither of which touches
-    the sweep), so its presence in `selected` can only have come from
-    attribution.
+    A test now runs on a tracker change when it can READ the tracker. The
+    replacement claim, its four requirements and the non-vacuous version of the
+    `test_docs_merge.py` assertion below are in `test_prose_doc_selection.py`;
+    what this pins is the reversal itself, over the same population as before.
+
+    `test_markdown_policy.py` is the anchor, and it is the file the old
+    docstring named as the reason the old rule had to be conservative: it
+    exists to assert on markdown HANDLING, points `MarkdownPolicy` at a fixture
+    it writes itself, and is NOT reachable from `autoloop/merge_sweep.py` (it
+    imports `autoloop.audit.markdown` and `autoloop.errors`, neither of which
+    touches the sweep). So its absence here is the attribution having narrowed,
+    not the round having missed it by another route.
     """
     graph = real_repository_graph()
-    referencing = sorted(
+    naming = sorted(
         rel
         for rel in graph.test_files
         if rel.startswith("autoloop/tests/")
@@ -867,18 +905,25 @@ def test_every_test_naming_a_tracker_still_runs_on_a_tracker_change():
             for name in TRACKER_NAMES
         )
     )
-    assert len(referencing) >= 30, "the population the rule has to justify"
+    assert len(naming) >= 30, "the population the old rule had to justify"
 
     chosen = tracker_round_selection()
 
     assert not chosen.widened, chosen.reason
-    assert [rel for rel in referencing if rel not in chosen.selected] == []
+    # Vacuous on its own — this round also changes `autoloop/merge_sweep.py`,
+    # which reaches it. `test_prose_doc_selection.py` asserts it on a round with
+    # no Python in it, where only attribution could have selected it.
     assert "autoloop/tests/test_docs_merge.py" in chosen.selected
+    skipped = [rel for rel in naming if rel not in chosen.selected]
+    assert skipped, (
+        "naming a tracker is no longer depending on it; if every one of these "
+        "still ran, the tracker round would still be the whole suite"
+    )
     policy_test = "autoloop/tests/test_markdown_policy.py"
-    assert policy_test in chosen.selected
+    assert policy_test in skipped
     assert policy_test not in graph.reachable_from(["autoloop/merge_sweep.py"]), (
-        "if the module change reached it, this test would pass without the "
-        "markdown attribution having done anything"
+        "if the module change reached it, this test would fail for a reason "
+        "that has nothing to do with the attribution"
     )
 
 
@@ -1084,7 +1129,15 @@ def test_the_evidence_says_so_when_nothing_was_narrowed(repo):
 def test_the_evidence_is_bounded(repo):
     """It becomes `state.last_validation` — state.json, the transcript, blocker
     records and the CONTEXT block of every message — so it cannot grow with the
-    size of the suite."""
+    size of the suite.
+
+    The bound went 3000 -> 3300 at select-02 (2026-08-27), which added ~250
+    characters of CONSTANT text to the subset branch: the rule it describes
+    changed, and evidence that does not describe the run it made is the
+    rejection mode this module treats as worse than a wide run. What is pinned
+    here is that the string does not grow with the SUITE — 40 generated test
+    files below, and the selected list is still elided — and that is unchanged.
+    """
     for index in range(40):
         write(
             repo,
@@ -1096,7 +1149,7 @@ def test_the_evidence_is_bounded(repo):
 
     assert len(chosen.selected) > 20
     assert "more)" in chosen.evidence()
-    assert len(chosen.evidence()) < 3000
+    assert len(chosen.evidence()) < 3300
 
 
 # ---- integration: what the reviewer actually receives ------------------------
