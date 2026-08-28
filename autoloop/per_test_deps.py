@@ -63,6 +63,34 @@ _STRING_TARGET_CALLS = frozenset({"setattr", "delattr", "patch", "object"})
 _OPAQUE_NAMES = frozenset({"importlib", "getfixturevalue", "__import__", "eval", "exec"})
 
 
+def conftest_declares_autouse(root: Path, rel: str) -> bool:
+    """Does any `conftest.py` from `rel`'s directory up to `root` declare an
+    autouse fixture?
+
+    pytest applies a conftest to its whole directory tree, so such a fixture runs
+    for every test below it having been named by none of them. Its body is in
+    another file and is not followed here, so its mere PRESENCE makes the tests
+    beneath it opaque.
+
+    This checkout's `autoloop/tests/conftest.py` declares none TODAY — which is
+    exactly why the soundness gate could not have caught this, and why it is
+    closed by reading rather than by having been observed to fail.
+    """
+    directory = (root / rel).parent
+    while True:
+        candidate = directory / "conftest.py"
+        if candidate.is_file():
+            try:
+                tree = ast.parse(candidate.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, ValueError):
+                return True  # unreadable: assume the worst
+            if PerTestAnalysis._read_autouse(tree):
+                return True
+        if directory == root or root not in directory.parents:
+            return False
+        directory = directory.parent
+
+
 @dataclass(frozen=True)
 class TestDeps:
     """What one test can reach, and whether that answer is trustworthy."""
@@ -82,7 +110,20 @@ class PerTestAnalysis:
     instances: the tree is read once per file, per call.
     """
 
-    def __init__(self, root: Path, rel: str, files: frozenset[str]):
+    def __init__(
+        self,
+        root: Path,
+        rel: str,
+        files: frozenset[str],
+        conftest_autouse: bool | None = None,
+    ):
+        """`conftest_autouse` says whether any `conftest.py` above this file
+        declares an autouse fixture. Such a fixture runs for every test beneath
+        it while nothing in any test's text names it — the same invisibility as
+        a module-level autouse fixture, but the body lives in another file, so
+        it is not resolved here. When one exists, every test in this file is
+        opaque. Computed from the checkout when not supplied.
+        """
         self._files = files
         self._rel = rel
         source = (root / rel).read_text(encoding="utf-8")
@@ -100,6 +141,9 @@ class PerTestAnalysis:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self._defs.setdefault(node.name, node)
         self._autouse = self._read_autouse(tree)
+        if conftest_autouse is None:
+            conftest_autouse = conftest_declares_autouse(root, rel)
+        self._conftest_autouse = conftest_autouse
 
     # ---- resolution ---------------------------------------------------------
 
@@ -148,6 +192,34 @@ class PerTestAnalysis:
                         self._unresolved = True
 
     @staticmethod
+    def _indirectly_parametrised(node) -> bool:
+        """Does this test carry `parametrize(..., indirect=True)`?
+
+        Indirect parametrisation does not pass a VALUE to the test, it feeds the
+        value to a FIXTURE of that name and passes what the fixture returns. Which
+        fixture runs is therefore decided from the parameter name at run time, and
+        a partially indirect list (`indirect=["a"]`) sends only some names that
+        way. Nothing here models it, so a test that uses it is opaque rather than
+        quietly missing whatever the fixture reaches.
+        """
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call):
+                continue
+            func = decorator.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != "parametrize":
+                continue
+            for keyword in decorator.keywords:
+                if keyword.arg != "indirect":
+                    continue
+                value = keyword.value
+                # `indirect=False` is the default and is not a request.
+                if isinstance(value, ast.Constant) and not value.value:
+                    continue
+                return True
+        return False
+
+    @staticmethod
     def _read_autouse(tree) -> frozenset[str]:
         """Fixtures declared `autouse=True`.
 
@@ -181,7 +253,9 @@ class PerTestAnalysis:
         """`(modules named, definitions reached, opaque)` for one definition."""
         modules: set[str] = set()
         reached: set[str] = set()
-        opaque = self._unresolved
+        opaque = self._unresolved or self._conftest_autouse
+        if self._indirectly_parametrised(node):
+            opaque = True
         for sub in ast.walk(node):
             if isinstance(sub, (ast.Import, ast.ImportFrom)):
                 continue  # already in `_bindings`: `_read_imports` walked the tree
