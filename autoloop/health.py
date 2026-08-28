@@ -168,6 +168,35 @@ STUCK_STRANDED = "stranded"
 #: only when nothing else needs attention, and otherwise carried on whatever
 #: verdict did, in `Health.held_merge_sweep` and in the detail.
 STUCK_MERGE_BACKLOG = "merge_backlog_held"
+#: The loop could not be JUDGED AT ALL — its config would not load, or reading
+#: it raised. **`check` never returns this**, and that is the point: it is what a
+#: READER of several loops (`dashboard.projects_status`, port-04) reports for one
+#: it could not read, so "I looked and it is fine" and "I could not look" stay
+#: different answers in one vocabulary rather than becoming a second one.
+#:
+#: It NEEDS ATTENTION wherever it is reported. A loop nobody can see is not a
+#: loop that is fine, and the whole failure being guarded against is a stopped
+#: loop going unnoticed for hours.
+STUCK_UNKNOWN = "unknown"
+
+#: Every code above, in escalating order — the ONE vocabulary an operator has
+#: learned. A reader that reports on loops it did not judge itself (the
+#: multi-project view) picks from here rather than inventing its own words, and
+#: this tuple is what a test can pin that against.
+VERDICT_CODES = (
+    OK_RUNNING,
+    OK_PAUSED,
+    OK_IDLE,
+    STUCK_BLOCKED,
+    STUCK_PARKED,
+    STUCK_FAILED,
+    STUCK_STALE_LOCK,
+    STUCK_SILENT,
+    STUCK_NOT_RUNNING,
+    STUCK_STRANDED,
+    STUCK_MERGE_BACKLOG,
+    STUCK_UNKNOWN,
+)
 
 
 @dataclass(frozen=True)
