@@ -390,3 +390,45 @@ def test_revision_feedback_carries_the_same_containment():
     assert "re-check 036" in prompt
     assert "grants no additional authority" in prompt
     assert "within Documentation drift" in prompt
+
+
+def test_audit_validation_is_normalised_like_every_other_validation_run():
+    """The audit validates the WHOLE repository to prove its one markdown file
+    broke nothing, so it pays the suite's full cost on every run.
+
+    It used to run the CONFIGURED argv raw — `_run_validation` called the command
+    runner directly rather than going through `effective_validation_command` — so
+    a pytest command got no `-n auto`. Measured 2026-08-28: an audit sat on the
+    full suite SERIALLY for over fifteen minutes, where eight workers finish it
+    in about seven. Nothing failed and nothing said so; it was simply slow.
+    """
+    from autoloop.validation import effective_validation_command
+
+    raw = ("python3", "-m", "pytest", "autoloop/tests", "-q")
+    assert effective_validation_command(raw) == (
+        "python3", "-m", "pytest", "-n", "auto", "-p", "no:cacheprovider",
+        "autoloop/tests", "-q",
+    )
+
+
+def test_an_audit_unit_id_is_not_in_the_roadmap_namespace():
+    """`autoaudit-0007`, not `audit-0007`.
+
+    A roadmap task may legitimately be called `audit-0003`, and units are minted
+    from the loop iteration, which RESETS each session — so a restarted loop
+    re-mints ids it has used before. On this repository a completed roadmap task
+    `audit-0001` and a fresh audit unit of the same name appeared as one id in
+    the merge backlog, the dashboard and the transcript.
+
+    Both spellings are still RECOGNISED: worker repositories, quarantine entries
+    and archived records written before the rename carry the old one, and a
+    shipped record is never rewritten.
+    """
+    from autoloop.contract import AUDIT_TASK_ID, AUDIT_UNIT_PREFIX, is_audit_unit
+
+    assert AUDIT_UNIT_PREFIX == "autoaudit-"
+    assert not AUDIT_UNIT_PREFIX.startswith(AUDIT_TASK_ID)
+    assert is_audit_unit("autoaudit-0001")
+    assert is_audit_unit("audit-0001"), "a unit minted before the rename still counts"
+    assert not is_audit_unit("t1")
+    assert not is_audit_unit("brw-19c")

@@ -1366,12 +1366,12 @@ def test_audit_dispatch_is_not_wrapped_by_the_escape_detector(tmp_path, monkeypa
     monkeypatch.setattr(orch, "_execute_with_escape_detection", spy_escape)
 
     orch._dispatch_executor(Directive(decision=Decision.AUDIT, reason="orient"))
-    assert executor.calls == ["audit-0000"], "the audit executor must actually have run"
+    assert executor.calls == ["autoaudit-0000"], "the audit executor must actually have run"
     assert calls == [], "audit dispatch must never go through the escape detector"
 
     orch.state.phase = Phase.READY.value
     orch._dispatch_executor(implement("t1"))
-    assert executor.calls == ["audit-0000", "t1"], "the implement executor must actually have run"
+    assert executor.calls == ["autoaudit-0000", "t1"], "the implement executor must actually have run"
     assert calls == ["t1"], "a non-audit write-capable dispatch must go through the escape detector"
 
 

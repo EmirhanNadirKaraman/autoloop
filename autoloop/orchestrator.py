@@ -361,6 +361,8 @@ from .conversation import (
 )
 from .contract import (
     AUDIT_TASK_ID,
+    AUDIT_UNIT_PREFIX,
+    is_audit_unit,
     COMMIT_DECISIONS,
     PUSH_DECISIONS,
     RETIRED_DECISIONS,
@@ -4943,7 +4945,7 @@ class Orchestrator:
         state = self.state
         task_id = directive.task_id or ""
 
-        if task_id == AUDIT_TASK_ID or task_id.startswith("audit-"):
+        if task_id == AUDIT_TASK_ID or is_audit_unit(task_id):
             # An audit unit is synthetic, minted per iteration and never
             # planned, so there is no queue to return it to and a "fresh cut"
             # of it is just the next `audit`. Refused by NAME rather than by
@@ -5840,7 +5842,7 @@ class Orchestrator:
         revise arrives with no audit currently on record.
         """
         if directive.decision is Decision.AUDIT:
-            unit_id = f"audit-{state.iteration:04d}"
+            unit_id = f"{AUDIT_UNIT_PREFIX}{state.iteration:04d}"
             # The audit pseudo-task skips `authorize_directive`'s
             # `_check_task_reference`, so nothing else asks whether the id
             # about to be dispatched is one the operator already quarantined.
@@ -5876,7 +5878,7 @@ class Orchestrator:
                 return None
         else:
             prior = (state.current_task or {}).get("task_id") or ""
-            if not prior.startswith("audit-"):
+            if not is_audit_unit(prior):
                 state.last_response = None
                 self._to_needs_user(
                     "revise of the audit pseudo-task has no audit currently on "
@@ -8622,7 +8624,7 @@ class Orchestrator:
         specs = directive.tasks or ()
         origin = REVIEWER_SPLIT_ORIGIN
 
-        if task_id == AUDIT_TASK_ID or task_id.startswith("audit-"):
+        if task_id == AUDIT_TASK_ID or is_audit_unit(task_id):
             # Refused by NAME rather than by registry lookup, exactly as
             # `_dispatch_recut` does: most audit units are not in the registry
             # at all, so a lookup would answer `task_unknown` and send the
@@ -10087,7 +10089,7 @@ class Orchestrator:
         through them; a second copy is how two answers to one question start
         disagreeing.
         """
-        if task.id == AUDIT_TASK_ID or task.id.startswith("audit-"):
+        if task.id == AUDIT_TASK_ID or is_audit_unit(task.id):
             return (
                 "No split was offered: an audit unit is not a roadmap task — "
                 "there is no registry row to retire and nothing to retire it "

@@ -47,6 +47,42 @@ PROTOCOL_VERSION = 3
 # feedback. It never exists in the task registry.
 AUDIT_TASK_ID = "audit"
 
+#: Prefix of a SYNTHETIC per-run audit unit id (`autoaudit-0007`), minted from
+#: the loop iteration. Distinct from `AUDIT_TASK_ID` above, which is the
+#: protocol pseudo-id the reviewer sends, and — since 2026-08-28 — distinct
+#: from the ROADMAP namespace too.
+#:
+#: Units were minted `audit-<iteration>` until then, and a roadmap task may
+#: legitimately be called `audit-0001`. Observed on this repository: a COMPLETED
+#: roadmap task `audit-0001` (2026-08-02) and a freshly minted audit unit of the
+#: same name appeared as one id in the merge backlog, the dashboard and the
+#: transcript, and the iteration counter resets each session so a restarted loop
+#: re-mints ids it has used before. The names could not be told apart by anyone
+#: reading them, operator included.
+AUDIT_UNIT_PREFIX = "autoaudit-"
+
+#: What units were minted as BEFORE that rename. Recognised, never minted:
+#: worker repositories, quarantine entries, archived records and every
+#: transcript written before 2026-08-28 carry it, and a shipped record is never
+#: rewritten (see CLAUDE.md).
+#:
+#: It still collides with a roadmap task named `audit-*`, and cannot stop doing
+#: so — that ambiguity is exactly what the rename removes GOING FORWARD, for
+#: names minted from here on. It is not retroactive.
+LEGACY_AUDIT_UNIT_PREFIX = "audit-"
+
+
+def is_audit_unit(task_id: str) -> bool:
+    """Is `task_id` a synthetic audit unit, in either spelling?
+
+    Used wherever the loop must refuse to treat an audit as a roadmap task. Both
+    prefixes are accepted because a run in flight, a quarantine entry or a
+    worker repository from before the rename must keep being recognised.
+    """
+    return task_id.startswith(AUDIT_UNIT_PREFIX) or task_id.startswith(
+        LEGACY_AUDIT_UNIT_PREFIX
+    )
+
 
 class Decision(str, Enum):
     AUDIT = "audit"

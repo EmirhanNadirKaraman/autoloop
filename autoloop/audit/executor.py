@@ -62,7 +62,7 @@ from ..executor import ExecutionOutcome
 from ..git_gateway import GitGateway
 from ..policy import PolicyEngine
 from ..tasks import Task, TaskRegistry
-from ..validation import SAFE_VALIDATION_BINARIES
+from ..validation import SAFE_VALIDATION_BINARIES, effective_validation_command
 from ..worker_env import worker_env
 from .agents import AgentResult, AgentRunner, AgentSpec
 from .findings import FINDINGS_SCHEMA_TEXT, parse_findings
@@ -986,6 +986,15 @@ class AuditExecutor:
         return results
 
     def _run_validation(self, git: GitGateway, argv: tuple[str, ...]) -> ValidationRun:
+        # Normalised exactly as `run_validation_commands` normalises the
+        # implementation path's commands. Without this the audit ran the
+        # CONFIGURED argv raw, so a `pytest` command got no `-n auto` and no
+        # `-p no:cacheprovider`: measured 2026-08-28, an audit sat on the full
+        # suite SERIALLY for over fifteen minutes where the same suite takes
+        # about seven across eight workers. The audit changes one markdown file
+        # and validates the whole repository to prove it broke nothing, so it
+        # pays this on every run.
+        argv = effective_validation_command(argv)
         command = " ".join(argv)
         binary = Path(argv[0]).name if argv else ""
         if binary not in SAFE_VALIDATION_BINARIES:
