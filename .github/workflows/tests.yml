@@ -42,3 +42,30 @@ jobs:
       # loop's own post-commit gate reports as validation having MUTATED the
       # worker tree.
       - run: python3 -m pytest autoloop/tests -q -n auto -p no:cacheprovider
+
+  selection-soundness:
+    name: per-test dependencies cover what runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pytest-xdist pytest-cov
+      # `autoloop/per_test_deps.py` decides STATICALLY which modules one test can
+      # reach. If that answer is ever missing a module the test really executes,
+      # a narrowed round skips a test that does exercise the change AND REPORTS
+      # SUCCESS — nothing raises and the suite stays green. The only way to know
+      # is to run the tests and look, so this job is the check.
+      #
+      # A separate job, not a step in the one above: it runs the whole suite a
+      # second time under coverage, and GitHub runs jobs in parallel, so it adds
+      # no wall time to the merge gate. Contexts survive `-n auto` — serially
+      # this takes over an hour.
+      - name: run the suite under per-test coverage contexts
+        run: |
+          COVERAGE_FILE=.coverage-contexts python3 -m pytest autoloop/tests \
+            --cov=autoloop --cov-context=test --cov-report= \
+            -q -n auto -p no:cacheprovider
+      - name: every test's static module set must cover what it ran
+        run: python3 scripts/check_selection_soundness.py .coverage-contexts
