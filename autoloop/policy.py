@@ -273,7 +273,13 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     "merge-base": frozenset({"--is-ancestor"}),
     "rev-list": frozenset(),
     "ls-remote": frozenset({"--heads"}),
-    "config": frozenset({"--get", "--get-regexp", "--get-all"}),
+    # `--list -z` reads EVERY key git can see in one call, for
+    # `environment.snapshot()`. Read-only like the other three, and no
+    # wider: `--get-regexp` already walks the same system/global layers.
+    # `-z` is not decoration — `--list` alone is newline-delimited and a
+    # config VALUE may contain a newline, so the unseparated form cannot be
+    # parsed without ambiguity.
+    "config": frozenset({"--get", "--get-regexp", "--get-all", "--list", "-z"}),
     # Autoloop M2 (`publisher.py`'s `import_candidate` / `worker_env.py`'s
     # `WorkerRepo`): fetching a SINGLE already-existing object by its literal
     # 40-hex id from a LOCAL filesystem path, with no destination ref and no

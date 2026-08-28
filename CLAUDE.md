@@ -68,6 +68,31 @@ Breaking either rule stops a parallel merge exactly like a source conflict.
 section and nothing auto-resolves them — a conflict there stops the merge
 deliberately, because they carry claims that need a human.
 
+## Writing tests
+
+Most tests here need a git repository. Build it with
+`autoloop/tests/gitrepo.py`:
+
+```python
+from gitrepo import make_repo_from_template
+
+make_repo_from_template(root, branch="main", files=(("README.md", "hello\n"),))
+```
+
+It copies a prebuilt template instead of running `init`, three `config`, `add`
+and `commit` — 11.7ms against 158.8ms, measured. Writing the six-subprocess
+version by hand is the single most expensive habit in this suite: it was 2,206
+repository builds and 19,614 of ~45,000 git spawns per run before 30 files were
+converted away from it. Reach for `run_git` from the same module for anything it
+does not model, rather than redefining it a fifty-third time.
+
+Prefer the cheapest test that can fail for the right reason. A real repository,
+a real subprocess or a real agent round is worth it when the CLAIM is about git,
+processes or agents — and is dead weight when the claim is about a pure
+function. The suite is ~4,100 tests at ~100ms of wall each, so roughly every
+hundred tasks doubles it; a test that could have been a fixture is a cost every
+round pays forever.
+
 ## Conventions
 
 - Commit messages never mention AI tooling.

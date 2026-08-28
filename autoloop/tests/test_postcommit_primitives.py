@@ -562,6 +562,49 @@ def test_environment_unchanged_reports_nothing(repo):
     assert environment.verify_unchanged(before, gw) == []
 
 
+def test_the_batched_config_read_returns_what_asking_key_by_key_returned(repo):
+    """`snapshot` reads every key from ONE `config_map()`. This pins it against
+    the `config --get` calls it replaced, field by field, on a repository where
+    each field is actually SET — an all-empty snapshot would agree trivially.
+
+    The failure this guards is silent. `git config --list` LOWERCASES the keys
+    it reports, so `core.hooksPath` comes back as `core.hookspath` and
+    `url.<base>.insteadOf` as `...insteadof`. A lookup that spelled either the
+    way the config file does finds nothing, and a missing key is indistinguishable
+    from an unset one — the snapshot would simply stop tracking that field and
+    `verify_unchanged` would stop reporting drift in it, with no error anywhere.
+    """
+    run_git(repo, "remote", "add", "origin", "https://example.invalid/a.git")
+    run_git(repo, "remote", "add", "second", "https://example.invalid/b.git")
+    run_git(repo, "config", "remote.origin.pushurl", "https://example.invalid/push.git")
+    run_git(repo, "config", "remote.origin.push", "refs/heads/*:refs/heads/*")
+    run_git(repo, "config", "url.https://mirror.invalid/.insteadOf", "https://example.invalid/")
+    (repo / "myhooks").mkdir()
+    run_git(repo, "config", "core.hooksPath", "myhooks")
+    gw = gateway(repo)
+
+    taken = environment.snapshot(gw)
+
+    assert taken.core_hooks_path == gw.config_get("core.hooksPath") != ""
+    names = ("origin", "second")
+    assert taken.remote_urls == tuple(
+        sorted((n, gw.config_get(f"remote.{n}.url")) for n in names)
+    )
+    assert taken.remote_pushurls == tuple(
+        sorted((n, gw.config_get(f"remote.{n}.pushurl")) for n in names)
+    )
+    assert taken.remote_push_refspecs == tuple(
+        sorted((n, gw.config_get(f"remote.{n}.push")) for n in names)
+    )
+    # The rule is spelled `insteadOf` in the config and reported `insteadof`.
+    assert taken.instead_of_rules == (
+        ("url.https://mirror.invalid/.insteadof", "https://example.invalid/"),
+    )
+    # An unset key is "", not missing: `second` has no pushurl and no refspec.
+    assert dict(taken.remote_pushurls)["second"] == ""
+    assert dict(taken.remote_push_refspecs)["second"] == ""
+
+
 # ---- 17. corrupt records raise, never read as absent ------------------------
 
 
