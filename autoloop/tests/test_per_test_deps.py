@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from autoloop.per_test_deps import dependencies_by_test
+from autoloop.per_test_deps import conftest_declares_autouse, dependencies_by_test
 
 #: A file set standing in for the import graph's. Only membership matters.
 FILES = frozenset(
@@ -207,3 +207,69 @@ def test_one():
     importlib.import_module("autoloop.orchestrator")
 """)
     assert found["test_one"].opaque
+
+
+def test_indirect_parametrisation_is_opaque(tmp_path):
+    """`indirect=True` feeds the parameter to a FIXTURE of that name instead of
+    to the test, so which fixture runs is decided at run time from a string.
+    Nothing here models that, so it must widen rather than quietly miss whatever
+    the fixture reaches."""
+    found = analyse(tmp_path, """
+import pytest
+
+@pytest.mark.parametrize("thing", ["a"], indirect=True)
+def test_one(thing):
+    assert thing
+""")
+    assert found["test_one"].opaque
+
+
+def test_ordinary_parametrisation_is_not_opaque(tmp_path):
+    """`indirect` defaults to False, and a plain parametrised test passes VALUES.
+    Treating every parametrised test as opaque would give most of the suite back."""
+    found = analyse(tmp_path, """
+import pytest
+
+@pytest.mark.parametrize("thing", ["a", "b"])
+def test_one(thing):
+    assert thing
+
+@pytest.mark.parametrize("thing", ["a"], indirect=False)
+def test_two(thing):
+    assert thing
+""")
+    assert not found["test_one"].opaque
+    assert not found["test_two"].opaque
+
+
+def test_a_conftest_autouse_fixture_makes_every_test_below_it_opaque(tmp_path):
+    """A conftest fixture applies to its whole directory tree while no test names
+    it, and its body lives in a file this does not follow. Its PRESENCE is enough.
+
+    This checkout's own conftest declares none today, which is why the soundness
+    gate could not have caught this: it is closed by reading, not by observation.
+    """
+    (tmp_path / "autoloop" / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "autoloop" / "tests" / "conftest.py").write_text(
+        "import pytest\n\n@pytest.fixture(autouse=True)\ndef _thing():\n    yield\n",
+        encoding="utf-8",
+    )
+    found = analyse(tmp_path, """
+def test_one():
+    assert True
+""")
+    assert found["test_one"].opaque
+    assert conftest_declares_autouse(tmp_path, "autoloop/tests/test_subject.py")
+
+
+def test_a_conftest_without_autouse_does_not_widen(tmp_path):
+    (tmp_path / "autoloop" / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "autoloop" / "tests" / "conftest.py").write_text(
+        "import sys\nsys.path.insert(0, '.')\n", encoding="utf-8"
+    )
+    found = analyse(tmp_path, """
+def test_one():
+    assert True
+""")
+    assert not found["test_one"].opaque
+    assert not conftest_declares_autouse(tmp_path, "autoloop/tests/test_subject.py")

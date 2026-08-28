@@ -87,13 +87,16 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import hashlib
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
+from .per_test_deps import dependencies_by_test
 from .validation_env import ValidationEnv, redact_with, strip_validation_vars
 
 #: Validation commands may only start with these binaries.
@@ -698,7 +701,24 @@ def run_validation_commands(
 #: values of `[audit] test_selection`.
 TEST_SELECTION_REACHABLE = "reachable"
 TEST_SELECTION_FULL = "full"
-TEST_SELECTION_MODES: tuple[str, ...] = (TEST_SELECTION_REACHABLE, TEST_SELECTION_FULL)
+#: Everything `reachable` does, and then WITHIN each selected file the tests that
+#: cannot reach the change are deselected (`autoloop.per_test_deps`). Strictly
+#: narrower: a test is dropped only when the analysis positively says it reaches
+#: nothing changed, so the file set is identical and only the test count moves.
+#:
+#: DEFAULT OFF. `reachable` narrows to whole FILES and is the mode this
+#: repository has run since select-01; the measurements that justify this one are
+#: in the commit that added `per_test_deps`, and the check that it never drops a
+#: test which really does exercise the change is a CI job
+#: (`scripts/check_selection_soundness.py`), not an argument.
+TEST_SELECTION_PER_TEST = "per_test"
+TEST_SELECTION_MODES: tuple[str, ...] = (
+    TEST_SELECTION_REACHABLE,
+    TEST_SELECTION_FULL,
+    TEST_SELECTION_PER_TEST,
+)
+#: The modes that narrow at all. `full` is the only one that does not.
+_NARROWING_MODES = frozenset({TEST_SELECTION_REACHABLE, TEST_SELECTION_PER_TEST})
 
 #: Directory names the graph walk never descends into. Dot-prefixed directories
 #: are skipped as a class (`.git`, `.venv`, `.pytest_cache`, `.autoloop`); this
@@ -1458,6 +1478,9 @@ class TestSelection:
     selected: tuple[str, ...] = ()
     #: How many test files the graph knows about at all.
     total_test_files: int = 0
+    #: Individual tests deselected WITHIN the selected files, under
+    #: `test_selection = "per_test"`. 0 in every other mode.
+    deselected: int = 0
     #: Configured commands dropped because no selected test lives under their
     #: declared paths, each with the reason — reported explicitly, never
     #: silently absent from the summary.
@@ -1511,6 +1534,23 @@ class TestSelection:
             text += " Attributed: " + "; ".join(shown) + "."
         return text
 
+    def _deselection_accounting(self) -> str:
+        """What `per_test` dropped WITHIN the selected files, or "" for the
+        modes that drop nothing. Stated separately from the file count because
+        they are different claims: the files are chosen by reachability, the
+        tests within them by what each one can reach."""
+        if not self.deselected:
+            return ""
+        return (
+            f" Within those files, {self.deselected} individual test(s) were "
+            "DESELECTED as unable to reach the change "
+            '([audit] test_selection = "per_test"): each one names no module '
+            "the change reaches, is not opaque, and sits in a file the commit "
+            "did not itself touch. A test whose dependencies cannot be read "
+            "statically, or which sits in a file selected by attribution rather "
+            "than by import reachability, is never dropped."
+        )
+
     def evidence(self) -> str:
         if not self.applicable:
             return ""
@@ -1557,6 +1597,7 @@ class TestSelection:
             "than in a comment or docstring and able to address this checkout, "
             "closed over the same edges. A path that can be attributed nothing "
             "at all still widens the whole run."
+            f"{self._deselection_accounting()}"
             f"{self._path_accounting()}"
             f"{dropped} {PRECOMMIT_EVIDENCE} To widen, "
             "either OPERATOR lever (a `plan` directive can set neither): "
@@ -1651,6 +1692,70 @@ _RETARGET_UNCHANGED = "unchanged"
 _RETARGET_NARROWED = "narrowed"
 _RETARGET_SKIP = "skip"
 _RETARGET_BLOCKED = "blocked"
+
+
+def _tests_that_reach_nothing(
+    repo_root: Path,
+    graph: ImportGraph,
+    selected: Sequence[str],
+    reachable: frozenset[str],
+    never_narrow: frozenset[str],
+) -> tuple[str, ...]:
+    """`path::name` for every selected test that reaches nothing that changed.
+
+    A test is named here — i.e. dropped — only when the analysis POSITIVELY says
+    so: it is not opaque, and no module it can reach is one the change reaches.
+    Every other outcome runs. That asymmetry is the whole safety argument, and it
+    is why the plugin takes a drop-list rather than a keep-list.
+
+    `never_narrow` holds the files nothing may be dropped from:
+
+    * a test file the commit itself CHANGED — its own edit is the thing under
+      test, and no module-level reasoning describes that;
+    * a file selected by ATTRIBUTION rather than by import reachability (a
+      changed `.md` or `.toml`, matched by `_files_reading_documents` or
+      `_reference_tokens`). Attribution is a claim about the FILE naming a
+      document; it says nothing about which of its tests do, and the seeds are
+      not modules, so `reachable` cannot answer for them.
+
+    A file that cannot be read or parsed contributes nothing, so all of it runs.
+    """
+    entries: list[str] = []
+    for rel in selected:
+        if rel in never_narrow:
+            continue
+        try:
+            tests = dependencies_by_test(repo_root, rel, graph.files)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for name, deps in sorted(tests.items()):
+            if deps.opaque or (deps.modules & reachable):
+                continue
+            entries.append(f"{rel}::{name}")
+    return tuple(entries)
+
+
+def _deselect_args(entries: Sequence[str]) -> tuple[str, ...]:
+    """Write the drop-list and return the pytest flags that read it.
+
+    OUTSIDE the checkout, deliberately: validation runs inside the task's worker
+    repository and the gate right after it refuses a tree validation dirtied, so
+    a list written next to the tests would fail the very round it was narrowing.
+
+    Named by the hash of its own contents, so the same selection reuses one file
+    and the command stays a pure function of the round. Returns `()` when the
+    file cannot be written, and the caller then runs everything — a list that
+    does not exist must never be read as "drop nothing you cannot see".
+    """
+    body = "\n".join(entries) + "\n"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+    path = Path(tempfile.gettempdir()) / f"autoloop-deselect-{digest}.txt"
+    try:
+        if not path.exists():
+            path.write_text(body, encoding="utf-8")
+    except OSError:
+        return ()
+    return ("-p", "autoloop.pytest_deselect", "--autoloop-deselect", str(path))
 
 
 def _retarget_pytest(
@@ -1788,7 +1893,7 @@ def select_validation_commands(
         return full("no pytest command is configured, so there is nothing to select")
     if full_reason:
         return full(full_reason)
-    if mode != TEST_SELECTION_REACHABLE:
+    if mode not in _NARROWING_MODES:
         return full('[audit] test_selection = "full"')
     if not considered:
         return full("no changed paths were established for this run")
@@ -1892,11 +1997,26 @@ def select_validation_commands(
             attributed=tuple(attributed),
             consulted=True,
         )
+    deselect_args: tuple[str, ...] = ()
+    deselected = 0
+    if mode == TEST_SELECTION_PER_TEST:
+        entries = _tests_that_reach_nothing(
+            repo_root, graph, selected, reachable, attributed_tests | set(considered)
+        )
+        deselected = len(entries)
+        if entries:
+            deselect_args = _deselect_args(entries)
+            if not deselect_args:
+                deselected = 0  # the list could not be written; run everything
+
     kept: list[tuple[str, ...]] = []
     skipped: list[tuple[tuple[str, ...], str]] = []
     blocked: list[str] = []
     for argv in commands:
         status, rewritten, note = _retarget_pytest(argv, selected)
+        if status == _RETARGET_NARROWED and deselect_args:
+            start = _pytest_index(rewritten)
+            rewritten = rewritten[: start + 1] + deselect_args + rewritten[start + 1 :]
         if status == _RETARGET_BLOCKED:
             blocked.append(f"`{' '.join(argv)}` ({note})")
             continue
@@ -1931,6 +2051,7 @@ def select_validation_commands(
         commands=tuple(kept),
         widened=False,
         reason="",
+        deselected=deselected,
         considered=considered,
         selected=selected,
         total_test_files=total,
