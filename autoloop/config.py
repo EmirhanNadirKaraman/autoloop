@@ -369,7 +369,12 @@ class AuditConfig:
     agent_ceiling_seconds: float = DEFAULT_CEILING_SECONDS
     max_parallel_agents: int = 3
     validation_commands: tuple[tuple[str, ...], ...] = (("ruff", "check", "."),)
-    #: How the POST-COMMIT validation re-run decides which tests to run.
+    #: How a round's validation runs decide which tests to run. BOTH of them
+    #: since val-04 (2026-08-27) — the authoritative pre-commit run inside
+    #: `ImplementExecutor` and the post-commit re-run in `orchestrator` — which
+    #: is why this is one setting rather than one per phase: `cli._build_executor`
+    #: passes it to the executor and `_run_post_commit_validation` reads it here,
+    #: so `"full"` turns selection off at both ends or at neither.
     #:
     #: `"reachable"` (default) narrows each configured pytest command to the
     #: test files reachable from the commit's own changed paths through the

@@ -386,6 +386,35 @@ class GitGateway:
             return []
         return [line for line in proc.stdout.splitlines() if line.strip()]
 
+    def config_map(self) -> dict[str, list[str]]:
+        """Every config key git can see, in ONE call, `{key: [values...]}`.
+
+        For a caller that needs SEVERAL keys AT ONE INSTANT —
+        `environment.snapshot()` is the only one — where asking per key both
+        costs a subprocess each and reads them at slightly different moments,
+        so what it returns is not quite the snapshot it is named for.
+
+        NOT a replacement for `config_get` in `push_exact`. The repeated reads
+        there are deliberately separated IN TIME (see the `insteadOf` re-check
+        after the push); collapsing them into one map would delete the property
+        they exist for.
+
+        `--list -z` rather than `--list`: entries are NUL-separated and the key
+        is split from its value by a newline, so a value CONTAINING a newline
+        stays unambiguous. Values are stripped and order is preserved, so the
+        LAST entry for a key is what `config --get` would have returned.
+        """
+        proc = self._git("config", "--list", "-z", check=False)
+        if proc.returncode != 0:
+            return {}
+        found: dict[str, list[str]] = {}
+        for entry in proc.stdout.split("\0"):
+            if not entry:
+                continue
+            key, separator, value = entry.partition("\n")
+            found.setdefault(key, []).append(value.strip() if separator else "")
+        return found
+
     def config_get_regexp(self, pattern: str) -> str:
         """`git config --get-regexp <pattern>`, or "" if nothing matches.
 
@@ -1224,10 +1253,19 @@ class GitGateway:
         path = Path(raw)
         return path if path.is_absolute() else self._repo_root / path
 
-    def active_hooks(self, names: "tuple[str, ...]") -> tuple[Path, list[str]]:
+    def active_hooks(
+        self, names: "tuple[str, ...]", directory: Path | None = None
+    ) -> tuple[Path, list[str]]:
         """(effective hooks dir, active hooks among `names`). See
-        `active_commit_hooks` for what "active" means."""
-        directory = self.hooks_dir()
+        `active_commit_hooks` for what "active" means.
+
+        `directory` lets a caller that already resolved the hooks path reuse it
+        rather than pay `rev-parse --git-path hooks` again. Only pass one where
+        the two reads are meant to be the SAME instant — `environment.snapshot()`
+        asks for commit and push hooks out of one directory on purpose. A check
+        made immediately before a push must resolve it afresh.
+        """
+        directory = self.hooks_dir() if directory is None else directory
         active = [
             name
             for name in names

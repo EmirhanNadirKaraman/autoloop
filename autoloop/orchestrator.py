@@ -9808,18 +9808,23 @@ class Orchestrator:
           from a subdirectory takes paths relative to THAT directory, and the
           two would not line up. The backend suite is exactly this case.
 
-        **This is the only call site that narrows.** A round validates twice,
-        and the OTHER run — `ImplementExecutor`'s own, before the commit — still
-        executes every configured command in full. That is a scope boundary, not
-        a design one: the selector takes a command list, changed repo-relative
-        paths and a repo root, all three of which that call site already holds
-        (`sorted(git.dirty_paths_all())` and `git.repo_root`, read a few lines
-        above its `run_validation_commands` call); adopting it there is a change
-        to `implement_executor.py` plus one constructor argument threaded from
-        `cli._build_executor`, neither of which was in val-02's approved paths.
-        Until that lands, a round costs one full suite plus one narrowed suite,
-        and `validation.PRECOMMIT_EVIDENCE` tells the reviewer exactly that
-        rather than letting a narrowed summary read as the whole story.
+        **This is NOT the only call site that narrows** — it was until val-04
+        (2026-08-27), and the sentence saying so outlived the change by a day.
+        A round validates twice, and the OTHER run —
+        `ImplementExecutor._select_validation`, before the commit — now puts the
+        same command list through the same selector, from `dirty_paths_all()`
+        and the worker repo root. So a round no longer costs one full suite plus
+        one narrowed suite: no full-suite run is GUARANTEED at either phase, and
+        a round that narrows at both has none at all.
+
+        What this site still contributes is not independence but SUBJECT. It
+        grades the COMMITTED tree, which a commit hook can have changed after
+        the pre-commit run looked — the reason this method exists at all, stated
+        at the top. Two correlated runs over two different trees; the earlier
+        one is no longer a full backstop underneath this one, and the two may
+        disagree honestly, since each reports its own decision where it ran.
+        `validation.PRECOMMIT_EVIDENCE` is what tells the reviewer that, rather
+        than letting a narrowed summary read as the whole story.
 
         Whatever it decides is APPENDED to the returned summary, which becomes
         `state.last_validation` and reaches the reviewer in the CONTEXT block of

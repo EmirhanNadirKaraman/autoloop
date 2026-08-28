@@ -326,13 +326,17 @@ validation_commands = [
 # subset. The four commands shipped here are all narrowable; a command you add
 # that is not will simply turn selection off, visibly, and say which one did it.
 #
-# WHICH RUN this governs, as of 2026-08-20: the POST-COMMIT re-run only, the one
-# whose result the reviewer is shown. A round validates twice — once inside
-# ImplementExecutor before the commit, once against the committed worktree — and
-# the pre-commit run still executes every command above in full, so a round costs
-# one full suite plus one narrowed suite rather than two full ones. Narrowing the
-# pre-commit site needs a change in autoloop/implement_executor.py (the inputs are
-# already in hand there) and in cli._build_executor (to thread this setting to it).
+# WHICH RUNS this governs, as of val-04 (2026-08-27): BOTH runs of a round. It
+# was the post-commit re-run only from 2026-08-20 until then. A round validates
+# twice — once inside ImplementExecutor before the commit, from that tree's own
+# dirty paths, and once against the committed worktree, from git's account of the
+# commit range — and this one setting is read by both (cli._build_executor passes
+# it to the executor as well), so "full" restores the pre-2026-08-20 behaviour at
+# both ends rather than at one. A round no longer costs one full suite plus one
+# narrowed suite: no full-suite run is guaranteed at either phase, and a round
+# that narrows at both has none. The pre-commit run is therefore no longer an
+# independent backstop under the post-commit one — what the later run still adds
+# is its SUBJECT, the committed tree a commit hook can have changed.
 #
 # Whatever it decides is recorded in the validation summary the reviewer reads,
 # naming the selected files, the changed paths they were selected from, and the

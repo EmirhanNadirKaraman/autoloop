@@ -22,6 +22,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: Config keys are matched by PREFIX AND SUFFIX rather than by these patterns
+#: now that `snapshot` reads one `config_map()`. Kept because they say what a
+#: key of each kind looks like, and because `git config --list` LOWERCASES every
+#: key it reports: `core.hooksPath` comes back as `core.hookspath` and
+#: `url.<base>.insteadOf` as `...insteadof`, which is why the suffix tests below
+#: and these patterns are both spelled in lower case.
 _REMOTE_URL_KEY_RE_GROUP = r"^remote\..*\.url$"
 _INSTEAD_OF_KEY_RE_GROUP = r"^url\..*\.insteadof$"
 
@@ -56,47 +62,61 @@ class EnvSnapshot:
     remote_push_refspecs: tuple[tuple[str, str], ...]
 
 
-def _remote_names(git) -> tuple[str, ...]:
+def _remote_names(config: dict[str, list[str]]) -> tuple[str, ...]:
     """Remote names derived from `remote.<name>.url` config keys directly —
     never `git remote -v`, for the reason in the module docstring."""
-    raw = git.config_get_regexp(_REMOTE_URL_KEY_RE_GROUP)
-    names: set[str] = set()
-    for line in raw.splitlines():
-        key = line.split(" ", 1)[0] if line else ""
-        if key.startswith("remote.") and key.endswith(".url"):
-            names.add(key[len("remote."):-len(".url")])
-    return tuple(sorted(names))
+    return tuple(sorted(
+        key[len("remote."):-len(".url")]
+        for key in config
+        if key.startswith("remote.") and key.endswith(".url")
+    ))
 
 
-def _instead_of_rules(git) -> tuple[tuple[str, str], ...]:
-    raw = git.config_get_regexp(_INSTEAD_OF_KEY_RE_GROUP)
-    rules = []
-    for line in raw.splitlines():
-        if not line:
-            continue
-        key, _, value = line.partition(" ")
-        rules.append((key, value))
-    return tuple(sorted(rules))
+def _instead_of_rules(config: dict[str, list[str]]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(
+        (key, value)
+        for key, values in config.items()
+        if key.startswith("url.") and key.endswith(".insteadof")
+        for value in values
+    ))
+
+
+def _last(config: dict[str, list[str]], key: str) -> str:
+    """What `git config --get <key>` would have returned: the LAST value for a
+    multi-valued key, or "" when it is unset."""
+    values = config.get(key)
+    return values[-1] if values else ""
 
 
 def snapshot(git) -> EnvSnapshot:
     """Capture the current hook set, hooks directory, `core.hooksPath`,
-    every `insteadOf` rule, and every remote's url / pushurl / push refspec."""
-    hooks_dir, active = git.active_commit_hooks()
-    _pushdir, active_push = git.active_push_hooks()
-    names = _remote_names(git)
+    every `insteadOf` rule, and every remote's url / pushurl / push refspec.
+
+    Every config key comes from ONE `config_map()`, and the hooks directory is
+    resolved once and reused for both hook sets. That is a correctness point
+    before it is a cost one: this is a SNAPSHOT, so its fields should describe a
+    single instant, and reading eight keys through eight subprocesses described
+    eight consecutive ones. (It also cost eight git spawns per snapshot, which
+    the test suite paid ~1,400 times a run.) `verify_unchanged` compares two of
+    these, so the tighter each one is, the less drift it can straddle.
+    """
+    config = git.config_map()
+    hooks_dir = git.hooks_dir()
+    _dir, active = git.active_hooks(git.COMMIT_HOOKS, hooks_dir)
+    _pushdir, active_push = git.active_hooks(git.PUSH_HOOKS, hooks_dir)
+    names = _remote_names(config)
     return EnvSnapshot(
         hooks_dir=str(hooks_dir),
         active_hooks=tuple(active),
         active_push_hooks=tuple(active_push),
-        core_hooks_path=git.config_get("core.hooksPath"),
-        instead_of_rules=_instead_of_rules(git),
-        remote_urls=tuple(sorted((name, git.config_get(f"remote.{name}.url")) for name in names)),
+        core_hooks_path=_last(config, "core.hookspath"),
+        instead_of_rules=_instead_of_rules(config),
+        remote_urls=tuple(sorted((n, _last(config, f"remote.{n}.url")) for n in names)),
         remote_pushurls=tuple(
-            sorted((name, git.config_get(f"remote.{name}.pushurl")) for name in names)
+            sorted((n, _last(config, f"remote.{n}.pushurl")) for n in names)
         ),
         remote_push_refspecs=tuple(
-            sorted((name, git.config_get(f"remote.{name}.push")) for name in names)
+            sorted((n, _last(config, f"remote.{n}.push")) for n in names)
         ),
     )
 
