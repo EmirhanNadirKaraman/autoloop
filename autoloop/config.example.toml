@@ -589,3 +589,25 @@ workers_root = "~/.autoloop/workers"
 # The write-capable agent subprocess has these variables explicitly removed
 # from its environment and never learns this path.
 # validation_env_file = "~/.autoloop/validation.env"
+
+# [projects]
+# OPTIONAL, and only read by `python -m autoloop projects` — the one status view
+# across every loop you run (docs/AUTOLOOP.md, "One view across projects").
+#
+# Each entry is the CONFIG FILE of another loop: its own state_dir, its own
+# checkout, its own branch. From that one path the view resolves everything else
+# by the loop's own rules, so adding a fifth project is a line here rather than a
+# code change. Paths must be ABSOLUTE (`~` is expanded): the command is run from
+# wherever you are standing, and a relative entry would name a different file
+# each time.
+#
+# The view is READ-ONLY and takes no lock — safe to run against a loop that is
+# mid-round — and a project whose config is missing or unreadable is reported as
+# `unknown` with the reason while every other project still renders.
+#
+# Listing this deployment's OWN config here is allowed and shows it as one more
+# row; nothing reads this section recursively.
+# configs = [
+#   "~/code/project-a/.autoloop/config.toml",
+#   "~/code/project-b/.autoloop/config.toml",
+# ]
