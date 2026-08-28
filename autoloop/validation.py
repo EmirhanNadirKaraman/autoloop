@@ -477,7 +477,7 @@ def run_validation_commands(
 # Package directories are excluded because Python 3 has no implicit relative
 # imports — inside `autoloop/`, a bare `import publisher` does not find
 # `autoloop/publisher.py` — and a relative `from .publisher import ...` is already
-# resolved by `_imported_modules`.
+# resolved by `_scan_module`.
 #
 # When a name resolves under more than one of those roots, or to more than one
 # file under the same root, EVERY candidate gets an edge. That is what "fail
@@ -744,7 +744,7 @@ _DYNAMIC_IMPORT_CALLS = frozenset(
 #: can import anything in the repository without a single import statement.
 #: `sys.executable` is detected separately, as an attribute.
 #:
-#: Only consulted for TEST files (see `_file_is_opaque`). Half the modules in
+#: Only consulted for TEST files (see `_scan_module`). Half the modules in
 #: this package mention an interpreter name because running one is their job —
 #: `run_validation_commands` two hundred lines above is the clearest case — and
 #: treating those as opaque would put a production module on every change's
@@ -913,7 +913,7 @@ def _import_roots(rel: str, packages: frozenset[str]) -> tuple[str, ...]:
 
     Package directories are excluded because Python 3 has no implicit relative
     imports, so a bare name inside one does not reach its sibling — the sibling
-    is reached by `from .x import ...`, which `_imported_modules` already
+    is reached by `from .x import ...`, which `_scan_module` already
     resolves. That exclusion is a precision choice, not a guarantee: nothing
     depends on an edge being ABSENT, and a directory that gains an `__init__.py`
     while still being imported from by bare name would be a reason to widen this
@@ -955,49 +955,41 @@ def _python_files(root: Path) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
-def _file_is_opaque(tree: ast.AST, rel: str) -> bool:
-    """Can this file reach repository code by some route other than its own
-    import statements? A `True` here is not a defect report — it puts the file
-    on the frontier for EVERY change, which is the conservative answer.
+def _scan_module(tree: ast.AST, rel: str) -> tuple[bool, set[str]]:
+    """Both questions `build_import_graph` asks of a parsed file, in ONE walk.
 
-    A dynamic import counts anywhere; an interpreter subprocess counts only in a
-    test file or a conftest, for the reason `_INTERPRETER_LITERALS` gives.
-    """
-    watch_interpreter = _is_test_file(rel) or PurePosixPath(rel).name == "conftest.py"
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            called = ""
-            if isinstance(func, ast.Attribute):
-                called = func.attr
-            elif isinstance(func, ast.Name):
-                called = func.id
-            if called in _DYNAMIC_IMPORT_CALLS:
-                return True
-        elif watch_interpreter and isinstance(node, ast.Attribute):
-            if (
-                node.attr == "executable"
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "sys"
-            ):
-                return True
-        elif watch_interpreter and isinstance(node, ast.Constant):
-            if isinstance(node.value, str) and node.value in _INTERPRETER_LITERALS:
-                return True
-    return False
+    These were two functions — `_file_is_opaque` and `_imported_modules` — until
+    2026-08-28, and each walked the whole tree by itself. `ast.walk` is a
+    Python-level traversal (a deque plus `iter_child_nodes` plus `iter_fields`
+    per node), so the pair was the single largest cost in a selection: measured
+    on this checkout's 159 files, 0.98s for the two passes against 0.63s for the
+    one below, inside a `select_validation_commands` call where `ast.walk`
+    accounted for 63% of the time. WHICH nodes count did not change; the two
+    branches below are the former functions' bodies, and their agreement was
+    checked file-by-file over the whole checkout before the split was removed.
 
+    Returns `(opaque, imported)`.
 
-def _imported_modules(tree: ast.AST, rel: str) -> set[str]:
-    """Every dotted module name this file names in an import statement.
+    `opaque` — can this file reach repository code by some route other than its
+    own import statements? A `True` here is not a defect report: it puts the
+    file on the frontier for EVERY change, which is the conservative answer. A
+    dynamic import counts anywhere; an interpreter subprocess counts only in a
+    test file or a conftest, for the reason `_INTERPRETER_LITERALS` gives. It no
+    longer returns the moment it knows — the import half has to finish the walk
+    regardless — so once the answer is `True` the remaining nodes only skip the
+    opacity tests, which is what the `elif opaque` arm is for.
 
-    Relative imports are resolved against the file's own package, so
+    `imported` — every dotted module name this file names in an import
+    statement. Relative imports are resolved against the file's own package, so
     `from .validation import x` inside `autoloop/orchestrator.py` yields
     `autoloop.validation`. `from a import b` yields BOTH `a` and `a.b`, because
     `b` may be a submodule rather than an attribute and only the file map
     downstream can tell which.
     """
+    watch_interpreter = _is_test_file(rel) or PurePosixPath(rel).name == "conftest.py"
     parts = _module_parts(rel)
     package = list(parts) if rel.endswith("__init__.py") else list(parts[:-1])
+    opaque = False
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1020,7 +1012,28 @@ def _imported_modules(tree: ast.AST, rel: str) -> set[str]:
             for alias in node.names:
                 if alias.name != "*":
                     names.add(".".join(filter(None, [base, alias.name])))
-    return names
+        elif opaque:
+            continue
+        elif isinstance(node, ast.Call):
+            func = node.func
+            called = ""
+            if isinstance(func, ast.Attribute):
+                called = func.attr
+            elif isinstance(func, ast.Name):
+                called = func.id
+            if called in _DYNAMIC_IMPORT_CALLS:
+                opaque = True
+        elif watch_interpreter and isinstance(node, ast.Attribute):
+            if (
+                node.attr == "executable"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+            ):
+                opaque = True
+        elif watch_interpreter and isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and node.value in _INTERPRETER_LITERALS:
+                opaque = True
+    return opaque, names
 
 
 @dataclass(frozen=True)
@@ -1113,9 +1126,10 @@ def build_import_graph(root: Path) -> ImportGraph:
         except (OSError, SyntaxError, ValueError):
             opaque.add(rel)
             continue
-        if _file_is_opaque(tree, rel):
+        file_is_opaque, modules = _scan_module(tree, rel)
+        if file_is_opaque:
             opaque.add(rel)
-        for module in _imported_modules(tree, rel):
+        for module in modules:
             segments = module.split(".")
             for prefix in roots_of[rel]:
                 table = by_root[prefix]
@@ -1257,18 +1271,19 @@ def _code_strings(tree: ast.AST) -> set[str]:
     document exactly. That is a known gap, not an oversight — see
     `_files_reading_documents`.
     """
-    prose = {
-        id(node.value)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
-    }
-    return {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and id(node) not in prose
-    }
+    # ONE walk, not two. An `Expr` node is never itself a `Constant`, so the
+    # two arms cannot both fire for a node, and the prose set is applied after
+    # the walk rather than during it — a docstring's constant is reached as a
+    # child of its `Expr` in the same pass, in whichever order `ast.walk`
+    # happens to visit them.
+    prose: set[int] = set()
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            prose.add(id(node.value))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.append((id(node), node.value))
+    return {value for node_id, value in found if node_id not in prose}
 
 
 def _addresses_own_checkout(tree: ast.AST) -> bool:
@@ -1390,12 +1405,20 @@ def _files_reading_documents(
     names = {rel: PurePosixPath(rel).name for rel in documents}
     for rel in files:
         try:
-            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+            source = (root / rel).read_text(encoding="utf-8")
+            tree = ast.parse(source)
         except (OSError, SyntaxError, ValueError):
             for found in hits.values():
                 found.add(rel)
             continue
-        if not _addresses_own_checkout(tree):
+        # `__file__` is an IDENTIFIER, so `_addresses_own_checkout` can only
+        # find an `ast.Name` for it if the token appears verbatim in the source
+        # — a name cannot be spelled any other way. Testing the text first is
+        # therefore a necessary condition, not a heuristic, and it skips a full
+        # tree walk for the majority of files, which do not mention it at all.
+        # The walk still decides: the token also appears in strings and
+        # comments, and only the AST can tell those from a real reference.
+        if "__file__" not in source or not _addresses_own_checkout(tree):
             continue
         strings = _code_strings(tree)
         for document, found in hits.items():

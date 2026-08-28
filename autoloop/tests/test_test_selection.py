@@ -324,7 +324,7 @@ def test_a_bare_sibling_import_is_a_real_edge_in_the_real_repository():
 def sibling_tree(root: Path) -> Path:
     """A non-package test directory whose files import each other by bare name.
 
-    Deliberately free of the literals `_file_is_opaque` watches for — no
+    Deliberately free of the literals `_scan_module` watches for — no
     `"python"`, no `importlib` — so nothing here is opaque and every selection
     below is carried by an import edge rather than by the frontier.
 
@@ -416,7 +416,7 @@ def test_an_ambiguous_bare_import_gets_an_edge_to_every_candidate(tmp_path):
 # Nothing here pins the ABSENCE of an edge. `_import_roots` excludes package
 # directories (Python 3 has no implicit relative imports, so a bare name inside
 # `autoloop/` does not reach `autoloop/publisher.py` — `from .publisher import`
-# does, and `_imported_modules` already resolves that), but that is a precision
+# does, and `_scan_module` already resolves that), but that is a precision
 # choice, not a guarantee. Asserting it would make an under-selection into a
 # contract, and the direction this model is allowed to be wrong in is the other
 # one: a directory that gains an `__init__.py` while still being imported from by

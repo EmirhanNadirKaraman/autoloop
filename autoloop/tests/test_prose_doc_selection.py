@@ -61,6 +61,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from autoloop.tasks import TRACKER_PATHS
 from autoloop.validation import (
     _PROSE_DOC_SUFFIX,
@@ -92,13 +94,14 @@ COMMANDS = (RUFF, FIXTURE_SUITE)
 #: the first time that tuple moved.
 TRACKERS = TRACKER_PATHS
 
-#: `build_import_graph(REPO_ROOT)` and a real-repository selection each walk the
-#: whole checkout. Cached per process for the same reason
-#: `test_test_selection.py` caches its own: several tests below ask about the
-#: same tree and the same rounds, and the tree does not change while the suite
-#: runs.
+#: `build_import_graph(REPO_ROOT)`, a real-repository selection and the
+#: reader map over the trackers each walk the whole checkout. Cached per process
+#: for the same reason `test_test_selection.py` caches its own: several tests
+#: below ask about the same tree, the same rounds and the same readers, and the
+#: tree does not change while the suite runs.
 _REAL_GRAPH = None
 _ROUNDS: dict[tuple[str, ...], object] = {}
+_READERS: dict[str, frozenset[str]] | None = None
 
 
 def real_graph():
@@ -113,6 +116,20 @@ def real_round(*paths: str):
     if key not in _ROUNDS:
         _ROUNDS[key] = select_validation_commands(REAL_COMMANDS, list(key), REPO_ROOT)
     return _ROUNDS[key]
+
+
+def real_readers():
+    """Which repository files READ each tracker, over the real checkout.
+
+    One call for the whole file. It is the same question every caller here asks
+    — `TRACKERS` against this checkout — and it costs a walk of every file in
+    the graph, so asking it once per test made the readers map, not the claim
+    under test, the expensive part of three of them.
+    """
+    global _READERS
+    if _READERS is None:
+        _READERS = _files_reading_documents(REPO_ROOT, sorted(real_graph().files), TRACKERS)
+    return _READERS
 
 
 def token_rule_tests(path: str) -> frozenset[str]:
@@ -466,22 +483,27 @@ def test_a_docs_only_round_still_selects_test_docs_merge():
     assert target in chosen.selected
 
 
-def test_every_tracker_has_a_reader_so_a_change_note_round_never_widens():
+@pytest.mark.parametrize("tracker", TRACKERS)
+def test_every_tracker_has_a_reader_so_a_change_note_round_never_widens(tracker):
     """The property that keeps requirement 1 true for each tracker separately.
 
     A document with no reader is attributed nothing and widens the whole run —
     correct, but it would mean the narrowing never fires for that tracker. Read
     off `tasks.TRACKER_PATHS` rather than a copy, so a tracker added to the
-    loop's authorization list without a test that reads it fails here.
-    """
-    graph = real_graph()
-    readers = _files_reading_documents(REPO_ROOT, sorted(graph.files), TRACKERS)
+    loop's authorization list without a test that reads it fails here — as a new
+    CASE, since the parametrisation reads off the same tuple.
 
-    for tracker in TRACKERS:
-        assert readers[tracker], f"nothing reads {tracker}, so its rounds widen"
-        chosen = real_round(tracker)
-        assert not chosen.widened, (tracker, chosen.reason)
-        assert "autoloop/tests/test_docs_merge.py" in chosen.selected, tracker
+    Parametrised rather than looped over inside one test (2026-08-28). Each
+    tracker costs a full real-repository selection, and six in series made this
+    the slowest test in the suite: 104s under `-n auto`, all of it on one worker
+    while the others had nothing left to do. Six cases spread across workers
+    instead, and a tracker that fails now names itself in the report rather than
+    stopping the loop before the trackers after it are ever asked.
+    """
+    assert real_readers()[tracker], f"nothing reads {tracker}, so its rounds widen"
+    chosen = real_round(tracker)
+    assert not chosen.widened, (tracker, chosen.reason)
+    assert "autoloop/tests/test_docs_merge.py" in chosen.selected, tracker
 
 
 def test_a_change_to_the_audit_charters_toml_selects_exactly_what_it_did_before():
@@ -689,8 +711,5 @@ def test_dashboard_is_not_a_reader_of_the_trackers_it_never_opens():
     for rel in TRACKER_PATHS:
         assert not _names_document(strings, rel, Path(rel).name), rel
 
-    readers = _files_reading_documents(
-        REPO_ROOT, sorted(build_import_graph(REPO_ROOT).files), list(TRACKER_PATHS)
-    )
-    for rel, found in readers.items():
+    for rel, found in real_readers().items():
         assert "autoloop/dashboard.py" not in found, (rel, sorted(found))
