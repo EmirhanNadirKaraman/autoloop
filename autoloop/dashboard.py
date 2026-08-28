@@ -72,11 +72,20 @@ dependency (nothing to do), **Needs a human** waits on you, **Retired** waits on
 nobody — it was superseded, and its row names the successor rather than asking
 for anything. Six of the seven `blocked` rows on 2026-08-14 were retirements,
 which is what made the blocked count useless as a call to action.
+
+**One view across several projects** (port-04, 2026-08-28) lives at the foot of
+this file and is a different thing from everything above: `ProjectStatus`,
+`projects_status` and `render_projects_text` take a LIST OF CONFIG PATHS, open
+no checkout at all, and answer one question per loop — is it up, on what, quiet
+how long, blockers, when it last finished work. Everything above binds ONE repo
+to `Handler.repo` and reads git per request; four of those would be four times
+the cost for an answer none of them gives. See the banner comment there.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -101,9 +110,24 @@ from .auto_merge import UPGRADE_PENDING, UpgradeStore, loop_code_paths
 # The loop's OWN state-directory rule, imported rather than re-implemented
 # (port-06). `config` pulls in nothing optional — `errors`, `policy`, `stall`,
 # `validation` and `tomllib`, all pure Python — so this costs nothing that the
-# three imports above do not already cost. `load_config` itself stays a
-# deferred import inside `merge_window`, because THAT needs `cli`.
-from .config import resolve_state_dir, workers_root_from
+# three imports above do not already cost. `merge_window` still defers its own
+# `cli` import, which is what that comment was about.
+#
+# `load_config` and `LEGACY_STATE_DIR_NAME` joined them for the multi-project
+# view at the foot of this file: that view's whole input is a list of config
+# paths, so opening one with the loop's own loader is the first thing it does.
+from .config import (
+    LEGACY_STATE_DIR_NAME,
+    load_config,
+    resolve_state_dir,
+    workers_root_from,
+)
+# The verdict vocabulary the multi-project view reports in, and the transcript
+# reader it measures silence with. Module level because `ProjectStatus` names
+# `health.STUCK_UNKNOWN` as a field DEFAULT, which is evaluated at class
+# definition. `health` imports nothing that imports this module, and everything
+# it pulls in is pure Python — no cycle, no optional dependency.
+from . import health
 from .errors import ConfigError, StateError, TaskGraphError
 from .tasks import (
     SATISFIES_DEPENDENCY,
@@ -7162,6 +7186,521 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass  # a poll every 2s would bury the terminal
+
+
+# ---------------------------------------------------------------------------
+# ONE VIEW ACROSS EVERY CONFIGURED PROJECT (port-04, 2026-08-28)
+# ---------------------------------------------------------------------------
+#
+# Everything above this line is ONE project: `Handler.repo` is bound to a single
+# checkout and every panel answers "what is happening inside it right now", with
+# git subprocesses per request. This section answers the other question — "which
+# of the four loops needs me" — and it is deliberately a different thing:
+#
+# * its INPUT is a list of CONFIG PATHS, not a checkout. Every other path (state
+#   dir, lock, transcript, blockers, registry) follows from one config by the
+#   loop's own resolution rules, so a fifth project is a config line rather than
+#   a code change;
+# * it TOUCHES NO CHECKOUT AT ALL. No git, no repo root, no import of anything
+#   living in an observed tree. Four separate incidents on 2026-08-15/16 were a
+#   dashboard restart and a health poller writing `__pycache__` INSIDE a live
+#   checkout, which the escape detector correctly reported as a worker-isolation
+#   escape and which cost a reset and the in-flight round each time. So this
+#   reads files and nothing else, and runs inside `_no_bytecode_writes()` on top
+#   of that;
+# * it reuses `health`'s verdict vocabulary rather than inventing a second one,
+#   and adds exactly one word to it — `health.STUCK_UNKNOWN`, for a project it
+#   could not read — which lives in `health.py` beside the others.
+
+#: The env var that stops a child process writing `.pyc` files, spelled once.
+BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE"
+
+#: `loop_state` — a FACT about the lock, never a verdict. `code` carries the
+#: verdict (`health`'s vocabulary) and these carry whether a process is actually
+#: up, because the two genuinely disagree and treating them as one is the
+#: measured failure: `health` reports `blocked` whenever ANY blocker is open,
+#: including while continuous mode happily works other tasks on that project,
+#: and a reader that read `blocked` as "down" raised a false parked alarm and
+#: sent a needless email on 2026-08-15.
+PROJECT_LIVE = "live"
+#: No live lock, but the operator asked for that — the PAUSE flag is set.
+PROJECT_PAUSED = "paused"
+#: No live lock and nothing says that was intended. THE thing this view exists
+#: to make impossible to miss.
+PROJECT_STOPPED = "stopped"
+#: The lock could not be read, or the config never loaded. Not "stopped": no
+#: lock was read, so there is no fact to report, and a loop running perfectly
+#: would be reported dead (`STATE_DIR_UNRESOLVED_LABEL` makes the same choice).
+PROJECT_LOOP_UNKNOWN = "unknown"
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectStatus:
+    """One row of the multi-project view: one loop, as far as it can be read.
+
+    Every field is either a fact read off disk or `health`'s own verdict. The
+    two are kept APART on purpose — see `PROJECT_LIVE` — so no reader has to
+    infer "is a process up" from a verdict that does not answer that question.
+
+    `None` means UNREADABLE and is rendered `—`, never `0`, for both
+    `silent_minutes` and `open_blockers`. A zero in either column reads as "just
+    active" / "nothing open", which is exactly the fail-open this view is for.
+    """
+
+    #: The project's name, for a human. `_project_label`.
+    label: str
+    #: The config file this row was read from, verbatim.
+    config_path: str
+    #: `health`'s verdict code, or `health.STUCK_UNKNOWN`.
+    code: str = health.STUCK_UNKNOWN
+    needs_attention: bool = True
+    #: One of `PROJECT_LIVE` / `PROJECT_PAUSED` / `PROJECT_STOPPED` /
+    #: `PROJECT_LOOP_UNKNOWN`. A FACT about the lock; see above.
+    loop_state: str = PROJECT_LOOP_UNKNOWN
+    summary: str = ""
+    detail: str = ""
+    phase: str = ""
+    #: The task the loop's OWN state names. It outlives its round (`state.
+    #: current_task` is replaced by the next dispatch), so it is "the last task
+    #: this loop dispatched" whenever `loop_state` is not `live`.
+    current_task: str = ""
+    #: Wall-clock minutes since the newest transcript entry, or `None` when
+    #: there is no transcript to date. Deliberately NOT sleep-discounted: that
+    #: correction belongs to the verdict, which `code` carries.
+    silent_minutes: float | None = None
+    #: Open blockers, counted from the blocker directory rather than taken from
+    #: `Health.open_blockers` — `_judge` returns `stale_lock` BEFORE it reads
+    #: blockers, so that field is 0 while blockers are open. `None` = unreadable.
+    open_blockers: int | None = None
+    #: The newest `completed_at` in the registry, and the task carrying it —
+    #: i.e. when this loop last FINISHED a task. Whether that work is also
+    #: integrated into the branch is `merge_report`'s question, needs git and a
+    #: checkout, and is deliberately not asked here.
+    last_completed_task: str = ""
+    last_completed_at: str = ""
+    last_completed_hours: float | None = None
+    #: Anything that could not be read while building this row. Non-empty
+    #: escalates `needs_attention`: a fact this view could not establish is not
+    #: a fact it may quietly report as fine.
+    notes: tuple[str, ...] = ()
+
+    @property
+    def stopped(self) -> bool:
+        """The one question the operator is really asking. Never derived from
+        `code`, for the reason `PROJECT_LIVE` gives."""
+        return self.loop_state == PROJECT_STOPPED
+
+
+@contextlib.contextmanager
+def _no_bytecode_writes():
+    """Guarantee that observing a project writes no `.pyc` anywhere, then put
+    the process back exactly as it was found.
+
+    Belt and braces, and both are meant. Nothing in this section imports from an
+    observed checkout — it reads files — so there should be nothing to suppress;
+    this closes the case where a future reader (or a subprocess `health` shells
+    out to) does. `sys.dont_write_bytecode` covers this process, the environment
+    variable covers anything it spawns.
+
+    RESTORED on the way out rather than set once and left, because this is a
+    library function that a long-lived process may call: switching a global off
+    permanently as a side effect of one read is its own surprise.
+    """
+    previous_flag = sys.dont_write_bytecode
+    previous_env = os.environ.get(BYTECODE_ENV)
+    sys.dont_write_bytecode = True
+    os.environ[BYTECODE_ENV] = "1"
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = previous_flag
+        if previous_env is None:
+            os.environ.pop(BYTECODE_ENV, None)
+        else:
+            os.environ[BYTECODE_ENV] = previous_env
+
+
+def _project_label(config_path) -> str:
+    """A name for the project whose config lives at `config_path`.
+
+    The config has always lived INSIDE the state directory (`cli.DEFAULT_CONFIG`
+    is `.autoloop/config.toml`), so the interesting name is one level up from
+    it; `legacy_state_dir_for` reads the same shape for the same reason. Falls
+    back to the path itself, so a config in an unusual place still gets a label
+    rather than an empty column.
+
+    Two projects whose directories share a name get the same label. That is
+    accepted rather than solved: `config_path` is carried on every row and
+    printed under it, so the rows stay distinguishable where it matters.
+    """
+    path = Path(config_path)
+    parent = path.parent
+    if parent.name in ("", LEGACY_STATE_DIR_NAME):
+        parent = parent.parent
+    return parent.name or str(path)
+
+
+def _loop_state(config) -> tuple[str, str]:
+    """`(loop_state, note)` — is a loop process actually up for this project?
+
+    THE fact `health` does not report. `LoopLock.is_live` is the authority and
+    is boot-aware, exactly as `health._judge` uses it; matching process names is
+    what it looks like you should do and is wrong twice over (see `health`'s
+    module docstring).
+
+    A pause flag is only consulted once the lock is known not to be live: a
+    paused loop that is still finishing its round IS up, and reporting it as
+    down would be the same conflation this view exists to remove.
+    """
+    from .lock import LoopLock
+
+    try:
+        info = LoopLock(config.state_dir).read()
+        live = info is not None and LoopLock.is_live(info)
+    except Exception as exc:
+        # Broad, like every other helper here: whatever a hand-edited lock file
+        # or an unreadable directory produces, it must cost this row its LOCK
+        # cell and nothing else — and `unknown`, never `stopped`, because no
+        # lock was read and a running loop would otherwise be reported dead.
+        return PROJECT_LOOP_UNKNOWN, f"the loop lock could not be read ({_one_line(exc)})"
+    if live:
+        return PROJECT_LIVE, ""
+    try:
+        paused = config.pause_file.exists() or config.legacy_pause_file.exists()
+    except Exception as exc:
+        # `stopped` with the reason attached: the lock has already answered that
+        # nothing is running, and only the OPERATOR'S INTENT is in doubt. Reading
+        # an unreadable pause flag as "paused" would silence the alarm.
+        return PROJECT_STOPPED, f"the pause flag could not be read ({_one_line(exc)})"
+    return (PROJECT_PAUSED if paused else PROJECT_STOPPED), ""
+
+
+def _open_blocker_count(config) -> tuple[int | None, str]:
+    """`(count, note)` — how many blockers are open, read from the blocker
+    directory itself.
+
+    NOT `Health.open_blockers`: `_judge` returns `stale_lock` before it ever
+    reads blockers, so that field is 0 on exactly the verdict where an operator
+    most needs to know a decision is also waiting. An absent directory is 0 (a
+    loop that has never filed one), while a directory that will not read is
+    `None` — "could not count" and "none open" must not be the same answer.
+    """
+    from .blockers import BlockerStore
+
+    try:
+        return len(BlockerStore(config.blockers_dir).open_blockers_by_severity()), ""
+    except Exception as exc:
+        # Deliberately broad: a corrupt blocker record raises `StateError` here
+        # by design, a hand-edited one can raise anything the JSON decoder and
+        # the dataclass construction between them produce, and none of that may
+        # take down a view of four projects.
+        return None, f"open blockers could not be counted ({_one_line(exc)})"
+
+
+def _silent_minutes(config, now: datetime) -> float | None:
+    """Wall-clock minutes since this loop last wrote to its transcript, or
+    `None` when it has never written one.
+
+    `health.last_transcript_event` does the reading — a bounded tail read, so
+    this stays cheap enough to run against four projects on a schedule. A stamp
+    in the future is a clock adjustment and reads as 0, the same direction
+    `health` takes on skew everywhere else.
+
+    `None` on anything unreadable, which renders `—`. It has no note channel of
+    its own because there is nothing to say beyond "no measurable silence", and
+    `—` already says that — while a number here that was secretly a failure
+    would read as "just active", the fail-open this column must not have.
+    """
+    try:
+        last = health.last_transcript_event(config.transcript_file)
+        if last is None:
+            return None
+        return max(0.0, (now - last).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def _current_task(config) -> tuple[str, str, str]:
+    """`(task_id, phase, note)` from the loop's own state file."""
+    from .state import StateStore
+
+    try:
+        if not config.state_file.exists():
+            return "", "", ""
+        state = StateStore(config.state_file).load()
+    except Exception as exc:
+        return "", "", f"the loop state could not be read ({_one_line(exc)})"
+    if state is None:
+        return "", "", ""
+    current = getattr(state, "current_task", None) or {}
+    task_id = str(current.get("task_id") or "") if isinstance(current, dict) else ""
+    return task_id, str(getattr(state, "phase", "") or ""), ""
+
+
+def _last_completed(config, now: datetime) -> tuple[str, str, float | None, str]:
+    """`(task_id, stamp, hours_ago, note)` for the newest task this loop
+    finished, or empties when it has finished none.
+
+    Read from the registry's own `completed_at`, which `TaskRegistry.
+    mark_completed` is the only writer of. "Landed" here means COMPLETED, not
+    merged — `completed` means published, not integrated, and the difference is
+    `merge_report`'s question, which needs git and a checkout this view
+    deliberately never opens.
+
+    An absent registry is not a failure: a state directory the loop has never
+    written to has no completions to report.
+    """
+    from .tasks import TaskStore
+
+    try:
+        # NO ledger: this reads and never writes, so there is no mutation to
+        # attest — and `MutationLedger` would create the state directory.
+        registry = TaskStore(config.tasks_file).load()
+    except Exception as exc:
+        return "", "", None, f"the task registry could not be read ({_one_line(exc)})"
+    if registry is None:
+        return "", "", None, ""
+    newest_task, newest_at, newest_stamp = "", "", None
+    for task in registry.all_tasks():
+        stamp = _parse_stamp(getattr(task, "completed_at", None))
+        if stamp is None:
+            continue
+        if newest_stamp is None or stamp > newest_stamp:
+            newest_task, newest_at, newest_stamp = task.id, str(task.completed_at), stamp
+    if newest_stamp is None:
+        return "", "", None, ""
+    hours = max(0.0, (now - newest_stamp).total_seconds() / 3600.0)
+    return newest_task, newest_at, hours, ""
+
+
+def project_status(config_path, now: datetime | None = None, checker=None) -> ProjectStatus:
+    """One project, read from its config path. NEVER raises.
+
+    That is the whole isolation contract: one unreachable or misconfigured
+    project must not blank the view, so every failure becomes a row reading
+    `health.STUCK_UNKNOWN` with the reason on it, and the other projects still
+    render. `needs_attention` is TRUE on such a row — a loop nobody can see is
+    not a loop that is fine, and the failure being guarded against is a stopped
+    loop going unnoticed for hours.
+
+    `checker` is the seam for tests: `checker(config, now) -> health.Health`,
+    defaulting to `health.check`, which is itself read-only and lock-free.
+
+    The FACTS are gathered before the verdict and survive it: if `health.check`
+    raises, the row still says whether the lock is live, what it was working and
+    how long it has been quiet, because those are what an operator acts on.
+
+    The bytecode guard is HERE rather than only around the list, so it is a
+    property of observing A PROJECT rather than of the entry point that happened
+    to be called — `projects_status` holds it too, and the nesting restores
+    correctly because the inner hold sees the outer's value as the one to put
+    back.
+    """
+    with _no_bytecode_writes():
+        return _read_project(config_path, now, checker)
+
+
+def _read_project(config_path, now: datetime | None, checker) -> ProjectStatus:
+    """The body of `project_status`, inside its bytecode guard."""
+    now = now or datetime.now(timezone.utc)
+    label = _project_label(config_path)
+    path_text = str(config_path)
+    try:
+        config = load_config(Path(config_path))
+    except Exception as exc:
+        # Broad on purpose. `load_config` raises `ConfigError` for everything it
+        # judges, but the path may also be a directory, a dangling symlink, a
+        # file this user cannot read, or a TOML file whose contents make a
+        # loader helper raise something else entirely — and the requirement is
+        # that ANY of those leaves the other three projects rendering.
+        return ProjectStatus(
+            label=label,
+            config_path=path_text,
+            code=health.STUCK_UNKNOWN,
+            needs_attention=True,
+            loop_state=PROJECT_LOOP_UNKNOWN,
+            summary="the loop's configuration could not be read",
+            detail=_one_line(exc),
+            notes=(f"{path_text} could not be loaded",),
+        )
+    try:
+        return _observe(config, label, path_text, now, checker or _default_checker)
+    except Exception as exc:  # pragma: no cover - defensive
+        # Nothing below is expected to raise (every helper returns a note
+        # instead), so this is the backstop that makes "never raises" true
+        # rather than intended.
+        return ProjectStatus(
+            label=label,
+            config_path=path_text,
+            code=health.STUCK_UNKNOWN,
+            needs_attention=True,
+            loop_state=PROJECT_LOOP_UNKNOWN,
+            summary="this project could not be read",
+            detail=_one_line(exc),
+            notes=(f"{path_text} could not be observed",),
+        )
+
+
+def _default_checker(config, now: datetime):
+    """`health.check`, which is read-only, lock-free and safe mid-round."""
+    return health.check(config, now=now)
+
+
+def _observe(config, label: str, path_text: str, now: datetime, checker) -> ProjectStatus:
+    """The body of `project_status`, for a config that loaded."""
+    notes: list[str] = []
+    loop_state, lock_note = _loop_state(config)
+    blockers, blocker_note = _open_blocker_count(config)
+    task_id, phase, state_note = _current_task(config)
+    completed_task, completed_at, completed_hours, registry_note = _last_completed(config, now)
+    silent = _silent_minutes(config, now)
+    notes.extend(n for n in (lock_note, blocker_note, state_note, registry_note) if n)
+
+    facts = {
+        "label": label,
+        "config_path": path_text,
+        "loop_state": loop_state,
+        "phase": phase,
+        "current_task": task_id,
+        "silent_minutes": silent,
+        "open_blockers": blockers,
+        "last_completed_task": completed_task,
+        "last_completed_at": completed_at,
+        "last_completed_hours": completed_hours,
+    }
+    try:
+        verdict = checker(config, now)
+    except Exception as exc:
+        # Same reasoning as the config arm: the verdict is the part that can
+        # fail, and losing it must not lose the facts beside it.
+        return ProjectStatus(
+            code=health.STUCK_UNKNOWN,
+            needs_attention=True,
+            summary="the health verdict could not be computed",
+            detail=_one_line(exc),
+            notes=tuple(notes) + ("health.check raised",),
+            **facts,
+        )
+    return ProjectStatus(
+        code=verdict.code,
+        # A note escalates. It means a fact could not be established, and this
+        # view reporting an unreadable project as quietly fine is the one
+        # outcome that would make it worse than the four dashboards it replaces.
+        needs_attention=bool(verdict.needs_attention or notes),
+        summary=verdict.summary,
+        detail=verdict.detail,
+        notes=tuple(notes),
+        **facts,
+    )
+
+
+def projects_status(config_paths, now: datetime | None = None, checker=None):
+    """Every configured project, in CONFIGURED ORDER, as `ProjectStatus` rows.
+
+    Read-only and lock-free throughout, exactly like `health.check` and the rest
+    of this module: it is safe to look at a project while its loop is mid-round,
+    which is the only time anyone wants to.
+
+    Order is the operator's, not sorted by severity: they read this page many
+    times a day and a list whose rows move around is a list you stop being able
+    to scan. `render_projects_text` puts the count of what needs attention at
+    the bottom instead.
+    """
+    now = now or datetime.now(timezone.utc)
+    # Held here AND inside `project_status`, deliberately: this hold covers the
+    # whole sweep, that one makes the guarantee true for a caller who reads one
+    # project. Re-entering restores correctly — the inner hold puts back what the
+    # outer one set, and the outer puts back what the process arrived with.
+    with _no_bytecode_writes():
+        return tuple(project_status(path, now, checker) for path in config_paths)
+
+
+#: What the view says when it has been given nothing to look at. NOT an empty
+#: table: "no projects" and "four projects, all fine" must never render alike.
+NO_PROJECTS_CONFIGURED = (
+    "no projects configured — list them in [projects].configs (see "
+    "config.example.toml) or pass --project PATH"
+)
+
+
+def _minutes_text(minutes: float | None) -> str:
+    """`—` for unknown, never `0m`. A zero there reads as "just active"."""
+    return "—" if minutes is None else f"{minutes:.0f}m"
+
+
+def _hours_text(hours: float | None) -> str:
+    return "—" if hours is None else (f"{hours:.0f}h" if hours < 48 else f"{hours / 24:.0f}d")
+
+
+def render_projects_text(rows) -> str:
+    """The view an operator reads: one line per project, then the reasons.
+
+    Deliberately plain text. It is the format that works in a terminal, in a
+    `watch`, in a launchd job's log and in a notification body — the paths this
+    operator already gets told things on (`autoloop_health_notify.sh` reads
+    `health --json` the same way).
+    """
+    rows = list(rows)
+    if not rows:
+        return NO_PROJECTS_CONFIGURED
+    header = ("", "PROJECT", "LOOP", "HEALTH", "TASK", "QUIET", "BLOCKERS", "LANDED")
+    body = [
+        (
+            "!" if row.needs_attention else " ",
+            row.label,
+            row.loop_state,
+            row.code,
+            row.current_task or "—",
+            _minutes_text(row.silent_minutes),
+            "—" if row.open_blockers is None else str(row.open_blockers),
+            _hours_text(row.last_completed_hours),
+        )
+        for row in rows
+    ]
+    widths = [max(len(cell) for cell in column) for column in zip(header, *body)]
+    lines = ["  ".join(cell.ljust(width) for cell, width in zip(header, widths)).rstrip()]
+    # Two projects whose checkout directories share a name share a LABEL, and
+    # then the column identifies neither. Only then is the config path printed:
+    # it is the thing that actually tells them apart, and printing it under
+    # every row would double the height of a page whose whole value is being
+    # scannable.
+    ambiguous = {row.label for row in rows if [r.label for r in rows].count(row.label) > 1}
+    for row, cells in zip(rows, body):
+        lines.append("  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip())
+        # The reason goes UNDER its row rather than in a column: it is the part
+        # that tells the operator what to do, and truncating it into a table
+        # cell is how the merge-backlog log line went unread for 225 hours.
+        path_note = (row.config_path,) if row.label in ambiguous else ()
+        for reason in (*path_note, row.summary, row.detail, *row.notes):
+            if reason:
+                lines.append(f"      {_one_line(reason)}")
+    attention = [row for row in rows if row.needs_attention]
+    stopped = [row for row in rows if row.stopped]
+    tail = f"{len(attention)} of {len(rows)} project(s) need attention"
+    if stopped:
+        # Named separately, and only when there are any: `blocked` while the
+        # loop keeps working is not the same emergency as a loop that is down,
+        # and a footer that said "0 stopped" every time would train the eye to
+        # skip the word that matters.
+        tail += f"; {len(stopped)} STOPPED: " + ", ".join(row.label for row in stopped)
+    lines.append(tail)
+    return "\n".join(lines)
+
+
+def projects_json(rows) -> str:
+    """The same rows, machine-readable, for a scheduler or a notifier.
+
+    `stopped` is carried EXPLICITLY even though it is a property rather than a
+    field, so `dataclasses.asdict` would drop it. That is the one answer this
+    view exists to give, and the audience of this format — a cron wrapper, a
+    notifier — is exactly the one that would otherwise re-derive it from
+    `loop_state` or, far worse, from `code`. The second rule is the 2026-08-15
+    false alarm: `blocked` fires while continuous mode works other tasks, and a
+    reader that read it as "down" sent a needless email. One rule, in one place.
+    """
+    return json.dumps(
+        [{**dataclasses.asdict(row), "stopped": row.stopped} for row in rows], indent=2
+    )
 
 
 def main(argv=None) -> int:

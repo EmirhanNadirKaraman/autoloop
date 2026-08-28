@@ -766,6 +766,22 @@ class AutoloopConfig:
     #: positional meaning of every argument after it, and the fifty-odd
     #: `AutoloopConfig(...)` sites in the suite are not all keyword-only.
     observed_checkout: Path | None = None
+    #: `[projects].configs` — the OTHER loops this deployment wants one view of
+    #: (port-04, 2026-08-28). Absolute config-file paths, in the order written,
+    #: read by exactly one reader: `dashboard.projects_status`, which opens each
+    #: one with `load_config` and reports on the loop it describes. Empty — the
+    #: default, and every config that predates the section — means the
+    #: multi-project view has nothing to show and says so.
+    #:
+    #: A LIST of config paths rather than a list of repositories, because that is
+    #: the one input from which every other path (state dir, lock, transcript,
+    #: blockers, registry) follows by the loop's own resolution rules. Adding a
+    #: fifth project is then a line in this file rather than a code change.
+    #:
+    #: Appended last, after `observed_checkout`, for the reason that field's own
+    #: comment gives: the positional meaning of everything before it must not
+    #: move.
+    projects: tuple[Path, ...] = ()
 
     @property
     def state_file(self) -> Path:
@@ -973,7 +989,7 @@ class AutoloopConfig:
 
 _SECTIONS = {
     "browser", "policy", "paths", "conversation", "codex", "executor", "audit",
-    "repo", "autonomy",
+    "repo", "autonomy", "projects",
 }
 
 
@@ -1310,6 +1326,64 @@ def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
     return RepoConfig(**repo_data), notices
 
 
+def _load_projects_section(data: dict) -> tuple[Path, ...]:
+    """`[projects].configs`, validated — the config files of the OTHER loops
+    this deployment wants one status view of (port-04, 2026-08-28).
+
+    Absent means `()`, which is every config written before this section
+    existed: the section is optional, and an empty list is a real answer that
+    the view reports as "no projects configured" rather than as an error.
+
+    **Absolute only, `~` expanded.** Exactly the rule `workers_root`,
+    `validation_env_file` and `observed_checkout` are held to, for exactly their
+    reason: this list is read by a status command an operator runs from wherever
+    they happen to be standing, so a relative entry would name a different file
+    per invocation and the view would silently report on nothing. Refusing here
+    is cheap; a config path that does not EXIST is deliberately not refused
+    here — that is the observed loop being unreachable, which the view reports
+    per project as `unknown` while still showing the rest.
+
+    Order is preserved and duplicates are kept as written. The view renders the
+    list in configured order, and deduplicating would quietly drop a row an
+    operator can see they asked for.
+    """
+    raw = data.get("projects", {})
+    # Shape first, exactly as `_load_repo_section` does it: `projects = "a.toml"`
+    # gets this loader's own error naming the section rather than a raw
+    # conversion complaint from somewhere further down.
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[projects] must be a table, got {raw!r} — write it as a section "
+            'header (`[projects]` followed by `configs = ["/path/to/config.toml"]`)'
+        )
+    _check_keys("projects", raw, {"configs"})
+    configs = raw.get("configs", [])
+    if not isinstance(configs, list) or not all(isinstance(c, str) for c in configs):
+        raise ConfigError(
+            "projects.configs must be a list of strings, e.g. "
+            '["~/code/app-a/.autoloop/config.toml", '
+            '"~/code/app-b/.autoloop/config.toml"]'
+        )
+    resolved: list[Path] = []
+    for entry in configs:
+        if not entry.strip():
+            raise ConfigError(
+                f"projects.configs contains a blank entry ({entry!r}) — remove it "
+                "rather than leaving a placeholder, which would resolve to the "
+                "current directory"
+            )
+        path = Path(entry).expanduser()
+        if not path.is_absolute():
+            raise ConfigError(
+                f"projects.configs entries must be absolute paths, got {entry!r} "
+                "(after expanding '~') — the status view is run from whatever "
+                "directory the operator is standing in, so a relative entry names "
+                "a different file each time"
+            )
+        resolved.append(path)
+    return tuple(resolved)
+
+
 def load_config(path: Path) -> AutoloopConfig:
     path = Path(path)
     if not path.exists():
@@ -1543,6 +1617,7 @@ def load_config(path: Path) -> AutoloopConfig:
     autonomy = AutonomyConfig(**autonomy_data)
 
     repo, repo_notices = _load_repo_section(data)
+    projects = _load_projects_section(data)
 
     return AutoloopConfig(
         browser=browser,
@@ -1559,4 +1634,5 @@ def load_config(path: Path) -> AutoloopConfig:
         repo=repo,
         migration_notices=migration_notices + conversation_notices + repo_notices,
         observed_checkout=observed_checkout,
+        projects=projects,
     )
