@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.changeset_review import (
     ChangesetBinding,
     build_changeset_binding,
@@ -90,13 +92,13 @@ class _NoExecutor:
 def build_orchestrator(tmp_path, branch="feature/x", with_publisher=True):
     repo = tmp_path / "repo"
     repo.mkdir()
-    run_git(repo, "init", "-q", "-b", branch)
-    run_git(repo, "config", "user.email", "t@example.com")
-    run_git(repo, "config", "user.name", "T")
-    run_git(repo, "config", "commit.gpgsign", "false")
-    (repo / "a.txt").write_text("one\n")
-    run_git(repo, "add", "-A")
-    run_git(repo, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        repo,
+        branch=branch,
+        files=(("a.txt", "one\n"),),
+        email="t@example.com",
+        name="T",
+    )
 
     upstream = make_bare(tmp_path)
     run_git(repo, "remote", "add", "origin", str(upstream))

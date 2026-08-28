@@ -47,6 +47,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from gitrepo import make_repo_from_template
+
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive, ReviewRef
 from autoloop.errors import GitError
@@ -122,13 +124,7 @@ def worktree_git_for(worktrees: WorktreeManager, task_id: str) -> GitGateway:
 def build(tmp_path, executor, task_id="t1", policy=None):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
+    make_repo_from_template(repo_root, branch="main", files=(("README.md", "hello\n"),))
 
     git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
     worktrees = WorktreeManager(git, tmp_path / "worktrees")

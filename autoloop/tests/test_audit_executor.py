@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.audit.agents import AgentResult
 from autoloop.audit.executor import AuditExecutor
 from autoloop.audit.markdown import MarkdownPolicy
@@ -24,13 +26,13 @@ def run_git(cwd, *args):
 def repo(tmp_path):
     root = tmp_path / "repo"
     (root / "docs").mkdir(parents=True)
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "t@e.c")
-    run_git(root, "config", "user.name", "T")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "README.md").write_text("hi")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        root,
+        branch="main",
+        files=(("README.md", "hi"),),
+        email="t@e.c",
+        name="T",
+    )
     return root
 
 

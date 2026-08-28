@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop import cli
 from autoloop.auto_merge import MergeDeferralStore
 from autoloop.blockers import BlockerStore
@@ -101,13 +103,7 @@ def install_hook(directory, name, body="#!/bin/sh\nexit 0\n", executable=True):
 def repo(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "test@example.com")
-    run_git(root, "config", "user.name", "Test")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "a.txt").write_text("one\n")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(root, branch="main", files=(("a.txt", "one\n"),))
     return root
 
 
@@ -771,13 +767,7 @@ def ok_validation(argv, **kwargs):
 def build_orchestrator_with_publisher(tmp_path, task_id="t1"):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
+    make_repo_from_template(repo_root, branch="main", files=(("README.md", "hello\n"),))
 
     upstream = make_bare(tmp_path)
     run_git(repo_root, "remote", "add", "origin", str(upstream))

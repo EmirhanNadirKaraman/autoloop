@@ -42,6 +42,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.audit.agents import AgentResult
 from autoloop.audit.executor import (
     BUILT_IN_FRAMING,
@@ -72,13 +74,13 @@ def run_git(cwd, *args):
 def make_repo(root: Path) -> Path:
     """A git repository with a `docs/` directory, ready to be audited."""
     (root / "docs").mkdir(parents=True)
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "t@e.c")
-    run_git(root, "config", "user.name", "T")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "README.md").write_text("hi", encoding="utf-8")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        root,
+        branch="main",
+        files=(("README.md", "hi"),),
+        email="t@e.c",
+        name="T",
+    )
     return root
 
 

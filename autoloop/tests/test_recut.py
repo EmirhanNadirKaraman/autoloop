@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import (
     ACTIVE_DECISIONS,
@@ -219,13 +221,7 @@ class Wiring:
 def make_repo(tmp_path: Path) -> Path:
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
+    make_repo_from_template(repo_root, branch="main", files=(("README.md", "hello\n"),))
     return repo_root
 
 
