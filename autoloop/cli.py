@@ -6339,6 +6339,40 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return dashboard_main(["--repo", str(repo), "--port", str(args.port)])
 
 
+#: `projects` found nothing to look at. Deliberately its own exit code: an
+#: empty view is not "every project is fine", and a scheduler that tested only
+#: for 0 would read a misconfigured `[projects]` section as good news.
+PROJECTS_UNCONFIGURED_EXIT = 2
+
+
+def _cmd_projects(args: argparse.Namespace) -> int:
+    """One status view across every configured project.
+
+    Read-only and lock-free, exactly like `health` — safe to run while any of
+    those loops is mid-round — and it opens no checkout at all: the input is a
+    list of CONFIG PATHS, and every other path follows from one by the loop's
+    own resolution rules.
+
+    Exit codes mirror `health`, so the same cron wrapper works: 0 = every
+    project is fine, 1 = at least one needs you, 2 = nothing was configured to
+    look at.
+
+    `--project` skips loading this deployment's own config entirely, so the view
+    works from a machine that runs no loop of its own.
+    """
+    from . import dashboard
+
+    paths = [str(p) for p in (args.project or ())]
+    if not paths:
+        paths = [str(p) for p in load_config(args.config).projects]
+    if not paths:
+        print(dashboard.NO_PROJECTS_CONFIGURED)
+        return PROJECTS_UNCONFIGURED_EXIT
+    rows = dashboard.projects_status(paths)
+    print(dashboard.projects_json(rows) if args.json else dashboard.render_projects_text(rows))
+    return 1 if any(row.needs_attention for row in rows) else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autoloop")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -6818,6 +6852,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="checkout whose .autoloop/ to read (default: cwd)",
     )
     dash.set_defaults(func=_cmd_dashboard)
+
+    projects = sub.add_parser(
+        "projects",
+        help=(
+            "one status view across every configured project: running? on what? "
+            "quiet how long? blockers? last landed? (read-only, no lock; exit "
+            "0 = all fine, 1 = one needs you, 2 = none configured)"
+        ),
+    )
+    add_config(projects)
+    projects.add_argument(
+        "--project",
+        type=Path,
+        action="append",
+        help=(
+            "config file of a project to report on; repeatable. Given at least "
+            "once, [projects].configs is not consulted and neither is --config"
+        ),
+    )
+    projects.add_argument("--json", action="store_true", help="machine-readable rows")
+    projects.set_defaults(func=_cmd_projects)
 
     reset = sub.add_parser(
         "reset", help="archive the session state (keeps the task registry)"
