@@ -42,6 +42,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop import cli
 from autoloop.auto_merge import (
     UPGRADE_EXEC_FAILED,
@@ -267,13 +269,7 @@ class MergeHarness:
 def build_merge(tmp_path, per_task):
     repo = tmp_path / "repo"
     repo.mkdir()
-    run_git(repo, "init", "-q", "-b", BASE)
-    run_git(repo, "config", "user.email", "test@example.com")
-    run_git(repo, "config", "user.name", "Test")
-    run_git(repo, "config", "commit.gpgsign", "false")
-    (repo / "README.md").write_text("hello\n")
-    run_git(repo, "add", "-A")
-    run_git(repo, "commit", "-q", "-m", "init")
+    make_repo_from_template(repo, branch=BASE, files=(("README.md", "hello\n"),))
 
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)

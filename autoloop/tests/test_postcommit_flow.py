@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
 from autoloop.errors import GitCommandError, StateError
@@ -45,13 +47,7 @@ def run_git(cwd, *args):
 def repo(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "test@example.com")
-    run_git(root, "config", "user.name", "Test")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "README.md").write_text("hello\n")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(root, branch="main", files=(("README.md", "hello\n"),))
     return root
 
 
@@ -277,13 +273,7 @@ def build_postcommit(
     task's worktree, which does not exist until this function builds it."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
+    make_repo_from_template(repo_root, branch="main", files=(("README.md", "hello\n"),))
 
     git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
     worktrees = WorktreeManager(git, tmp_path / "worktrees")

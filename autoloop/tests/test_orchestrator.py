@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.conversation import SubmitResult, register_provider
 from autoloop.contract import Decision, Directive
@@ -537,13 +539,7 @@ def build_postcommit(
     repository with that sha present."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
+    make_repo_from_template(repo_root, branch="main", files=(("README.md", "hello\n"),))
 
     policy_config = policy or PolicyConfig()
     git = GitGateway(repo_root, PolicyEngine(policy_config))

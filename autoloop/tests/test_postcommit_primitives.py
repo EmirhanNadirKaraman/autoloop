@@ -14,6 +14,8 @@ import subprocess
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop import environment
 from autoloop.errors import GitCommandError, StateCorruptError
 from autoloop.git_gateway import GitGateway
@@ -39,13 +41,7 @@ def run_git(cwd, *args):
 def repo(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "test@example.com")
-    run_git(root, "config", "user.name", "Test")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "a.txt").write_text("one\n")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(root, branch="main", files=(("a.txt", "one\n"),))
     return root
 
 

@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop.git_gateway import GitGateway
 from autoloop.errors import ManifestViolation
 from autoloop.manifest import (
@@ -33,13 +35,13 @@ def run_git(cwd, *args):
 def repo(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "t@example.com")
-    run_git(root, "config", "user.name", "T")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "tracked.txt").write_text("v1\n")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        root,
+        branch="main",
+        files=(("tracked.txt", "v1\n"),),
+        email="t@example.com",
+        name="T",
+    )
     return root
 
 

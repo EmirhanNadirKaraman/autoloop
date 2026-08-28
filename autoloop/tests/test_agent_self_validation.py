@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop import implement_executor
 from autoloop.audit.agents import AgentResult
 from autoloop.git_gateway import GitGateway
@@ -61,7 +63,6 @@ from test_implement_executor import (
     FakeAgentRunner,
     implement_directive,
     make_agent_runner_factory,
-    run_git,
 )
 
 RUFF = ("ruff", "check", ".")
@@ -70,13 +71,13 @@ SUITE = ("python3", "-m", "pytest", "autoloop/tests")
 
 def _init_repo(root: Path, branch: str) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    run_git(root, "init", "-q", "-b", branch)
-    run_git(root, "config", "user.email", "t@e.c")
-    run_git(root, "config", "user.name", "T")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "README.md").write_text("hi")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        root,
+        branch=branch,
+        files=(("README.md", "hi"),),
+        email="t@e.c",
+        name="T",
+    )
     return root
 
 

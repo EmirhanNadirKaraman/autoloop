@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import make_repo_from_template
+
 from autoloop import cli
 from autoloop.audit.agents import AgentResult, AgentSpec, ClaudeCliRunner
 from autoloop.config import load_config
@@ -524,13 +526,13 @@ def run_git(cwd, *args):
 def worker_repo(tmp_path):
     root = tmp_path / "worker"
     root.mkdir(parents=True, exist_ok=True)
-    run_git(root, "init", "-q", "-b", "autoloop/t1")
-    run_git(root, "config", "user.email", "t@e.c")
-    run_git(root, "config", "user.name", "T")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "README.md").write_text("hi\n")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        root,
+        branch="autoloop/t1",
+        files=(("README.md", "hi\n"),),
+        email="t@e.c",
+        name="T",
+    )
     return root
 
 
@@ -538,13 +540,13 @@ def worker_repo(tmp_path):
 def main_repo(tmp_path):
     root = tmp_path / "main"
     root.mkdir(parents=True, exist_ok=True)
-    run_git(root, "init", "-q", "-b", "main")
-    run_git(root, "config", "user.email", "t@e.c")
-    run_git(root, "config", "user.name", "T")
-    run_git(root, "config", "commit.gpgsign", "false")
-    (root / "README.md").write_text("hi\n")
-    run_git(root, "add", "-A")
-    run_git(root, "commit", "-q", "-m", "init")
+    make_repo_from_template(
+        root,
+        branch="main",
+        files=(("README.md", "hi\n"),),
+        email="t@e.c",
+        name="T",
+    )
     return root
 
 
