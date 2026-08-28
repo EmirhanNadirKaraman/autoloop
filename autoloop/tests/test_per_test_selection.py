@@ -48,6 +48,39 @@ def pytest_command(selection) -> tuple[str, ...]:
     return next(c for c in selection.commands if "pytest" in c)
 
 
+def nested_pytest(target: Path, *args: str):
+    """Run pytest in a CHILD process, isolated from the run that spawned it.
+
+    Three things this must not inherit, each of which broke it once:
+
+    * **`pytest-randomly`.** Passing a path outside the checkout makes pytest
+      compute ROOTDIR FROM THAT PATH, so the repository's `pytest.ini` is never
+      read and its `-p no:randomly` never applies — and that plugin is installed
+      here, so omitting it changes behaviour (pytest.ini says so). The child then
+      seeded numpy from the inherited xdist environment and numpy refused the
+      value: `ValueError: Seed must be between 0 and 2**32 - 1`. Passed
+      explicitly rather than relied upon.
+    * **the parent's xdist environment.** `PYTEST_XDIST_*` and
+      `PYTEST_CURRENT_TEST` describe the OUTER run. A child that reads them
+      believes it is a worker of a session it is not part of — which is what
+      produced the seed above.
+    * **the parent's working directory.** `cwd` is the target, and the package
+      is reached through `PYTHONPATH`, so nothing here depends on what the other
+      seven xdist workers are doing to the checkout at the same moment.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", str(target), "-q",
+         "-p", "no:cacheprovider", "-p", "no:randomly", *args],
+        cwd=str(target), env=env, capture_output=True, text=True,
+    )
+
+
 # ---- the file set must not move ---------------------------------------------
 
 
@@ -179,9 +212,6 @@ def test_an_unreadable_list_drops_nothing(tmp_path):
 def test_the_plugin_drops_the_named_tests_and_every_case_of_them(tmp_path):
     """End to end through a real pytest run: the list names FUNCTIONS, and a
     parametrised function's cases all go with it."""
-    import subprocess
-    import sys
-
     (tmp_path / "test_demo.py").write_text(
         "import pytest\n"
         "def test_kept(): assert True\n"
@@ -193,10 +223,8 @@ def test_the_plugin_drops_the_named_tests_and_every_case_of_them(tmp_path):
     listed = tmp_path / "drop.txt"
     listed.write_text("test_demo.py::test_dropped\ntest_demo.py::test_cases\n", encoding="utf-8")
 
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", str(tmp_path), "-q", "-p", "no:cacheprovider",
-         "-p", "autoloop.pytest_deselect", "--autoloop-deselect", str(listed)],
-        cwd=str(REPO_ROOT), capture_output=True, text=True,
+    proc = nested_pytest(
+        tmp_path, "-p", "autoloop.pytest_deselect", "--autoloop-deselect", str(listed)
     )
     # The dropped ones would FAIL if they ran, so a green run is the assertion.
     assert proc.returncode == 0, proc.stdout[-2000:]
@@ -205,14 +233,7 @@ def test_the_plugin_drops_the_named_tests_and_every_case_of_them(tmp_path):
 
 def test_the_plugin_is_inert_when_no_list_is_named(tmp_path):
     """Loading it must not be a change in behaviour by itself."""
-    import subprocess
-    import sys
-
     (tmp_path / "test_demo.py").write_text("def test_one(): assert True\n", encoding="utf-8")
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", str(tmp_path), "-q", "-p", "no:cacheprovider",
-         "-p", "autoloop.pytest_deselect"],
-        cwd=str(REPO_ROOT), capture_output=True, text=True,
-    )
+    proc = nested_pytest(tmp_path, "-p", "autoloop.pytest_deselect")
     assert proc.returncode == 0, proc.stdout[-2000:]
     assert "1 passed" in proc.stdout and "deselected" not in proc.stdout
