@@ -27,7 +27,7 @@ from gitrepo import make_repo_from_template
 
 from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.conversation import SubmitResult, register_provider
-from autoloop.contract import Decision, Directive
+from autoloop.contract import AUDIT_UNIT_PREFIX, Decision, Directive
 from autoloop.errors import (
     GitCommandError,
     LoginExpiredError,
@@ -618,7 +618,7 @@ def test_audit_decision_executes_and_reports(tmp_path):
     assert directive.decision is Decision.AUDIT
     # a synthetic per-run unit id, not the literal "audit" pseudo-task id —
     # see `Orchestrator._resolve_audit_task`.
-    assert task is not None and task.id.startswith("audit-")
+    assert task is not None and task.id.startswith(AUDIT_UNIT_PREFIX)
     assert "committed task" in orch.state.outbox  # postcommit_review template
 
     execution = execution_store.load(task.id)
@@ -669,7 +669,9 @@ def test_two_audits_in_one_session_get_distinct_worker_units(tmp_path):
     _, first_task = executor.calls[0]
     _, second_task = executor.calls[1]
     assert first_task.id != second_task.id
-    assert first_task.id.startswith("audit-") and second_task.id.startswith("audit-")
+    assert first_task.id.startswith(AUDIT_UNIT_PREFIX) and second_task.id.startswith(
+        AUDIT_UNIT_PREFIX
+    )
 
     first_execution = execution_store.load(first_task.id)
     second_execution = execution_store.load(second_task.id)
@@ -699,8 +701,8 @@ def test_crash_recovery_during_audit_redispatches(tmp_path):
     orch.run(max_steps=1)
     assert len(executor.calls) == 1
     assert orch.state.phase == Phase.READY.value
-    # iteration=1 at dispatch time -> minted unit id "audit-0001"
-    execution = execution_store.load("audit-0001")
+    # iteration=1 at dispatch time -> minted unit id "autoaudit-0001"
+    execution = execution_store.load(f"{AUDIT_UNIT_PREFIX}0001")
     assert execution is not None
     assert execution.review_round == 1
 
@@ -1678,7 +1680,7 @@ def test_audit_on_a_quarantined_unit_is_denied_not_re_dispatched(tmp_path):
         tmp_path, responses=[audit_block(), stop_block()]
     )
     orch.state.iteration = 7
-    unit_id = "audit-0007"
+    unit_id = f"{AUDIT_UNIT_PREFIX}0007"
     orch._registry.add(
         Task(id=unit_id, title="repository audit", description="repository audit")
     )
@@ -1701,7 +1703,7 @@ def test_a_fresh_audit_unit_is_never_treated_as_quarantined(tmp_path):
     orch, _, _, executor, _, _, _ = build_postcommit(
         tmp_path, responses=[audit_block(), approval(decision="push"), stop_block()]
     )
-    unit_id = f"audit-{orch.state.iteration:04d}"
+    unit_id = f"{AUDIT_UNIT_PREFIX}{orch.state.iteration:04d}"
     assert not orch._registry.has(unit_id)
 
     assert orch.run() == Phase.STOPPED.value
