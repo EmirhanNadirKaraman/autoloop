@@ -196,28 +196,48 @@ that silence is the whole subject of this section.
 | Entry | What happened | What the record does |
 |---|---|---|
 | `self_upgrade_exec` | replaced, `argv` in the entry | settled `execed` (one shot) |
-| `self_upgrade_unapplicable` | the merge moved a different checkout | settled |
-| `self_upgrade_preflight_failed` | the merged tree does not import | settled, `detail` carries the error |
-| `self_upgrade_exec_failed` | marker unwritable, lock unarmable, or `execv` refused | settled |
+| `self_upgrade_unapplicable` | the merge moved a different checkout | **stays pending** |
+| `self_upgrade_preflight_failed` | the merged tree does not import | **stays pending**, `detail` carries the error |
+| `self_upgrade_exec_failed` | marker unwritable, lock unarmable, or `execv` refused | **stays pending** |
 | `self_upgrade_deferred` | this process may not hand off | **stays pending** |
 | `self_upgrade_none` | nothing pending was left to act on | no record |
 
-**No outcome but `exec` ends the process.** A settled outcome means the loop
-carries on with the code it has, which was working a second ago; exiting is the
-one response that guarantees no further work happens. A failed preflight in
-particular is *reported and refused*, never fatal — replacing a working loop
-with a tree that cannot start is the failure that check exists to prevent.
+**No outcome but `exec` ends the process, and no outcome but `exec` settles the
+record.** Carrying on means carrying on with the code it has, which was working
+a second ago; exiting is the one response that guarantees no further work
+happens. A failed preflight in particular is *reported and refused*, never fatal
+— replacing a working loop with a tree that cannot start is the failure that
+check exists to prevent.
 
-**`deferred` is the one outcome that leaves the record pending**, and it is the
-one an operator acts on. It means the boundary was reached by a **single-round**
-`run` — `run` with no `--continuous`, and therefore also `--retry`, `--answer`,
-`--resubmit` and `resume`, all of which funnel into the same path. Such a
-process cannot hand off, because its own command line manages ONE round:
-`--kickoff` refuses a session that now exists and `--answer` refuses a phase
-that is no longer `needs_user`, so the successor would die on a `StateError`
-instead of continuing the loop. Nothing about the merged tree has been judged,
-so nothing is settled: the loop finishes the session it is in, and the upgrade
-waits. Perform it with
+**Every refusal is retryable by the next process**, and that is the 2026-08-27
+lesson stated as a rule: a refused handoff is a fact about the process that
+refused it, not a judgement the next one inherits. One launch could not hand off
+at 08:13:47 and the next exec'd the *same record* at 08:15:30. Until 2026-08-31
+the three non-`deferred` outcomes wrote themselves into `status`, which took the
+sha out of `pending` for good — and `_self_upgrade_due` only ever offers
+`pending`, so the merged code sat on disk with nothing left to run it. They now
+leave the record alone; `detail` records the outcome (`preflight_failed: rc=1
+SyntaxError…`) so the state dir says why without a trip to the transcript. A
+record on disk that still says `preflight_failed`, `unapplicable` or
+`exec_failed` was settled by an older build: it is not offered, and clearing the
+file is the way to re-arm it.
+
+The exception is a refusal *after* the one-shot marker was written (an unarmable
+lock, an `execv` that raised). Those restore `pending` explicitly, and if that
+write fails the record is **removed** rather than left saying `execed` — a
+delayed restart costs less than `_confirm_self_upgrade` retiring a replacement
+that never happened. The entry says `REMOVED` when it happens; a plain process
+start picks the merged code up.
+
+**`deferred` is the outcome an operator acts on directly.** It means the
+boundary was reached by a **single-round** `run` — `run` with no `--continuous`,
+and therefore also `--retry`, `--answer`, `--resubmit` and `resume`, all of
+which funnel into the same path. Such a process cannot hand off, because its own
+command line manages ONE round: `--kickoff` refuses a session that now exists
+and `--answer` refuses a phase that is no longer `needs_user`, so the successor
+would die on a `StateError` instead of continuing the loop. Nothing about the
+merged tree has been judged, so nothing is settled: the loop finishes the
+session it is in, and the upgrade waits. Perform it with
 
     python -m autoloop start          # or: run --continuous
 
@@ -232,13 +252,26 @@ four seconds later, which is what proves the merge was fine and the *path* was
 not.
 
 **The loop cannot restart in a circle.** Three separate bounds, none of them a
-timer: an `execed` record is never offered again, so a successor that dies
-before completing one iteration is not retried (`_confirm_self_upgrade` retires
-the marker after one full pass); every settled outcome has left `pending`, so it
-cannot come back round; and a `deferred` boundary is declined for that
-`base_sha` in the declining process, so the round it carries on into is not
-offered the same upgrade again. A later merge is a different `base_sha` and does
-get its own boundary.
+timer:
+
+1. **`execed` is a one-shot.** A record saying it is never offered again, so a
+   successor that dies before completing one iteration is not retried;
+   `_confirm_self_upgrade` retires the marker after one full pass under the
+   merged code, and only then.
+2. **Every answered boundary is declined for its `base_sha` in the process that
+   answered it** — `Orchestrator.decline_self_upgrade`, carried across the
+   per-iteration orchestrator rebuild by `_run_continuous`'s
+   `answered_upgrades`. This is what a retryable record needs and where the
+   whole spin bound now lives: in memory, per process, saying nothing about the
+   next one. So a refused handoff costs at most one preflight (one subprocess,
+   120s ceiling) and one entry per process, not one per round.
+3. **A record with no `base_sha` is never offered at all.** Every bound above is
+   keyed on that sha, so a record without one could not be declined and would be
+   offered forever. Nothing the merger writes lacks one.
+
+A later merge is a different `base_sha` and does get its own boundary — which is
+also the unstick path for a tree that fails its preflight: `auto_merge`
+overwrites the record when the fix merges, and the new sha is offered normally.
 
 **The successor's command line is `python -m autoloop run --continuous`**, plus
 `--config` and `--null-executor` when this process had them — rebuilt, not the

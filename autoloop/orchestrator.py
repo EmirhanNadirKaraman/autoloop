@@ -1494,11 +1494,12 @@ class Orchestrator:
         #: the preemption it describes has been recorded.
         self._urgent_first_seen_phase = None
         #: Upgrade `base_sha`s this PROCESS has already been offered and turned
-        #: down (`cli._defer_self_upgrade`). In memory and never persisted: it
-        #: says something about this process's ability to hand off, not about
-        #: the merge, and a successor must be free to perform an upgrade this
-        #: one could not. Its whole job is to stop a declined boundary being
-        #: offered again on the next call — the record stays `pending`, so
+        #: down (`cli._defer_self_upgrade`, `cli._run_continuous`). In memory
+        #: and never persisted: it says something about this process's ability
+        #: to hand off, not about the merge, and a successor must be free to
+        #: perform an upgrade this one could not. Its whole job is to stop an
+        #: answered boundary being offered again on the next call — no boundary
+        #: outcome but the exec itself moves the record out of `pending`, so
         #: nothing else would.
         self._declined_upgrades: set[str] = set()
         #: Phase steps this orchestrator has actually taken, across every call
@@ -1803,20 +1804,25 @@ class Orchestrator:
         """Stop offering the boundary for `base_sha` in this process. Returns
         whether that sha was newly declined.
 
-        For the caller that reached a boundary it cannot act on and means to
-        CARRY ON rather than end the process (`cli._defer_self_upgrade`). The
-        record is left `pending` on purpose there — nothing has judged the
-        merged tree, so a later process must still be able to perform it — and
-        `pending` is exactly what `_self_upgrade_due` offers, so without this
-        the next `run` would return `SELF_UPGRADE` again on the same record,
-        and the one after that, forever.
+        For the caller that reached a boundary it did not hand off at and means
+        to CARRY ON rather than end the process. Two of them, and they are the
+        two halves of the same rule: `cli._defer_self_upgrade` (a single-round
+        `run`, which may not hand off at all) and `cli._run_continuous`, which
+        re-declines every sha this run has already answered onto the
+        orchestrator it rebuilds each iteration (`answered_upgrades`).
+
+        The record is left `pending` in every one of those cases — a refused
+        handoff is a fact about the process that refused it, not a judgement
+        the next process has to inherit — and `pending` is exactly what
+        `_self_upgrade_due` offers, so without this the next `run` would return
+        `SELF_UPGRADE` again on the same record, and the one after that,
+        forever.
 
         The return value is the caller's loop bound: a second decline of a sha
         already declined means nothing moved, and the caller stops instead of
-        re-entering. An empty `base_sha` (the record vanished between the
-        boundary and here) is never declined for that reason — there is nothing
-        to key on, and `_self_upgrade_due` already answers False without a
-        record.
+        re-entering. An empty `base_sha` is never declined — there is nothing
+        to key on — and it never needs to be: `_self_upgrade_due` refuses to
+        offer a boundary for a record without one, for that same reason.
         """
         if not base_sha or base_sha in self._declined_upgrades:
             return False
@@ -1832,14 +1838,26 @@ class Orchestrator:
         that boundary loses nothing: the successor loads the same state file and
         prepares the same request from the same outbox.
 
-        Reads the record, never writes it. An unreadable or already-settled
-        record answers False — the fail-closed direction here is to keep
-        running the code that works. So does an orchestrator whose caller never
-        asked for the boundary (`self_upgrade_enabled`, see the constructor),
-        and so does one whose caller has already been offered this exact sha
-        and declined it (`decline_self_upgrade`) — that record stays `pending`
-        deliberately, and offering it again would be a spin rather than a
-        second chance.
+        Reads the record, never writes it. An unreadable record, or one whose
+        status is not `pending`, answers False — the fail-closed direction here
+        is to keep running the code that works. So does an orchestrator whose
+        caller never asked for the boundary (`self_upgrade_enabled`, see the
+        constructor), and so does one whose caller has already been offered
+        this exact sha and answered it (`decline_self_upgrade`). That last one
+        carries the whole weight now: since a boundary the caller could not act
+        on leaves the record `pending` so a LATER process can still perform it
+        (`cli._carry_on_upgrade`), the decline is the only thing standing
+        between "retryable" and "offered again every round forever".
+
+        A record with an EMPTY `base_sha` is refused outright, and that is the
+        same guard rather than a different one: every bound in this design is
+        keyed on that sha — the decline set here, `_run_continuous`'s
+        `answered_upgrades`, the one-shot on `execed` — so a record with
+        nothing to key on is one no caller can ever answer, and offering it
+        would spin at the speed of the loop. Nothing the merger writes is
+        without a base sha (`AutoMerger` records the base head after the
+        merge); a record that has one is hand-written or corrupt, and refusing
+        it keeps this process running the code it has.
 
         The decline is checked BEFORE the entry is written: a boundary already
         answered once is not a new boundary, and logging it every round would
@@ -1855,6 +1873,12 @@ class Orchestrator:
             return False
         if record is None or record.status != UPGRADE_PENDING:
             return False
+        # `isinstance` and not just truthiness: the sha comes out of a JSON file
+        # this process did not necessarily write, and an unhashable value there
+        # (a list, an object) would raise on the membership test one line down
+        # — a boundary check that kills the loop instead of answering it.
+        if not isinstance(record.base_sha, str) or not record.base_sha:
+            return False
         if record.base_sha in self._declined_upgrades:
             return False
         self._log(
@@ -1862,7 +1886,13 @@ class Orchestrator:
             data={
                 "base_sha": record.base_sha,
                 "task_id": record.task_id,
-                "paths": list(record.paths)[:20],
+                # Same reasoning, one field over, and the same guard
+                # `dashboard._view` applies to the same field: `paths` is
+                # evidence for a human, and a record carrying `null` there must
+                # not turn the entry that announces the boundary into a
+                # TypeError raised while building it — which is a boundary
+                # followed by silence, arrived at from the other direction.
+                "paths": list(record.paths)[:20] if isinstance(record.paths, list) else [],
                 "phase": phase.value,
             },
         )
