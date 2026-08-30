@@ -353,6 +353,32 @@ class UpgradeStore:
         self.path.unlink(missing_ok=True)
 
 
+def upgrade_bound_sha(record: PendingUpgrade | None) -> str:
+    """The `base_sha` a boundary's bounds can be keyed on, or `""` when the
+    record carries nothing usable.
+
+    ONE predicate, three readers — `orchestrator._self_upgrade_due`,
+    `cli._self_upgrade_at_boundary` and `cli._defer_self_upgrade` — because
+    they are asking the same question, and a second copy of the answer is a
+    second answer the first time one of them moves. Every bound in this design
+    is keyed on that sha (the per-process decline, `_run_continuous`'s
+    `answered_upgrades`, the one-shot on `execed`), so "usable" means exactly
+    what those uses need and nothing more: a non-empty `str`.
+
+    `isinstance` and not just truthiness, because `UpgradeStore.load` builds
+    the record with `PendingUpgrade(**data)` and coerces nothing — the field
+    holds whatever JSON was in the file. A `dict`, an `int` or `null` there
+    raises TypeError on the `[:12]` slices the exec path prints; a `list`
+    raises it on `set.add`. Either one is raised AFTER `self_upgrade_boundary`
+    has been logged and before any outcome entry, which is precisely the
+    boundary-then-silence this whole path exists to end. A record that fails
+    here is refused at the boundary — an outcome, with an entry — rather than
+    acted on, and is left exactly as it is for a reader to fix.
+    """
+    sha = record.base_sha if record is not None else ""
+    return sha if isinstance(sha, str) and sha else ""
+
+
 def loop_code_paths(paths) -> list:
     """The subset of `paths` that is the loop's own code.
 

@@ -57,6 +57,7 @@ from autoloop.auto_merge import (
     PendingUpgrade,
     UpgradeStore,
     loop_code_paths,
+    upgrade_bound_sha,
 )
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
@@ -547,6 +548,55 @@ def test_a_record_with_no_base_sha_is_never_offered(tmp_path):
     )
 
 
+#: What `pending_upgrade.json` can hand back in `base_sha` that is NOT a key a
+#: bound can be hung on. `UpgradeStore.load` builds the record with
+#: `PendingUpgrade(**data)` and coerces nothing, so every one of these is
+#: reachable from a hand-edited, half-written or foreign state dir. They divide
+#: into the two ways they used to kill the loop, and the suite covers both:
+#: `None`/`5`/`{}` raise TypeError on the `[:12]` slices the exec path prints,
+#: and `[]`/`{}` raise it on `set.add` and on the `in` test the decline makes.
+UNUSABLE_SHAS = [None, 5, {"sha": "b" * 40}, ["b" * 40], ""]
+UNUSABLE_IDS = ["none", "int", "dict", "list", "empty"]
+
+
+@pytest.mark.parametrize("sha", UNUSABLE_SHAS, ids=UNUSABLE_IDS)
+def test_only_a_non_empty_string_is_a_sha_a_bound_can_be_keyed_on(sha):
+    """The one predicate, tested where it is cheapest — a pure function, no
+    repository and no process. `upgrade_bound_sha` is what
+    `_self_upgrade_due`, `_self_upgrade_at_boundary` and `_defer_self_upgrade`
+    all ask, so a change to what counts as usable moves in one place."""
+    assert upgrade_bound_sha(pending_record(base_sha=sha)) == ""
+    assert upgrade_bound_sha(None) == "", "no record is no key either"
+    assert upgrade_bound_sha(pending_record()) == "b" * 40, "and a real one is"
+
+
+@pytest.mark.parametrize("sha", UNUSABLE_SHAS, ids=UNUSABLE_IDS)
+def test_a_record_whose_base_sha_is_not_a_key_is_never_offered(tmp_path, sha):
+    """`test_a_record_with_no_base_sha_is_never_offered` generalised past the
+    empty string, because the empty string is the one shape that fails SAFELY.
+    A `list` or a `dict` there reaches `base_sha in self._declined_upgrades` and
+    raises `TypeError: unhashable type` — a boundary CHECK that kills the loop,
+    which is the outage's own shape reached from a fresh direction."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record(base_sha=sha))
+
+    assert orch.run(max_steps=0) == Phase.READY.value
+    assert orch.run(max_steps=0) == Phase.READY.value, "and not on the next round"
+    assert entries(config, "self_upgrade_boundary") == [], (
+        "no boundary, so no missing outcome either"
+    )
+
+
+@pytest.mark.parametrize("sha", UNUSABLE_SHAS, ids=UNUSABLE_IDS)
+def test_a_sha_that_is_not_a_string_is_refused_rather_than_declined(tmp_path, sha):
+    """The same guard on the entry point a CALLER reaches with a value read off
+    the same file. `not base_sha` alone lets `["b"*40]` through to the
+    membership test, and the decline is called precisely to keep a process
+    running past a boundary — it must not be what ends it."""
+    orch, _config = orchestrator_at(tmp_path, Phase.READY)
+    assert orch.decline_self_upgrade(sha) is False
+
+
 def test_a_record_whose_paths_field_is_not_a_list_still_reaches_an_outcome(
     tmp_path, monkeypatch
 ):
@@ -592,6 +642,40 @@ def test_a_record_whose_repo_root_is_not_a_path_reaches_an_outcome_too(tmp_path)
     assert cli._self_upgrade_at_boundary(config, None) == UPGRADE_UNAPPLICABLE
     assert entries(config, f"self_upgrade_{UPGRADE_UNAPPLICABLE}")
     assert UpgradeStore(config.pending_upgrade_file).load().status == UPGRADE_PENDING
+
+
+def test_a_repo_root_the_filesystem_refuses_reaches_an_outcome_as_well(tmp_path):
+    """One step further along the same line. `str()` makes `Path(...)` safe, but
+    `resolve()` goes to the filesystem: a NUL inside the string — `chr(0)` here,
+    and a legal JSON escape in the file — raises `ValueError: embedded null
+    byte` on the `os.lstat` underneath it, in the same gap and with the same
+    ending. A repo_root this process cannot even resolve is certainly not the
+    tree it imports from, so it is the `unapplicable` outcome it already had a
+    name for, reported with the error rather than raised."""
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    root = f"{tmp_path}{chr(0)}/merged"
+    store.save(pending_record(repo_root=root))
+    try:
+        Path(root).resolve()
+    except (OSError, ValueError):
+        # Which interpreter is running decides whether `realpath` re-raises a
+        # null byte or swallows it, so the STRONGER assertion is made only
+        # where the raise is real. The weaker one — an outcome rather than a
+        # traceback — is the claim, and it holds either way.
+        refused = True
+    else:
+        refused = False
+
+    assert cli._self_upgrade_at_boundary(config, None) == UPGRADE_UNAPPLICABLE
+
+    logged = entries(config, f"self_upgrade_{UPGRADE_UNAPPLICABLE}")
+    assert logged, "the boundary is answered, never left hanging"
+    if refused:
+        assert "cannot resolve" in logged[0]["data"]["detail"], (
+            "and it says which field it could not use, with the error"
+        )
+    assert store.load().status == UPGRADE_PENDING, "still retryable, as every refusal is"
 
 
 def test_an_orchestrator_that_cannot_act_on_the_boundary_is_not_offered_it(tmp_path):
@@ -1051,6 +1135,144 @@ def test_a_boundary_with_no_record_at_all_says_so_too(tmp_path):
 
     assert cli._self_upgrade_at_boundary(config, None) == "none"
     assert entries(config, f"self_upgrade_{UPGRADE_NONE}")
+
+
+@pytest.mark.parametrize("sha", UNUSABLE_SHAS, ids=UNUSABLE_IDS)
+def test_a_record_that_goes_unusable_between_the_two_reads_reaches_an_outcome(
+    tmp_path, monkeypatch, sha
+):
+    """THE SECOND READ. The orchestrator reads the record to decide there is a
+    boundary; `_self_upgrade_at_boundary` reads the same file again and acts on
+    what IT got back. Between the two the file can be rewritten, hand-edited or
+    truncated — and a `base_sha` that is not a string then reaches
+    `mark_exec_handoff(f"self_upgrade {base_sha[:12]}")`, which raises TypeError
+    on a dict, an int or null: after `self_upgrade_boundary`, before any
+    outcome. That is 2026-08-27's silence, reached without any of that day's
+    causes.
+
+    The preflight is stubbed PASSING and a real lock is held on purpose: both
+    would otherwise be the thing that stopped the exec, and this test is about
+    the guard. `no_process_replacement` is the backstop — reaching the real
+    `os.execv` fails the test loudly.
+    """
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record(base_sha=sha))
+    on_disk = config.pending_upgrade_file.read_text(encoding="utf-8")
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+
+    assert cli._self_upgrade_at_boundary(config, held_lock(config)) == UPGRADE_NONE
+
+    logged = entries(config, f"self_upgrade_{UPGRADE_NONE}")
+    assert len(logged) == 1, "one boundary, one outcome, never silence"
+    assert "carries on" in logged[0]["data"]["detail"]
+    assert type(sha).__name__ in logged[0]["data"]["detail"] or sha == "", (
+        "and it names WHAT it could not use, which is what an operator has to "
+        "fix by hand"
+    )
+    assert config.pending_upgrade_file.read_text(encoding="utf-8") == on_disk, (
+        "nothing was written: a record this process could not make sense of is "
+        "the evidence for fixing it, and `_carry_on_upgrade` would rewrite it"
+    )
+
+
+@pytest.mark.parametrize("sha", UNUSABLE_SHAS, ids=UNUSABLE_IDS)
+def test_a_record_that_goes_unusable_at_the_boundary_does_not_end_continuous_mode(
+    tmp_path, monkeypatch, sha
+):
+    """The same race, driven through the loop it would kill.
+
+    `_run_continuous` re-reads the record beside the decision so it can bound
+    the carry-on (`answered_upgrades`), and `set.add` on a `list` or a `dict`
+    raises `TypeError: unhashable type` — one statement after the boundary
+    carried on, with the traceback taking continuous mode down. Every non-exec
+    outcome must leave this loop RUNNING, so the proof is that iteration two
+    happened: `rounds` has two entries, and the second was recorded at the top
+    of an iteration that could only exist if the first one returned.
+
+    The orchestrator is a stand-in BECAUSE the real one refuses this record —
+    that refusal is the outer guard and is tested above. This test is about
+    what the cli does when the boundary arrives anyway, which is the case a
+    file rewritten between the two reads produces.
+    """
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record(base_sha=sha))
+    on_disk = config.pending_upgrade_file.read_text(encoding="utf-8")
+    ready_session(config)
+    lock = held_lock(config)
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    rounds: list = []
+    built: list = []
+
+    class BoundaryThenStop:
+        """Offers the boundary in round one and ends the test from inside
+        iteration two — so reaching it at all is the assertion."""
+
+        def __init__(self, state):
+            self.state = state
+            self.declined: list = []
+
+        def run(self, *_args, **_kwargs):
+            rounds.append(len(rounds))
+            if len(rounds) >= 2:
+                raise StopLoop()
+            return SELF_UPGRADE
+
+        def decline_self_upgrade(self, base_sha):
+            self.declined.append(base_sha)
+            return True
+
+    def build(config_, args_, store_, state_, task_store_, registry_):
+        built.append(BoundaryThenStop(state_))
+        return built[-1]
+
+    monkeypatch.setattr(cli, "_build_orchestrator", build)
+    args = argparse.Namespace(config=None, continuous=True, null_executor=True)
+
+    with pytest.raises(StopLoop):
+        cli._run_continuous(args, config, lock)
+
+    assert len(rounds) == 2, (
+        f"base_sha={sha!r} ended the loop — the process must still be here"
+    )
+    assert entries(config, f"self_upgrade_{UPGRADE_NONE}"), (
+        "and the boundary is answered in the transcript, not left hanging"
+    )
+    assert built[1].declined == [], (
+        "the round-two orchestrator is handed no sha to re-decline, because "
+        "there was none to key on. That a REAL orchestrator then offers no "
+        "boundary for such a record — the other half of the no-spin claim — is "
+        "`test_a_record_whose_base_sha_is_not_a_key_is_never_offered`, not this "
+        "stand-in, whose round two ends the test unconditionally"
+    )
+    assert config.pending_upgrade_file.read_text(encoding="utf-8") == on_disk, (
+        "and the malformed record is left for a person to look at"
+    )
+
+
+def test_a_single_round_boundary_survives_a_record_it_cannot_key_on(
+    tmp_path, capsys
+):
+    """`_defer_self_upgrade`, same defect, other path. It hands its sha to
+    `decline_self_upgrade`, where `["b"*40]` raises on the membership test —
+    ending the single-round `run` at exactly the boundary this function exists
+    to carry the process past. The stand-in key bounds it just as the vanished
+    record does: carried on from once, stopped the second time."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record(base_sha=["b" * 40]))
+
+    assert cli._defer_self_upgrade(config, orch) is True, "carry on"
+    assert cli._defer_self_upgrade(config, orch) is False, "but not forever"
+
+    logged = entries(config, f"self_upgrade_{UPGRADE_DEFERRED}")
+    assert len(logged) == 2, "both boundaries answered in the transcript"
+    assert logged[0]["data"]["base_sha"] == "", (
+        "the entry reports no key rather than the value that is not one — and "
+        "builds at all, which a non-serialisable field would not"
+    )
+    assert UpgradeStore(config.pending_upgrade_file).load().status == UPGRADE_PENDING
+    capsys.readouterr()
 
 
 def single_round_args(max_steps=0):
