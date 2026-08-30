@@ -333,6 +333,7 @@ from .auto_merge import (
     MergeDeferral,
     MergeDeferralStore,
     UpgradeStore,
+    upgrade_bound_sha,
 )
 from .blockers import (
     NO_TASK,
@@ -1823,8 +1824,19 @@ class Orchestrator:
         re-entering. An empty `base_sha` is never declined — there is nothing
         to key on — and it never needs to be: `_self_upgrade_due` refuses to
         offer a boundary for a record without one, for that same reason.
+
+        Anything that is not a `str` is refused by the same rule and for a
+        sharper one: a caller reading the sha off a JSON file could hand this a
+        `list` or a `dict`, and the membership test one line down would raise
+        `TypeError: unhashable type` — a decline that KILLS the process it was
+        called to keep running. The guard is `isinstance` here rather than
+        `upgrade_bound_sha` because the input is a bare string, not a record;
+        it is the same predicate applied to a different argument, not a second
+        copy of it.
         """
-        if not base_sha or base_sha in self._declined_upgrades:
+        if not isinstance(base_sha, str) or not base_sha:
+            return False
+        if base_sha in self._declined_upgrades:
             return False
         self._declined_upgrades.add(base_sha)
         return True
@@ -1849,15 +1861,17 @@ class Orchestrator:
         (`cli._carry_on_upgrade`), the decline is the only thing standing
         between "retryable" and "offered again every round forever".
 
-        A record with an EMPTY `base_sha` is refused outright, and that is the
-        same guard rather than a different one: every bound in this design is
-        keyed on that sha — the decline set here, `_run_continuous`'s
-        `answered_upgrades`, the one-shot on `execed` — so a record with
-        nothing to key on is one no caller can ever answer, and offering it
-        would spin at the speed of the loop. Nothing the merger writes is
-        without a base sha (`AutoMerger` records the base head after the
-        merge); a record that has one is hand-written or corrupt, and refusing
-        it keeps this process running the code it has.
+        A record whose `base_sha` is empty — or is not a string at all — is
+        refused outright (`auto_merge.upgrade_bound_sha`, the one predicate
+        every reader of that field shares), and that is the same guard rather
+        than a different one: every bound in this design is keyed on that sha —
+        the decline set here, `_run_continuous`'s `answered_upgrades`, the
+        one-shot on `execed` — so a record with nothing to key on is one no
+        caller can ever answer, and offering it would spin at the speed of the
+        loop. Nothing the merger writes is without a base sha (`AutoMerger`
+        records the base head after the merge); a record that has one is
+        hand-written or corrupt, and refusing it keeps this process running the
+        code it has.
 
         The decline is checked BEFORE the entry is written: a boundary already
         answered once is not a new boundary, and logging it every round would
@@ -1873,18 +1887,21 @@ class Orchestrator:
             return False
         if record is None or record.status != UPGRADE_PENDING:
             return False
-        # `isinstance` and not just truthiness: the sha comes out of a JSON file
-        # this process did not necessarily write, and an unhashable value there
-        # (a list, an object) would raise on the membership test one line down
-        # — a boundary check that kills the loop instead of answering it.
-        if not isinstance(record.base_sha, str) or not record.base_sha:
+        # `upgrade_bound_sha` and not just truthiness: the sha comes out of a
+        # JSON file this process did not necessarily write, and an unhashable
+        # value there (a list, an object) would raise on the membership test one
+        # line down — a boundary check that kills the loop instead of answering
+        # it. The two `cli` readers apply the same predicate to the same field
+        # for the same reason.
+        base_sha = upgrade_bound_sha(record)
+        if not base_sha:
             return False
-        if record.base_sha in self._declined_upgrades:
+        if base_sha in self._declined_upgrades:
             return False
         self._log(
             "self_upgrade_boundary",
             data={
-                "base_sha": record.base_sha,
+                "base_sha": base_sha,
                 "task_id": record.task_id,
                 # Same reasoning, one field over, and the same guard
                 # `dashboard._view` applies to the same field: `paths` is

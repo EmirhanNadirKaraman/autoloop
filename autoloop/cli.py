@@ -143,6 +143,7 @@ from .auto_merge import (
     MergeDeferralStore,
     PendingUpgrade,
     UpgradeStore,
+    upgrade_bound_sha,
 )
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
@@ -937,7 +938,12 @@ def _carry_on_upgrade(
             except OSError as clear_exc:
                 detail += (
                     f", nor removed: {clear_exc}. pending_upgrade.json may "
-                    f"still say `{UPGRADE_EXECED}` for {record.base_sha[:12]}, "
+                    # `str()` around the slice: every caller reaches here with a
+                    # record whose sha the boundary guard already validated, and
+                    # this branch is the last chance to say ANYTHING about a
+                    # record left saying `execed` — it must not be the line that
+                    # raises if that ever stops being true.
+                    f"still say `{UPGRADE_EXECED}` for {str(record.base_sha)[:12]}, "
                     "and no boundary offers that — check it by hand)"
                 )
         else:
@@ -1069,21 +1075,49 @@ def _self_upgrade_at_boundary(
     store = UpgradeStore(config.pending_upgrade_file)
     log = TranscriptLogger(config.transcript_file).append
     record = store.load()
-    if record is None or record.status != UPGRADE_PENDING:
+    # THE SECOND READ OF A MUTABLE FILE. The orchestrator read this record to
+    # decide there was a boundary; this is a fresh read of the same path, and
+    # everything below — the `[:12]` slices, the one-shot write, the exec — acts
+    # on what THIS read returned. So the shape it needs is established here,
+    # once, before any of it: a `pending` record whose `base_sha` is a key the
+    # bounds can be hung on (`upgrade_bound_sha`). Without that check a record
+    # that went malformed between the two reads raises TypeError on
+    # `record.base_sha[:12]` below — after `self_upgrade_boundary` and before
+    # any outcome entry, which is 2026-08-27's silence exactly.
+    base_sha = upgrade_bound_sha(record)
+    if record is None or record.status != UPGRADE_PENDING or not base_sha:
         # The one outcome with no record to settle, and it is logged for exactly
         # that reason: the caller has already written `self_upgrade_boundary`,
         # so returning quietly here leaves a boundary in the transcript with
         # nothing after it — the shape that made 2026-08-27's outage unreadable.
-        # Reachable when the record is removed or settled between the
+        # Reachable when the record is removed, settled or rewritten between the
         # orchestrator's check and this one (a `dashboard` restart decision, an
         # operator deleting the file, a state dir that stopped being readable).
+        #
+        # `UPGRADE_NONE` and not `_carry_on_upgrade` for the unusable-sha case
+        # too, deliberately: that function SAVES the record it was handed, and
+        # rewriting a record this process could not make sense of would destroy
+        # the evidence a person needs to fix it. Nothing is written, nothing is
+        # settled, and the file is left exactly as it is.
         log(
             f"self_upgrade_{UPGRADE_NONE}",
             data={
                 "status": record.status if record is not None else "",
+                # `str(...)` and capped: this is the field that was just judged
+                # unusable, so it may be a dict or a list, and an entry that
+                # raised while being built would be the silence again.
+                "base_sha": str(record.base_sha)[:80] if record is not None else "",
                 "detail": (
                     "the boundary was reached with no pending upgrade left to "
                     "act on — nothing was replaced and the loop carries on"
+                    if record is None or record.status != UPGRADE_PENDING
+                    else "the pending record's base_sha is not a usable key "
+                    f"({type(record.base_sha).__name__}), so nothing could be "
+                    "keyed on it — the one-shot, the per-process decline and "
+                    "the restart line all need it. Nothing was replaced and "
+                    "nothing was written; the loop carries on with the code it "
+                    "has, and this record is not offered again until it is "
+                    "fixed or overwritten by the next merge"
                 ),
             },
         )
@@ -1095,7 +1129,26 @@ def _self_upgrade_at_boundary(
     # TypeError here is a boundary followed by silence — the caller has already
     # logged `self_upgrade_boundary`. Anything that is not a path this process
     # imports from comes out `unapplicable`, which is an outcome with an entry.
-    merged = Path(str(record.repo_root)).resolve() if record.repo_root else running
+    #
+    # And `resolve()` itself is inside the guard, not merely `Path(...)`: it
+    # calls into the filesystem, so an embedded NUL escape (which JSON permits)
+    # raises ValueError and a path the OS refuses to walk raises OSError —
+    # both in the same gap, with the same result. A string this process cannot
+    # resolve is not the tree it imports from, which is the `unapplicable`
+    # answer already; it is reported with the raw value so the operator can see
+    # what is in the file.
+    try:
+        merged = Path(str(record.repo_root)).resolve() if record.repo_root else running
+    except (OSError, ValueError) as exc:
+        return _carry_on_upgrade(
+            store,
+            record,
+            UPGRADE_UNAPPLICABLE,
+            "the merge names a repo_root this process cannot resolve "
+            f"({type(exc).__name__}: {exc}), so it is not the tree it imports "
+            f"autoloop from ({running}) — nothing was replaced",
+            log,
+        )
     if merged != running:
         return _carry_on_upgrade(
             store,
@@ -1142,7 +1195,10 @@ def _self_upgrade_at_boundary(
     # between here and the exec may spawn a child — a token in the environment
     # is inherited by every subprocess started while it is set, and the
     # preflight (the one subprocess on this path) has already run.
-    if lock is None or not lock.mark_exec_handoff(f"self_upgrade {record.base_sha[:12]}"):
+    # `base_sha`, the local the guard at the top of this function validated, and
+    # not `record.base_sha` re-read: this is the first of two slices on the exec
+    # path, and a slice is what a `dict` or an `int` in that field raises on.
+    if lock is None or not lock.mark_exec_handoff(f"self_upgrade {base_sha[:12]}"):
         # `execed_on_disk=True`: the marker above landed, so the record on disk
         # says `execed` and has to be put back — a process that never went
         # anywhere must not leave the status that means "a successor is
@@ -1179,7 +1235,7 @@ def _self_upgrade_at_boundary(
         },
     )
     print(
-        f"\nrestarting into {record.base_sha[:12]} — the merge for task "
+        f"\nrestarting into {base_sha[:12]} — the merge for task "
         f"{record.task_id} changed the loop's own code (same pid, lock held).\n"
     )
     # There is no "after" to flush in: `execv` replaces the image, so anything
@@ -1259,11 +1315,13 @@ def _confirm_self_upgrade(config: AutoloopConfig) -> bool:
 #: Why the single-round `run` path may not perform the handoff. One string,
 #: because it is both what the transcript records and what the operator is
 #: told, and the two must not drift.
-#: Stands in for a `base_sha` when the record has gone between the boundary and
-#: the decision. Not a sha and never equal to one, so declining it bounds the
-#: carry-on exactly as a real sha does: the first disappearance is carried on
-#: from, a second one in the same run stops rather than spinning on a state dir
-#: that is flapping under a running loop.
+#: Stands in for a `base_sha` when there is nothing at the boundary to key a
+#: bound on — the record has gone between the boundary and the decision, or the
+#: sha it carries is not a usable key (`auto_merge.upgrade_bound_sha`). Not a
+#: sha and never equal to one, so declining it bounds the carry-on exactly as a
+#: real sha does: the first such boundary is carried on from, a second one in
+#: the same run stops rather than spinning on a state dir that is flapping under
+#: a running loop.
 MISSING_UPGRADE_RECORD = "(no record at the boundary)"
 
 SINGLE_ROUND_DEFER_REASON = (
@@ -1309,7 +1367,14 @@ def _defer_self_upgrade(config: AutoloopConfig, orchestrator) -> bool:
     is bounded by the same rule.
     """
     record = UpgradeStore(config.pending_upgrade_file).load()
-    base_sha = record.base_sha if record is not None else ""
+    # The same second read of a mutable file `_self_upgrade_at_boundary` makes,
+    # and the same predicate over it. A raw `record.base_sha` here would reach
+    # `decline_self_upgrade` below, where an unhashable value (a `list`, a
+    # `dict`) raises `TypeError` on the membership test — this function's whole
+    # job is to keep the process alive past the boundary, so it must not be the
+    # thing that ends it. Anything unusable declines `MISSING_UPGRADE_RECORD`,
+    # which bounds this run exactly as a real sha would.
+    base_sha = upgrade_bound_sha(record)
     TranscriptLogger(config.transcript_file).append(
         f"self_upgrade_{UPGRADE_DEFERRED}",
         data={
@@ -1745,10 +1810,23 @@ def _run_continuous(
                 # round: `answered_upgrades` is what keeps the carry-on from
                 # being a hot loop, and it has to be keyed on the record that
                 # was actually offered.
+                #
+                # VALIDATED, not trusted. This is a second read of a file that
+                # is mutable and hand-editable, so the value may be a `list` or
+                # a `dict` — and `set.add` on one of those raises `TypeError:
+                # unhashable type`, one statement after the boundary carried on,
+                # which would end the loop for the exact reason this whole path
+                # exists to prevent. `upgrade_bound_sha` answers `""` for
+                # anything that is not a key, and `""` is safe to skip rather
+                # than fail open: it is the SAME predicate `_self_upgrade_due`
+                # applies, so a record it rejects is a record the next round
+                # will not offer either. If the file becomes valid again, that
+                # round offers it, this branch reads a real sha and bounds it.
                 offered = UpgradeStore(config.pending_upgrade_file).load()
+                answered = upgrade_bound_sha(offered)
                 _self_upgrade_at_boundary(config, lock, args)
-                if offered is not None:
-                    answered_upgrades.add(offered.base_sha)
+                if answered:
+                    answered_upgrades.add(answered)
                 continue
             if outcome == Phase.NEEDS_USER.value:
                 if _handle_parked_task(config, store, task_store, registry, orchestrator.state) == "task_fatal":

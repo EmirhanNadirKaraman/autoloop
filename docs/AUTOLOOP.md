@@ -196,11 +196,11 @@ that silence is the whole subject of this section.
 | Entry | What happened | What the record does |
 |---|---|---|
 | `self_upgrade_exec` | replaced, `argv` in the entry | settled `execed` (one shot) |
-| `self_upgrade_unapplicable` | the merge moved a different checkout | **stays pending** |
+| `self_upgrade_unapplicable` | the merge moved a different checkout, or named a `repo_root` this process cannot resolve | **stays pending** |
 | `self_upgrade_preflight_failed` | the merged tree does not import | **stays pending**, `detail` carries the error |
 | `self_upgrade_exec_failed` | marker unwritable, lock unarmable, or `execv` refused | **stays pending** |
 | `self_upgrade_deferred` | this process may not hand off | **stays pending** |
-| `self_upgrade_none` | nothing pending was left to act on | no record |
+| `self_upgrade_none` | nothing pending was left to act on, or its `base_sha` is not a usable key | left exactly as found |
 
 **No outcome but `exec` ends the process, and no outcome but `exec` settles the
 record.** Carrying on means carrying on with the code it has, which was working
@@ -265,9 +265,23 @@ timer:
    whole spin bound now lives: in memory, per process, saying nothing about the
    next one. So a refused handoff costs at most one preflight (one subprocess,
    120s ceiling) and one entry per process, not one per round.
-3. **A record with no `base_sha` is never offered at all.** Every bound above is
-   keyed on that sha, so a record without one could not be declined and would be
-   offered forever. Nothing the merger writes lacks one.
+3. **A record with no usable `base_sha` is never offered at all.** Every bound
+   above is keyed on that sha, so a record without one could not be declined and
+   would be offered forever. Nothing the merger writes lacks one.
+
+   "Usable" is one predicate, `auto_merge.upgrade_bound_sha`: a non-empty
+   `str`. `UpgradeStore.load` builds the record with `PendingUpgrade(**data)`
+   and coerces nothing, so a hand-edited or half-written file can put a `dict`,
+   a `list`, an `int` or `null` in that field — and the loop then dies *between*
+   `self_upgrade_boundary` and any outcome, which is the silence this whole
+   section exists to end: `[:12]` on the exec path raises `TypeError` for a
+   dict, an int or null, and `set.add`/`in` raise it for a list or a dict.
+   `_self_upgrade_due` refuses to offer such a record; the two `cli` readers
+   check again, because each of them makes its own **second read** of a file
+   that is mutable between the two. At the boundary itself the outcome is
+   `self_upgrade_none` naming the type it found, **nothing is written** (the
+   malformed record is the evidence for fixing it), and the loop carries on with
+   the code it has.
 
 A later merge is a different `base_sha` and does get its own boundary — which is
 also the unstick path for a tree that fails its preflight: `auto_merge`
