@@ -26,3 +26,4 @@ marker.
 | Date | Task | Note |
 |---|---|---|
 | 2026-08-27 | split | extracted from language-app with git filter-repo, 414 commits of history preserved; this tracker seeded here. |
+| 2026-08-30 | upgrade-01 | Symptom: the loop is gone and the last transcript line is `self_upgrade_boundary`, with nothing after it. Not a crash and not the lock: a non-`--continuous` launch (`run`, `--retry`, `--answer`, `resume`) reached the boundary in `cli._run_locked`, which returned 0 mid-session, while `_cmd_run`'s `finally` published the heartbeat `stopped` — outside `ATTENTION_STATUSES`, so nothing alarmed either. Every outcome now logs `self_upgrade_<outcome>`; a boundary with no entry after it means the running build predates 2026-08-30. The record stays pending, so `python -m autoloop start` still performs the upgrade. |

@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -46,8 +47,10 @@ from gitrepo import make_repo_from_template
 
 from autoloop import cli
 from autoloop.auto_merge import (
+    UPGRADE_DEFERRED,
     UPGRADE_EXEC_FAILED,
     UPGRADE_EXECED,
+    UPGRADE_NONE,
     UPGRADE_PENDING,
     UPGRADE_PREFLIGHT_FAILED,
     UPGRADE_UNAPPLICABLE,
@@ -544,23 +547,34 @@ def held_lock(config) -> LoopLock:
 def test_the_boundary_replaces_the_process_with_a_fresh_interpreter(tmp_path, monkeypatch):
     """The whole feature. `os.execv` — not `importlib.reload`: reloading modules
     in a running orchestrator leaves half-reloaded modules and live objects
-    holding the old classes, in a process that authorizes git pushes."""
+    holding the old classes, in a process that authorizes git pushes.
+
+    The successor's command line is DERIVED, not replayed, and this drives it
+    from the worst case: the operator typed `start`, so `sys.argv[1:]` is
+    `["start"]` — a verb whose successor refuses on its own live lock (see
+    `test_a_start_shaped_successor_refuses_on_the_lock_the_exec_preserved`).
+    """
     config = make_config(tmp_path)
     store = UpgradeStore(config.pending_upgrade_file)
     store.save(pending_record())
     lock = held_lock(config)
     monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
-    monkeypatch.setattr(sys, "argv", ["/x/autoloop/__main__.py", "run", "--continuous"])
+    monkeypatch.setattr(sys, "argv", ["/x/autoloop/__main__.py", "start"])
     calls = recording_execv(monkeypatch)
+    args = argparse.Namespace(config=None, continuous=True, null_executor=False)
 
     with pytest.raises(Execed):
-        cli._self_upgrade_at_boundary(config, lock)
+        cli._self_upgrade_at_boundary(config, lock, args)
 
     assert calls == [(sys.executable, [sys.executable, "-m", "autoloop", "run", "--continuous"])], (
         "the documented launch shape, rebuilt — argv[0] under `-m` is the path "
-        "to __main__.py, and re-running THAT as a script breaks its imports"
+        "to __main__.py, and re-running THAT as a script breaks its imports; "
+        "the verb is the one that CONTINUES a loop, not the one that was typed"
     )
-    assert entries(config, "self_upgrade_exec")
+    logged = entries(config, "self_upgrade_exec")
+    assert logged and logged[0]["data"]["argv"] == calls[0][1], (
+        "and the transcript records the command line actually handed over"
+    )
     assert store.load().status == UPGRADE_EXECED, "the one-shot, recorded BEFORE the exec"
 
 
@@ -679,6 +693,11 @@ def test_a_merge_in_another_checkout_is_not_a_reason_to_restart(tmp_path, monkey
 
     assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_UNAPPLICABLE
     assert store.load().status == UPGRADE_UNAPPLICABLE
+    logged = entries(config, f"self_upgrade_{UPGRADE_UNAPPLICABLE}")
+    assert logged and "somewhere-else" in logged[0]["data"]["detail"], (
+        "a status written into the record that no event mirrors is invisible "
+        "to `status`, to the dashboard and to the log after the loop is gone"
+    )
 
 
 def test_the_replacement_is_refused_when_the_lock_cannot_be_armed(tmp_path, monkeypatch):
@@ -691,6 +710,12 @@ def test_the_replacement_is_refused_when_the_lock_cannot_be_armed(tmp_path, monk
 
     assert cli._self_upgrade_at_boundary(config, None) == UPGRADE_EXEC_FAILED
     assert store.load().status == UPGRADE_EXEC_FAILED
+    logged = entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}")
+    assert logged and "lock could not be armed" in logged[0]["data"]["detail"], (
+        "the refusal names itself in the transcript — this is the branch whose "
+        "own message the 2026-08-27 postmortem suspected, and it would have "
+        "left an entry if it had fired"
+    )
 
 
 def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
@@ -728,6 +753,348 @@ def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
     assert cli._self_upgrade_at_boundary(config, lock) == "none", (
         "still one-shot: a refused exec is not a licence to try the same sha again"
     )
+
+
+# --- no boundary ends in silence, and none of them ends the process ----------
+#
+# 2026-08-27, verbatim from the deployment transcript:
+#
+#   08:13:47  self_upgrade_boundary  split-05   <- reached
+#             ...nothing. The process was gone.
+#   08:15:26  an operator ran `python3 -m autoloop start` by hand
+#   08:15:30  self_upgrade_boundary  split-05   <- the SAME pending record
+#   08:15:30  self_upgrade_exec      split-05
+#
+# The divergence is the code PATH, not the verb: `_run_continuous` handed the
+# boundary to `_self_upgrade_at_boundary`, and the single-round `_run_locked`
+# — every non-`--continuous` entry, `run`, `--retry`, `--answer`, `--resubmit`
+# and `resume` alike — answered `SELF_UPGRADE` by returning. No store write, no
+# transcript call, mid-session, with the record left `pending`. That last fact
+# is what excludes every other candidate: each of the settled outcomes both
+# logs (`_settle_upgrade`) and moves the record out of `pending`, and a settled
+# record is never offered again (`_self_upgrade_due`), so none of them can end
+# in "no event + still pending + exec'd two minutes later".
+
+
+def test_a_boundary_with_nothing_left_to_act_on_still_says_so(tmp_path):
+    """The fallthrough with no record to settle, and therefore the one that had
+    no event at all. The caller has already written `self_upgrade_boundary`, so
+    a quiet return leaves a boundary with nothing after it — the exact shape
+    that made the outage unreadable."""
+    config = make_config(tmp_path)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record(status=UPGRADE_EXECED))
+
+    assert cli._self_upgrade_at_boundary(config, None) == "none"
+
+    logged = entries(config, f"self_upgrade_{UPGRADE_NONE}")
+    assert logged and logged[0]["data"]["status"] == UPGRADE_EXECED
+    assert "carries on" in logged[0]["data"]["detail"]
+
+
+def test_a_boundary_with_no_record_at_all_says_so_too(tmp_path):
+    """Same branch, the other half of its condition — a record removed under a
+    running loop (an operator, a wiped state dir) must not be a silent return
+    either."""
+    config = make_config(tmp_path)
+
+    assert cli._self_upgrade_at_boundary(config, None) == "none"
+    assert entries(config, f"self_upgrade_{UPGRADE_NONE}")
+
+
+def single_round_args(max_steps=0):
+    """A single-round `run`: no `--continuous`, no manual flag. `max_steps=0`
+    keeps `Orchestrator.run` above its first step — the boundary check runs
+    before the budget check, so a real orchestrator answers the real question
+    without needing a client, an executor or a git checkout."""
+    return argparse.Namespace(
+        config=None,
+        continuous=False,
+        kickoff=None,
+        kickoff_audit=False,
+        answer=None,
+        retry=False,
+        resubmit=False,
+        max_steps=max_steps,
+        null_executor=True,
+    )
+
+
+def real_orchestrator(config_, args_, store_, state_, task_store_, registry_):
+    """Stand in for `cli._build_orchestrator` with the real class, built on the
+    objects `_run_locked` hands it — so the boundary, the decline and the step
+    budget under test are the production ones. Only the collaborators a
+    boundary check never reaches are left out (no client, no executor, no git);
+    `orchestrator_at` above leaves out the same ones for the same reason."""
+
+    def no_client():
+        raise AssertionError("no client expected at a boundary check")
+
+    return Orchestrator(
+        config=config_,
+        store=store_,
+        state=state_,
+        policy=PolicyEngine(config_.policy),
+        git=None,
+        executor=None,
+        transcript=TranscriptLogger(config_.transcript_file),
+        client_factory=no_client,
+        registry=registry_,
+        task_store=task_store_,
+        manifest_store=ManifestStore(config_.manifests_dir),
+        self_upgrade_enabled=True,
+    )
+
+
+def ready_session(config) -> LoopState:
+    state = LoopState.new(URL)
+    state.phase = Phase.READY.value
+    state.outbox = "the next packet's payload"
+    StateStore(config.state_file).save(state)
+    TaskStore(config.tasks_file).save(TaskRegistry([]))
+    return state
+
+
+def test_the_single_round_path_records_the_boundary_and_keeps_running(
+    tmp_path, monkeypatch, capsys
+):
+    """THE OUTAGE, end to end, through the real `_run_locked` with a real
+    orchestrator. Three claims, and the third is the one that took the loop
+    down: the outcome is named in the transcript, the process does NOT end at
+    the boundary, and the record is left `pending` so the next process can
+    still perform the upgrade."""
+    config = make_config(tmp_path)
+    upgrades = UpgradeStore(config.pending_upgrade_file)
+    upgrades.save(pending_record())
+    ready_session(config)
+    monkeypatch.setattr(cli, "_build_orchestrator", real_orchestrator)
+
+    rc = cli._run_locked(single_round_args(), config)
+
+    assert rc == 0
+    boundaries = entries(config, "self_upgrade_boundary")
+    deferred = entries(config, f"self_upgrade_{UPGRADE_DEFERRED}")
+    assert len(boundaries) == 1, "the boundary was reached once"
+    assert len(deferred) == 1, "and answered once — no boundary without an outcome"
+    assert deferred[0]["data"]["base_sha"] == "b" * 40
+    assert deferred[0]["data"]["task_id"] == "t1"
+    assert "StateError" in deferred[0]["data"]["detail"], "and it says WHY, actionably"
+    assert upgrades.load().status == UPGRADE_PENDING, (
+        "the one outcome that is deliberately NOT settled: nothing here judged "
+        "the merged tree, so the next `run --continuous` must still find it"
+    )
+    assert "carrying on" in capsys.readouterr().out
+
+
+def test_a_deferred_boundary_leaves_the_upgrade_for_the_next_process(
+    tmp_path, monkeypatch
+):
+    """08:15:30, reproduced: the record the single-round path declined is the
+    same one a continuous process then execs. This is what makes "not settled"
+    a real property rather than a comment."""
+    config = make_config(tmp_path)
+    upgrades = UpgradeStore(config.pending_upgrade_file)
+    upgrades.save(pending_record())
+    ready_session(config)
+    monkeypatch.setattr(cli, "_build_orchestrator", real_orchestrator)
+
+    cli._run_locked(single_round_args(), config)
+
+    # ---- the operator starts a continuous loop; same state dir, same record --
+    lock = held_lock(config)
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    recording_execv(monkeypatch)
+
+    with pytest.raises(Execed):
+        cli._self_upgrade_at_boundary(config, lock)
+
+    assert entries(config, "self_upgrade_exec"), "the upgrade was still there to do"
+
+
+def test_a_declined_boundary_is_not_offered_twice_in_one_process(tmp_path):
+    """The bound on carrying on. The record stays `pending` — which is what
+    `_self_upgrade_due` offers — so without the decline the very next `run()`
+    would return `SELF_UPGRADE` again, and the one after that, forever.
+
+    Asserted on the ORCHESTRATOR rather than through the cli, because the
+    decline is per instance: a future `_run_locked` that rebuilt one per step
+    would lose the bound, and this is the test that fails when it does."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record())
+
+    assert orch.run(max_steps=0) == SELF_UPGRADE
+    assert orch.decline_self_upgrade("b" * 40) is True
+
+    assert orch.run(max_steps=0) == Phase.READY.value, "no second offer"
+    assert orch.run(max_steps=0) == Phase.READY.value, "and no third"
+    assert len(entries(config, "self_upgrade_boundary")) == 1, (
+        "the entry is written after the decline check: a boundary already "
+        "answered is not a new boundary, and logging it every round would bury "
+        "the outcome that answered it"
+    )
+    assert orch.decline_self_upgrade("b" * 40) is False, (
+        "the caller's loop bound — a second decline of the same sha means "
+        "nothing moved, and `_run_locked` stops rather than re-entering"
+    )
+    assert UpgradeStore(config.pending_upgrade_file).load().status == UPGRADE_PENDING
+
+
+def test_a_declined_boundary_is_only_declined_for_its_own_sha(tmp_path):
+    """A later merge in the same session is a DIFFERENT upgrade, not a retry of
+    the one this process turned down, and it gets its own boundary."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record())
+
+    assert orch.run(max_steps=0) == SELF_UPGRADE
+    orch.decline_self_upgrade("b" * 40)
+    store.save(pending_record(base_sha="d" * 40, task_id="t2"))
+
+    assert orch.run(max_steps=0) == SELF_UPGRADE
+    assert [e["data"]["base_sha"] for e in entries(config, "self_upgrade_boundary")] == [
+        "b" * 40,
+        "d" * 40,
+    ]
+
+
+def test_an_empty_sha_is_never_declined(tmp_path):
+    """An empty sha is not a key, so it declines nothing: a set holding `""`
+    would match no record and bound nothing. The caller substitutes
+    `cli.MISSING_UPGRADE_RECORD` for exactly that reason (the test below)."""
+    orch, _config = orchestrator_at(tmp_path, Phase.READY)
+    assert orch.decline_self_upgrade("") is False
+
+
+def test_a_boundary_whose_record_vanished_still_carries_on_and_is_still_bounded(
+    tmp_path, capsys
+):
+    """The narrow race the decline has to survive: the record is gone by the
+    time the outcome is decided. There is no sha to key on, so
+    `MISSING_UPGRADE_RECORD` stands in — the loop carries on (an exit here
+    would be the very failure this task is about), and a second disappearance
+    in the same run stops instead of spinning on a flapping state dir."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+
+    assert cli._defer_self_upgrade(config, orch) is True, "carry on"
+    assert cli._defer_self_upgrade(config, orch) is False, "but not forever"
+
+    logged = entries(config, f"self_upgrade_{UPGRADE_DEFERRED}")
+    assert len(logged) == 2, "and both are in the transcript, sha or no sha"
+    assert logged[0]["data"]["base_sha"] == ""
+    capsys.readouterr()
+
+
+class BudgetSpy:
+    """Records the step budget each re-entry is given, and spends two steps
+    before the boundary — the shape `--max-steps` has to survive."""
+
+    def __init__(self, state):
+        self.state = state
+        self.budgets: list = []
+        self.declined: list = []
+        self.steps_taken = 0
+
+    def run(self, max_steps=None):
+        self.budgets.append(max_steps)
+        if len(self.budgets) == 1:
+            self.steps_taken = 2
+            return SELF_UPGRADE
+        return Phase.READY.value
+
+    def decline_self_upgrade(self, base_sha):
+        self.declined.append(base_sha)
+        return True
+
+
+def test_a_declined_boundary_does_not_hand_out_a_second_step_budget(
+    tmp_path, monkeypatch
+):
+    """`--max-steps` is a budget for the RUN. Re-entering `run()` with the same
+    number would silently double it."""
+    config = make_config(tmp_path)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record())
+    state = ready_session(config)
+    spy = BudgetSpy(state)
+    monkeypatch.setattr(cli, "_build_orchestrator", lambda *a, **k: spy)
+
+    cli._run_locked(single_round_args(max_steps=5), config)
+
+    assert spy.budgets == [5, 3], "two steps were spent before the boundary"
+    assert spy.declined == ["b" * 40]
+
+
+def test_the_step_budget_arithmetic_never_goes_negative():
+    """`run(max_steps=0)` returns at the top of its loop without stepping, which
+    is the right answer to a budget already spent; a negative would read as
+    "no budget given" one call later."""
+    assert cli._remaining_steps(None, 7) is None
+    assert cli._remaining_steps(5, 2) == 3
+    assert cli._remaining_steps(2, 5) == 0
+
+
+# --- the successor's command line --------------------------------------------
+
+
+def test_the_successor_command_continues_the_loop_whatever_verb_was_typed():
+    """`sys.argv[1:]` is the verb an operator typed, and only one of them is a
+    verb a successor can continue on. `start` re-runs `_cmd_start`, which reads
+    the lock before acquiring it and refuses on the live one the exec preserved
+    (the test below); `resume` and a bare `run` are single-round paths that
+    would defer the upgrade they were exec'd to perform."""
+    argv = cli._successor_argv(None)
+
+    assert argv == [sys.executable, "-m", "autoloop", "run", "--continuous"]
+    assert "start" not in argv and "resume" not in argv
+
+
+def test_the_successor_keeps_the_config_and_the_dry_run_it_was_given():
+    """The two flags whose loss changes what the successor DOES: a dropped
+    `--config` lets its own `DEFAULT_CONFIG` repoint it at another deployment,
+    and a dropped `--null-executor` turns a dry run into one that writes."""
+    args = argparse.Namespace(config=Path("/tmp/elsewhere.toml"), null_executor=True)
+
+    assert cli._successor_argv(args) == [
+        sys.executable,
+        "-m",
+        "autoloop",
+        "run",
+        "--continuous",
+        "--config",
+        "/tmp/elsewhere.toml",
+        "--null-executor",
+    ]
+
+
+def test_a_start_shaped_successor_refuses_on_the_lock_the_exec_preserved(
+    tmp_path, monkeypatch, capsys
+):
+    """WHY the verb is not replayed, proved rather than asserted. `os.execv`
+    preserves the pid and never releases the lock — that is the whole point —
+    so a successor running `start` finds a LIVE lock naming itself, prints
+    "already running" and returns 0. A successful exec would still have ended
+    the loop, and with nothing in the transcript."""
+    config = make_config(tmp_path)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    write_lock(
+        config.state_dir,
+        LockInfo(
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            started_at=utcnow_iso(),
+            run_id="the-run-that-exec-ed",
+            state_dir=str(config.state_dir),
+        ),
+        handoff={"pid": os.getpid(), "run_id": "the-run-that-exec-ed", "token": "t"},
+    )
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(
+        cli, "_cmd_run", lambda args: pytest.fail("start never got as far as running")
+    )
+
+    rc = cli._cmd_start(argparse.Namespace(config=None, check_only=False))
+
+    assert rc == 0
+    assert "already running — nothing to do" in capsys.readouterr().out
+    assert entries(config) == [], "and not one word of it in the transcript"
 
 
 # --- the preflight actually launches an interpreter --------------------------
@@ -859,6 +1226,7 @@ def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
 
         def __init__(self, state):
             self.state = state
+            self.declined: list = []
 
         def run(self, *_args, **_kwargs):
             rounds.append(store.load())
@@ -866,11 +1234,20 @@ def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
                 raise StopLoop()
             return SELF_UPGRADE
 
-    monkeypatch.setattr(
-        cli,
-        "_build_orchestrator",
-        lambda config_, args_, store_, state_, task_store_, registry_: BoundaryThenStop(state_),
-    )
+        def decline_self_upgrade(self, base_sha):
+            # `_run_continuous` re-declines what this run has already answered
+            # onto each rebuilt orchestrator; recorded so the assertion below
+            # can show the settled sha really was carried across the rebuild.
+            self.declined.append(base_sha)
+            return True
+
+    built: list = []
+
+    def build(config_, args_, store_, state_, task_store_, registry_):
+        built.append(BoundaryThenStop(state_))
+        return built[-1]
+
+    monkeypatch.setattr(cli, "_build_orchestrator", build)
     args = argparse.Namespace(config=None, continuous=True, null_executor=True)
 
     with pytest.raises(StopLoop):
@@ -888,6 +1265,12 @@ def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
         "an entry here would record a replacement that did not happen"
     )
     assert entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}"), "reported instead"
+    assert built[1].declined == ["b" * 40], (
+        "and the sha this run has already answered is re-declined onto the "
+        "orchestrator iteration two builds — the settled record covers this "
+        "case, and that carry-across is what covers the one where the record "
+        "could not be written at all"
+    )
 
 
 def test_confirmation_leaves_a_pending_record_alone(tmp_path):
