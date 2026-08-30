@@ -1751,6 +1751,185 @@ def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
     )
 
 
+# --- the bound is keyed on the record the DECISION acted on ------------------
+#
+# TWO READS of one mutable file. `_run_continuous` reads `pending_upgrade.json`
+# on its way into the boundary, and `_self_upgrade_at_boundary` reads it again
+# to decide. Everything in this section is about the case where they disagree —
+# a merge landing between them, an operator editing the state dir — because the
+# record the decision acted on is the only one whose refusal has to be bounded.
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [UPGRADE_PREFLIGHT_FAILED, UPGRADE_UNAPPLICABLE, UPGRADE_EXEC_FAILED],
+)
+def test_a_refused_outcome_names_the_record_it_acted_on(tmp_path, monkeypatch, outcome):
+    """Every refusal comes back as the slug it always was, plus WHICH record it
+    was about. The caller cannot re-derive that: its own read already happened,
+    and asking the file a third time would just be a third answer."""
+    config = make_config(tmp_path)
+    UpgradeStore(config.pending_upgrade_file).save(
+        pending_record(repo_root=str(tmp_path / "elsewhere"))
+        if outcome == UPGRADE_UNAPPLICABLE
+        else pending_record()
+    )
+    monkeypatch.setattr(
+        cli,
+        "_preflight_import",
+        (lambda root: (False, "SyntaxError: invalid syntax"))
+        if outcome == UPGRADE_PREFLIGHT_FAILED
+        else (lambda root: (True, "")),
+    )
+
+    # `None` for the lock is the unarmable handoff, as in the refusal tests above.
+    refused = cli._self_upgrade_at_boundary(
+        config, None if outcome == UPGRADE_EXEC_FAILED else held_lock(config)
+    )
+
+    assert refused == outcome, "still the slug everywhere it is read"
+    assert refused.base_sha == "b" * 40, "and the key the caller's bound needs"
+    assert refused.candidate_sha == "c" * 40, "and the merge it was about"
+
+
+def test_the_empty_handed_outcome_offers_no_identity_to_key_on(tmp_path):
+    """`none` is the outcome that acted on NOTHING — the record went between the
+    two reads, or the `base_sha` in it is not a key. Handing that field back as
+    an identity would hand back the very value this branch just judged unusable,
+    so it comes back empty and the caller falls back on the sha it read on its
+    way in, which is the record the boundary was offered for."""
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+
+    gone = cli._self_upgrade_at_boundary(config, None)
+    assert gone == UPGRADE_NONE
+    assert gone.base_sha == "" and gone.candidate_sha == ""
+
+    store.save(pending_record(base_sha=["b" * 40]))
+    unusable = cli._self_upgrade_at_boundary(config, None)
+    assert unusable == UPGRADE_NONE and unusable.base_sha == ""
+    # The bound does `set.add` on this field. A `list` arriving here raises
+    # `TypeError: unhashable type` one statement after the boundary carried on,
+    # which is 2026-08-27's silence rebuilt by the fix for it.
+    bound: set = set()
+    bound.add(unusable.base_sha)
+
+
+@pytest.mark.parametrize("unusable", [None, 7, ["b" * 40], {"sha": "b" * 40}, ""])
+def test_an_identity_that_is_not_a_key_is_never_offered_as_one(unusable):
+    """One predicate, applied once, where the value is built — so no caller has
+    to remember. Both fields are read off a JSON file nobody validated."""
+    outcome = cli.UpgradeOutcome(
+        UPGRADE_EXEC_FAILED, base_sha=unusable, candidate_sha=unusable
+    )
+
+    assert outcome == UPGRADE_EXEC_FAILED
+    assert outcome.base_sha == "" and outcome.candidate_sha == ""
+    bound: set = set()
+    bound.add(outcome.base_sha)  # a list or a dict raises here
+
+
+class BoundaryOnlyRounds:
+    """The orchestrator's part of an iteration, asked of the REAL class.
+
+    `_run_continuous` rebuilds an orchestrator every iteration, so this wraps a
+    real one built the same way (`real_orchestrator`) and puts the single
+    question under test to it through the real `run()`: `max_steps=0` returns at
+    the top without stepping, and the boundary check sits deliberately BEFORE
+    the budget check, so `_self_upgrade_due` is what answers. The round body is
+    not the claim here and would need a client, a git gateway and an executor.
+
+    `decline_self_upgrade` delegates, so the decline set under test is the real
+    orchestrator's — a spy recording the calls would prove a decline happened,
+    not that the next boundary was suppressed.
+    """
+
+    def __init__(self, real, rounds):
+        self._real = real
+        self._rounds = rounds
+        self.state = real.state
+
+    def run(self, max_steps=None):
+        outcome = self._real.run(max_steps=0)
+        self._rounds.append(outcome)
+        # Two exits, and the second one is what keeps a REGRESSION here from
+        # hanging the suite instead of failing it: a lost bound offers the
+        # boundary again every round forever, so this stops at three and lets
+        # the assertions below say what happened.
+        if outcome != SELF_UPGRADE or len(self._rounds) >= 3:
+            raise StopLoop()
+        return outcome
+
+    def decline_self_upgrade(self, base_sha):
+        return self._real.decline_self_upgrade(base_sha)
+
+
+def test_a_record_swapped_in_between_the_two_reads_is_the_one_bounded(
+    tmp_path, monkeypatch
+):
+    """A/B, and the whole reason the decision hands back an identity.
+
+    The loop reads record A on its way into the boundary; the record on disk
+    becomes B before the decision reads it, and B is what gets refused and left
+    `pending` — which is exactly what `_self_upgrade_due` offers. Bounding the
+    run on A alone leaves B undeclined, so the next round offers it again, and
+    the round after that, at the speed of a `continue`. That is the failure this
+    test pins: against a build that declines only the pre-read sha, `rounds`
+    below is three `SELF_UPGRADE`s.
+
+    Driven through the real orchestrator, so the SUPPRESSION is asserted on
+    `_self_upgrade_due` — the thing that offers the boundary — rather than on a
+    recorded call.
+    """
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record())                       # A: the record read first
+    ready_session(config)
+    monkeypatch.setattr(
+        cli, "_preflight_import", lambda root: (False, "B does not import")
+    )
+    rounds: list = []
+    monkeypatch.setattr(
+        cli,
+        "_build_orchestrator",
+        lambda *built: BoundaryOnlyRounds(real_orchestrator(*built), rounds),
+    )
+    decide = cli._self_upgrade_at_boundary
+    swapped: list = []
+
+    def swap_then_decide(config_, lock_, args_=None):
+        # The race made deterministic: the loop has read A and is about to
+        # decide; the record on disk becomes B first. The real decision then
+        # runs on B, which is the point.
+        if not swapped:
+            swapped.append("B")
+            store.save(
+                pending_record(base_sha="d" * 40, candidate_sha="e" * 40, task_id="t2")
+            )
+        return decide(config_, lock_, args_)
+
+    monkeypatch.setattr(cli, "_self_upgrade_at_boundary", swap_then_decide)
+    args = argparse.Namespace(config=None, continuous=True, null_executor=True)
+
+    with pytest.raises(StopLoop):
+        cli._run_continuous(args, config)
+
+    assert rounds == [SELF_UPGRADE, Phase.READY.value], (
+        "iteration two ran — the process is still here — and was NOT offered "
+        "the boundary again; a second offer is the spin this bound exists to stop"
+    )
+    assert len(entries(config, "self_upgrade_boundary")) == 1
+    refused = entries(config, f"self_upgrade_{UPGRADE_PREFLIGHT_FAILED}")
+    assert len(refused) == 1 and refused[0]["data"]["base_sha"] == "d" * 40, (
+        "B is what was really acted on, and the entry says so — the identity "
+        "the bound is keyed on comes from the decision, not from the read before it"
+    )
+    assert store.load().status == UPGRADE_PENDING, (
+        "and B stays retryable: the bound is in memory and per process, so the "
+        "next one still performs this upgrade"
+    )
+
+
 def test_confirmation_leaves_a_pending_record_alone(tmp_path):
     """A `pending` record describes an upgrade that has NOT happened — clearing
     it on someone else's completed iteration would drop the restart entirely."""

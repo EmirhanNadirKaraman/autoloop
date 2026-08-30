@@ -265,6 +265,20 @@ timer:
    whole spin bound now lives: in memory, per process, saying nothing about the
    next one. So a refused handoff costs at most one preflight (one subprocess,
    120s ceiling) and one entry per process, not one per round.
+
+   The sha declined is **the one the decision acted on**, plus the one the loop
+   read on its way in — *the two reads can disagree*. `_run_continuous` reads
+   `pending_upgrade.json` before the boundary and
+   `cli._self_upgrade_at_boundary` reads it again to decide, so a merge landing
+   between them (or an operator editing the state dir) means record B is
+   refused where record A was read. The decision therefore returns which record
+   it acted on — `cli.UpgradeOutcome`, a `str` subclass carrying `base_sha` and
+   `candidate_sha`, so it is still the outcome slug everywhere else — and both
+   shas are declined. Declining the extra one costs at most a retry by the next
+   process, since the record stays `pending` on disk and the decline is in
+   memory; declining neither is the unbounded spin. When the decision acted on
+   nothing (`none`), it returns no identity and the pre-read sha is the only
+   key there is, which is why that read stays.
 3. **A record with no usable `base_sha` is never offered at all.** Every bound
    above is keyed on that sha, so a record without one could not be declined and
    would be offered forever. Nothing the merger writes lacks one.

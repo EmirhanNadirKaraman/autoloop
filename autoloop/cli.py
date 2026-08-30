@@ -861,6 +861,48 @@ def _preflight_import(root: Path) -> tuple[bool, str]:
     return True, ""
 
 
+class UpgradeOutcome(str):
+    """A boundary outcome slug, plus WHICH record it was decided about.
+
+    A `str` subclass rather than a tuple, because the outcome IS the slug
+    everywhere it is read — every caller and every test compares it against an
+    `UPGRADE_*` constant, and the entry type is built from it — and the
+    identity is a second question only the caller that has to BOUND the
+    boundary asks.
+
+    WHY THE IDENTITY TRAVELS WITH IT. `_run_continuous` reads the record on its
+    way in and `_self_upgrade_at_boundary` makes its own, later read of the same
+    mutable file. The two can disagree: a merge landing between them, an
+    operator editing the state dir, a `dashboard` decision. The record the
+    DECISION acted on is the one the process has to decline — declining the
+    other one leaves the acted-on record `pending` and undeclined, so
+    `_self_upgrade_due` offers it again at the very next round, and the round
+    after that, at the speed of a `continue`. That is the bounded-handoff rule
+    in BOUNDS, and it cannot be enforced from a sha the caller read before the
+    decision.
+
+    `base_sha` and `candidate_sha` are validated HERE, once, by the predicate
+    every other bound in this design shares (`auto_merge.upgrade_bound_sha`,
+    applied to a bare field rather than to a record — the same reasoning as
+    `Orchestrator.decline_self_upgrade`'s `isinstance` guard). The fields come
+    off a JSON file this process did not necessarily write, and `set.add` on a
+    `list` or a `dict` raises `TypeError: unhashable type` — one statement
+    after the boundary carried on, which is 2026-08-27's silence rebuilt by the
+    fix for it. Anything unusable reads `""`, which every caller skips.
+    """
+
+    base_sha: str
+    candidate_sha: str
+
+    def __new__(cls, outcome: str, *, base_sha="", candidate_sha="") -> "UpgradeOutcome":
+        self = super().__new__(cls, outcome)
+        self.base_sha = base_sha if isinstance(base_sha, str) and base_sha else ""
+        self.candidate_sha = (
+            candidate_sha if isinstance(candidate_sha, str) and candidate_sha else ""
+        )
+        return self
+
+
 def _carry_on_upgrade(
     store: UpgradeStore,
     record: PendingUpgrade,
@@ -869,9 +911,12 @@ def _carry_on_upgrade(
     log,
     *,
     execed_on_disk: bool = False,
-) -> str:
+) -> UpgradeOutcome:
     """Name a boundary outcome that was NOT a handoff, and leave the upgrade
-    RETRYABLE. Returns `outcome`.
+    RETRYABLE. Returns `outcome`, carrying the identity of the record it was
+    about (`UpgradeOutcome`) — this is the one place every non-exec outcome but
+    the empty-handed `none` passes through, so it is where the caller's bound
+    learns WHICH record was really acted on.
 
     Every non-exec path goes through here, and all three of them end the same
     way: an entry in the transcript saying which outcome and why, and a record
@@ -894,7 +939,10 @@ def _carry_on_upgrade(
     is per PROCESS and per `base_sha` — `Orchestrator.decline_self_upgrade`,
     carried across the orchestrator rebuild by `_run_continuous`'s
     `answered_upgrades` — which is the bound a retryable record needs: it stops
-    this process re-asking, and says nothing about the next one.
+    this process re-asking, and says nothing about the next one. The sha it is
+    keyed on is `record`'s, returned from here rather than re-read by the
+    caller: the caller's own read happened before the decision, and this is the
+    record the decision was really about (`UpgradeOutcome`).
 
     `execed_on_disk` is the one thing the caller has to get right. The exec
     path writes `execed` to disk BEFORE the replacement (it must be durable
@@ -984,7 +1032,12 @@ def _carry_on_upgrade(
             else "restart it when convenient to pick the merged code up.\n"
         )
     )
-    return outcome
+    # Named with the record it was about, not bare: the caller bounds this run
+    # on the identity the DECISION acted on (`UpgradeOutcome`), which is not
+    # necessarily the one it read on its way in.
+    return UpgradeOutcome(
+        outcome, base_sha=record.base_sha, candidate_sha=record.candidate_sha
+    )
 
 
 #: The successor's command line, minus the interpreter and the `-m autoloop`
@@ -1030,11 +1083,14 @@ def _self_upgrade_at_boundary(
     config: AutoloopConfig,
     lock: LoopLock | None,
     args: argparse.Namespace | None = None,
-) -> str:
+) -> UpgradeOutcome:
     """Replace this process with a fresh interpreter running the merged tree.
 
     **Does not return on success** — `os.execv` never returns. A return value is
-    therefore always "carry on in this process", and names why. EVERY one of
+    therefore always "carry on in this process", and names why — and names the
+    RECORD it was about, because this function makes its own read of a mutable
+    file and the caller's bound has to be keyed on what was really acted on
+    (`UpgradeOutcome`). It is a `str` for every other purpose. EVERY one of
     them is also a transcript entry (`self_upgrade_<outcome>`), because a
     boundary that ends in a status nobody logged is invisible to `status`, to
     the dashboard and to whoever reads the log after the loop is gone:
@@ -1121,7 +1177,13 @@ def _self_upgrade_at_boundary(
                 ),
             },
         )
-        return UPGRADE_NONE
+        # NO IDENTITY, deliberately: nothing was acted on, so there is nothing
+        # for the caller to key its per-process bound on. It falls back to the
+        # sha it read on its way in, which is the record the boundary was
+        # offered for — see `_run_continuous`. Returning `record.base_sha` here
+        # instead would hand back the very field this branch just judged
+        # unusable.
+        return UpgradeOutcome(UPGRADE_NONE)
 
     running = _package_root()
     # `str()` around a field read off a JSON file this process did not
@@ -1269,7 +1331,9 @@ def _self_upgrade_at_boundary(
             log,
             execed_on_disk=True,
         )
-    return UPGRADE_EXECED      # pragma: no cover - execv does not return
+    return UpgradeOutcome(  # pragma: no cover - execv does not return
+        UPGRADE_EXECED, base_sha=base_sha, candidate_sha=record.candidate_sha
+    )
 
 
 def _confirm_self_upgrade(config: AutoloopConfig) -> bool:
@@ -1709,6 +1773,11 @@ def _run_continuous(
     #: within one instance. Per RUN and never persisted, which is exactly the
     #: claim being made — this process could not hand off, and says nothing
     #: about the one that starts after it.
+    #:
+    #: Holds the record the boundary DECISION acted on, and the one this loop
+    #: read on its way in — two reads of a mutable file, which can disagree.
+    #: See the `SELF_UPGRADE` branch below for why both are needed and why
+    #: declining the extra one is the safe direction.
     answered_upgrades: set[str] = set()
     while True:
         if pause_requested(config):
@@ -1805,11 +1874,29 @@ def _run_continuous(
                 # entry, so the boundary above is never the last word in the
                 # transcript.
                 #
-                # The sha is read BEFORE the decision and remembered after it,
-                # because a pending record is offered again at the very next
-                # round: `answered_upgrades` is what keeps the carry-on from
-                # being a hot loop, and it has to be keyed on the record that
-                # was actually offered.
+                # TWO SHAS, and they are the same one in every ordinary round.
+                # A pending record is offered again at the very next round, so
+                # `answered_upgrades` is what keeps the carry-on from being a
+                # hot loop — and it has to be keyed on the record that was
+                # really acted on, which this branch cannot know by reading the
+                # file itself. `_self_upgrade_at_boundary` makes its OWN, later
+                # read of `pending_upgrade.json`, and a merge landing between
+                # the two, or an operator editing the state dir, makes them
+                # disagree: the decision then refuses record B, leaves it
+                # `pending`, and declining only A would have the next round
+                # offer B again, and the round after that, forever. So the
+                # decision RETURNS the identity it acted on and that is what is
+                # declined here.
+                #
+                # The sha read on the way in is declined as well, and it is not
+                # belt-and-braces: it is the only key available when the
+                # decision acted on nothing at all (`none` — the record went
+                # between the two reads), where declining nothing spins on a
+                # flapping state dir at the speed of a `continue`. Declining a
+                # sha this process did not act on costs at most a retry by the
+                # NEXT process — the decline is in memory, per process, and the
+                # record stays `pending` on disk — which is the safe direction
+                # of the two.
                 #
                 # VALIDATED, not trusted. This is a second read of a file that
                 # is mutable and hand-editable, so the value may be a `list` or
@@ -1824,9 +1911,18 @@ def _run_continuous(
                 # round offers it, this branch reads a real sha and bounds it.
                 offered = UpgradeStore(config.pending_upgrade_file).load()
                 answered = upgrade_bound_sha(offered)
-                _self_upgrade_at_boundary(config, lock, args)
-                if answered:
-                    answered_upgrades.add(answered)
+                acted = _self_upgrade_at_boundary(config, lock, args)
+                # `getattr` because this is the branch whose whole job is to
+                # keep the process alive past a boundary: a callee that came
+                # back a bare slug (a future refactor, a test double) must not
+                # end the loop on an `AttributeError` one statement after the
+                # carry-on. `""` then falls back on the sha read above, which
+                # still bounds the run — and the swap regression in
+                # `test_self_upgrade.py` fails loudly if the identity ever
+                # stops arriving.
+                for sha in (answered, getattr(acted, "base_sha", "")):
+                    if sha:
+                        answered_upgrades.add(sha)
                 continue
             if outcome == Phase.NEEDS_USER.value:
                 if _handle_parked_task(config, store, task_store, registry, orchestrator.state) == "task_fatal":
