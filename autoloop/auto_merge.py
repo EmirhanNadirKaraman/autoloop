@@ -152,6 +152,23 @@ UPGRADE_PREFLIGHT_FAILED = "preflight_failed"   # the merged tree does not impor
 UPGRADE_UNAPPLICABLE = "unapplicable"  # the merged checkout is not the running tree
 UPGRADE_EXEC_FAILED = "exec_failed"    # nothing was replaced; this process carries on
 
+#: The boundary outcome that is deliberately NOT a `PendingUpgrade.status`: a
+#: process reached the boundary and is not one that may hand off (the
+#: single-round `run` path — see `cli._run_locked`). It names an OUTCOME, for
+#: the transcript entry and for the return value, and the record stays
+#: `pending` on purpose so the next boundary — the next `run --continuous` /
+#: `start` — still finds an upgrade to perform. Writing it into `status` would
+#: settle the record, and `orchestrator._self_upgrade_due` would then never
+#: offer that sha again: the merge would be on disk with nothing left to run
+#: it, which is the failure this whole file exists to prevent.
+UPGRADE_DEFERRED = "deferred"
+#: The other outcome with no status behind it: the boundary was reached and
+#: there was no `pending` record left to act on by the time the decision site
+#: read it. Returned as `"none"` by `cli._self_upgrade_at_boundary` (its
+#: callers compare against that literal), and logged so that no boundary can
+#: end without an entry saying what became of it.
+UPGRADE_NONE = "none"
+
 
 @dataclass
 class MergeDeferral:

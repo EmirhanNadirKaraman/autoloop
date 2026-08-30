@@ -173,3 +173,77 @@ forecloses nothing; the aggregation (`dashboard.projects_status`, and
 `render_projects_text` / `projects_json` over it) is deliberately separate from
 its front door so that a later `--projects` mode of the dashboard renders the
 same rows rather than re-deriving them.
+
+---
+
+## Reading a self-upgrade boundary in the transcript
+
+A merge that touches `autoloop/` changes the code the loop is running, and a
+live Python process does not notice. So `auto_merge` writes one
+`pending_upgrade.json` record (`self_upgrade_pending`), the orchestrator offers
+a **boundary** at the next `ready` phase with no packet in flight
+(`self_upgrade_boundary`), and the process replaces itself with `os.execv` —
+same pid, same lock.
+
+**Every boundary is now followed by at least one outcome entry**, named
+`self_upgrade_<outcome>`. Exactly one, except for a refused replacement:
+`self_upgrade_exec` is written *before* `os.execv` — it has to be, there is no
+"after" in a process that has been replaced — so an `execv` that raises leaves
+the pair `exec` then `exec_failed`, in that order. If you find a boundary with
+nothing after it at all, the process was running a build older than 2026-08-30;
+that silence is the whole subject of this section.
+
+| Entry | What happened | What the record does |
+|---|---|---|
+| `self_upgrade_exec` | replaced, `argv` in the entry | settled `execed` (one shot) |
+| `self_upgrade_unapplicable` | the merge moved a different checkout | settled |
+| `self_upgrade_preflight_failed` | the merged tree does not import | settled, `detail` carries the error |
+| `self_upgrade_exec_failed` | marker unwritable, lock unarmable, or `execv` refused | settled |
+| `self_upgrade_deferred` | this process may not hand off | **stays pending** |
+| `self_upgrade_none` | nothing pending was left to act on | no record |
+
+**No outcome but `exec` ends the process.** A settled outcome means the loop
+carries on with the code it has, which was working a second ago; exiting is the
+one response that guarantees no further work happens. A failed preflight in
+particular is *reported and refused*, never fatal — replacing a working loop
+with a tree that cannot start is the failure that check exists to prevent.
+
+**`deferred` is the one outcome that leaves the record pending**, and it is the
+one an operator acts on. It means the boundary was reached by a **single-round**
+`run` — `run` with no `--continuous`, and therefore also `--retry`, `--answer`,
+`--resubmit` and `resume`, all of which funnel into the same path. Such a
+process cannot hand off, because its own command line manages ONE round:
+`--kickoff` refuses a session that now exists and `--answer` refuses a phase
+that is no longer `needs_user`, so the successor would die on a `StateError`
+instead of continuing the loop. Nothing about the merged tree has been judged,
+so nothing is settled: the loop finishes the session it is in, and the upgrade
+waits. Perform it with
+
+    python -m autoloop start          # or: run --continuous
+
+which reaches the same boundary and execs the same record.
+
+Until 2026-08-30 that path did not defer — it **returned**, ending the process
+mid-session with no entry at all, and `run`'s ordinary exit then published the
+heartbeat `stopped`, which is deliberately not an attention status ("you stopped
+it, you know"). On 2026-08-27 that took the loop down at 08:13:47 and it stayed
+down until an operator ran `start` by hand at 08:15:26 — the same record exec'd
+four seconds later, which is what proves the merge was fine and the *path* was
+not.
+
+**The loop cannot restart in a circle.** Three separate bounds, none of them a
+timer: an `execed` record is never offered again, so a successor that dies
+before completing one iteration is not retried (`_confirm_self_upgrade` retires
+the marker after one full pass); every settled outcome has left `pending`, so it
+cannot come back round; and a `deferred` boundary is declined for that
+`base_sha` in the declining process, so the round it carries on into is not
+offered the same upgrade again. A later merge is a different `base_sha` and does
+get its own boundary.
+
+**The successor's command line is `python -m autoloop run --continuous`**, plus
+`--config` and `--null-executor` when this process had them — rebuilt, not the
+verb you typed. `os.execv` preserves the pid and the lock is never released
+(that is the point), so a successor re-running `start` would read a live lock
+naming itself, print "already running — nothing to do" and exit: a successful
+handoff that still ends the loop. It is recorded in the `argv` field of
+`self_upgrade_exec`.

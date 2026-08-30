@@ -1493,6 +1493,17 @@ class Orchestrator:
         #: never saw. `None` means "not seen yet", and it is cleared again once
         #: the preemption it describes has been recorded.
         self._urgent_first_seen_phase = None
+        #: Upgrade `base_sha`s this PROCESS has already been offered and turned
+        #: down (`cli._defer_self_upgrade`). In memory and never persisted: it
+        #: says something about this process's ability to hand off, not about
+        #: the merge, and a successor must be free to perform an upgrade this
+        #: one could not. Its whole job is to stop a declined boundary being
+        #: offered again on the next call — the record stays `pending`, so
+        #: nothing else would.
+        self._declined_upgrades: set[str] = set()
+        #: Phase steps this orchestrator has actually taken, across every call
+        #: to `run`. Public, and read by `cli._remaining_steps`.
+        self.steps_taken = 0
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -1611,6 +1622,13 @@ class Orchestrator:
             if max_steps is not None and steps >= max_steps:
                 return phase.value
             steps += 1
+            # Mirrored onto the instance as it is spent, not totalled at the
+            # exit: `run` has a dozen returns, and a caller that re-enters after
+            # a boundary it declined (`cli._run_locked`) needs the count from
+            # whichever one fired. Cumulative across those re-entries, which is
+            # what makes `--max-steps` a budget for the RUN rather than one per
+            # call (`cli._remaining_steps`).
+            self.steps_taken += 1
             # Before the step, because the step is what talks to ChatGPT. An
             # unfinished back-off left by a killed process is served here — the
             # ordinary case is no wait outstanding and this costs nothing. It
@@ -1781,6 +1799,30 @@ class Orchestrator:
         """
         return phase is Phase.READY and self.state.pending_request is None
 
+    def decline_self_upgrade(self, base_sha: str) -> bool:
+        """Stop offering the boundary for `base_sha` in this process. Returns
+        whether that sha was newly declined.
+
+        For the caller that reached a boundary it cannot act on and means to
+        CARRY ON rather than end the process (`cli._defer_self_upgrade`). The
+        record is left `pending` on purpose there — nothing has judged the
+        merged tree, so a later process must still be able to perform it — and
+        `pending` is exactly what `_self_upgrade_due` offers, so without this
+        the next `run` would return `SELF_UPGRADE` again on the same record,
+        and the one after that, forever.
+
+        The return value is the caller's loop bound: a second decline of a sha
+        already declined means nothing moved, and the caller stops instead of
+        re-entering. An empty `base_sha` (the record vanished between the
+        boundary and here) is never declined for that reason — there is nothing
+        to key on, and `_self_upgrade_due` already answers False without a
+        record.
+        """
+        if not base_sha or base_sha in self._declined_upgrades:
+            return False
+        self._declined_upgrades.add(base_sha)
+        return True
+
     def _self_upgrade_due(self, phase: Phase) -> bool:
         """Is this the moment at which the process may be replaced?
 
@@ -1793,7 +1835,15 @@ class Orchestrator:
         Reads the record, never writes it. An unreadable or already-settled
         record answers False — the fail-closed direction here is to keep
         running the code that works. So does an orchestrator whose caller never
-        asked for the boundary (`self_upgrade_enabled`, see the constructor).
+        asked for the boundary (`self_upgrade_enabled`, see the constructor),
+        and so does one whose caller has already been offered this exact sha
+        and declined it (`decline_self_upgrade`) — that record stays `pending`
+        deliberately, and offering it again would be a spin rather than a
+        second chance.
+
+        The decline is checked BEFORE the entry is written: a boundary already
+        answered once is not a new boundary, and logging it every round would
+        bury the outcome entry that answered it.
         """
         if not self._self_upgrade_enabled:
             return False
@@ -1804,6 +1854,8 @@ class Orchestrator:
         except OSError:
             return False
         if record is None or record.status != UPGRADE_PENDING:
+            return False
+        if record.base_sha in self._declined_upgrades:
             return False
         self._log(
             "self_upgrade_boundary",

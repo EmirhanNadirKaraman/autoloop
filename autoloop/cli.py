@@ -133,8 +133,10 @@ from .inbox import (
     submit_draft,
 )
 from .auto_merge import (
+    UPGRADE_DEFERRED,
     UPGRADE_EXEC_FAILED,
     UPGRADE_EXECED,
+    UPGRADE_NONE,
     UPGRADE_PENDING,
     UPGRADE_PREFLIGHT_FAILED,
     UPGRADE_UNAPPLICABLE,
@@ -892,11 +894,57 @@ def _settle_upgrade(
     return status
 
 
-def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> str:
+#: The successor's command line, minus the interpreter and the `-m autoloop`
+#: that `_successor_argv` puts in front of it. ALWAYS this, never the argv the
+#: operator typed: the only process that performs a handoff is a continuous one
+#: (`_run_continuous` is the sole caller of `_self_upgrade_at_boundary`), and
+#: `run --continuous` is what such a process is doing whatever verb started it.
+#: Replaying the typed verb is how a successful exec still ends the loop —
+#: `start` re-runs `_cmd_start`, which reads the lock BEFORE acquiring it, finds
+#: a live one naming its own pid (the exec preserved it), prints "already
+#: running — nothing to do" and returns 0.
+SUCCESSOR_COMMAND = ("run", "--continuous")
+
+
+def _successor_argv(args: argparse.Namespace | None) -> list[str]:
+    """The command line for the image that replaces this one.
+
+    Rebuilt from what this process is DOING rather than from `sys.argv`, for two
+    separate reasons. `sys.argv[0]` under `-m` is the path to `__main__.py` and
+    re-running THAT as a script breaks its relative imports — hence the explicit
+    `-m autoloop`. And `sys.argv[1:]` is the verb an operator typed, which is
+    not necessarily a verb that continues a loop (see `SUCCESSOR_COMMAND`).
+
+    The two flags that ARE carried across are the ones whose loss would change
+    what the successor does rather than how it was spelled:
+
+    * `--config`, always when it is set at all — this process may have loaded a
+      config from anywhere, and dropping the flag would let the successor's own
+      `DEFAULT_CONFIG` silently repoint it at a different deployment;
+    * `--null-executor`, because a dry run that came back executing for real is
+      the one difference here that writes to a repository.
+    """
+    argv = [sys.executable, "-m", "autoloop", *SUCCESSOR_COMMAND]
+    config_path = getattr(args, "config", None)
+    if config_path:
+        argv += ["--config", str(config_path)]
+    if getattr(args, "null_executor", False):
+        argv.append("--null-executor")
+    return argv
+
+
+def _self_upgrade_at_boundary(
+    config: AutoloopConfig,
+    lock: LoopLock | None,
+    args: argparse.Namespace | None = None,
+) -> str:
     """Replace this process with a fresh interpreter running the merged tree.
 
     **Does not return on success** — `os.execv` never returns. A return value is
-    therefore always "carry on in this process", and names why:
+    therefore always "carry on in this process", and names why. EVERY one of
+    them is also a transcript entry (`self_upgrade_<outcome>`), because a
+    boundary that ends in a status nobody logged is invisible to `status`, to
+    the dashboard and to whoever reads the log after the loop is gone:
 
     * `none` — nothing pending (a docs-only merge leaves no record at all), or
       the record has already been settled. The `execed` case is the one-shot:
@@ -923,12 +971,33 @@ def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> 
     The caller reaches here only at `Orchestrator.run`'s boundary, so "never
     mid-round, and never while an agent holds a worker" is established there,
     by the phase, not re-derived here.
+
+    `args` is the namespace this process is running under, and is used for one
+    thing: rebuilding the successor's command line (`_successor_argv`). None
+    means "no flags to carry across", which is the plain `run --continuous`.
     """
     store = UpgradeStore(config.pending_upgrade_file)
     log = TranscriptLogger(config.transcript_file).append
     record = store.load()
     if record is None or record.status != UPGRADE_PENDING:
-        return "none"
+        # The one outcome with no record to settle, and it is logged for exactly
+        # that reason: the caller has already written `self_upgrade_boundary`,
+        # so returning quietly here leaves a boundary in the transcript with
+        # nothing after it — the shape that made 2026-08-27's outage unreadable.
+        # Reachable when the record is removed or settled between the
+        # orchestrator's check and this one (a `dashboard` restart decision, an
+        # operator deleting the file, a state dir that stopped being readable).
+        log(
+            f"self_upgrade_{UPGRADE_NONE}",
+            data={
+                "status": record.status if record is not None else "",
+                "detail": (
+                    "the boundary was reached with no pending upgrade left to "
+                    "act on — nothing was replaced and the loop carries on"
+                ),
+            },
+        )
+        return UPGRADE_NONE
 
     running = _package_root()
     merged = Path(record.repo_root).resolve() if record.repo_root else running
@@ -980,10 +1049,11 @@ def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> 
             log,
         )
 
-    # The documented launch shape (`python -m autoloop ...`), rebuilt rather
-    # than reused: `sys.argv[0]` under `-m` is the path to `__main__.py`, and
-    # re-running THAT as a script breaks its relative imports.
-    argv = [sys.executable, "-m", "autoloop", *sys.argv[1:]]
+    # The documented launch shape (`python -m autoloop run --continuous`),
+    # derived from what this process is DOING rather than from the verb its
+    # operator typed — see `_successor_argv`, and `SUCCESSOR_COMMAND` for the
+    # exit a replayed `start` produces.
+    argv = _successor_argv(args)
     log(
         "self_upgrade_exec",
         data={
@@ -1068,6 +1138,99 @@ def _confirm_self_upgrade(config: AutoloopConfig) -> bool:
         },
     )
     return True
+
+
+#: Why the single-round `run` path may not perform the handoff. One string,
+#: because it is both what the transcript records and what the operator is
+#: told, and the two must not drift.
+#: Stands in for a `base_sha` when the record has gone between the boundary and
+#: the decision. Not a sha and never equal to one, so declining it bounds the
+#: carry-on exactly as a real sha does: the first disappearance is carried on
+#: from, a second one in the same run stops rather than spinning on a state dir
+#: that is flapping under a running loop.
+MISSING_UPGRADE_RECORD = "(no record at the boundary)"
+
+SINGLE_ROUND_DEFER_REASON = (
+    "a single-round `run` is not a command a successor can repeat — its flags "
+    "manage ONE round (`--kickoff` refuses a session that now exists, "
+    "`--answer` refuses a phase that is no longer needs_user), so the "
+    "replacement would die on a StateError instead of continuing the loop"
+)
+
+
+def _defer_self_upgrade(config: AutoloopConfig, orchestrator) -> bool:
+    """Record a boundary this process will not act on, and take it off the
+    table for the rest of this run. Returns whether anything was declined.
+
+    THE OUTCOME OF THE 2026-08-27 OUTAGE. The single-round path used to answer
+    `SELF_UPGRADE` by returning from `_run_locked`: the process ended mid-session
+    with the record still `pending`, no transcript entry between
+    `self_upgrade_boundary` and the exit, and `_cmd_run`'s `finally` publishing
+    the heartbeat `stopped` — a status deliberately outside `ATTENTION_STATUSES`
+    ("you stopped it, you know"), so nothing raised an alarm either.
+
+    Two things change and neither is the refusal itself, which is right:
+    replacing this process with `python -m autoloop run --answer ...` would end
+    it on a StateError (`SINGLE_ROUND_DEFER_REASON`). What changes is that the
+    refusal is REPORTED, and that the loop keeps working afterwards.
+
+    The record deliberately stays `pending` — this is the one boundary outcome
+    that is not settled. Nothing about the merged tree has been judged here, so
+    settling would take a real upgrade off the table for good; leaving it lets
+    the next `run --continuous`/`start` perform it, which is exactly what
+    happened at 08:15:30 that day. `dashboard.upgrade_decision` keeps reporting
+    it too, for the same reason.
+
+    Declining is per PROCESS and per sha, and it is what bounds the carry-on:
+    the boundary is offered from a live pending record, so without it the very
+    next `run()` would return `SELF_UPGRADE` again on the same record forever.
+    It relies on `_run_locked` re-entering the SAME orchestrator instance — a
+    future refactor that rebuilds one per step would lose the bound, and
+    `test_a_declined_boundary_is_not_offered_twice_in_one_process` fails loudly
+    if it does. A record that has GONE between the boundary and here declines
+    `MISSING_UPGRADE_RECORD` instead, so that case is carried on from too and
+    is bounded by the same rule.
+    """
+    record = UpgradeStore(config.pending_upgrade_file).load()
+    base_sha = record.base_sha if record is not None else ""
+    TranscriptLogger(config.transcript_file).append(
+        f"self_upgrade_{UPGRADE_DEFERRED}",
+        data={
+            "base_sha": base_sha,
+            "candidate_sha": record.candidate_sha if record is not None else "",
+            "task_id": record.task_id if record is not None else "",
+            "detail": SINGLE_ROUND_DEFER_REASON,
+            # WHICH launch reached this boundary, capped. The 2026-08-27
+            # reconstruction needed exactly this and had to infer it from the
+            # command an operator remembered typing.
+            "argv": [str(a)[:200] for a in sys.argv[1:11]],
+            "note": (
+                "nothing was replaced and nothing was settled — this process "
+                "carries on with the code it has, and the record stays pending "
+                "for the next `run --continuous` / `start`"
+            ),
+        },
+    )
+    print(
+        "\nA merge changed the loop's own code, so this process is running a "
+        "stale copy — and it is carrying on with it, which is what it was doing "
+        "a second ago. Nothing was lost and nothing was replaced; the upgrade "
+        "stays pending for the next `run --continuous` (or `start`).\n"
+    )
+    return orchestrator.decline_self_upgrade(base_sha or MISSING_UPGRADE_RECORD)
+
+
+def _remaining_steps(max_steps: int | None, spent: int) -> int | None:
+    """The step budget left after `spent` of it has been used.
+
+    `--max-steps` is documented as a budget for the RUN, so re-entering
+    `Orchestrator.run` after a declined boundary must not hand out a second
+    one. `run(max_steps=0)` returns at the top of its loop without stepping,
+    which is the right answer to a budget already spent.
+    """
+    if max_steps is None:
+        return None
+    return max(0, max_steps - spent)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -1221,6 +1384,26 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
 
     orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
     outcome = orchestrator.run(max_steps=args.max_steps)
+    # THE SESSION CARRIES ON ACROSS A BOUNDARY THIS PROCESS CANNOT ACT ON.
+    # `Orchestrator.run` returns `SELF_UPGRADE` mid-session — at `ready`, with
+    # the next payload already in `state.outbox` — and this path is not one that
+    # may hand off (`_defer_self_upgrade` says why). Returning here is what took
+    # the loop down on 2026-08-27: the round that had just merged split-05
+    # ENDED, silently, with the record left pending and nothing in the
+    # transcript after `self_upgrade_boundary`. So the outcome is recorded, the
+    # boundary is declined for that sha in this process, and the same
+    # orchestrator is stepped again — the old code was working a second ago.
+    #
+    # The loop is bounded by the decline: `run` can only offer the boundary
+    # again for a DIFFERENT record (a second merge later in the same session),
+    # and `_defer_self_upgrade` returning False — nothing new to decline —
+    # stops it rather than risking a spin.
+    while outcome == SELF_UPGRADE:
+        if not _defer_self_upgrade(config, orchestrator):
+            break
+        outcome = orchestrator.run(
+            max_steps=_remaining_steps(args.max_steps, orchestrator.steps_taken)
+        )
     # Checked BEFORE the ordinary ending, and it exits non-zero even though the
     # PHASE is the one a healthy run ends in: `stopped` stopped meaning
     # "finished" the moment the loop could end itself on a wall
@@ -1233,20 +1416,6 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     # second one.
     if _is_fault_stop(orchestrator.state):
         return _report_fault_stop(config, orchestrator.state, registry)
-    if outcome == SELF_UPGRADE:
-        # Reported, not performed. A single-round `run` carries flags that are
-        # not safe to re-run — `--kickoff` refuses a session that now exists,
-        # `--answer` refuses a phase that is no longer `needs_user` — so
-        # re-execing this argv would end the process on a StateError. The
-        # record stays `pending`; the session is mid-flight and untouched, so
-        # the next start picks up both.
-        print(_summary(config, orchestrator.state, registry))
-        print(
-            "\nA merge changed the loop's own code, so this process is running "
-            "a stale copy. Nothing was lost — the session is exactly where it "
-            "was. Start it again (`run --continuous` restarts itself for this)."
-        )
-        return 0
     print(_summary(config, orchestrator.state, registry))
     # Before the generic ending line, because "Loop ended: stopped" on its own
     # reads as the reviewer's own `stop` — which is the one thing a preemption
@@ -1347,6 +1516,15 @@ def _run_continuous(
     blocker_store = BlockerStore(config.blockers_dir)
     iterations = 0
     upgrade_checked = False
+    #: Upgrade shas this RUN has already answered at a boundary. Ordinarily
+    #: redundant — every outcome but `deferred` settles the record, and a
+    #: settled record is never offered again — and load-bearing in exactly one
+    #: state: a state dir that can neither save the settled record nor remove
+    #: it (`_settle_upgrade` tries both). The record then still says `pending`,
+    #: every iteration rebuilds the orchestrator, and the boundary would be
+    #: offered again immediately, forever, at the speed of a `continue`. The
+    #: same per-sha bound `_run_locked` uses, carried across the rebuild.
+    answered_upgrades: set[str] = set()
     while True:
         if pause_requested(config):
             print("paused")
@@ -1398,6 +1576,11 @@ def _run_continuous(
 
         if state is not None and Phase(state.phase) not in TERMINAL_PHASES:
             orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
+            # Carried across the rebuild: this orchestrator is a new object each
+            # iteration, so the shas this RUN has already answered have to be
+            # re-declined on it. See `answered_upgrades`.
+            for answered in answered_upgrades:
+                orchestrator.decline_self_upgrade(answered)
             outcome = orchestrator.run()
             if outcome == "paused":
                 return 0
@@ -1432,8 +1615,18 @@ def _run_continuous(
                 # settled, so the next round will not offer the same sha again,
                 # AND it no longer says `execed`, so the confirmation at the top
                 # of the next iteration has nothing to retire. The loop simply
-                # carries on with the code it has.
-                _self_upgrade_at_boundary(config, lock)
+                # carries on with the code it has — and every one of those
+                # outcomes is a `self_upgrade_<outcome>` entry, so the boundary
+                # above is never the last word in the transcript.
+                #
+                # The sha is read BEFORE the decision and remembered after it,
+                # so the one state in which a settled record does not stay
+                # settled — a state dir that can neither write it nor remove it
+                # — cannot turn the carry-on into a hot loop.
+                offered = UpgradeStore(config.pending_upgrade_file).load()
+                _self_upgrade_at_boundary(config, lock, args)
+                if offered is not None:
+                    answered_upgrades.add(offered.base_sha)
                 continue
             if outcome == Phase.NEEDS_USER.value:
                 if _handle_parked_task(config, store, task_store, registry, orchestrator.state) == "task_fatal":
