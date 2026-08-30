@@ -502,11 +502,15 @@ def test_a_parked_loop_reports_the_park_not_the_upgrade(tmp_path):
     [UPGRADE_EXECED, UPGRADE_PREFLIGHT_FAILED, UPGRADE_UNAPPLICABLE, UPGRADE_EXEC_FAILED],
 )
 def test_a_settled_record_is_never_offered_again(tmp_path, status):
-    """The one-shot, seen from the boundary: only `pending` is offered, so a
-    sha that has been tried once cannot come back round. Every settled status
-    is here, `exec_failed` included — it is the one a refused `execv` settles
-    to, so leaving it out would leave the mainline refusal unpinned at this
-    level."""
+    """The one-shot, seen from the boundary: only `pending` is offered, so
+    `execed` — a replacement that is already running — cannot come back round.
+
+    The other three are no longer written into `status` by any boundary (they
+    are OUTCOME names now, and their records stay `pending` so the next process
+    can retry), and they stay in this parametrisation for the state dir this
+    build inherits: one written by a pre-2026-08-31 loop can hold any of them,
+    and "not pending, so not offered" is the answer that keeps such a record
+    from being acted on twice."""
     orch, config = orchestrator_at(tmp_path, Phase.READY)
     UpgradeStore(config.pending_upgrade_file).save(pending_record(status=status))
 
@@ -520,6 +524,74 @@ def test_an_unreadable_record_is_no_record(tmp_path):
     config.pending_upgrade_file.write_text("{not json", encoding="utf-8")
 
     assert orch.run(max_steps=0) == Phase.READY.value
+
+
+def test_a_record_with_no_base_sha_is_never_offered(tmp_path):
+    """A boundary nobody could ever answer is not offered at all.
+
+    Every bound in this design is keyed on `base_sha` — the per-process
+    decline, `_run_continuous`'s `answered_upgrades`, the one-shot on `execed`
+    — and no boundary outcome but the exec moves the record out of `pending`.
+    So a record with no sha to key on would be offered, carried on from,
+    offered again on the very next call, forever, at the speed of the loop.
+    Nothing the merger writes lacks one; a record that does is hand-written or
+    corrupt, and refusing it keeps this process running the code it has."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record(base_sha=""))
+
+    assert orch.run(max_steps=0) == Phase.READY.value
+    assert orch.run(max_steps=0) == Phase.READY.value, "and not on the next round"
+    assert entries(config, "self_upgrade_boundary") == [], (
+        "no boundary, so no missing outcome either — the silence this task is "
+        "about is a boundary with nothing after it, and there is no boundary"
+    )
+
+
+def test_a_record_whose_paths_field_is_not_a_list_still_reaches_an_outcome(
+    tmp_path, monkeypatch
+):
+    """The same silence, arrived at from the other direction.
+
+    `paths` is evidence for a human and nothing branches on it, but it is read
+    into the entry that ANNOUNCES the boundary — so a record carrying `null`
+    there (a hand-edited file, a half-written one) used to raise a TypeError
+    while that entry was being built: no entry, and the traceback takes the
+    loop with it. `UpgradeStore.load` validates the record's SHAPE, never its
+    field types, so this is reachable from any state dir a person has touched."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record(paths=None))
+
+    assert orch.run(max_steps=0) == SELF_UPGRADE
+    boundary = entries(config, "self_upgrade_boundary")
+    assert boundary and boundary[0]["data"]["paths"] == []
+
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    recording_execv(monkeypatch)
+
+    with pytest.raises(Execed):
+        cli._self_upgrade_at_boundary(config, held_lock(config))
+
+    logged = entries(config, "self_upgrade_exec")
+    assert logged and logged[0]["data"]["paths"] == [], (
+        "and the handoff entry, written in the last instant before `execv`, "
+        "builds too"
+    )
+
+
+def test_a_record_whose_repo_root_is_not_a_path_reaches_an_outcome_too(tmp_path):
+    """Same family, one field over. `Path(None)` and `Path([...])` raise
+    TypeError, and that read happens AFTER the caller has written
+    `self_upgrade_boundary` — so the crash lands exactly in the gap the outage
+    lived in. Anything unreadable as a path is simply not the tree this process
+    imports from, which is an outcome, with an entry of its own."""
+    config = make_config(tmp_path)
+    UpgradeStore(config.pending_upgrade_file).save(
+        pending_record(repo_root=["/one", "/other"])
+    )
+
+    assert cli._self_upgrade_at_boundary(config, None) == UPGRADE_UNAPPLICABLE
+    assert entries(config, f"self_upgrade_{UPGRADE_UNAPPLICABLE}")
+    assert UpgradeStore(config.pending_upgrade_file).load().status == UPGRADE_PENDING
 
 
 def test_an_orchestrator_that_cannot_act_on_the_boundary_is_not_offered_it(tmp_path):
@@ -651,19 +723,39 @@ def test_a_tree_that_does_not_import_is_not_exec_ed_and_the_loop_carries_on(
     assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_PREFLIGHT_FAILED
 
     record = store.load()
-    assert record.status == UPGRADE_PREFLIGHT_FAILED
+    assert record.status == UPGRADE_PENDING, (
+        "REPORTED and REFUSED, not settled: the refusal is this checkout's "
+        "answer for as long as the tree stays broken, and the merge that fixes "
+        "it lands in the same tree — so the record has to still be there"
+    )
+    assert record.settled_at == "", "nothing was settled, so nothing settled it"
+    assert record.detail.startswith(UPGRADE_PREFLIGHT_FAILED)
     assert "SyntaxError" in record.detail
     logged = entries(config, f"self_upgrade_{UPGRADE_PREFLIGHT_FAILED}")
     assert logged and "SyntaxError" in logged[0]["data"]["detail"]
     # And the lock was never armed: nothing was going to be handed anywhere.
     assert lock.read().exec_handoff is None
+    # RETRYABLE IS NOT WEAKER. The record staying pending buys a later process
+    # another attempt, not a softer answer: the same tree gets the same refusal,
+    # and `no_process_replacement` is what makes "no exec" an assertion — an
+    # exec from here would raise instead of passing quietly.
+    assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_PREFLIGHT_FAILED
+    assert lock.read().exec_handoff is None
 
 
 def test_a_failed_preflight_is_not_retried_every_round(tmp_path, monkeypatch):
-    """The record is SETTLED rather than left pending. While it says pending,
-    `Orchestrator.run` hands the process back at every single round — a loop
-    that reports busily and never advances."""
-    config = make_config(tmp_path)
+    """The bound on the retry, at the level where it now lives, driven in the
+    order production drives it: boundary, refusal, decline, next round.
+
+    The record stays `pending` on purpose — a later process must be able to try
+    the same merge — and `pending` is exactly what `_self_upgrade_due` offers,
+    so without a per-process bound `Orchestrator.run` would hand the process
+    back at every single round and launch a preflight interpreter each time: a
+    loop that reports busily and never advances. The bound is the DECLINE,
+    which `_run_continuous` re-applies to the orchestrator it rebuilds each
+    iteration (`answered_upgrades`), so this asserts it on the real class
+    rather than on a status written to disk."""
+    orch, config = orchestrator_at(tmp_path, Phase.READY)
     store = UpgradeStore(config.pending_upgrade_file)
     store.save(pending_record())
     lock = held_lock(config)
@@ -675,9 +767,68 @@ def test_a_failed_preflight_is_not_retried_every_round(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "_preflight_import", preflight)
 
-    cli._self_upgrade_at_boundary(config, lock)
-    assert cli._self_upgrade_at_boundary(config, lock) == "none"
-    assert len(attempts) == 1
+    assert orch.run(max_steps=0) == SELF_UPGRADE, "offered once"
+    assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_PREFLIGHT_FAILED
+    assert orch.decline_self_upgrade("b" * 40) is True
+
+    assert orch.run(max_steps=0) == Phase.READY.value, "and not again in this process"
+    assert orch.run(max_steps=0) == Phase.READY.value
+    assert len(attempts) == 1, "one preflight per process, not one per round"
+    assert len(entries(config, "self_upgrade_boundary")) == 1
+    assert store.load().status == UPGRADE_PENDING, "still there for the next one"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [UPGRADE_PREFLIGHT_FAILED, UPGRADE_UNAPPLICABLE, UPGRADE_EXEC_FAILED],
+)
+def test_a_refused_handoff_is_still_there_for_the_next_process(
+    tmp_path, monkeypatch, outcome
+):
+    """08:15:30, generalised to every non-exec outcome. One process reaches the
+    boundary and cannot hand off; the NEXT one exec's the same record — which is
+    exactly what happened on 2026-08-27 and is the reason none of these is a
+    judgement the later process has to inherit.
+
+    Each parametrisation drives the real refusal, not a hand-written status:
+    a preflight that says no, a record naming another checkout, and a handoff
+    with no lock to arm."""
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(
+        pending_record(repo_root=str(tmp_path / "elsewhere"))
+        if outcome == UPGRADE_UNAPPLICABLE
+        else pending_record()
+    )
+    lock = held_lock(config)
+    monkeypatch.setattr(
+        cli,
+        "_preflight_import",
+        (lambda root: (False, "SyntaxError: invalid syntax"))
+        if outcome == UPGRADE_PREFLIGHT_FAILED
+        else (lambda root: (True, "")),
+    )
+
+    # The process that cannot: `None` for the lock is the unarmable handoff.
+    refused = cli._self_upgrade_at_boundary(
+        config, None if outcome == UPGRADE_EXEC_FAILED else lock
+    )
+    assert refused == outcome
+    assert entries(config, f"self_upgrade_{outcome}"), "and it said so"
+    assert store.load().status == UPGRADE_PENDING, "the upgrade is still to do"
+
+    # ---- a later process: a lock it can arm, a tree that imports ------------
+    if outcome == UPGRADE_UNAPPLICABLE:
+        # The one outcome that is a fact about the RECORD rather than about the
+        # process, so the later process is one whose checkout the merge moved.
+        store.save(pending_record())
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    recording_execv(monkeypatch)
+
+    with pytest.raises(Execed):
+        cli._self_upgrade_at_boundary(config, lock)
+
+    assert entries(config, "self_upgrade_exec"), "the second process handed off"
 
 
 def test_a_merge_in_another_checkout_is_not_a_reason_to_restart(tmp_path, monkeypatch):
@@ -692,11 +843,18 @@ def test_a_merge_in_another_checkout_is_not_a_reason_to_restart(tmp_path, monkey
     )
 
     assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_UNAPPLICABLE
-    assert store.load().status == UPGRADE_UNAPPLICABLE
+    assert store.load().status == UPGRADE_PENDING, (
+        "and it is a fact about THIS process's checkout, not about the merge — "
+        "the process that does run that tree still has the upgrade to do"
+    )
     logged = entries(config, f"self_upgrade_{UPGRADE_UNAPPLICABLE}")
     assert logged and "somewhere-else" in logged[0]["data"]["detail"], (
-        "a status written into the record that no event mirrors is invisible "
-        "to `status`, to the dashboard and to the log after the loop is gone"
+        "an outcome no event mirrors is invisible to `status`, to the "
+        "dashboard and to the log after the loop is gone"
+    )
+    assert logged[0]["data"]["candidate_sha"] == "c" * 40, (
+        "the entry names the merge it is about, both shas — the 08:13:47 "
+        "reconstruction had neither"
     )
 
 
@@ -709,7 +867,13 @@ def test_the_replacement_is_refused_when_the_lock_cannot_be_armed(tmp_path, monk
     monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
 
     assert cli._self_upgrade_at_boundary(config, None) == UPGRADE_EXEC_FAILED
-    assert store.load().status == UPGRADE_EXEC_FAILED
+    restored = store.load()
+    assert restored.status == UPGRADE_PENDING, (
+        "the one-shot marker was already written — `execed` has to be durable "
+        "BEFORE the exec — so a refusal after it has to put the record back, "
+        "or the upgrade is lost to a process that never went anywhere"
+    )
+    assert restored.settled_at == ""
     logged = entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}")
     assert logged and "lock could not be armed" in logged[0]["data"]["detail"], (
         "the refusal names itself in the transcript — this is the branch whose "
@@ -722,7 +886,7 @@ def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
     """`execv` raising means the process is still here, still holding the lock,
     and no successor is coming — so the marker has to go, or the NEXT acquire
     in this pid would adopt a handoff that never happened, and the RECORD has
-    to be settled, or the confirmation one iteration later reports a
+    to stop saying `execed`, or the confirmation one iteration later reports a
     replacement that did not happen (the loop-level half is
     `test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened`)."""
     config = make_config(tmp_path)
@@ -743,16 +907,97 @@ def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
         "cannot need it, and the subprocesses this run keeps spawning would "
         "otherwise inherit it"
     )
-    settled = store.load()
-    assert settled.status == UPGRADE_EXEC_FAILED, (
-        "the record is SETTLED, not left saying `execed`: `execed` means a "
+    restored = store.load()
+    assert restored.status == UPGRADE_PENDING, (
+        "the record is put BACK, not left saying `execed`: `execed` means a "
         "successor is running, and `_confirm_self_upgrade` retires it one "
-        "iteration later — but this process never went anywhere"
+        "iteration later — but this process never went anywhere, and the "
+        "merge it could not exec into is still waiting for a process that can"
     )
-    assert "Exec format error" in settled.detail
-    assert cli._self_upgrade_at_boundary(config, lock) == "none", (
-        "still one-shot: a refused exec is not a licence to try the same sha again"
+    assert restored.settled_at == ""
+    assert "Exec format error" in restored.detail
+    assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_EXEC_FAILED, (
+        "a second attempt in this process reaches the same refusal and says so "
+        "again — what stops that being a spin is the per-process decline, not "
+        "a status on disk (`test_a_failed_preflight_is_not_retried_every_round`)"
     )
+
+
+def test_a_record_that_cannot_be_put_back_is_removed_rather_than_left_execed(
+    tmp_path, monkeypatch
+):
+    """The fail-open the retryable record introduces, closed.
+
+    `execed` is written before the exec because it has to survive it, so a
+    refusal afterwards depends on a SECOND write to put the record back. If
+    that write fails and the record is simply left alone, the state dir says
+    `execed` — and `_confirm_self_upgrade` at the top of the next iteration
+    retires it and logs a replacement that never happened, with the pending
+    upgrade destroyed on the way past. So the fallback is to REMOVE it: that
+    costs a delayed restart (the merged code is on disk, and the next process
+    START loads it) instead of a false confirmation plus a lost upgrade."""
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record())
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    saves: list = []
+    real_save = UpgradeStore.save
+
+    def flaky_save(self, record):
+        saves.append(record.status)
+        if len(saves) == 1:
+            return real_save(self, record)  # the one-shot marker lands
+        raise OSError("state dir went read-only")
+
+    monkeypatch.setattr(UpgradeStore, "save", flaky_save)
+
+    # No lock to arm: the refusal that happens AFTER the marker was written.
+    assert cli._self_upgrade_at_boundary(config, None) == UPGRADE_EXEC_FAILED
+
+    assert saves == [UPGRADE_EXECED, UPGRADE_PENDING], "it tried to put it back"
+    assert store.load() is None, "and removed it when it could not"
+    assert not config.pending_upgrade_file.exists()
+    logged = entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}")
+    assert logged and "REMOVED" in logged[0]["data"]["detail"], (
+        "an operator has to be told the marker is gone — this is the one "
+        "outcome that needs a restart rather than a boundary"
+    )
+    monkeypatch.undo()
+    assert cli._confirm_self_upgrade(config) is False
+    assert entries(config, "self_upgrade_confirmed") == [], (
+        "nothing left saying `execed`, so nothing to confirm falsely"
+    )
+
+
+def test_a_marker_that_cannot_be_written_leaves_the_pending_record_alone(
+    tmp_path, monkeypatch
+):
+    """The other side of that fallback, and the reason it is not unconditional.
+
+    Here the write that fails IS the one-shot marker — so the exec never
+    happened, and `UpgradeStore.save` being temp + `os.replace` means the file
+    still holds the `pending` record it held a moment ago. Clearing it would
+    answer a write that never landed by destroying a healthy record, and the
+    upgrade would be lost to a transient ENOSPC."""
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record())
+    lock = held_lock(config)
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+
+    def refuse_save(self, record):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(UpgradeStore, "save", refuse_save)
+
+    assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_EXEC_FAILED
+
+    monkeypatch.undo()
+    assert store.load().status == UPGRADE_PENDING, "untouched, and still to do"
+    assert lock.read().exec_handoff is None, "nothing was armed, either"
+    logged = entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}")
+    assert logged and "No space left on device" in logged[0]["data"]["detail"]
+    assert "retryable" in logged[0]["data"]["detail"]
 
 
 # --- no boundary ends in silence, and none of them ends the process ----------
@@ -769,11 +1014,18 @@ def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
 # boundary to `_self_upgrade_at_boundary`, and the single-round `_run_locked`
 # — every non-`--continuous` entry, `run`, `--retry`, `--answer`, `--resubmit`
 # and `resume` alike — answered `SELF_UPGRADE` by returning. No store write, no
-# transcript call, mid-session, with the record left `pending`. That last fact
-# is what excludes every other candidate: each of the settled outcomes both
-# logs (`_settle_upgrade`) and moves the record out of `pending`, and a settled
-# record is never offered again (`_self_upgrade_due`), so none of them can end
-# in "no event + still pending + exec'd two minutes later".
+# transcript call, mid-session, with the record left `pending`.
+#
+# That last fact is what excluded every other candidate at the time, and the
+# argument is worth keeping because it is structural rather than circumstantial:
+# the build running that day SETTLED each of the other outcomes — wrote
+# `preflight_failed` / `unapplicable` / `exec_failed` into `status` — and
+# `_self_upgrade_due` only ever offers `pending`. So none of them could have
+# ended in "no event + still pending + exec'd two minutes later"; the record
+# would not have been offered again at 08:15:30. (Since 2026-08-31 those three
+# leave the record `pending` too, which is why each of them now has a test
+# proving the next process still performs the upgrade — the property this
+# transcript demonstrated, made general.)
 
 
 def test_a_boundary_with_nothing_left_to_act_on_still_says_so(tmp_path):
@@ -879,8 +1131,8 @@ def test_the_single_round_path_records_the_boundary_and_keeps_running(
     assert deferred[0]["data"]["task_id"] == "t1"
     assert "StateError" in deferred[0]["data"]["detail"], "and it says WHY, actionably"
     assert upgrades.load().status == UPGRADE_PENDING, (
-        "the one outcome that is deliberately NOT settled: nothing here judged "
-        "the merged tree, so the next `run --continuous` must still find it"
+        "nothing here judged the merged tree — nothing was even attempted — so "
+        "the next `run --continuous` must still find it"
     )
     assert "carrying on" in capsys.readouterr().out
 
@@ -1199,9 +1451,10 @@ def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
     the one place `_confirm_self_upgrade` fires. A record still saying `execed`
     there is retired with a `self_upgrade_confirmed` entry claiming an
     iteration completed under the merged code, when no replacement ever
-    happened and that iteration was the OLD image's own. So the refusal settles
-    the record itself, and the confirmation at the top of iteration two finds
-    nothing to retire.
+    happened and that iteration was the OLD image's own. So the refusal puts
+    the record back to `pending` itself, and the confirmation at the top of
+    iteration two finds nothing to retire — and the upgrade survives for a
+    process that can perform it.
     """
     config = make_config(tmp_path)
     store = UpgradeStore(config.pending_upgrade_file)
@@ -1259,17 +1512,20 @@ def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
         "the confirmation at the top of iteration two must not have cleared it: "
         "there was no replacement to confirm"
     )
-    assert rounds[1].status == UPGRADE_EXEC_FAILED
-    assert store.load().status == UPGRADE_EXEC_FAILED, "and it stays settled"
+    assert rounds[1].status == UPGRADE_PENDING
+    assert store.load().status == UPGRADE_PENDING, (
+        "and it stays RETRYABLE — the next process to reach a boundary on this "
+        "state dir performs the upgrade this one could not"
+    )
     assert entries(config, "self_upgrade_confirmed") == [], (
         "an entry here would record a replacement that did not happen"
     )
     assert entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}"), "reported instead"
     assert built[1].declined == ["b" * 40], (
         "and the sha this run has already answered is re-declined onto the "
-        "orchestrator iteration two builds — the settled record covers this "
-        "case, and that carry-across is what covers the one where the record "
-        "could not be written at all"
+        "orchestrator iteration two builds — with the record still `pending` "
+        "that carry-across is the ONLY thing standing between a retryable "
+        "upgrade and a boundary offered every round forever"
     )
 
 

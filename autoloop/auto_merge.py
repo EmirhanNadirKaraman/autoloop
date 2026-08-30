@@ -143,30 +143,36 @@ DISABLED = "disabled"                # policy.auto_merge_enabled is false
 #: inert for the whole night the same way.
 LOOP_CODE_PREFIX = "autoloop/"
 
-#: `PendingUpgrade.status`, in the order one record moves through them. A
-#: record only ever leaves `pending` by being SETTLED (or cleared), which is
-#: what makes the exec one-shot — see `UpgradeStore`.
+#: TWO statuses a live record moves through, and three names that are OUTCOMES
+#: only. `pending` -> `execed` is the whole of the state machine, and `execed`
+#: is what makes the exec one-shot — see `UpgradeStore`.
 UPGRADE_PENDING = "pending"            # a merge changed loop code; not acted on yet
 UPGRADE_EXECED = "execed"              # the `os.execv` did not return: a successor is running
+
+#: The three ways a boundary ends without a handoff. Each names a transcript
+#: entry (`self_upgrade_<outcome>`) and `cli._self_upgrade_at_boundary`'s
+#: return value — and NONE of them is written into `status` any more. A refused
+#: handoff is a fact about the process that refused it: on 2026-08-27 one
+#: launch could not hand off at 08:13:47 and the next exec'd the same record at
+#: 08:15:30. Settling them (as this file did until 2026-08-31) left
+#: `orchestrator._self_upgrade_due` — which only ever offers `pending` — with
+#: nothing to offer, so the merged code sat on disk with nothing left to run
+#: it. They are still READ as statuses, because a state dir written by an
+#: older build can hold one, and "not pending" is the right answer for those.
 UPGRADE_PREFLIGHT_FAILED = "preflight_failed"   # the merged tree does not import
 UPGRADE_UNAPPLICABLE = "unapplicable"  # the merged checkout is not the running tree
 UPGRADE_EXEC_FAILED = "exec_failed"    # nothing was replaced; this process carries on
 
-#: The boundary outcome that is deliberately NOT a `PendingUpgrade.status`: a
-#: process reached the boundary and is not one that may hand off (the
-#: single-round `run` path — see `cli._run_locked`). It names an OUTCOME, for
-#: the transcript entry and for the return value, and the record stays
-#: `pending` on purpose so the next boundary — the next `run --continuous` /
-#: `start` — still finds an upgrade to perform. Writing it into `status` would
-#: settle the record, and `orchestrator._self_upgrade_due` would then never
-#: offer that sha again: the merge would be on disk with nothing left to run
-#: it, which is the failure this whole file exists to prevent.
+#: The fourth: a process reached the boundary and is not one that may hand off
+#: at all (the single-round `run` path — see `cli._run_locked`). Same rule as
+#: the three above and the same reason; it is named apart from them because
+#: nothing about the merged tree was judged to reach it.
 UPGRADE_DEFERRED = "deferred"
-#: The other outcome with no status behind it: the boundary was reached and
-#: there was no `pending` record left to act on by the time the decision site
-#: read it. Returned as `"none"` by `cli._self_upgrade_at_boundary` (its
-#: callers compare against that literal), and logged so that no boundary can
-#: end without an entry saying what became of it.
+#: And the fifth: the boundary was reached and there was no `pending` record
+#: left to act on by the time the decision site read it. Returned as `"none"`
+#: by `cli._self_upgrade_at_boundary` (its callers compare against that
+#: literal), and logged so that no boundary can end without an entry saying
+#: what became of it.
 UPGRADE_NONE = "none"
 
 
@@ -295,10 +301,18 @@ class PendingUpgrade:
     paths: list
     status: str
     recorded_at: str
-    #: When the record left `pending`, and why. `detail` carries the preflight
-    #: error when there is one — the whole point of a failed preflight is that
-    #: it is REPORTED rather than fatal.
+    #: When the record left `pending` — which today only `execed` does, so an
+    #: empty `settled_at` on a `pending` record is the ordinary case however
+    #: many boundaries have already refused it.
     settled_at: str = ""
+    #: The last thing that happened to this record, prefixed with the outcome
+    #: that happened (`preflight_failed: rc=1 SyntaxError…`). Written by
+    #: `cli._carry_on_upgrade` on a boundary that did not hand off, and left in
+    #: place while the record stays `pending`: the whole point of a failed
+    #: preflight is that it is REPORTED rather than fatal, and an operator
+    #: reading the state dir should not have to reach for the transcript to see
+    #: why a pending upgrade has not happened yet. Evidence, never re-derived
+    #: from — no code branches on it.
     detail: str = ""
 
 
