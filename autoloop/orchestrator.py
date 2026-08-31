@@ -3295,8 +3295,9 @@ class Orchestrator:
             # prints `blocker.question[:160]`, and a summary that spends all of
             # it on measurements cuts off the sentence saying what to do.
             "THE BROWSER, NOT A RATE LIMIT: nothing can attach to a page — open "
-            "the Chrome profile's window, or run "
-            "`python3 -m autoloop.browser.chrome_restart`, then resume with "
+            "the Chrome profile's window yourself (the shipped chrome_restart "
+            "helper is obsolete), or configure a browser.restart_command of "
+            "your own, then resume with "
             f"`python -m autoloop run --retry`. {evidence}. {restart_note} "
             "ChatGPT's throttle overlay could not be the cause — there is no "
             "page for it to cover, and a limit the loop cannot even ask about "
@@ -11378,10 +11379,15 @@ class Orchestrator:
         Declared rather than inferred: the loop knows a `cdp_url`, not which
         Chrome owns it, and pattern-matching process lists to decide what to
         kill is how an automation takes down someone's everyday browser. The
-        shipped implementation — `python3 -m autoloop.browser.chrome_restart`,
-        the value `config.example.toml` ships since 2026-08-16 — matches one
-        profile by its `--user-data-dir` EXACTLY, stops every instance on it,
-        and confirms the CDP endpoint answers before reporting success.
+        command is WHOLLY the operator's since brw-19c (2026-08-31): this
+        project shipped an implementation of it until the browser package was
+        retired, and `config.example.toml` no longer carries a value, so
+        whatever runs here is a command the deployment declared for itself.
+        What that command should do is unchanged — match ONE profile by its
+        `--user-data-dir` exactly, stop every instance on it, and confirm the
+        CDP endpoint answers before reporting success — but nothing in this
+        repository supplies it, and the two parks that mention a restart say so
+        rather than naming a module that is going away.
 
         The cooldown matters as much as the restart: without it a genuinely
         dead transport becomes a restart loop, thrashing the browser instead of
@@ -11465,8 +11471,9 @@ class Orchestrator:
                 "unrecovered because browser.restart_cooldown_seconds "
                 f"({cooldown:g}s) had not elapsed since the previous restart, "
                 "so no restart was attempted for any of them. Restart the "
-                "browser by hand (python3 -m autoloop.browser.chrome_restart, "
-                "run from the checkout), or "
+                "browser by hand (the chrome_restart helper this project used "
+                "to ship is obsolete — reopen the profile's window, or "
+                "configure a browser.restart_command of your own), or "
                 "lower browser.restart_cooldown_seconds, then resume. "
                 f"Last error: {exc}",
                 resume_phase=phase.value,

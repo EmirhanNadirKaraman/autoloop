@@ -11,7 +11,7 @@ used to, to prove the package still spoke the moved vocabulary — a claim about
 a package that is being deleted, held in a file whose own job is to prove
 nothing live depends on it.
 
-Three claims, and each is here because breaking it fails SILENTLY:
+Four claims, and each is here because breaking it fails SILENTLY:
 
 * **Identity, not equality.** Every caller compares with `is`
   (`orchestrator._submit_request`, `inbox.provider_asker`). Both enums subclass
@@ -34,6 +34,12 @@ Three claims, and each is here because breaking it fails SILENTLY:
   outside brw-17's approved scope and outside brw-19b's, and repointing those
   two lines belongs to whoever owns them. Scanning it would fail on a state
   this file was told to leave standing.
+* **Nor does the orchestrator ADVISE running one.** The fourth claim, added by
+  brw-19c (2026-08-31): a module path handed to an operator in park text is not
+  an import and never breaks a run, so every guard above passes it — it fails
+  later, when someone follows it while their browser is already down. Scanned
+  as source text, over `orchestrator.py` only; the file that still carries the
+  same path in a comment is named under THE GAP below.
 
 THE GAP THAT LEAVES, named here so it is visible rather than merely unscanned
 (brw-19c, 2026-08-31). Those two lines are
@@ -48,6 +54,15 @@ one-line change each and belongs to whoever deletes the package. It is NOT
 pinned by a test here on purpose: any test asserting those imports exist
 inverts the moment they are fixed, which is the wrong way round for a thing
 that ought to be fixed.
+
+`autoloop/conversation.py:385` is the smaller half of the same gap, and a
+milder one: it spells `python3 -m autoloop.browser.chrome_restart` inside a
+COMMENT that QUOTES the park a `codex_cli` run wrongly wrote on 2026-08-22, as
+the reason `_TRANSPORT_REMEDIES` exists. Nobody is being advised there and
+nothing breaks — but it is the same literal string, it is outside brw-19c's
+approved paths, and that is why the advice scan below reads `orchestrator.py`
+alone rather than the package: widened, it would go red on a line this round
+was not allowed to edit.
 """
 
 import re
@@ -67,24 +82,26 @@ PACKAGE_DIR = Path(autoloop.__file__).resolve().parent
 #: and a guard that watches one spelling is a guard the other spelling walks
 #: past. Deliberately NOT matched: prose and operator advice naming a module
 #: inside the package as a COMMAND LINE rather than as a dependency. That is
-#: still the right exclusion and it is now a smaller set than it was:
-#: `config.RESTART_COMMAND_REPLACEMENT` used to be the shipped example for
-#: `browser.restart_command` and brw-19c (2026-08-31) deleted it, because an
-#: example naming a module that is going away is advice that cannot work.
+#: still the right exclusion — such a line is wrong advice, not a broken
+#: import, and the two failures want different guards — but the set it excuses
+#: is now empty in the modules scanned here, and
+#: `test_no_operator_advice_in_the_orchestrator_names_the_retired_package` is
+#: the guard that keeps it empty.
 #:
-#: STILL OUTSTANDING, and left for the round that owns those paths:
-#: `orchestrator.py:3299`, `:11381` and `:11468` spell
-#: `python3 -m autoloop.browser.chrome_restart` in operator-facing park text.
-#: Wrong advice once brw-19a deletes the package, but not an import break — so
-#: the regex above is right to pass them, and this file cannot be the place
-#: they are fixed. Neither can brw-19c: `autoloop/orchestrator.py` is not in
-#: its approved paths, and the strings are PINNED from two more files that are
-#: not either — `test_rounds_and_restart.py:1062` and `:1069` (the second
-#: requires the command to survive `question[:160]`) and
-#: `test_transport_fault_recovery.py:908`, whose module-level `RESTART_COMMAND`
-#: at `:79` is the same argv. Rewording the parks without those three files in
-#: one commit turns three green tests red, which is why it is reported rather
-#: than half-done.
+#: How it got there. `config.RESTART_COMMAND_REPLACEMENT` was the shipped
+#: example for `browser.restart_command` and brw-19c (2026-08-31) deleted it,
+#: because an example naming a module that is going away is advice that cannot
+#: work. The same task then reworded the three places `orchestrator.py` spelled
+#: `python3 -m autoloop.browser.chrome_restart` — two parks and the docstring
+#: of `_browser_restart_outcome`, which stopped naming the module at all. The
+#: two PARKS still name `chrome_restart`, as the obsolete thing it is, and send
+#: the operator to their own `browser.restart_command` or to reopening the
+#: profile's window instead. Naming it is not
+#: decoration: `test_rounds_and_restart.py:1062`/`:1069` (the second over
+#: `question[:160]`) and `test_transport_fault_recovery.py:908` all require the
+#: word to survive in the park an operator reads, so a reword that simply
+#: deleted it would turn three tests red and take away the one string an
+#: operator who knows the old command would search for.
 _BROWSER_IMPORT = re.compile(
     r"^\s*(?:from \.{1,2}|from autoloop\.|import autoloop\.)browser(?:[.\s]|$)"
 )
@@ -201,3 +218,57 @@ def test_the_last_browser_import_and_everything_it_fed_are_gone():
     assert _REMOVED_BROWSER_IMPORT not in orchestrator_src
     assert not hasattr(orchestrator_module, "attachable_page_targets")
     assert not hasattr(Orchestrator, "_attachable_page_targets")
+
+
+# ---- nor does it tell an operator to RUN one ---------------------------------
+
+
+def test_no_operator_advice_in_the_orchestrator_names_the_retired_package():
+    """The other way a deleted package outlives itself: as a COMMAND LINE in
+    text handed to an operator, which no import guard can see.
+
+    Until brw-19c (2026-08-31) `orchestrator.py` told operators to run
+    `python3 -m autoloop.browser.chrome_restart` in two parks and one
+    docstring. That advice costs nothing at import time — it fails when someone
+    FOLLOWS it, with `No module named`, at the one moment it is reached: the
+    browser is already down and the loop has already stopped.
+
+    Source text rather than a built park, deliberately. Both parks need a
+    browser-backed transport and a fault injected at the right step;
+    `test_rounds_and_restart.py` and `test_transport_fault_recovery.py` pay
+    that cost and pin what the parks DO say. What is cheap here — and what
+    those tests cannot see, because they only read the two messages they
+    already know about — is a FOURTH mention appearing in some message nothing
+    happens to assert on."""
+    source = (PACKAGE_DIR / "orchestrator.py").read_text(encoding="utf-8")
+    # The scan is worth exactly as much as the file behind it: a moved or
+    # emptied orchestrator.py would satisfy every assertion below by reading
+    # nothing, which is the shape this file exists to refuse elsewhere.
+    assert "_browser_restart_outcome" in source, "wrong file, or an empty one"
+
+    offenders = [
+        f"orchestrator.py:{lineno}: {line.strip()}"
+        for lineno, line in enumerate(source.splitlines(), start=1)
+        if "autoloop.browser" in line
+    ]
+    assert offenders == [], (
+        "operator-facing text must not name a module inside the retired "
+        f"package; say what to configure or do instead: {offenders}"
+    )
+
+    # The name SURVIVES, as the obsolete thing it is. Dropping it would read as
+    # the helper never existing, to the operator most likely to type it — and
+    # `test_rounds_and_restart.py:1062`/`:1069` and
+    # `test_transport_fault_recovery.py:908` require the word in the park text.
+    # The window is over raw source, so it spans the `"` `\n` `"` seams of the
+    # concatenated literals each message is built from.
+    windows = [
+        source[match.start() : match.start() + 240]
+        for match in re.finditer("chrome_restart", source)
+    ]
+    assert len(windows) >= 2, "both parks must still name what went obsolete"
+    for window in windows:
+        assert "obsolete" in window, (
+            "every surviving mention must say the helper is obsolete, not "
+            f"read as an instruction: {window[:120]!r}"
+        )
