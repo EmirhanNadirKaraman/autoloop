@@ -12,18 +12,20 @@ selected 92 test files. The selector was not wrong — every test really did
 execute that import — which is why the fix had to be here rather than there.
 
 What it imported for, and why that is gone (brw-16, 2026-08-25): a single
-autouse fixture, `_no_live_cdp_probe`, stubbed
-`Orchestrator._attachable_page_targets` so a hermetic suite would not dial a
-real Chrome on 127.0.0.1:9222. That probe is only ever reached for a provider
+autouse fixture, `_no_live_cdp_probe`, stubbed the orchestrator's CDP
+page-target probe so a hermetic suite would not dial a real Chrome on
+127.0.0.1:9222. That probe was only ever reached for a provider
 `conversation.transport_is_browser_backed` says drives a browser, and no
-registered provider does any more. Every module that still exercises the
-browser-backed recovery machinery — `test_orchestrator.py`,
+registered provider does any more; the two modules that could still reach it
+stubbed it on the orchestrator instance they built, locally and visibly. Since
+brw-19b there is nothing left to stub anywhere: the probe was the
+orchestrator's last import of `autoloop/browser/` and went with it, so no test
+in this tree can open that socket even by mistake. Every module that still
+exercises the browser-backed recovery machinery — `test_orchestrator.py`,
 `test_rounds_and_restart.py`, `test_transport_recovery.py` (and
 `test_conversation_retirement.py` through it) and
 `test_transport_fault_recovery.py` — registers a browser-backed adapter of its
-own through `register_provider(..., browser_backed=True)`, and the two whose
-tests can reach the probe stub it on the orchestrator instance they built —
-locally, visibly, in the file that needs it.
+own through `register_provider(..., browser_backed=True)`.
 
 Do NOT re-add a fixture here that reaches `autoloop` through a STRING
 monkeypatch target to dodge the import. That hides the edge from static

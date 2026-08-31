@@ -167,17 +167,16 @@ A transport without that declaration is never re-run automatically.
                                  `policy.max_rate_limit_backoffs`, which ends
                                  in a needs_user park naming the throttle
                                  (`rate_limited`).
-                                 The same error with NO attachable page behind
-                                 it is not a rate limit at all: nothing is
-                                 refusing the loop, it has no browser. That
-                                 state (`RL_BROWSER_UNATTACHABLE`) drops the
-                                 client, restarts the profile ONCE, re-probes,
-                                 and otherwise parks naming the BROWSER
-                                 (`browser_unattachable`) — outside the
-                                 back-off budget, which bounds waiting on the
-                                 server. A limit that has already cleared
-                                 resumes without a wait
-                                 (`_classify_rate_limit_state`)
+                                 A limit that has already cleared resumes
+                                 without a wait
+                                 (`_classify_rate_limit_state`). Its third
+                                 world — "there is no attachable page, so this
+                                 is not a limit at all" — was measured by
+                                 dialling the CDP endpoint through
+                                 `browser/playwright_session.py`, the last live
+                                 import of that package, and went with it
+                                 (brw-19b). `_recover_unattachable_browser` is
+                                 retained but has no caller: see its docstring
 * ResponseTimeoutError(start)  → ordinary budget as below. The per-request
                                  timeout counters are still kept (see above);
                                  nothing acts on them since brw-15
@@ -350,7 +349,6 @@ from .blockers import (
     BlockerStore,
     autonomous_recovery,
 )
-from .browser.playwright_session import attachable_page_targets
 from .changeset_review import ChangesetBinding, build_changeset_packet
 from .config import AutoloopConfig
 from .context import build_context, render_context
@@ -1192,13 +1190,18 @@ RESTART_SKIPPED_COOLDOWN = "skipped_cooldown"
 RESTART_DISABLED = "disabled"
 
 
-#: The three worlds `Orchestrator._classify_rate_limit_state` tells apart
-#: before it backs off, and before it concludes a limit still holds. Only the
-#: third one restarts anything — see `_handle_rate_limited`, whose refusal to
-#: restart on a THROTTLE is unchanged and load-bearing.
+#: The two worlds `Orchestrator._classify_rate_limit_state` tells apart before
+#: it backs off, and before it concludes a limit still holds. NEITHER restarts
+#: anything — see `_handle_rate_limited`, whose refusal to restart on a THROTTLE
+#: is unchanged and load-bearing.
+#:
+#: There was a third, `RL_BROWSER_UNATTACHABLE`: no attachable page behind the
+#: limit, so nothing was refusing the loop and there was no browser. It was
+#: measured by dialling the CDP endpoint through the browser package, which is
+#: the dependency brw-19b removed, so the classifier cannot produce it and this
+#: module names it no more.
 RL_THROTTLED = "throttled"
 RL_CLEARED = "cleared"
-RL_BROWSER_UNATTACHABLE = "browser_unattachable"
 
 #: A fifth restart outcome, produced only by `_recover_unattachable_browser`
 #: and never by `_browser_restart_outcome`: this throttle episode has already
@@ -1365,22 +1368,20 @@ class Orchestrator:
         #: monotonic timestamp of the last browser restart, for the cooldown.
         self._last_browser_restart = None
         #: True once this episode has already spent its ONE restart on an
-        #: unattachable browser (`_recover_unattachable_browser`). The restart
-        #: cooldown normally bounds that on its own, but a deployment running
-        #: `restart_cooldown_seconds = 0` would otherwise get a restart loop:
-        #: each attempt "succeeds", each re-probe still finds no page.
+        #: unattachable browser (`_recover_unattachable_browser`, dormant since
+        #: brw-19b). The restart cooldown normally bounds that on its own, but a
+        #: deployment running `restart_cooldown_seconds = 0` would otherwise get
+        #: a restart loop against a browser that never comes back.
         #:
         #: An EPISODE ends in two places. A step that COMPLETES (`run`'s
-        #: `else` branch, UNCONDITIONALLY: state 3 never increments
+        #: `else` branch, UNCONDITIONALLY: that recovery never increments
         #: `rate_limit_backoffs`, so a clear nested inside that counter would
         #: never fire for the very fault this bounds) — that one is evidence.
-        #: And any `RateLimitedError` classified as something OTHER than
-        #: unattachable (`_handle_rate_limited`), which includes the default
-        #: reached when nothing could be probed at all; see that site for why
-        #: that is deliberate rather than evidence. Neither is a successful
-        #: re-probe after the restart: targets that exist at probe time and
-        #: are gone at attach time would then restart, clear, restart — the
-        #: loop the bound exists to stop.
+        #: And any `RateLimitedError` reaching the back-off (`_handle_rate_
+        #: limited`), which since brw-19b is every one of them. Neither is the
+        #: recovery's own success: a browser that comes back and is gone again
+        #: by attach time would otherwise restart, clear, restart — the loop
+        #: the bound exists to stop.
         self._rate_limit_browser_restarted = False
         #: The `blockers.Blocker.id` an autonomous retry is currently riding on
         #: (halt-02), or `""`. Set by `_autonomous_retry`, consumed by
@@ -1726,14 +1727,14 @@ class Orchestrator:
                 #
                 # The same completed step also ends any UNATTACHABLE-BROWSER
                 # episode, and that clear sits OUTSIDE the counter check below
-                # on purpose: state 3 deliberately never increments
-                # `rate_limit_backoffs`, so nested inside it the common
-                # sequence (zero targets → restart → ordinary step completes)
-                # skipped the reset entirely and left the guard true for the
-                # rest of the process — parking the next, unrelated incident
-                # as `skipped_already_spent` instead of giving it the one
-                # restart it is owed. In-memory only, so no save is owed for
-                # it.
+                # on purpose: `_recover_unattachable_browser` deliberately
+                # never increments `rate_limit_backoffs`, so nested inside it
+                # the common sequence (dead browser → restart → ordinary step
+                # completes) skipped the reset entirely and left the guard true
+                # for the rest of the process — parking the next, unrelated
+                # incident as `skipped_already_spent` instead of giving it the
+                # one restart it is owed. In-memory only, so no save is owed
+                # for it.
                 self._rate_limit_browser_restarted = False
                 # Same evidence, a second reader: an autonomous retry that is
                 # followed by a completed step has recovered, and its blocker
@@ -3111,16 +3112,6 @@ class Orchestrator:
             # top of the throttle.
             pass
 
-    def _attachable_page_targets(self) -> int | None:
-        """How many pages the configured CDP endpoint reports, or None when
-        that could not be measured.
-
-        A method rather than a direct call so a test can describe the browser
-        without opening a socket — the loop suite is hermetic, and this is the
-        one probe here that dials anything.
-        """
-        return attachable_page_targets(self._config.browser.cdp_url)
-
     def _composer_takes_a_click(self) -> bool:
         """Positive interaction evidence from the page already held, or False.
 
@@ -3139,36 +3130,33 @@ class Orchestrator:
             return False
 
     def _classify_rate_limit_state(self) -> tuple[str, str]:
-        """Which of three worlds a `RateLimitedError` actually arrived from:
-        `(RL_THROTTLED | RL_CLEARED | RL_BROWSER_UNATTACHABLE, evidence)`.
+        """Which of two worlds a `RateLimitedError` actually arrived from:
+        `(RL_THROTTLED | RL_CLEARED, evidence)`.
 
-        The back-off's whole justification — no restart, no failure budget, no
-        client drop — assumes the browser is USABLE and merely being refused.
-        On 2026-08-17 that assumption was false: the operator closed the
-        browser window, Chrome stayed alive, `/json/version` kept answering
-        with a valid `webSocketDebuggerUrl`, and `/json/list` returned ZERO
-        targets. Playwright could not attach at all, so there was no page to
-        dismiss a modal on and nothing to re-probe. The loop spent its whole
-        budget waiting and parked saying "rate_limited" while the real cause
-        was that it had no browser; a probe reported "still rate limited" for
-        four hours.
+        Everything here is asked of the PAGE THIS LOOP ALREADY HOLDS, through
+        the same optional `getattr` capabilities the rest of the transport
+        surface is probed with. Nothing is dialled, and no transport module is
+        imported: a client that implements neither probe classifies as
+        `RL_THROTTLED` with a note saying it could not be asked.
 
         Order is the safety property. **The modal on a held page is asked
         FIRST**, so a genuine throttle is classified from the evidence the
-        selector docstring calls the only reliable one, and never from a
-        transiently odd answer at the CDP endpoint. State 1 therefore behaves
-        exactly as it did before this existed.
+        selector docstring calls the only reliable one.
 
         A composer is not consulted as presence: it reports visible and
         enabled while the overlay swallows every click (2026-08-15, three false
         all-clears). `RL_CLEARED` requires a real click to LAND.
 
-        The target count is the last question, asked only when the page could
-        not answer. Zero attachable pages is the one condition that means "not
-        a rate limit"; an unmeasurable endpoint is NOT evidence of anything and
-        keeps today's behaviour, because a browser that cannot be reached at
-        all already raises `BrowserError` from the next step and gets the
-        restart-and-budget path built for it.
+        There was a THIRD world until brw-19b: zero attachable page targets at
+        `browser.cdp_url`, which meant the limit was not a limit at all because
+        there was no page to be refused (2026-08-17 — the operator closed the
+        window, Chrome stayed alive, `/json/version` kept answering and
+        `/json/list` returned zero; the loop waited out a limit nobody had for
+        four hours). Measuring it was the orchestrator's last live import of
+        `autoloop/browser/`, and it went with that dependency. What remains is
+        the behaviour an UNMEASURABLE endpoint always had — back off, and let a
+        browser that genuinely cannot be reached raise `BrowserError` from the
+        next step onto the restart-and-budget path built for it.
         """
         modal: bool | None = None
         note = "no client is held, so the page itself could not be probed"
@@ -3190,22 +3178,25 @@ class Orchestrator:
                     "the throttle modal is gone and a real click on the composer landed",
                 )
             note = "no throttle modal on the held page, but the composer would not take a click"
-        targets = self._attachable_page_targets()
-        if targets == 0:
-            return (
-                RL_BROWSER_UNATTACHABLE,
-                f"{self._config.browser.cdp_url} answers but lists no attachable page "
-                f"target, so there is no page to be throttled ({note})",
-            )
-        if targets is None:
-            return (RL_THROTTLED, f"{note}; the CDP endpoint could not be measured")
-        return (RL_THROTTLED, f"{note}; the CDP endpoint lists {targets} attachable page(s)")
+        return (RL_THROTTLED, note)
 
     def _recover_unattachable_browser(
         self, phase: Phase, exc: RateLimitedError, evidence: str
     ) -> None:
-        """State 3: there is no browser to be rate limited. Restart it once and
-        re-probe, or park NAMING THE BROWSER.
+        """There is no browser to be rate limited. Restart it once, or park
+        NAMING THE BROWSER.
+
+        **DORMANT since brw-19b: nothing calls this.** The condition it
+        answers was detected by counting attachable page targets at
+        `browser.cdp_url`, and that probe was the orchestrator's last import of
+        `autoloop/browser/` — so `_classify_rate_limit_state` can no longer
+        reach the state that dispatched here. It is kept rather than deleted
+        because it is the only emitter of the `browser_unattachable` park code,
+        and `cli._RESOLUTION_PRECONDITIONS` carries a recheck keyed on that
+        code (pinned by `test_m1_hardening.py`, which walks THIS module for
+        every `code=` a blocker emitter is given). Both belong to one deletion,
+        and neither of those files was in brw-19b's scope. Its behaviour is
+        pinned by direct-call tests in `test_rounds_and_restart.py`.
 
         Deliberately outside the back-off budget. `rate_limit_backoffs` bounds
         waiting on the SERVER; this is a local recovery that makes no request
@@ -3218,22 +3209,28 @@ class Orchestrator:
         weakening of the no-drop rule — that rule protects a page that still
         exists.
 
-        Exactly one restart, then one re-probe, then a decision. Returning
-        without parking on a still-dead browser would leave the loop to
-        rediscover the same state on its next step with nothing bounding the
-        repetition. The bound is per EPISODE
-        (`_rate_limit_browser_restarted`), not only per cooldown window: a
-        deployment running `restart_cooldown_seconds = 0` has disabled the
-        time bound, and every attempt here "succeeds" while the re-probe still
-        finds no page — a restart loop by another door.
+        Exactly one restart, then a decision. Returning without parking on a
+        browser that could not be restarted would leave the loop to rediscover
+        the same state on its next step with nothing bounding the repetition.
+        The bound is per EPISODE (`_rate_limit_browser_restarted`), not only
+        per cooldown window: a deployment running `restart_cooldown_seconds =
+        0` has disabled the time bound, so a second attempt here would
+        "succeed" against the same dead browser — a restart loop by another
+        door.
 
-        A recovered re-probe does NOT end the episode; a step that COMPLETES
-        does (`run`). Targets can exist at probe time and be gone at attach
-        time, and clearing the bound here would answer that with restart →
-        probe OK → clear → restart, unbounded and never parking. Ending it on
-        a completed step keeps the bound per-episode in both directions: this
-        recovery cannot repeat inside one episode, and an episode that really
-        ended cannot leave the next fault with a spent restart.
+        A restart that REPORTED SUCCESS is taken at its word. It used to be
+        re-probed, and an unmeasurable endpoint already counted as recovered
+        there; with the probe gone (see above) every success reads that way,
+        and the honest re-probe is the next step itself — the phase is
+        untouched, so that is the step the loop was already in.
+
+        A recovery does NOT end the episode; a step that COMPLETES does
+        (`run`). A browser can come back and be gone again by attach time, and
+        clearing the bound here would answer that with restart → clear →
+        restart, unbounded and never parking. Ending it on a completed step
+        keeps the bound per-episode in both directions: this recovery cannot
+        repeat inside one episode, and an episode that really ended cannot
+        leave the next fault with a spent restart.
         """
         state = self.state
         self._log(
@@ -3259,27 +3256,23 @@ class Orchestrator:
             self._rate_limit_browser_restarted = True
             outcome = self._browser_restart_outcome()
         if outcome == RESTART_OK:
-            targets = self._attachable_page_targets()
-            if targets != 0:
-                # None (unmeasurable) counts as recovered: a restart that
-                # reported success and an endpoint this cannot measure are not
-                # evidence the browser is still dead, and the next step is the
-                # honest re-probe. The phase is untouched, so that step is the
-                # one the loop was already in.
-                self._log(
-                    "browser_reattached",
-                    data={
-                        "reason_code": "browser_unattachable",
-                        "phase": phase.value,
-                        "page_targets": targets,
-                    },
-                )
-                return
+            # A restart that reported success is recovered: an endpoint this
+            # loop cannot measure is not evidence the browser is still dead,
+            # and since brw-19b it can measure none. The phase is untouched, so
+            # the next step is both the honest re-probe and the step the loop
+            # was already in.
+            self._log(
+                "browser_reattached",
+                data={
+                    "reason_code": "browser_unattachable",
+                    "phase": phase.value,
+                },
+            )
+            return
         # The session ends here, so a candidate this task had out for review
         # dies with it — same rule as the throttle park below.
         self._note_round_fault("browser_unattachable")
         restart_note = {
-            RESTART_OK: "The browser was restarted and STILL lists no attachable page.",
             RESTART_FAILED: "The configured browser.restart_command ran and failed.",
             RESTART_SKIPPED_COOLDOWN: (
                 "A restart was refused because browser.restart_cooldown_seconds "
@@ -3291,9 +3284,9 @@ class Orchestrator:
                 "restarted automatically."
             ),
             RESTART_SKIPPED_ALREADY_SPENT: (
-                "This throttle episode had already restarted the browser once "
-                "and it came back with nothing to attach to, so it was not "
-                "restarted again."
+                "This throttle episode had already spent its one restart on "
+                "this browser and reached the same state again, so it was not "
+                "restarted a second time."
             ),
         }.get(outcome, "The browser restart did not complete.")
         self._to_needs_user(
@@ -3317,7 +3310,7 @@ class Orchestrator:
             code="browser_unattachable",
             detail=(
                 f"phase={phase.value} restart={outcome} "
-                f"cdp_url={self._config.browser.cdp_url} page_targets=0"
+                f"cdp_url={self._config.browser.cdp_url}"
             ),
         )
 
@@ -3345,16 +3338,17 @@ class Orchestrator:
         All three hold for a THROTTLE, which is what every line above is
         about, and none of them is relaxed by what follows.
 
-        What follows is the other question, asked FIRST because those rules
-        assume its answer: **is there a browser at all?** A `RateLimitedError`
-        can also arrive with no attachable page behind it, and then none of
-        the reasoning holds — nothing is being refused, so nothing is worth
-        waiting out. `_classify_rate_limit_state` separates the two (and a
-        third: a limit that has already cleared), and only
-        `RL_BROWSER_UNATTACHABLE` reaches `_recover_unattachable_browser`,
-        which restarts once and otherwise parks naming the BROWSER. It is
-        classified before the counter moves, because a local recovery must not
-        spend a budget that bounds waiting on the server.
+        What follows is the second question: **has the limit already lifted?**
+        `_classify_rate_limit_state` answers it from the page this loop already
+        holds, and `RL_CLEARED` resumes without a wait. It is classified before
+        the counter moves, which is where a third world used to be answered
+        too: a limit with no attachable page behind it was not a limit at all,
+        and `_recover_unattachable_browser` restarted the browser rather than
+        waiting. Detecting it meant dialling the CDP endpoint through
+        `autoloop/browser/`, and brw-19b removed that dependency, so this
+        handler no longer asks whether there is a browser at all. A browser
+        that genuinely cannot be reached still raises `BrowserError` from the
+        next step and gets `_handle_browser_failure`, on its own budget.
 
         The wait itself is DURABLE, not just its counter: the deadline is
         persisted before the sleep and served by `_await_rate_limit_deadline`
@@ -3376,35 +3370,27 @@ class Orchestrator:
             # Before the counter moves, so a browser fault never spends a budget
             # that exists to bound waiting on the SERVER (brw-03's rule).
             classification, evidence = self._classify_rate_limit_state()
-            if classification == RL_BROWSER_UNATTACHABLE:
-                self._recover_unattachable_browser(phase, exc, evidence)
-                return
         else:
             # A run with no browser is not asked the browser question at all.
-            # `_classify_rate_limit_state` reaches its third world by dialling
-            # `browser.cdp_url`, which answers about whatever Chrome happens to
-            # be running on this host — nothing to do with the transport that
-            # raised. A zero-target answer there would restart a browser for a
-            # non-browser fault, which is exactly the confusion this class of
-            # bug is made of, and even the classification's PROSE would put
-            # browser evidence into a codex park. No codex transport raises
-            # `RateLimitedError` today (`codex/protocol_errors.py` says so
-            # explicitly); this closes the door before someone opens it.
+            # The classification's evidence is PROSE ABOUT A PAGE — a modal, a
+            # composer that would not take a click — and a codex fault has
+            # neither, so quoting it into a codex park would put browser
+            # evidence in front of an operator investigating a subprocess. That
+            # is the confusion this class of bug is made of. No codex transport
+            # raises `RateLimitedError` today (`codex/protocol_errors.py` says
+            # so explicitly); this closes the door before someone opens it.
             classification, evidence = (
                 RL_THROTTLED,
                 f"the {self.active_provider()} transport reported a throttle; "
-                "this run drives no browser, so no page or CDP endpoint was "
-                "probed",
+                "this run drives no browser, so no page was probed",
             )
-        # Everything that reaches here is classified as something other than
-        # unattachable, so this episode's spent restart is settled and the next
-        # unattachable browser is a new fault with its own recovery. That
-        # INCLUDES the default `RL_THROTTLED` reached when nothing could be
-        # probed — deliberately, and it is the safe direction: a browser that
-        # genuinely cannot be reached raises `BrowserError` from the next step
-        # and gets the restart path built for it on its own budget, whereas
-        # holding the guard on unprobed evidence would refuse a real
-        # zero-target fault hours later the recovery it is owed.
+        # A throttle settles the per-episode restart guard, so an unattachable
+        # browser is always a fresh fault with its own restart. Kept even though
+        # nothing here dispatches to `_recover_unattachable_browser` any more:
+        # the guard is that method's, the two belong to one deletion, and the
+        # safe direction is the one this already took — holding the guard on
+        # unprobed evidence would refuse a real fault, hours later, the recovery
+        # it is owed.
         self._rate_limit_browser_restarted = False
         state.rate_limit_backoffs += 1
         verdict = self._policy.check_rate_limit_backoff_budget(state.rate_limit_backoffs)
