@@ -17,7 +17,7 @@ since the split; each section is titled rather than numbered.
 ## One view across projects
 
 Running one loop per project — separate `state_dir`, separate checkout,
-separate branch, separate browser profile — works: `LoopLock` is scoped to a
+separate branch, separate reviewer transport — works: `LoopLock` is scoped to a
 state directory and fails closed, and worker repositories are per task, so the
 projects do not collide. What does not follow from that is any way to *see* all
 of them. The dashboard binds one checkout; `health` judges one config. With four
