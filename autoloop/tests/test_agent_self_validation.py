@@ -21,6 +21,7 @@ of these arguments" observable rather than asserted.
 
 import inspect
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -2673,6 +2674,129 @@ def test_a_temp_root_inside_the_tree_is_refused_and_leaves_nothing_there(worker_
     assert list(inside.iterdir()) == [], "a refused cache directory was left in the tree"
     assert ("-p", "no:cacheprovider") in pairs(runner.calls[0]["argv"])
     assert "pytest cache could not be used" in text
+
+
+def test_a_cache_root_inside_the_repo_but_outside_a_declared_validation_cwd_is_refused(
+    worker_repo,
+):
+    """The hole the first version of this check had (found in review,
+    2026-08-31): it compared the temp directory against `cwd` ALONE, and `cwd` is
+    the declared `validation_cwd` — a SUBDIRECTORY of the worker repository —
+    whenever a task declares one.
+
+    A temp root in a SIBLING of that subdirectory is then outside `cwd`,
+    accepted, and inside the very tree the post-commit gate reads. The sanity
+    line below says so in the test rather than in prose: the shape asserted here
+    is one the old check let through.
+
+    `backend/` is created because `run()` returns `NOT_RUN` for a missing working
+    directory BEFORE it ever reaches the cache — which would give a `cache_dir`
+    of None for an entirely different reason and grade nothing. The two are told
+    apart by `cache_error` (empty on that path) and by the run really having
+    launched.
+    """
+    backend = worker_repo / "backend"
+    backend.mkdir()
+    inside = worker_repo / "tmp"
+    inside.mkdir()
+    assert not inside.is_relative_to(backend), (
+        "the point of this test is a temp root the OLD `cwd`-only check accepted"
+    )
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=backend,
+        command_runner=runner,
+        cache_root=inside,
+        repo_root=worker_repo,
+    )
+
+    text = service.run()
+
+    assert service.cache_dir is None
+    assert "inside the tree being validated" in service.cache_error
+    assert list(inside.iterdir()) == [], "a refused cache directory was left in the tree"
+    assert runner.calls, "the run must still have happened, just without a cache"
+    argv = runner.calls[0]["argv"]
+    assert ("-p", "no:cacheprovider") in pairs(argv)
+    assert cache_dir_of(argv) is None and not rerun_flags(argv)
+    assert "pytest cache could not be used" in text
+
+
+def test_the_executor_passes_the_repo_root_so_a_declared_cwd_cannot_widen_the_check(
+    main_repo, worker_repo, monkeypatch
+):
+    """The same hole, driven through the PRODUCTION wiring rather than through a
+    hand-built service — because `repo_root` defaults to `cwd`, which is right for
+    the shipped case and is also the one way this could quietly weaken again: a
+    caller that stops passing it gets the old check back and no test would
+    notice. This is that test.
+
+    `tempfile.tempdir` is patched rather than `TMPDIR`, and the difference
+    matters: `gettempdir()` caches its answer in that module global on first use,
+    which pytest has long since triggered, so setting the environment variable
+    here would change nothing. `TMPDIR` is set as well because it is what an
+    operator would really set and a future `mkdtemp` call that re-reads it must
+    land in the same place.
+    """
+    backend = worker_repo / "backend"
+    backend.mkdir()
+    tmpdir = worker_repo / "tmp"
+    tmpdir.mkdir()
+    monkeypatch.setenv("TMPDIR", str(tmpdir))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmpdir))
+    assert not tmpdir.is_relative_to(backend)
+    runner = RecordingRunner()
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(),
+        validation=(SUITE,),
+        command_runner=runner,
+    )
+
+    service = executor._advisory_for(
+        make_task(validation=(SUITE,), validation_cwd="backend"), worker_git(worker_repo)
+    )
+    text = service.run()
+
+    assert service.cache_dir is None
+    assert "inside the tree being validated" in service.cache_error
+    assert list(tmpdir.iterdir()) == []
+    assert runner.calls and runner.calls[0]["cwd"] == str(backend)
+    assert ("-p", "no:cacheprovider") in pairs(runner.calls[0]["argv"])
+    assert "pytest cache could not be used" in text
+
+
+def test_a_temp_root_symlinked_into_the_tree_is_refused_too(worker_repo, tmp_path):
+    """`is_relative_to` compares path PARTS and follows nothing, so a temp root
+    that is a symlink into the checkout is lexically outside it — the assertion
+    below — and physically inside. Where the bytes LAND is the only question the
+    gate asks, so the comparison runs over resolved paths as well as written
+    ones (`_path_forms`).
+
+    The refused directory is removed through the link, so the tree is left
+    exactly as it was found."""
+    target = worker_repo / "cache-target"
+    target.mkdir()
+    link = tmp_path / "linked-tmp"
+    link.symlink_to(target, target_is_directory=True)
+    assert not link.is_relative_to(worker_repo), "a lexical check would accept this"
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=worker_repo,
+        command_runner=runner,
+        cache_root=link,
+        repo_root=worker_repo,
+    )
+
+    service.run()
+
+    assert service.cache_dir is None
+    assert "inside the tree being validated" in service.cache_error
+    assert list(target.iterdir()) == []
+    assert ("-p", "no:cacheprovider") in pairs(runner.calls[0]["argv"])
 
 
 def test_a_cache_failure_can_never_leave_a_rerun_behind(worker_repo, tmp_path):
