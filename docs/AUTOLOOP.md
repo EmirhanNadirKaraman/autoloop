@@ -173,3 +173,138 @@ forecloses nothing; the aggregation (`dashboard.projects_status`, and
 `render_projects_text` / `projects_json` over it) is deliberately separate from
 its front door so that a later `--projects` mode of the dashboard renders the
 same rows rather than re-deriving them.
+
+---
+
+## Reading a self-upgrade boundary in the transcript
+
+A merge that touches `autoloop/` changes the code the loop is running, and a
+live Python process does not notice. So `auto_merge` writes one
+`pending_upgrade.json` record (`self_upgrade_pending`), the orchestrator offers
+a **boundary** at the next `ready` phase with no packet in flight
+(`self_upgrade_boundary`), and the process replaces itself with `os.execv` —
+same pid, same lock.
+
+**Every boundary is now followed by at least one outcome entry**, named
+`self_upgrade_<outcome>`. Exactly one, except for a refused replacement:
+`self_upgrade_exec` is written *before* `os.execv` — it has to be, there is no
+"after" in a process that has been replaced — so an `execv` that raises leaves
+the pair `exec` then `exec_failed`, in that order. If you find a boundary with
+nothing after it at all, the process was running a build older than 2026-08-30;
+that silence is the whole subject of this section.
+
+| Entry | What happened | What the record does |
+|---|---|---|
+| `self_upgrade_exec` | replaced, `argv` in the entry | settled `execed` (one shot) |
+| `self_upgrade_unapplicable` | the merge moved a different checkout, or named a `repo_root` this process cannot resolve | **stays pending** |
+| `self_upgrade_preflight_failed` | the merged tree does not import | **stays pending**, `detail` carries the error |
+| `self_upgrade_exec_failed` | marker unwritable, lock unarmable, or `execv` refused | **stays pending** |
+| `self_upgrade_deferred` | this process may not hand off | **stays pending** |
+| `self_upgrade_none` | nothing pending was left to act on, or its `base_sha` is not a usable key | left exactly as found |
+
+**No outcome but `exec` ends the process, and no outcome but `exec` settles the
+record.** Carrying on means carrying on with the code it has, which was working
+a second ago; exiting is the one response that guarantees no further work
+happens. A failed preflight in particular is *reported and refused*, never fatal
+— replacing a working loop with a tree that cannot start is the failure that
+check exists to prevent.
+
+**Every refusal is retryable by the next process**, and that is the 2026-08-27
+lesson stated as a rule: a refused handoff is a fact about the process that
+refused it, not a judgement the next one inherits. One launch could not hand off
+at 08:13:47 and the next exec'd the *same record* at 08:15:30. Until 2026-08-31
+the three non-`deferred` outcomes wrote themselves into `status`, which took the
+sha out of `pending` for good — and `_self_upgrade_due` only ever offers
+`pending`, so the merged code sat on disk with nothing left to run it. They now
+leave the record alone; `detail` records the outcome (`preflight_failed: rc=1
+SyntaxError…`) so the state dir says why without a trip to the transcript. A
+record on disk that still says `preflight_failed`, `unapplicable` or
+`exec_failed` was settled by an older build: it is not offered, and clearing the
+file is the way to re-arm it.
+
+The exception is a refusal *after* the one-shot marker was written (an unarmable
+lock, an `execv` that raised). Those restore `pending` explicitly, and if that
+write fails the record is **removed** rather than left saying `execed` — a
+delayed restart costs less than `_confirm_self_upgrade` retiring a replacement
+that never happened. The entry says `REMOVED` when it happens; a plain process
+start picks the merged code up.
+
+**`deferred` is the outcome an operator acts on directly.** It means the
+boundary was reached by a **single-round** `run` — `run` with no `--continuous`,
+and therefore also `--retry`, `--answer`, `--resubmit` and `resume`, all of
+which funnel into the same path. Such a process cannot hand off, because its own
+command line manages ONE round: `--kickoff` refuses a session that now exists
+and `--answer` refuses a phase that is no longer `needs_user`, so the successor
+would die on a `StateError` instead of continuing the loop. Nothing about the
+merged tree has been judged, so nothing is settled: the loop finishes the
+session it is in, and the upgrade waits. Perform it with
+
+    python -m autoloop start          # or: run --continuous
+
+which reaches the same boundary and execs the same record.
+
+Until 2026-08-30 that path did not defer — it **returned**, ending the process
+mid-session with no entry at all, and `run`'s ordinary exit then published the
+heartbeat `stopped`, which is deliberately not an attention status ("you stopped
+it, you know"). On 2026-08-27 that took the loop down at 08:13:47 and it stayed
+down until an operator ran `start` by hand at 08:15:26 — the same record exec'd
+four seconds later, which is what proves the merge was fine and the *path* was
+not.
+
+**The loop cannot restart in a circle.** Three separate bounds, none of them a
+timer:
+
+1. **`execed` is a one-shot.** A record saying it is never offered again, so a
+   successor that dies before completing one iteration is not retried;
+   `_confirm_self_upgrade` retires the marker after one full pass under the
+   merged code, and only then.
+2. **Every answered boundary is declined for its `base_sha` in the process that
+   answered it** — `Orchestrator.decline_self_upgrade`, carried across the
+   per-iteration orchestrator rebuild by `_run_continuous`'s
+   `answered_upgrades`. This is what a retryable record needs and where the
+   whole spin bound now lives: in memory, per process, saying nothing about the
+   next one. So a refused handoff costs at most one preflight (one subprocess,
+   120s ceiling) and one entry per process, not one per round.
+
+   The sha declined is **the one the decision acted on**, plus the one the loop
+   read on its way in — *the two reads can disagree*. `_run_continuous` reads
+   `pending_upgrade.json` before the boundary and
+   `cli._self_upgrade_at_boundary` reads it again to decide, so a merge landing
+   between them (or an operator editing the state dir) means record B is
+   refused where record A was read. The decision therefore returns which record
+   it acted on — `cli.UpgradeOutcome`, a `str` subclass carrying `base_sha` and
+   `candidate_sha`, so it is still the outcome slug everywhere else — and both
+   shas are declined. Declining the extra one costs at most a retry by the next
+   process, since the record stays `pending` on disk and the decline is in
+   memory; declining neither is the unbounded spin. When the decision acted on
+   nothing (`none`), it returns no identity and the pre-read sha is the only
+   key there is, which is why that read stays.
+3. **A record with no usable `base_sha` is never offered at all.** Every bound
+   above is keyed on that sha, so a record without one could not be declined and
+   would be offered forever. Nothing the merger writes lacks one.
+
+   "Usable" is one predicate, `auto_merge.upgrade_bound_sha`: a non-empty
+   `str`. `UpgradeStore.load` builds the record with `PendingUpgrade(**data)`
+   and coerces nothing, so a hand-edited or half-written file can put a `dict`,
+   a `list`, an `int` or `null` in that field — and the loop then dies *between*
+   `self_upgrade_boundary` and any outcome, which is the silence this whole
+   section exists to end: `[:12]` on the exec path raises `TypeError` for a
+   dict, an int or null, and `set.add`/`in` raise it for a list or a dict.
+   `_self_upgrade_due` refuses to offer such a record; the two `cli` readers
+   check again, because each of them makes its own **second read** of a file
+   that is mutable between the two. At the boundary itself the outcome is
+   `self_upgrade_none` naming the type it found, **nothing is written** (the
+   malformed record is the evidence for fixing it), and the loop carries on with
+   the code it has.
+
+A later merge is a different `base_sha` and does get its own boundary — which is
+also the unstick path for a tree that fails its preflight: `auto_merge`
+overwrites the record when the fix merges, and the new sha is offered normally.
+
+**The successor's command line is `python -m autoloop run --continuous`**, plus
+`--config` and `--null-executor` when this process had them — rebuilt, not the
+verb you typed. `os.execv` preserves the pid and the lock is never released
+(that is the point), so a successor re-running `start` would read a live lock
+naming itself, print "already running — nothing to do" and exit: a successful
+handoff that still ends the loop. It is recorded in the `argv` field of
+`self_upgrade_exec`.
