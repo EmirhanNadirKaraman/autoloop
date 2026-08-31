@@ -1926,17 +1926,33 @@ def test_pre_commit_failures_consume_the_attempt_budget_across_restart(tmp_path)
 # =============================================================================
 
 
-def test_worker_environment_drift_precondition_is_not_the_browser_check(tmp_path):
-    """Old behaviour (the bug): `worker_environment_drift` mapped to
-    `_precondition_browser`, whose checks (cdp/playwright/provider/
-    conversation_url/browser_live) never inspect git hooks or worker
-    isolation at all. New behaviour: a DEDICATED recheck that reuses
+def test_worker_environment_drift_precondition_is_not_the_transport_check(tmp_path):
+    """Old behaviour (the bug): `worker_environment_drift` mapped to the
+    transport recheck (`_precondition_browser` then, whose checks were
+    cdp/playwright/provider/conversation_url/browser_live;
+    `_precondition_transport_live` since brw-19d, whose rows are
+    `primary_live`/`provider`/`codex_command`). Neither generation inspects git
+    hooks or worker isolation at all, so ANY answer text resolved this blocker
+    regardless of whether the environment it describes was still broken. New
+    behaviour: a DEDICATED recheck that reuses
     `verify_worker_isolation` against a real throwaway probe repo, so it can
     actually distinguish a still-broken worker environment from a fixed
-    one — independent of whether a browser happens to be reachable."""
-    from autoloop.cli import _RESOLUTION_PRECONDITIONS, _precondition_browser
+    one — independent of whether a transport happens to be reachable.
 
-    assert _RESOLUTION_PRECONDITIONS["worker_environment_drift"] is not _precondition_browser
+    Named by IDENTITY against the live symbol rather than by the old name: an
+    alias kept for compatibility would make this assertion pass vacuously,
+    which is why brw-19d renamed without leaving one."""
+    from autoloop import cli as cli_module
+    from autoloop.cli import _RESOLUTION_PRECONDITIONS, _precondition_transport_live
+
+    assert not hasattr(cli_module, "_precondition_browser"), (
+        "the renamed-away symbol must not survive as an alias — this test and "
+        "the transport tests in test_blockers.py would both stop discriminating"
+    )
+    assert (
+        _RESOLUTION_PRECONDITIONS["worker_environment_drift"]
+        is not _precondition_transport_live
+    )
 
     repo_root = real_repo(tmp_path)
     precondition = _RESOLUTION_PRECONDITIONS["worker_environment_drift"]
@@ -2152,6 +2168,77 @@ def test_worker_isolation_violation_precondition_reuses_worker_environment_drift
         _RESOLUTION_PRECONDITIONS["worker_isolation_violation"]
         is _precondition_worker_environment_drift
     )
+
+
+def test_git_failure_budget_precondition_is_not_the_transport_check():
+    """Finding #7's shape, one code over, closed by brw-19d.
+
+    `git_failure_budget_exhausted` is `state.consecutive_failures` past
+    `policy.max_consecutive_failures` — a statement about GIT — and it was
+    mapped to the transport recheck, whose rows (`primary_live`, `provider`,
+    `codex_command`) say nothing about a repository. The mismatch cut both
+    ways: a dead reviewer seat made the blocker unanswerable, and a live one
+    cleared it while git was still broken.
+
+    Asserted as a THREE-WAY split rather than as one `is not`. The codes that
+    genuinely are about the transport must still route to the transport check —
+    a fix that simply unhooked everything would satisfy a bare inequality while
+    disarming `login_expired`."""
+    from autoloop.cli import (
+        _RESOLUTION_PRECONDITIONS,
+        _precondition_git_health,
+        _precondition_transport_live,
+    )
+
+    for code in ("login_expired", "submission_ambiguous", "browser_unattachable"):
+        assert _RESOLUTION_PRECONDITIONS[code] is _precondition_transport_live, code
+
+    entry = _RESOLUTION_PRECONDITIONS["git_failure_budget_exhausted"]
+    assert entry is not _precondition_transport_live
+    assert entry is _precondition_git_health
+    # ...and it is still PRESENT. Dropping the key would also satisfy the line
+    # above, and would make the code resolvable on answer text alone — the
+    # fail-open `test_security_and_environment_codes_all_have_a_precondition`
+    # below exists to forbid.
+    assert "git_failure_budget_exhausted" in _RESOLUTION_PRECONDITIONS
+
+
+def test_the_transport_precondition_grades_only_rows_doctor_can_emit():
+    """The required/optional split is what keeps this guard from switching
+    itself off, so the tuples themselves are pinned here.
+
+    The predecessor whitelist filtered `status != "ok" and name in <tuple>`, so
+    a name doctor stopped emitting became a name that could never fail —
+    `browser_live` (renamed away 2026-08-01) and then `cdp`/`playwright`/
+    `conversation_url` (brw-19c) each took one more member out of service, and
+    the last removal would have left the filter matching nothing and clearing
+    every transport blocker on text alone.
+
+    Three claims, all about the constants rather than about a run: no retired
+    browser name has survived in any tier; `fallback_live` is graded FAIL-ONLY
+    rather than required, because it is `warn` on any deployment that
+    configures no fallback and requiring it `ok` would wedge those deployments
+    forever; and no name sits in two tiers, which would make one tier's rule
+    silently unreachable. That doctor really does emit the required rows is
+    proved against a live sweep in `test_doctor.py`, not asserted here."""
+    from autoloop.cli import (
+        _TRANSPORT_PRECONDITION_CHECKS,
+        _TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS,
+        _TRANSPORT_PRECONDITION_OPTIONAL_CHECKS,
+    )
+
+    tiers = (
+        set(_TRANSPORT_PRECONDITION_CHECKS),
+        set(_TRANSPORT_PRECONDITION_OPTIONAL_CHECKS),
+        set(_TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS),
+    )
+    everything = set().union(*tiers)
+    retired = {"cdp", "playwright", "browser_live", "conversation_url", "project_url"}
+    assert not (everything & retired), sorted(everything & retired)
+    assert sum(len(tier) for tier in tiers) == len(everything), "a name is in two tiers"
+    assert set(_TRANSPORT_PRECONDITION_CHECKS) == {"primary_live", "provider"}
+    assert "fallback_live" in set(_TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS)
+    assert "fallback_live" not in set(_TRANSPORT_PRECONDITION_CHECKS)
 
 
 def test_security_and_environment_codes_all_have_a_precondition():
