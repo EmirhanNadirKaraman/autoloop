@@ -626,6 +626,13 @@ class LoopState:
     #: began it.
     rate_limit_retry_not_before: str | None = None
     parse_retries: int = 0
+    #: Consecutively refused directives in THIS session, spent against
+    #: `policy.max_policy_denials` by all three of `_handle_policy_denial`,
+    #: `_handle_review_mismatch` and the plan-rejection site. Cleared by
+    #: `_step_executing` only after a dispatch that ACTED on the directive —
+    #: never merely because `authorize_directive` allowed one, which is what
+    #: let a directive refused INSIDE `_dispatch` zero the counter it was about
+    #: to spend, and with it the budget (policy-01).
     policy_denials: int = 0
     outbox: str | None = None
     #: The raw patch text embedded in `outbox`, when that payload is a review
