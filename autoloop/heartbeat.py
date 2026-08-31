@@ -17,6 +17,11 @@ So the loop publishes; the monitor judges. The split matters:
   infer them from silence would be both slower and wrong (a pause is not a
   fault).
 
+`publish` also mails the operator on a CHANGE (`notify.py`, `[notify]`, off by
+default). That is the same split said again rather than a new one: the mail
+reports what the loop KNOWS and can never report the loop's own death, because
+a dead loop sends nothing. Only the external monitor sees silence.
+
 Written atomically, and never inside the checkout — see
 `AutoloopConfig.heartbeat_file` for both reasons.
 """
@@ -80,12 +85,31 @@ def write(
         pass
 
 
-def publish(config, state=None, status: str = RUNNING, detail: str = "") -> None:
+def publish(
+    config,
+    state=None,
+    status: str = RUNNING,
+    detail: str = "",
+    *,
+    notify_transport=None,
+) -> None:
     """Write a heartbeat from whatever the caller already has in hand.
 
     Deliberately tolerant: called from the hot loop, so it must not need a
     fully-formed state, a readable blocker directory, or anything else that
     could raise while the loop is mid-round.
+
+    THE ONE CHOKEPOINT, so it is also where the operator's email goes out
+    (notify-01, 2026-08-31). Every status update already passes through here —
+    six call sites, two in `cli.py` and four in `orchestrator.py` — so hooking
+    it means a new call site cannot forget to notify. `notify` sends only on a
+    CHANGE of (status, phase, task id, decision), swallows every failure and is
+    bounded by its own timeout; the `try` below is the second guarantee, not the
+    first. It reports only what the loop KNOWS, and covers death and staleness
+    not at all — see `notify`'s module docstring and the note above.
+
+    `notify_transport` exists for the tests: `None` means the real SMTP
+    transport, and no shipped caller passes anything.
     """
     open_blockers = 0
     try:
@@ -98,11 +122,37 @@ def publish(config, state=None, status: str = RUNNING, detail: str = "") -> None
     if status == RUNNING and open_blockers:
         status = BLOCKED
 
+    phase = getattr(state, "phase", "") or ""
+    session_id = getattr(state, "session_id", "") or ""
+    detail = detail or (getattr(state, "question", "") or "")
+
     write(
         config.heartbeat_file,
         status=status,
-        phase=getattr(state, "phase", "") or "",
-        session_id=getattr(state, "session_id", "") or "",
+        phase=phase,
+        session_id=session_id,
         open_blockers=open_blockers,
-        detail=detail or (getattr(state, "question", "") or ""),
+        detail=detail,
     )
+
+    # AFTER the write, and lazily imported in the same shape as `BlockerStore`
+    # above: publishing the beat is what the monitor depends on, so nothing in
+    # the notification path — including failing to import it — may stand
+    # between the loop and that file.
+    try:
+        from . import notify as _notify
+
+        _notify.notify_status_change(
+            config,
+            _notify.snapshot(
+                state,
+                status=status,
+                phase=phase,
+                session_id=session_id,
+                open_blockers=open_blockers,
+                detail=detail,
+            ),
+            transport=notify_transport,
+        )
+    except Exception:
+        pass
