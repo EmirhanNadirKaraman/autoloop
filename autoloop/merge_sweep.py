@@ -83,8 +83,12 @@ very likely a branch out there, and this module cannot name it:
   `execution_record_ancestry`, which since witness-01 (2026-08-27) is shared
   with `dashboard.registry_disagreements` so the report and the sweep cannot
   reach different verdicts about the same record.
-* **The record loads but names no candidate.** Completion implies a candidate,
-  so such a record cannot be describing the publication completion implies.
+* **The record loads but names no candidate**, and nothing else names one
+  either. Completion implies a candidate, so such a record cannot be describing
+  the publication completion implies. Since merge-09 the archive is asked for
+  the sha before this is concluded — a re-dispatched stub is exactly this shape
+  and the retirement it replaced named its own sha in the FILENAME (see "a
+  candidate the 2026-08-27 extraction rewrote").
 
 None of the four is ATTEMPTED: there is nothing here this module is allowed to
 merge, and inventing a branch out of a record's own claim is the fail-open
@@ -308,6 +312,60 @@ silence is unchanged. Nothing in what this module MERGES depends on any of it �
 the refusal to sweep past work it cannot judge is exactly as it was, and making
 that refusal visible is the whole change.
 
+## A candidate the 2026-08-27 extraction rewrote
+
+`git filter-repo --path autoloop/` rewrote every commit in this repository and
+migrated NO execution record, so 133 completed tasks still name a
+`candidate_sha` from the OLD history — an object that is not in this object
+database and never will be. Each reported `origin/refs/heads/autoloop/<id> does
+not exist` and the backlog was held for 90 hours on them. The ref message was a
+symptom: the record names a commit no ref anywhere can carry.
+
+Two repairs were tried and reverted. Pushing the 133 refs (2026-08-30) moves the
+answer to `is at <new>, not the candidate` — the same hold one step along, since
+the refs carry the REWRITTEN commits. An ancestor walk from each branch tip, the
+same day, put 8 branches on ANOTHER task's commit: near-in-history is not
+is-the-work.
+
+What answers is `docs/extraction/commit-map.tsv`, filter-repo's own old->new
+map, vendored as evidence (`docs/extraction/PROVENANCE.md`). `_recover` consults
+it, and three rules in one fixed order, for a candidate this checkout does not
+hold:
+
+1. **The record's own sha**, or — when the live record names none, which is what
+   a re-dispatched stub leaves — the sha in the newest ARCHIVED filename
+   (`<id>-reconciled-as-<sha>-<stamp>.json`, `<id>-merged-as-<sha>-<stamp>.json`).
+2. **The commit map**, keyed by that sha. A row mapping to a real commit is
+   judged by ancestry exactly as if the record had named it; a row of forty
+   zeros means the rewrite PRUNED the commit — it touched no path under
+   `autoloop/`, so there is nothing here to merge and nothing that should exist.
+   **A row that is present is FINAL**: mapped-but-not-an-ancestor is
+   `unresolved`, never rescued by rule 3.
+3. **A merge commit on the base head's first-parent chain** whose SUBJECT is
+   `Merge task <id> (<sha>)` — `AutoMerger._merge`'s own wording, which is the
+   loop's record of having integrated that task. Last resort, for a candidate
+   the operator discarded, and reached only after the publication check has
+   already failed: a task that was merged once and RE-dispatched has such a
+   commit in the base while its new branch is genuinely outstanding, and reading
+   the old merge as an answer about the new branch would skip it.
+
+Everything here is gated on the candidate not being an object in this
+repository, so a record git can resolve is judged exactly as it was before —
+including the ordinary case of a candidate this checkout has simply never
+fetched, which still goes to the remote and then to `_ensure_object`.
+
+FAIL CLOSED, everywhere. A map that is missing, unreadable or empty resolves
+NOTHING; an abbreviated sha matching more than one row resolves nothing; a
+first-parent walk that could not be completed resolves nothing; and no rule here
+clears a task on a written claim, on a task id appearing in a commit BODY, or on
+an ancestor walk from a branch tip. Each of those leaves the task `unresolved`,
+which is what it was before this existed.
+
+Nothing here MERGES. Every verdict is either "the branch is accounted for in the
+base", "the commit does not exist in this repository at all", or "still
+unresolved" — no candidate reaches `AutoMerger.attempt` through these rules,
+because the commit they are about is one nothing can merge from.
+
 ## Failure discipline
 
 Identical to `auto_merge.py`'s, and for the same reason: this runs at startup,
@@ -318,6 +376,7 @@ run from starting, so every failure swallows to a transcript entry.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -392,6 +451,14 @@ SWEEP_CLEARED_EVENTS = (
     SWEEP_DEFERRED_EVENT,
     SWEEP_STOPPED_EVENT,
 )
+
+#: One line per completed task a rule in "a candidate the 2026-08-27 extraction
+#: rewrote" answered for. Deliberately NOT silent, unlike the ordinary
+#: already-integrated case: these tasks held every sweep for 90 hours, and an
+#: operator repairing the records needs to see which rule answered for which
+#: task and on what sha. It is a LOG line and nothing else — the sweep merges
+#: nothing because of it.
+SWEEP_RECOVERED_EVENT = "merge_sweep_candidate_recovered"
 
 #: The only two per-branch outcomes the sweep continues past. Everything else
 #: — conflict, failed verification, deferral, a publication that stopped being
@@ -529,6 +596,14 @@ class BacklogSweeper:
         self._execution_store = execution_store
         self._registry = registry
         self._log = log
+        #: Read once per sweeper, and only when a candidate this checkout does
+        #: not hold actually needs them. `()` is "not looked at yet" and
+        #: `(value,)` is "looked at, and this is the answer" — a one-cell tuple
+        #: rather than `None`, because `merge_commit_subjects` answers `None`
+        #: for a walk it could not complete and that answer has to be memoized
+        #: as readily as a successful one.
+        self._commit_map_cache: tuple = ()
+        self._merge_index_cache: tuple = ()
         self._merger = merger or AutoMerger(
             config=config,
             git=git,
@@ -815,11 +890,22 @@ class BacklogSweeper:
                 # published — that is what completion means here. One that does
                 # not cannot be describing this task's publication, so the
                 # branch behind it is unaccounted for rather than absent.
+                #
+                # Except that a RE-DISPATCH leaves exactly this: an empty stub
+                # over a task whose earlier work was retired, and whose archived
+                # FILENAME still names the sha it was retired over (dash-02,
+                # pkt-02, pkt-03, audit-0001). There is no publication to check
+                # here — the record names no branch at all — so both the
+                # filename and the merge-subject rules are available at once.
+                recovery = self._recover(head, task_id, "", merge_commit=True)
+                if recovery.verdict in CANDIDATE_RESOLVED:
+                    self._log_recovered(task_id, recovery)
+                    continue
                 self._unresolved(
                     result,
                     task_id,
                     "its execution record names no candidate, though completion "
-                    "means one was published",
+                    f"means one was published — {recovery.detail}",
                 )
                 continue
             # ANCESTRY, and nothing else, decides merged-ness. Silent on
@@ -828,9 +914,42 @@ class BacklogSweeper:
             # would bury the handful that actually need integrating.
             if self._is_integrated(head, record.candidate_sha):
                 continue
+            # Is the commit the record names even IN this repository? The whole
+            # pre-extraction section hangs off that question and nothing else:
+            # False here is the 2026-08-27 rewrite (or a candidate this checkout
+            # has never fetched, which the publication check below still handles
+            # exactly as it always has), True is an ordinary outstanding branch
+            # that must keep going down the path it has always taken.
+            local = self._candidate_is_local(record.candidate_sha)
+            if not local:
+                recovery = self._recover(
+                    head, task_id, record.candidate_sha, merge_commit=False
+                )
+                if recovery.verdict in CANDIDATE_RESOLVED:
+                    self._log_recovered(task_id, recovery)
+                    continue
+                if recovery.verdict == CANDIDATE_OUTSTANDING:
+                    # The map ANSWERED and the answer was "still outstanding".
+                    # Named, never attempted: the record's own sha is not an
+                    # object anything can merge from, and the ref that would
+                    # carry the rewritten one is not what the record names.
+                    self._unresolved(result, task_id, recovery.detail)
+                    continue
             published, why_not = cli._candidate_publication(
                 self._config, _as_record_dict(record), seen, self._git
             )
+            if not published and not local:
+                # Nothing on the remote carries this candidate AND this
+                # repository does not hold it, which is the shape a discarded
+                # pre-extraction candidate leaves (brw-18). Only now is the
+                # merge-subject rule allowed to look — see `_recover`.
+                recovery = self._recover(
+                    head, task_id, record.candidate_sha, merge_commit=True
+                )
+                if recovery.verdict in CANDIDATE_RESOLVED:
+                    self._log_recovered(task_id, recovery)
+                    continue
+                why_not = f"{why_not}; {recovery.detail}" if recovery.detail else why_not
             if not published:
                 # Completed + unmerged + no branch on the remote carrying this
                 # candidate. `_mark_task_completed` only fires on a confirmed
@@ -899,6 +1018,12 @@ class BacklogSweeper:
         Nothing here is ever merged FROM: an archived record is not a merge
         source, because `AutoMerger.attempt` reads the LIVE record and would
         skip the task anyway. The honest report is the output.
+
+        A `not-in-base` or `absent` verdict is then offered to `_recover_retired`
+        before it is reported, because the 2026-08-27 rewrite renamed the commit
+        an archived record names exactly as it renamed a live one. That recovery
+        can only turn "unresolved" into "accounted for", never into a merge, and
+        the wording of every verdict it does not answer is untouched.
         """
         answer = execution_record_ancestry(
             self._execution_store.directory,
@@ -908,7 +1033,53 @@ class BacklogSweeper:
         )
         if answer.verdict == RECORD_IN_BASE:
             return True, ""
+        recovery = self._recover_retired(head, task_id, answer)
+        if recovery is not None:
+            self._log_recovered(task_id, recovery)
+            return True, ""
         return False, answer.detail
+
+    def _recover_retired(
+        self, head: str, task_id: str, answer: RecordAncestry
+    ) -> CandidateRecovery | None:
+        """The pre-extraction rules, applied to a task whose live record was
+        RETIRED — `None` when they answer nothing, which leaves the verdict and
+        the wording above exactly as they were.
+
+        Reached for the same reason the live-record path is: the 2026-08-27
+        rewrite renamed the commit an archived record names just as thoroughly as
+        the one a live record names, and `execution_record_ancestry` asks git
+        about a sha that is not in this object database. It is deliberately NOT
+        inside that shared function — `dashboard.registry_disagreements` asks it
+        the same question and must keep getting the same answer — so the recovery
+        is the sweep's own, exactly like the ancestry callable it injects.
+
+        The merge-subject rule IS allowed here, unlike on the live path. There is
+        no publication to check and no branch to skip: a retired record is never
+        a merge source (`AutoMerger.attempt` reads the LIVE record), so the only
+        two endings are "accounted for" and "unresolved", and no confirmed branch
+        can be lost by looking.
+
+        MORE THAN ONE sha and this refuses outright. `_record_verdict` requires
+        EVERY copy in a tied generation to be integrated, precisely because two
+        retirements inside the same second cannot be ordered; taking any-one-of
+        here would be a weaker rule wearing the same name.
+        """
+        if answer.verdict not in (RECORD_NOT_IN_BASE, RECORD_ABSENT):
+            # `unverified` is "could not look" — an unreadable copy, an archive
+            # that cannot be listed or ordered. Nothing here may turn that into
+            # an answer.
+            return None
+        if len(answer.shas) > 1:
+            return None
+        recovery = self._recover(
+            head,
+            task_id,
+            answer.shas[0] if answer.shas else "",
+            merge_commit=True,
+            named_by="its newest archived execution record",
+        )
+        return recovery if recovery.verdict in CANDIDATE_RESOLVED else None
 
     def _is_integrated(self, head: str, candidate_sha: str) -> bool:
         """Is `candidate_sha` already in the base? An object git cannot resolve
@@ -918,6 +1089,234 @@ class BacklogSweeper:
             return self._git.is_descendant(head, candidate_sha)
         except (GitError, OSError):
             return False
+
+    # ---- a candidate the 2026-08-27 extraction rewrote ----------------------
+    #
+    # The rules themselves are module-level (see the section of that name);
+    # these methods are the sweep's side of them — the ordering, the git
+    # questions, and the one transcript entry they write.
+
+    def _candidate_is_local(self, sha: str) -> bool:
+        """Does THIS repository hold the object the record names?
+
+        The gate on the whole section: a candidate git can resolve is judged
+        exactly as it was before, so nothing here can reach the ordinary case of
+        a branch this checkout has simply never fetched. `object_exists` raises
+        rather than answering when git could not look (an abbreviated name it
+        cannot resolve dies with 128, which is not "absent"), and that is
+        collapsed to False deliberately: the only thing downstream does with
+        False is consult evidence that names the commit some other way, and none
+        of that evidence can merge anything.
+
+        A gateway with no such probe answers False for the same reason and with
+        the same consequence — the rules below are then reached and resolve
+        whatever the map and the archive can prove, which for a gateway that
+        cannot answer this is usually nothing at all.
+        """
+        probe = getattr(self._git, "object_exists", None)
+        if probe is None:
+            return False
+        try:
+            return probe(sha)
+        except (GitError, OSError):
+            return False
+
+    def _commit_map(self) -> CommitMap:
+        """The vendored map, read at most once per sweep. A gateway that will
+        not name its repository root yields a map with an `error`, never one
+        read from `Path.cwd()`: the sweep's checkout is the only place this file
+        is evidence about."""
+        if not self._commit_map_cache:
+            root = getattr(self._git, "repo_root", None)
+            self._commit_map_cache = (load_commit_map(root),)
+        return self._commit_map_cache[0]
+
+    def _merge_subject_index(self, head: str):
+        """`merge_commit_subjects` over the base head, at most once per sweep.
+
+        Memoized because the walk costs one `cat-file` per commit on the
+        first-parent chain and every unrecovered task would otherwise repeat it.
+        Reached only where the sweep is already reporting a task it cannot judge
+        — a failed publication check, a record naming no candidate, a retired one
+        — so the ordinary sweep, every candidate confirmed on the remote, never
+        pays for it at all.
+        """
+        if not self._merge_index_cache:
+            self._merge_index_cache = (merge_commit_subjects(self._git, head),)
+        return self._merge_index_cache[0]
+
+    def _recover(
+        self,
+        head: str,
+        task_id: str,
+        candidate_sha: str,
+        *,
+        merge_commit: bool,
+        named_by: str = "its execution record",
+    ) -> CandidateRecovery:
+        """What the evidence OUTSIDE this checkout's object database says about
+        a candidate the object database does not hold.
+
+        The order is fixed and each step is tried once: the sha the record
+        names, or the one the newest archived FILENAME names when the record
+        names none; then the commit map; then — only when `merge_commit` — a
+        merge commit on the base head's first-parent chain.
+
+        `merge_commit` is False on the first pass and True only after the
+        publication check has failed, and that is not an optimisation. A task
+        that was merged once and RE-dispatched carries `Merge task <id>` in the
+        base while its NEW branch is genuinely outstanding and confirmed on the
+        remote; reading the old merge as an answer about the new branch would
+        skip a branch the sweep exists to merge.
+
+        Every step that cannot answer appends its reason and the next is tried.
+        Nothing is guessed at, and a run out of steps is `CANDIDATE_UNRECOVERED`
+        — which leaves the task exactly where it was before this existed.
+        """
+        tried: list[str] = []
+        sha = str(candidate_sha or "")
+        rule = RULE_RECORD
+        if not sha:
+            sha, source, why_not = archived_candidate_sha(
+                self._execution_store.directory, task_id
+            )
+            named_by, rule = f"its newest archived record ({source})", RULE_ARCHIVE
+            if not sha:
+                tried.append(why_not)
+        if sha:
+            answer = self._judge_recovered_sha(head, sha, named_by, rule, tried)
+            if answer is not None:
+                return answer
+        if merge_commit:
+            answer = self._judge_merge_subject(head, task_id, tried)
+            if answer is not None:
+                return answer
+        return CandidateRecovery(
+            CANDIDATE_UNRECOVERED, "; ".join(reason for reason in tried if reason)
+        )
+
+    def _judge_recovered_sha(
+        self, head: str, sha: str, named_by: str, rule: str, tried: list
+    ) -> CandidateRecovery | None:
+        """One sha, judged: by ancestry when this repository holds it, and
+        otherwise through the map. `None` means "no answer, try the next rule",
+        with the reason appended to `tried`.
+
+        **A row in the map is FINAL.** Mapped to a commit that is not an
+        ancestor is `outstanding` — an honest "this branch may still need
+        merging" — and is deliberately not passed on to the merge-subject rule:
+        the map is the authoritative link between the two histories, and letting
+        a commit subject overrule it would be exactly the written-claim
+        clearance this section refuses.
+        """
+        if self._candidate_is_local(sha):
+            if self._is_integrated(head, sha):
+                return CandidateRecovery(
+                    CANDIDATE_IN_BASE,
+                    f"{named_by} names {sha[:12]}, which is an ancestor of "
+                    f"{head[:12]} — the branch is accounted for in the base",
+                    sha=sha,
+                    rule=rule,
+                )
+            return CandidateRecovery(
+                CANDIDATE_OUTSTANDING,
+                f"{named_by} names {sha[:12]}, which this checkout holds and "
+                f"which is not an ancestor of {head[:12]} — the branch may still "
+                "be outstanding; merge it by hand",
+                sha=sha,
+                rule=rule,
+            )
+        commit_map = self._commit_map()
+        if commit_map.error:
+            tried.append(commit_map.error)
+            return None
+        new, why_not = commit_map.lookup(sha)
+        if not new:
+            tried.append(why_not)
+            return None
+        if new == NULL_SHA:
+            return CandidateRecovery(
+                CANDIDATE_PRUNED,
+                f"{named_by} names {sha[:12]}, which {COMMIT_MAP_PATH} records as "
+                "PRUNED by the 2026-08-27 extraction — it touched no path under "
+                "autoloop/, so there is nothing in this repository to merge and "
+                "nothing that should exist",
+                sha=NULL_SHA,
+                rule=RULE_COMMIT_MAP,
+            )
+        if self._is_integrated(head, new):
+            return CandidateRecovery(
+                CANDIDATE_IN_BASE,
+                f"{named_by} names the pre-extraction commit {sha[:12]}, which "
+                f"{COMMIT_MAP_PATH} rewrites to {new[:12]} — an ancestor of "
+                f"{head[:12]}, so the branch is accounted for in the base",
+                sha=new,
+                rule=RULE_COMMIT_MAP,
+            )
+        return CandidateRecovery(
+            CANDIDATE_OUTSTANDING,
+            f"{named_by} names the pre-extraction commit {sha[:12]}, which "
+            f"{COMMIT_MAP_PATH} rewrites to {new[:12]}"
+            + (
+                ""
+                if self._candidate_is_local(new)
+                else " — an object this checkout does not hold —"
+            )
+            + f" and that commit is not an ancestor of {head[:12]}; the work may "
+            "still be outstanding and no ref here can be merged for it",
+            sha=new,
+            rule=RULE_COMMIT_MAP,
+        )
+
+    def _judge_merge_subject(
+        self, head: str, task_id: str, tried: list
+    ) -> CandidateRecovery | None:
+        """The last resort: the loop's own merge commit for this task, on the
+        first-parent chain of the base head.
+
+        The id is matched by dict-key EQUALITY against the id parsed out of the
+        subject, so `pkt-03` can never answer for `pkt-030` and a mention in a
+        commit BODY is not looked at. Found means integrated: everything on that
+        chain is an ancestor of the head by construction.
+        """
+        index = self._merge_subject_index(head)
+        if index is None:
+            tried.append(
+                f"the first-parent chain of {head[:12]} could not be walked, so "
+                "whether a merge commit names this task is unknown"
+            )
+            return None
+        found = index.get(task_id)
+        if found is None:
+            tried.append(
+                f"no merge commit on the first-parent chain of {head[:12]} has "
+                f"the subject `Merge task {task_id} (<sha>)`"
+            )
+            return None
+        merge_sha, named = found
+        return CandidateRecovery(
+            CANDIDATE_IN_BASE,
+            f"the base head reaches merge commit {merge_sha[:12]}, whose subject "
+            f"is `Merge task {task_id} ({named})` — the work was integrated under "
+            "a candidate the execution record no longer names",
+            sha=merge_sha,
+            rule=RULE_MERGE_COMMIT,
+        )
+
+    def _log_recovered(self, task_id: str, recovery: CandidateRecovery) -> None:
+        """One transcript line for a task the rules answered for. Deliberately
+        not silent (see `SWEEP_RECOVERED_EVENT`): the records on disk are wrong,
+        and the operator repairing them needs to see which rule answered."""
+        self._log(
+            SWEEP_RECOVERED_EVENT,
+            data={
+                "task_id": task_id,
+                "verdict": recovery.verdict,
+                "rule": recovery.rule,
+                "sha": recovery.sha,
+                "detail": recovery.detail,
+            },
+        )
 
     def _publication_order(self, task_id: str, record) -> tuple:
         """`(group, timestamp, task_id)`. See the module docstring."""
@@ -1061,6 +1460,333 @@ def _as_record_dict(record) -> dict:
     return _publication_dict(
         record.candidate_sha, record.intended_remote, record.intended_remote_ref
     )
+
+
+# ---- a candidate the 2026-08-27 extraction rewrote ---------------------------
+#
+# merge-09, 2026-08-31. See the module docstring's section of the same name for
+# WHY these rules exist, what they may not do, and what was tried and reverted.
+# This section is the rules themselves; `BacklogSweeper._recover` is where they
+# are ordered and the only thing that calls them.
+
+#: The vendored map, relative to the repository root. filter-repo's own
+#: `.git/filter-repo/commit-map`, copied verbatim — `.git/` is never cloned, so
+#: a worker repository can only reach it because it is TRACKED.
+COMMIT_MAP_PATH = "docs/extraction/commit-map.tsv"
+
+#: What filter-repo writes in the `new` column for a commit the rewrite PRUNED.
+NULL_SHA = "0" * 40
+
+#: The shortest abbreviation this module will look up in the map by prefix. Git's
+#: own default abbreviation length, and the length the archived filenames carry
+#: (`dash-02-reconciled-as-dd28dfa-<stamp>.json`). A shorter prefix is refused
+#: rather than resolved: uniqueness is the real guard, but a two-character
+#: prefix that happens to be unique in a small map is an accident, not evidence.
+MIN_ABBREVIATED_SHA = 7
+
+#: How far `merge_commit_subjects` will walk before giving up. Far past this
+#: repository's first-parent chain; reaching it means the scan is INCOMPLETE,
+#: which is reported as such and clears nothing. A bound at all because the walk
+#: costs one `cat-file` per commit.
+FIRST_PARENT_WALK_CAP = 2000
+
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_HEX = re.compile(r"^[0-9a-f]+$")
+
+#: `AutoMerger._merge`'s own commit message — `f"Merge task {task_id} "
+#: f"({candidate[:12]}) into {base_branch}"` — read back. Anchored at the start
+#: of the SUBJECT, so a task id in a commit BODY can never match, and the id is
+#: a captured group compared by dict-key equality rather than by `in`, so
+#: `pkt-03` never answers for `pkt-030`. The trailing `into <branch>` is not
+#: required: the 91 such commits on this repository's mainline are not
+#: guaranteed to have all been written by the same generation of that code, and
+#: the sha in parentheses is already the discriminating part.
+_MERGE_SUBJECT = re.compile(
+    r"^Merge task ([A-Za-z0-9][A-Za-z0-9._-]{0,63}) \(([0-9a-f]{7,40})\)"
+)
+
+#: The two archive labels that name their own sha in the FILENAME, written by
+#: the reconciler and by a hand-merge. `published-<sha>` is deliberately NOT
+#: here: this rule is the narrow one the four re-dispatched stubs (dash-02,
+#: pkt-02, pkt-03, audit-0001) need, and widening it to every label that happens
+#: to end in hex is a different, larger claim.
+_ARCHIVED_SHA_LABELS = ("reconciled-as", "merged-as")
+
+#: What consulting the map, the archive filename and the merge subjects can
+#: conclude about one completed task's candidate. `PRUNED` is emphatically not
+#: `IN_BASE`: the commit touched no path under `autoloop/`, so there is nothing
+#: here to merge AND nothing that should exist — reporting it as merged would
+#: claim work landed that this repository never contained.
+CANDIDATE_IN_BASE = "in-base"
+CANDIDATE_PRUNED = "pruned"
+CANDIDATE_OUTSTANDING = "outstanding"
+CANDIDATE_UNRECOVERED = "unrecovered"
+
+#: Every verdict `BacklogSweeper._recover` can return, pinned as a tuple so a
+#: caller can assert it knows all of them rather than growing a silent `else`.
+CANDIDATE_VERDICTS = (
+    CANDIDATE_IN_BASE,
+    CANDIDATE_PRUNED,
+    CANDIDATE_OUTSTANDING,
+    CANDIDATE_UNRECOVERED,
+)
+
+#: The two verdicts that mean "this task needs nothing from the sweep". Both are
+#: SKIPS, never merges.
+CANDIDATE_RESOLVED = (CANDIDATE_IN_BASE, CANDIDATE_PRUNED)
+
+#: Which evidence answered, carried on the verdict so the transcript says it.
+RULE_RECORD = "execution-record"
+RULE_ARCHIVE = "archive-filename"
+RULE_COMMIT_MAP = "commit-map"
+RULE_MERGE_COMMIT = "merge-commit"
+
+
+@dataclass(frozen=True)
+class CandidateRecovery:
+    """What the rules concluded about one task's candidate, and from what.
+
+    `detail` is a sentence for an operator on EVERY verdict, including the two
+    that resolve — a reader of the transcript has to be able to see WHICH rule
+    cleared a task and on which sha, because the whole point of the exercise is
+    that the records on disk are wrong and someone is going to repair them.
+
+    `sha` is the commit that ANSWERED (the rewritten one for a map hit, the
+    merge commit for a subject hit), never the old sha the record named — and
+    forty zeros for a PRUNED verdict, because that is literally what the map
+    answered and there is no commit to name.
+    """
+
+    verdict: str
+    detail: str = ""
+    sha: str = ""
+    rule: str = ""
+
+
+@dataclass(frozen=True)
+class CommitMap:
+    """filter-repo's old->new commit map, parsed once per sweep.
+
+    `error` is an ANSWER — "there is no map to consult" — and not an absence,
+    for the same reason `_ArchivedCopy` keeps its own: a map that silently
+    degraded to "no rows, therefore nothing is pruned" would turn every
+    pre-extraction candidate into an unanswerable one WITHOUT saying so, which
+    is the fail-open this whole section is written against. A `CommitMap` with
+    an `error` answers nothing at all; `lookup` is not even called on one.
+    """
+
+    rows: dict = field(default_factory=dict)
+    error: str = ""
+
+    def lookup(self, sha: str) -> tuple[str, str]:
+        """`(new sha, "")` when the map answers, `("", why not)` when it does
+        not. Exactly one of the two is ever non-empty.
+
+        A full 40-hex key is looked up literally. A shorter one — which is what
+        an archived filename carries — is matched by PREFIX and must hit exactly
+        one row: two rows sharing a prefix is "I cannot tell", and this module
+        does not guess. `MIN_ABBREVIATED_SHA` is the floor below which even a
+        unique hit is refused.
+        """
+        key = str(sha or "").strip().lower()
+        if _FULL_SHA.match(key):
+            new = self.rows.get(key)
+            if new is None:
+                return "", f"{key[:12]} is not in {COMMIT_MAP_PATH}"
+            return new, ""
+        if not _HEX.match(key) or len(key) < MIN_ABBREVIATED_SHA:
+            return "", (
+                f"{key or '(empty)'} is not a sha {COMMIT_MAP_PATH} can be keyed "
+                f"by (40 hex characters, or at least {MIN_ABBREVIATED_SHA} of them)"
+            )
+        matches = sorted(old for old in self.rows if old.startswith(key))
+        if not matches:
+            return "", f"{key} is not in {COMMIT_MAP_PATH}"
+        if len(matches) > 1:
+            return "", (
+                f"{key} is a prefix of {len(matches)} rows in {COMMIT_MAP_PATH}, "
+                "so which commit it names cannot be told"
+            )
+        return self.rows[matches[0]], ""
+
+
+def parse_commit_map(text: str) -> dict[str, str]:
+    """`{old sha: new sha}` out of filter-repo's map file.
+
+    Both columns must be 40 hex characters. That is the whole validation, and it
+    is enough: it drops the `old new` header with no special case, and drops a
+    truncated or re-formatted line rather than reading half of it as a sha.
+
+    A duplicated `old` key with CONFLICTING values is dropped entirely rather
+    than resolved by position — the file is evidence, and a contradiction in it
+    is not something to pick a side of. A duplicate that agrees with itself is
+    kept, since there is nothing to disagree about.
+    """
+    rows: dict[str, str] = {}
+    conflicting: set[str] = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        old, new = parts[0].lower(), parts[1].lower()
+        if not _FULL_SHA.match(old) or not _FULL_SHA.match(new):
+            continue
+        if old in rows and rows[old] != new:
+            conflicting.add(old)
+        rows.setdefault(old, new)
+    for old in conflicting:
+        rows.pop(old, None)
+    return rows
+
+
+def load_commit_map(repo_root) -> CommitMap:
+    """Read and parse the vendored map, or come back saying why not.
+
+    An unreadable, absent or empty map is a `CommitMap` carrying an `error` and
+    no rows. Nothing downstream may treat that as "this commit is not in the
+    map": absence of the map is absence of evidence, and every candidate it
+    would have answered for stays unresolved.
+    """
+    if repo_root is None:
+        return CommitMap(
+            error="the checkout would not name its repository root, so "
+            f"{COMMIT_MAP_PATH} could not be located"
+        )
+    path = Path(repo_root) / COMMIT_MAP_PATH
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return CommitMap(error=f"{COMMIT_MAP_PATH} could not be read ({exc})")
+    rows = parse_commit_map(text)
+    if not rows:
+        return CommitMap(
+            error=f"{COMMIT_MAP_PATH} holds no usable old->new rows"
+        )
+    return CommitMap(rows=rows)
+
+
+def archived_candidate_sha(executions_dir, task_id: str) -> tuple[str, str, str]:
+    """`(sha, source filename(s), why not)` — the sha the NEWEST archived record
+    for `task_id` names in its own FILENAME.
+
+    For the four tasks whose live execution record is an empty re-dispatched
+    stub (dash-02, pkt-02, pkt-03, audit-0001) this is the only thing on disk
+    that names the commit their completion was recorded over. The reconciler
+    wrote it into the label — `<id>-reconciled-as-<sha>-<stamp>.json` — and the
+    record INSIDE names nothing.
+
+    The generation rules are not reimplemented here: `_read_record`,
+    `_is_another_tasks_copy` and `_newest_generation` are the same three the
+    archive has always been read through, and they are the part nobody
+    reconstructs correctly twice. Only the question is new, so only the reading
+    of the FILENAME is new.
+
+    Fail-closed twice over. The label must be one of `_ARCHIVED_SHA_LABELS` and
+    must follow this task's own id, so a sibling whose id shares a prefix cannot
+    answer. And when the newest generation is a TIE — two retirements inside the
+    same second — every copy in it must name the same sha, because there is no
+    way to tell which came last.
+    """
+    archive = Path(executions_dir) / "archive"
+    try:
+        paths = sorted(archive.glob(f"{task_id}-*.json"))
+    except OSError as exc:
+        return "", "", f"its execution archive could not be listed ({exc})"
+    copies = [
+        copy
+        for copy in (_read_record(path) for path in paths)
+        if not _is_another_tasks_copy(copy, task_id)
+    ]
+    if not copies:
+        return "", "", "nothing in its execution archive names a candidate either"
+    newest, why_not = _newest_generation(copies)
+    if not newest:
+        return "", ", ".join(c.name for c in copies), why_not
+    source = ", ".join(c.name for c in newest)
+    shas = [_filename_sha(copy.path, task_id) for copy in newest]
+    if not any(shas):
+        return "", source, (
+            f"its newest archived record ({source}) names no sha in its filename"
+        )
+    if not all(shas) or len(set(shas)) != 1:
+        return "", source, (
+            f"its newest archived records ({source}) name different shas in their "
+            "filenames, so which one describes the retirement cannot be told"
+        )
+    return shas[0], source, ""
+
+
+def _filename_sha(path: Path, task_id: str) -> str:
+    """The sha an archive label names, or `""`.
+
+    Anchored on the task id AND on a whole label from `_ARCHIVED_SHA_LABELS`, so
+    `rt-1-b-reconciled-as-<sha>-<stamp>.json` cannot answer for `rt-1` — the
+    same prefix hazard `_is_another_tasks_copy` documents, closed here by
+    construction rather than by reading the file.
+    """
+    labels = "|".join(re.escape(label) for label in _ARCHIVED_SHA_LABELS)
+    match = re.match(
+        rf"^{re.escape(task_id)}-(?:{labels})-([0-9a-f]{{7,40}})(?:-|$)", path.stem
+    )
+    return match.group(1) if match else ""
+
+
+def merge_commit_subjects(git, head: str, cap: int | None = None):
+    """`{task_id: (merge sha, sha it names)}` for every `Merge task <id> (<sha>)`
+    MERGE commit on the first-parent chain of `head` — or `None` when the walk
+    could not be completed.
+
+    FIRST-PARENT, and that is the whole reason this is cheap and sound at once.
+    `AutoMerger._merge` runs `git merge --no-ff` while the base branch is checked
+    out, so every merge it has ever made is on that chain and its first parent is
+    the base as it was. Walking it therefore finds the loop's own integrations
+    and nothing else — and every commit found is an ancestor of `head` BY
+    CONSTRUCTION, so no second ancestry question is asked and no second failure
+    mode exists.
+
+    `None`, never `{}`, when git would not answer or the cap is reached. An
+    incomplete walk that returned its partial index would report "no merge
+    commit names this task" for a task whose merge is just past where it
+    stopped, which is a false negative dressed as a search — the same collapse
+    `dashboard.commit_subjects` refuses. `None` clears nothing.
+
+    `AttributeError` is caught beside the git failures for that same reason and
+    no other: a gateway that does not implement `read_commit` at all cannot be
+    walked, which is one more way to have looked at nothing. It resolves nothing
+    either way, so the only thing the distinction could change is whether a
+    sweep crashes.
+
+    A commit is only read as an integration when it has TWO OR MORE PARENTS. An
+    ordinary commit whose subject happens to be shaped like a merge's is not one,
+    and the loop's own merges always are.
+    """
+    # Read at CALL time, not bound as a default: the cap is a module constant a
+    # test lowers to reproduce a truncated walk, and a default argument would
+    # have captured its value at import.
+    limit = FIRST_PARENT_WALK_CAP if cap is None else cap
+    index: dict[str, tuple[str, str]] = {}
+    sha = str(head or "")
+    steps = 0
+    while sha:
+        if steps >= limit:
+            return None
+        try:
+            info = git.read_commit(sha)
+        except (GitError, OSError, AttributeError):
+            return None
+        parents = list(info.get("parents") or [])
+        lines = str(info.get("message") or "").splitlines()
+        if len(parents) >= 2:
+            match = _MERGE_SUBJECT.match(lines[0] if lines else "")
+            if match:
+                # `setdefault`: the walk is newest-first, and a task merged more
+                # than once keeps its newest merge. Any of them being on this
+                # chain answers the question equally, so this is a reporting
+                # choice rather than a decision.
+                index.setdefault(match.group(1), (sha, match.group(2)))
+        sha = parents[0] if parents else ""
+        steps += 1
+    return index
 
 
 # ---- one task's execution record, asked about ancestry -----------------------
