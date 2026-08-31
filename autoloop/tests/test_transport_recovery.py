@@ -29,15 +29,10 @@ browser, not because anything under test still rotates.
 
 import json
 import subprocess
+from dataclasses import dataclass
 
 import pytest
 
-from autoloop.browser.observation import (
-    SendObservation,
-    classify_submission,
-    is_send_path,
-    scrub_path,
-)
 from autoloop.cli import _authorize_resubmit
 from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.config_writer import (
@@ -81,6 +76,24 @@ def stop_block(reason="all done"):
     return block({"version": 3, "decision": "stop", "reason": reason})
 
 
+@dataclass
+class Observed:
+    """One network observation, in the shape the optional send-observation
+    capability is contracted to produce: three flat fields and nowhere to put a
+    header, a cookie or a body.
+
+    Declared HERE rather than imported from `browser/observation.py`, which is
+    where it came from until brw-19b. The claim the orchestrator owns is that
+    it copies whatever an adapter reports into the transcript and adds nothing —
+    and that claim is stronger when the object is not the browser's own, since a
+    local class proves `_observation_summary` never reaches for a type it knows.
+    """
+
+    path: str
+    status: int | None = None
+    failure: str = ""
+
+
 class RotatingFakeClient:
     """Conversation double with per-conversation server truth and rotation.
 
@@ -119,7 +132,7 @@ class RotatingFakeClient:
         self.closed = False
         self.send_attempted = False
         self.send_outcome = SendOutcome.UNKNOWN
-        self.send_observations: list[SendObservation] = []
+        self.send_observations: list[Observed] = []
         # Queue consumed one entry per `reconcile_no_response()` call (tail
         # repeats, same convention as `submit_results`). True = "still no
         # assistant turn for this request" (a rotation candidate); False =
@@ -920,26 +933,24 @@ def test_drift_guard_accepts_a_recorded_rotation_and_nothing_else(tmp_path):
 
 
 # ---- 13. observations carry no sensitive metadata ---------------------------
-
-
-def test_observation_vocabulary_cannot_express_a_secret():
-    fields = set(SendObservation.__dataclass_fields__)
-    assert fields == {"path", "status", "failure"}
-    for forbidden in ("headers", "cookie", "cookies", "authorization", "body", "token"):
-        assert forbidden not in fields
-
-
-def test_observed_paths_drop_query_strings():
-    assert scrub_path("https://chatgpt.com/backend-api/conversation?token=SECRET") == (
-        "/backend-api/conversation"
-    )
-    assert "SECRET" not in scrub_path("https://chatgpt.com/backend-api/conversation?token=SECRET")
+#
+# The two unit tests that lived here — the observation dataclass has exactly
+# three fields, and `scrub_path` drops a query string — asserted properties of
+# `browser/observation.py`, and went with brw-19b's removal of this file's
+# import of that package. What the ORCHESTRATOR owes is asserted below and is
+# the half that survives the transport: whatever an adapter reports is copied
+# into the transcript verbatim and nothing is added to it. The scrubbing itself
+# is the adapter's job, pinned wherever that adapter lives.
 
 
 def test_rejected_submission_logs_only_path_status_and_failure(tmp_path):
+    """The transcript row carries EXACTLY the reported fields — asserted as an
+    equality on the key set, so a summariser that started reaching for a
+    `headers` or `cookies` attribute on the observation it was handed would
+    fail here rather than widen the record silently."""
     client = RotatingFakeClient(submit_results=[SubmitResult.REJECTED])
     client.send_observations = [
-        SendObservation(path="/backend-api/conversation", status=429, failure="")
+        Observed(path="/backend-api/conversation", status=429, failure="")
     ]
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
@@ -952,6 +963,7 @@ def test_rejected_submission_logs_only_path_status_and_failure(tmp_path):
     assert rows
     observations = rows[0]["data"]["observations"]
     assert observations == [{"path": "/backend-api/conversation", "status": 429, "failure": ""}]
+    assert set(observations[0]) == {"path", "status", "failure"}
     raw = config.transcript_file.read_text(encoding="utf-8").lower()
     for forbidden in ("cookie", "authorization", "bearer", "session-token"):
         assert forbidden not in raw
@@ -1192,32 +1204,17 @@ def test_restart_preserves_the_timeout_count(tmp_path):
 
 
 # ---- classification unit tests ---------------------------------------------
-
-
-def test_classification_is_conservative():
-    assert classify_submission([]) is SendOutcome.UNKNOWN
-    ok = SendObservation(path="/backend-api/conversation", status=200)
-    bad = SendObservation(path="/backend-api/conversation", status=500)
-    dead = SendObservation(path="/backend-api/conversation", status=None, failure="ERR_FAILED")
-    assert classify_submission([ok]) is SendOutcome.ACCEPTED
-    assert classify_submission([bad]) is SendOutcome.REJECTED
-    assert classify_submission([dead]) is SendOutcome.REJECTED
-    # A window holding both a failure and a success is exactly where a resend
-    # could double-post, so it resolves to UNKNOWN, not to either verdict.
-    assert classify_submission([bad, ok]) is SendOutcome.UNKNOWN
-    assert classify_submission([ok, bad]) is SendOutcome.UNKNOWN
-
-
-def test_send_path_allowlist_is_narrow():
-    assert is_send_path("https://chatgpt.com/backend-api/conversation")
-    assert is_send_path("https://chatgpt.com/backend-api/f/conversation")
-    assert is_send_path("https://chatgpt.com/backend-api/conversation/abc123")
-    # Neighbouring endpoints that are NOT a turn submission.
-    assert not is_send_path("https://chatgpt.com/backend-api/conversation/init")
-    assert not is_send_path("https://chatgpt.com/backend-api/conversation/gen_title")
-    assert not is_send_path("https://chatgpt.com/backend-api/models")
-    assert not is_send_path("https://chatgpt.com/backend-api/accounts/check")
-    assert not is_send_path("https://chatgpt.com/")
+#
+# `classify_submission` and `is_send_path` were unit-tested here — how a window
+# of observations folds to one `SendOutcome`, and which paths count as a turn
+# submission. Both are functions of `browser/observation.py`, reached through
+# this file's import of that package, and both went with it (brw-19b). The
+# vocabulary they answer in is still pinned, in
+# `test_transport_vocabulary.py`; the fold and the allowlist belong to whichever
+# adapter implements the optional send-observation capability. What is asserted
+# HERE is what the orchestrator does with the answer, which is every remaining
+# test in this file: UNCONFIRMED licenses nothing, REJECTED licenses exactly one
+# resend after reconciliation, and a second REJECTED parks.
 
 
 def _raiser(exc):

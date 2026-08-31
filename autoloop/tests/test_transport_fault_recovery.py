@@ -30,11 +30,14 @@ Four properties, and the fourth is the one a rename would fail:
    only in `awaiting`, only after `reconcile` confirms absence, and only within
    a bound (§3);
 4. the browser provider's restart, cooldown and fault-budget behaviour is
-   unchanged, which the untouched `test_rounds_and_restart.py` and
+   unchanged, which the `test_rounds_and_restart.py` and
    `test_transport_recovery.py` suites assert directly and §4 re-checks through
    the new dispatch site. (Conversation rotation was the fourth item on that
    list until brw-15 removed it; §4's browser/codex split is now about the
-   REMEDY each park quotes, not about which recovery each transport gets.)
+   REMEDY each park quotes, not about which recovery each transport gets. The
+   unattachable-browser recovery left the list in brw-19b: it is retained but
+   no longer dispatched to, because detecting the state meant importing
+   `autoloop/browser/` — see `_classify_rate_limit_state`.)
 
 No codex binary is involved: `CodexRunner` is a protocol and every test injects
 a fake, exactly as `test_codex_provider.py` does.
@@ -79,9 +82,11 @@ RESTART_COMMAND = ("python3", "-m", "autoloop.browser.chrome_restart")
 #: Since brw-16 (2026-08-25) no SHIPPED provider is browser-backed, so §4's
 #: "the browser provider is untouched" tests would otherwise be asserting about
 #: a transport that does not exist. What they are really about — that a
-#: browser-backed transport still gets the restart, the cooldown park and the
-#: unattachable recovery, and that a NON-browser one gets none of it — is
-#: unchanged, and this is the seam a browser adapter arrives through now:
+#: browser-backed transport still gets the restart and the cooldown park, and
+#: that a NON-browser one gets neither — is unchanged. (The unattachable
+#: recovery was on that list until brw-19b: it is retained but no longer
+#: dispatched to, because detecting the state meant importing the browser
+#: package.) This is the seam a browser adapter arrives through now:
 #: `register_provider(..., browser_backed=True)`. Using the retired name here
 #: would test nothing, since `transport_is_browser_backed` no longer knows it.
 BROWSER_PROVIDER = "fake_browser_for_fault_tests"
@@ -208,12 +213,11 @@ def build(
         task_store=TaskStore(config.tasks_file),
         manifest_store=ManifestStore(config.manifests_dir),
     )
-    # The one probe in this file's reach that dials a real socket. Stubbed on
-    # the instance to UNMEASURABLE — the job the autouse `_no_live_cdp_probe`
-    # conftest fixture did for the whole suite until brw-16 removed it (see
-    # `conftest.py` for why it could not stay there). Tests that describe a
-    # particular browser assign their own afterwards.
-    orch._attachable_page_targets = lambda: None
+    # Nothing to blind here any more. This file's reach used to include one
+    # probe that dialled a real socket — `_classify_rate_limit_state`'s CDP
+    # page-target count — and every orchestrator built here was stubbed to
+    # UNMEASURABLE first. brw-19b removed the probe with the orchestrator's last
+    # import of `autoloop/browser/`, so the classifier asks only the client.
     return orch, store, config
 
 
@@ -904,9 +908,19 @@ def test_the_browser_provider_still_parks_on_the_cooldown(tmp_path, restarts):
     assert "chrome_restart" in (orch.state.question or "")
 
 
-def test_a_browser_rate_limit_still_reaches_the_unattachable_recovery(tmp_path, restarts):
-    """The rate-limit guard added for non-browser transports must not disable
-    the browser's own zero-target recovery."""
+def test_a_browser_rate_limit_backs_off_and_reaches_no_recovery_at_all(tmp_path, restarts):
+    """The browser arm of `_handle_rate_limited`, after brw-19b.
+
+    It used to have a second exit: zero attachable page targets meant the limit
+    was not a limit, and `_recover_unattachable_browser` restarted Chrome
+    instead of waiting. Detecting that meant dialling the CDP endpoint through
+    `autoloop/browser/`, so the exit went with the import. What is left for a
+    browser-backed transport whose page cannot answer is what an unmeasurable
+    endpoint always produced: back off, restart nothing.
+
+    Asserted here as well as in `test_rounds_and_restart.py` because THIS file
+    owns the guard that the two transports get different recoveries — and a
+    guard is worth as much as the map of what it guards."""
     orch, store, config = build(
         tmp_path,
         PlainClient(),
@@ -915,20 +929,30 @@ def test_a_browser_rate_limit_still_reaches_the_unattachable_recovery(tmp_path, 
         restart_command=RESTART_COMMAND,
         restart_cooldown_seconds=0.0,
     )
-    orch._attachable_page_targets = lambda: 0
     orch._sleep = lambda seconds: None
 
     orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
 
-    assert restarts == [list(RESTART_COMMAND)]
+    assert restarts == [], "no browser is restarted for a throttle any more"
+    assert orch.state.rate_limit_backoffs == 1, "it backs off instead"
+    assert rows(config, "browser_unattachable") == []
+    limited = rows(config, "rate_limited")
+    assert limited and limited[-1]["data"]["classification"] == "throttled"
 
 
 def test_a_rate_limit_on_a_non_browser_transport_never_restarts(tmp_path, restarts):
     """A codex transport does not raise `RateLimitedError` today
-    (`codex/protocol_errors.py` says so explicitly). If one ever does, the
-    classification's third world — reached by dialling `browser.cdp_url`, which
-    answers about whatever Chrome happens to be running on this HOST — must not
-    turn it into a browser restart."""
+    (`codex/protocol_errors.py` says so explicitly). If one ever does, it must
+    not be classified from browser evidence, and the park it can reach must not
+    quote any.
+
+    The classification used to have a third world reached by dialling
+    `browser.cdp_url` — which answers about whatever Chrome happens to be
+    running on this HOST, nothing to do with the transport that raised — and
+    this guard was what kept a codex fault away from it. That world is gone
+    (brw-19b), and the guard still earns its place: the two remaining worlds
+    are evidence about a PAGE, and a codex run has none, so its evidence is
+    written here instead of being asked for."""
     orch, store, config = build(
         tmp_path,
         PlainClient(),
@@ -937,7 +961,6 @@ def test_a_rate_limit_on_a_non_browser_transport_never_restarts(tmp_path, restar
         restart_command=RESTART_COMMAND,
         restart_cooldown_seconds=0.0,
     )
-    orch._attachable_page_targets = lambda: 0  # a Chrome with no tabs, on this host
     orch._sleep = lambda seconds: None
 
     orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
@@ -964,7 +987,6 @@ def test_the_rate_limit_park_does_not_send_a_codex_run_to_the_browser(tmp_path, 
         restart_command=RESTART_COMMAND,
         restart_cooldown_seconds=0.0,
     )
-    orch._attachable_page_targets = lambda: 0
     orch._sleep = lambda seconds: None
 
     for _ in range(2):
@@ -1089,7 +1111,7 @@ def test_the_browser_rate_limit_park_keeps_its_exact_wording(tmp_path, restarts)
         state=state_in(Phase.AWAITING, pending_request=pending(submitted=True)),
         policy=PolicyConfig(max_rate_limit_backoffs=1),
     )
-    orch._sleep = lambda seconds: None  # `_attachable_page_targets` stays None
+    orch._sleep = lambda seconds: None  # no client is held, so nothing is probed
 
     for _ in range(2):
         orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
