@@ -27,3 +27,4 @@ _None recorded yet in this repository._
 | Date | Task | Note |
 |---|---|---|
 | 2026-08-27 | split | extracted from language-app with git filter-repo, 414 commits of history preserved; this tracker seeded here. |
+| 2026-08-31 | brw-19c | `autoloop/cli.py:_precondition_browser` — a name-whitelist recheck is disarmed by deleting the checks it names, and nothing fails while it happens. Severity: medium; a blocker recording an unresolved ENVIRONMENT fault becomes resolvable by answer text alone, which is Autoloop M1 finding #7's exact shape. Verify: answering a `login_expired` blocker must be REFUSED while the configured provider cannot be opened. Fixed here — the whitelist is `_BROWSER_PRECONDITION_CHECKS`, led by `primary_live`, which `run_doctor` still emits; `cdp`/`playwright` are retained but dead. |

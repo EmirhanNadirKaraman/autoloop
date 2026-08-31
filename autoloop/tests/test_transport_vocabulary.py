@@ -34,6 +34,20 @@ Three claims, and each is here because breaking it fails SILENTLY:
   outside brw-17's approved scope and outside brw-19b's, and repointing those
   two lines belongs to whoever owns them. Scanning it would fail on a state
   this file was told to leave standing.
+
+THE GAP THAT LEAVES, named here so it is visible rather than merely unscanned
+(brw-19c, 2026-08-31). Those two lines are
+`autoloop/codex/conversation.py:83` and
+`autoloop/codex/app_server_conversation.py:62`, both
+`from ..browser.chatgpt import SubmitResult`. They are LIVE imports on the
+transports the loop actually runs, so deleting `autoloop/browser/` breaks both
+adapters at import time — and this file stays green while it happens, because
+the scan below deliberately does not read that directory. Repointing them at
+`autoloop.conversation`, where the vocabulary has lived since brw-17, is a
+one-line change each and belongs to whoever deletes the package. It is NOT
+pinned by a test here on purpose: any test asserting those imports exist
+inverts the moment they are fixed, which is the wrong way round for a thing
+that ought to be fixed.
 """
 
 import re
@@ -51,9 +65,15 @@ PACKAGE_DIR = Path(autoloop.__file__).resolve().parent
 #: OR by absolute one (`from autoloop.browser…`, `import autoloop.browser…`).
 #: Both, deliberately: brw-17's own DONE MEANS greps for the relative form only,
 #: and a guard that watches one spelling is a guard the other spelling walks
-#: past. Deliberately NOT matched: prose and operator advice naming
-#: `autoloop.browser.chrome_restart`, which is a command line rather than a
-#: dependency — `config.RESTART_COMMAND_REPLACEMENT` is the shipped example.
+#: past. Deliberately NOT matched: prose and operator advice naming a module
+#: inside the package as a COMMAND LINE rather than as a dependency. That is
+#: still the right exclusion and it is now a smaller set than it was:
+#: `config.RESTART_COMMAND_REPLACEMENT` used to be the shipped example for
+#: `browser.restart_command` and brw-19c (2026-08-31) deleted it, because an
+#: example naming a module that is going away is advice that cannot work.
+#: `orchestrator.py` still carries the same command in operator-facing park
+#: text (three places) — wrong advice after the package is deleted, not an
+#: import break, and outside brw-19c's approved paths.
 _BROWSER_IMPORT = re.compile(
     r"^\s*(?:from \.{1,2}|from autoloop\.|import autoloop\.)browser(?:[.\s]|$)"
 )

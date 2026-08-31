@@ -7,24 +7,47 @@ CONFIGURATION half and what falls out of it:
 1. a config with no `[browser]` section at all loads;
 2. a config that still HAS one loads, unchanged, and is simply not consulted —
    an operator upgrading mid-flight must not have to edit a file first;
+2b. `restart_command` in particular: still accepted, still shape-checked, still
+   stored verbatim (including a value naming the retired shell helper), and the
+   example the shape check prints no longer points at a module that is going
+   away with the browser package (brw-19c, 2026-08-31);
 3. a `[conversation]` section still naming the retired provider is handled
    EXPLICITLY, never silently;
 4. `autoloop/tests/conftest.py` no longer imports `autoloop`, which is what
    makes `validation.select_validation_commands` able to narrow anything at all.
+
+The direction of §2 is worth stating once, because every test under it looks
+like a test of something inert: what is being defended is that the retirement
+took no KEY with it. `load_config` is strict by design, so a key removed
+becomes `unknown keys in [browser]` on the next start — and that failure lands
+on `status` and `doctor` too, i.e. on exactly the commands an operator would
+reach for to fix it.
 """
 
 from pathlib import Path
 
 import pytest
 
+import autoloop.config as config_module
 from autoloop.config import (
+    RESTART_COMMAND_EXAMPLE,
     RETIRED_BROWSER_PROVIDER,
+    RETIRED_RESTART_SCRIPT,
     BrowserConfig,
     ConversationConfig,
     load_config,
 )
 from autoloop.conversation import available_providers
 from autoloop.errors import ConfigError
+
+#: An operator's own restart command. It was
+#: `["python3", "-m", "autoloop.browser.chrome_restart"]` until brw-19c
+#: (2026-08-31) — the implementation this project shipped, in the package that
+#: is being retired. The value here is deliberately something the loop neither
+#: ships nor recommends, because that is now the only kind of value this key
+#: can honestly hold, and a fixture naming a doomed module would keep the
+#: retirement blocked on this file.
+LEFTOVER_RESTART_COMMAND = ("/opt/autoloop/restart-chrome", "--profile", "autoloop")
 
 #: Every key `[browser]` accepts, written out, so "an unused section is ignored
 #: rather than rejected" is checked against the WHOLE section and not just the
@@ -45,7 +68,9 @@ FULL_BROWSER_SECTION = "\n".join(
         "reconcile_timeout_seconds = 30.0",
         "poll_interval_seconds = 2.0",
         "stability_seconds = 3.0",
-        'restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]',
+        "restart_command = ["
+        + ", ".join(f'"{token}"' for token in LEFTOVER_RESTART_COMMAND)
+        + "]",
         "restart_cooldown_seconds = 120.0",
         "rate_limit_backoff_seconds = 60.0",
         "rate_limit_backoff_max_seconds = 600.0",
@@ -109,13 +134,50 @@ def test_a_config_that_still_has_a_full_browser_section_loads(tmp_path):
 
     assert config.browser.conversation_url == "https://chatgpt.com/c/left-over"
     assert config.browser.project_url.endswith("/project")
-    assert config.browser.restart_command == (
-        "python3",
-        "-m",
-        "autoloop.browser.chrome_restart",
-    )
+    assert config.browser.restart_command == LEFTOVER_RESTART_COMMAND
     assert config.browser.attach_oversized_diff is True
     assert config.migration_notices == (), "an unused section is not a retired key"
+
+
+def test_every_browser_key_survived_the_retirement(tmp_path):
+    """The compatibility contract stated as a SET, not as whichever keys the
+    section above happens to list.
+
+    brw-19c (2026-08-31) removed the last preflight that graded any of these
+    and removed no KEY. Dropping one is the change that breaks an unmigrated
+    deployment loudly and at the worst moment — `load_config` is strict, so a
+    retired key becomes `unknown keys in [browser]` and EVERY command
+    (`status`, `doctor`, the recovery commands) fails on the config the
+    operator would use them to fix. Asserted against the dataclass so a field
+    deleted without a thought about that fails here rather than in the field."""
+    import dataclasses
+    import tomllib
+
+    fields = {f.name for f in dataclasses.fields(BrowserConfig)}
+
+    assert fields == {
+        "conversation_url",
+        "cdp_url",
+        "attach_oversized_diff",
+        "project_url",
+        "composer_timeout_seconds",
+        "input_sync_timeout_seconds",
+        "send_ready_timeout_seconds",
+        "submit_timeout_seconds",
+        "response_start_timeout_seconds",
+        "response_timeout_seconds",
+        "reconcile_timeout_seconds",
+        "poll_interval_seconds",
+        "stability_seconds",
+        "restart_command",
+        "restart_cooldown_seconds",
+        "rate_limit_backoff_seconds",
+        "rate_limit_backoff_max_seconds",
+    }
+    # And the section written out above really does exercise all of them, so
+    # "the whole section loads" keeps meaning what it says rather than meaning
+    # "the subset someone remembered to list loads".
+    assert set(tomllib.loads(FULL_BROWSER_SECTION)["browser"]) == fields
 
 
 def test_an_unknown_key_in_that_section_is_still_refused(tmp_path):
@@ -132,6 +194,74 @@ def test_a_malformed_restart_command_in_that_section_is_still_refused(tmp_path):
         load_config(
             write_config(tmp_path, '[browser]\nrestart_command = "restart.sh"')
         )
+
+
+# ---- 2b. the restart command, after the shipped implementation went away ------
+
+
+def test_the_pasteable_example_names_no_module_in_this_package(tmp_path):
+    """A config error is plausibly the only thing an operator sees — `cli.main`
+    prints `error: <exc>` and nothing else — so the line it hands them has to
+    be one that could work.
+
+    Until brw-19c (2026-08-31) it was
+    `["python3", "-m", "autoloop.browser.chrome_restart"]`, the shipped
+    implementation. That package is being retired, so pasting that line would
+    produce a `restart_command` that fails with `No module named` at the exact
+    moment it is reached — a silent browser, mid-run. The example is a
+    PLACEHOLDER now, and this test is what stops a plausible-looking module
+    path being reintroduced by someone tidying it up."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(write_config(tmp_path, "[browser]\nrestart_command = 7"))
+
+    message = str(excinfo.value)
+    assert "restart_command = [" in message, "still paste-ready"
+    assert "autoloop.browser" not in message
+    assert "autoloop." not in message, "no module in this package is named at all"
+    for token in RESTART_COMMAND_EXAMPLE:
+        assert token in message
+
+
+def test_the_retired_replacement_constant_is_gone(tmp_path):
+    """`config.RESTART_COMMAND_REPLACEMENT` held the module path above. It was
+    never imported anywhere — only quoted — so deleting it breaks nothing, and
+    keeping it would have left this package spelling out a command that stops
+    existing. Pinned as an ABSENCE because the constant is exactly the kind of
+    thing a later round restores by reflex while resurrecting the example."""
+    assert not hasattr(config_module, "RESTART_COMMAND_REPLACEMENT")
+
+
+def test_a_restart_command_still_naming_the_retired_shell_helper_loads(tmp_path):
+    """THE retired-key boundary for this key, and the one that must not tighten.
+
+    `load_config` deliberately does not act on `RETIRED_RESTART_SCRIPT` (brw-08,
+    2026-08-16): the live `.autoloop/config.toml` is not in this repository, so
+    refusing here would make `status`, `doctor` and every recovery command fail
+    on an unmigrated deployment — taking away the tooling needed to migrate it.
+    brw-19c removed browser CHECKS, not this tolerance, and the distinction is
+    the whole task: a value is stored EXACTLY as written, neither refused nor
+    rewritten, and no notice is raised for it either."""
+    config = load_config(
+        write_config(
+            tmp_path, f'[browser]\nrestart_command = ["./scripts/{RETIRED_RESTART_SCRIPT}"]'
+        )
+    )
+
+    assert config.browser.restart_command == (f"./scripts/{RETIRED_RESTART_SCRIPT}",)
+    assert config.migration_notices == ()
+
+
+def test_an_empty_restart_command_is_the_default_and_means_no_auto_restart(tmp_path):
+    """The state every config that never configured one is in, including every
+    config written since the template stopped shipping a `[browser]` section.
+    It has to stay loadable and stay FALSY: `cli._repair_browser` reads
+    emptiness as "say so and stop" rather than as "guess which Chrome to
+    kill"."""
+    assert BrowserConfig().restart_command == ()
+    assert not load_config(write_config(tmp_path)).browser.restart_command
+    assert not load_config(
+        write_config(tmp_path, "[browser]\nrestart_command = []")
+    ).browser.restart_command
 
 
 # ---- 3. a [conversation] section naming the retired provider ------------------
