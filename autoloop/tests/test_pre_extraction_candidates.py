@@ -437,6 +437,121 @@ def test_only_the_NEWEST_archived_generation_answers(fx):
     assert outstanding[:12] in fx.reason("retry-01", result)
 
 
+def test_a_NEWER_archive_naming_no_sha_does_not_hide_an_older_one_that_does(fx):
+    """`audit-0001`, the last of the 133 (2026-08-31). Two archived copies: an
+    older `-reconciled-as-<sha>-<stamp>` naming the commit its completion was
+    recorded over, and a NEWER `-report-recovered-by-operator-<stamp>` naming
+    none. Reading only the newest found nothing and gave up, and the task stayed
+    unjudgeable for want of a file the rule does not even apply to.
+
+    A label carrying no sha is not evidence that no archived label names the
+    commit — the scan passes over it and asks the generation below. Here that
+    yields a sha the map records as PRUNED, which is the real audit-0001
+    answer: its only files were `docs/AUDIT_*.md` at the SOURCE repo root, never
+    under `autoloop/`.
+    """
+    fx.write_map([(OLD_PRUNED, merge_sweep.NULL_SHA)])
+    fx.completed("audit-0001", "")
+    fx.archived("audit-0001", f"reconciled-as-{OLD_PRUNED[:7]}-20260817T230000Z")
+    fx.archived("audit-0001", "report-recovered-by-operator-20260825T120000Z")
+
+    result = fx.sweep()
+
+    assert result.outcome == merge_sweep.NOTHING_TO_DO
+    assert result.unresolved == []
+    assert result.is_clear is True
+    assert fx.merger.attempted == [], "nothing here may be merged"
+    [entry] = fx.recovered()
+    assert entry["task_id"] == "audit-0001"
+    assert entry["verdict"] == merge_sweep.CANDIDATE_PRUNED
+    assert entry["sha"] == merge_sweep.NULL_SHA
+    assert "reconciled-as" in entry["detail"], "the copy that answered is named"
+    assert "report-recovered" not in entry["detail"], (
+        "the newest copy named no sha and did not answer; saying it did would be "
+        "a false statement in the operator's transcript"
+    )
+
+
+def test_the_first_MATCHING_label_answers_even_when_an_OLDER_one_would_resolve(fx):
+    """The fail-open the scan itself could become. It stops at the first label
+    the pattern applies to — NOT at the first sha that happens to resolve — so a
+    superseded reconciliation cannot clear a task whose latest one names work
+    that is still outstanding. Walking on past an unwelcome answer would be a
+    search for good news rather than for evidence."""
+    landed = fx.commit("the abandoned attempt", **{"autoloop/a.py": "one\n"})
+    outstanding = fx.side_commit("autoloop/late", "the retry, never merged")
+    fx.write_map([(OLD_LANDED, landed), (OLD_DISCARDED, outstanding)])
+    fx.completed("scan-01", "")
+    fx.archived("scan-01", f"reconciled-as-{OLD_LANDED[:7]}-20260810T000000Z")
+    fx.archived("scan-01", f"reconciled-as-{OLD_DISCARDED[:7]}-20260812T000000Z")
+    fx.archived("scan-01", "report-recovered-by-operator-20260814T000000Z")
+
+    result = fx.sweep()
+
+    assert [tid for tid, _why in result.unresolved] == ["scan-01"]
+    assert fx.recovered() == []
+    why = fx.reason("scan-01", result)
+    assert outstanding[:12] in why, "the newest label NAMING a sha is the answer"
+    assert landed[:12] not in why, "an older, superseded label may not answer"
+
+
+def test_a_TIE_in_which_only_ONE_copy_names_a_sha_is_refused_not_passed_over(fx):
+    """Passing over a label the pattern does not cover is a rule about ORDER —
+    an older generation answering when a newer one is silent. Inside a single
+    generation there is no order: two retirements written in the same second
+    cannot be told apart, so which of them describes the retirement is exactly
+    what is unknown. Refused, like a tie naming two different shas."""
+    landed = fx.commit("work", **{"autoloop/a.py": "one\n"})
+    fx.write_map([(OLD_LANDED, landed)])
+    fx.completed("tie-01", "")
+    fx.archived("tie-01", f"reconciled-as-{OLD_LANDED[:7]}-20260812T000000Z")
+    fx.archived("tie-01", "report-recovered-by-operator-20260812T000000Z")
+
+    result = fx.sweep()
+
+    assert [tid for tid, _why in result.unresolved] == ["tie-01"]
+    assert fx.recovered() == []
+    assert "do not agree on one sha" in fx.reason("tie-01", result)
+
+
+def test_a_DIGIT_RUN_in_a_label_the_pattern_does_not_cover_is_not_a_sha(fx):
+    """`-report-recovered-by-operator-20260825-` carries a dash-delimited run of
+    hex-shaped characters, and a pattern loosened to "a sha-shaped substring
+    somewhere in the filename" would read it as one. The map here has a row
+    keyed by exactly that run, so a loosened pattern would CLEAR this task; the
+    anchored one answers nothing at all."""
+    landed = fx.commit("work a loose pattern would claim", **{"autoloop/a.py": "1\n"})
+    fx.write_map([("20260825" + "e" * 32, landed)])
+    fx.completed("loose-01", "")
+    fx.archived("loose-01", "report-recovered-by-operator-20260825-20260825T230000Z")
+
+    result = fx.sweep()
+
+    assert [tid for tid, _why in result.unresolved] == ["loose-01"]
+    assert fx.recovered() == []
+    assert fx.merger.attempted == []
+    assert "names no sha in its filename" in fx.reason("loose-01", result)
+
+
+def test_an_UNORDERABLE_archive_is_still_refused_when_the_newest_names_no_sha(fx):
+    """Passing over a label the pattern does not cover must not leak into
+    passing over one that cannot be ORDERED. Dropping the unstamped copy and
+    scanning what is left would answer here — and would be answering from a
+    generation that may not be the newest, which is the whole reason an
+    unorderable archive is refused."""
+    landed = fx.commit("work", **{"autoloop/a.py": "one\n"})
+    fx.write_map([(OLD_LANDED, landed)])
+    fx.completed("ord-01", "")
+    fx.archived("ord-01", f"reconciled-as-{OLD_LANDED[:7]}-20260810T000000Z")
+    fx.archived("ord-01", "report-recovered-by-operator")
+
+    result = fx.sweep()
+
+    assert [tid for tid, _why in result.unresolved] == ["ord-01"]
+    assert fx.recovered() == []
+    assert "cannot be put in order" in fx.reason("ord-01", result)
+
+
 def test_archived_copies_that_cannot_be_ORDERED_answer_nothing(fx):
     """Two generations and one unstamped label: which is newest cannot be told,
     and an unorderable archive is refused rather than guessed at."""
