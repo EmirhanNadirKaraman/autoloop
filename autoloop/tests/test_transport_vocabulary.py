@@ -71,9 +71,20 @@ PACKAGE_DIR = Path(autoloop.__file__).resolve().parent
 #: `config.RESTART_COMMAND_REPLACEMENT` used to be the shipped example for
 #: `browser.restart_command` and brw-19c (2026-08-31) deleted it, because an
 #: example naming a module that is going away is advice that cannot work.
-#: `orchestrator.py` still carries the same command in operator-facing park
-#: text (three places) — wrong advice after the package is deleted, not an
-#: import break, and outside brw-19c's approved paths.
+#:
+#: STILL OUTSTANDING, and left for the round that owns those paths:
+#: `orchestrator.py:3299`, `:11381` and `:11468` spell
+#: `python3 -m autoloop.browser.chrome_restart` in operator-facing park text.
+#: Wrong advice once brw-19a deletes the package, but not an import break — so
+#: the regex above is right to pass them, and this file cannot be the place
+#: they are fixed. Neither can brw-19c: `autoloop/orchestrator.py` is not in
+#: its approved paths, and the strings are PINNED from two more files that are
+#: not either — `test_rounds_and_restart.py:1062` and `:1069` (the second
+#: requires the command to survive `question[:160]`) and
+#: `test_transport_fault_recovery.py:908`, whose module-level `RESTART_COMMAND`
+#: at `:79` is the same argv. Rewording the parks without those three files in
+#: one commit turns three green tests red, which is why it is reported rather
+#: than half-done.
 _BROWSER_IMPORT = re.compile(
     r"^\s*(?:from \.{1,2}|from autoloop\.|import autoloop\.)browser(?:[.\s]|$)"
 )
