@@ -20,13 +20,14 @@ of these arguments" observable rather than asserted.
 """
 
 import inspect
+import os
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from gitrepo import make_repo_from_template
+from gitrepo import make_repo_from_template, run_git
 
 from autoloop import implement_executor
 from autoloop.audit.agents import AgentResult
@@ -54,7 +55,12 @@ from autoloop.implement_executor import (
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import EXECUTION_ABORTED
 from autoloop.tasks import Task
-from autoloop.validation import NOT_RUN
+from autoloop.validation import (
+    CACHE_DIR_INI,
+    NOT_RUN,
+    RERUN_SELECTION_FLAGS,
+    run_validation_commands,
+)
 
 # Sibling test module, importable because pytest's prepend import mode puts this
 # directory on `sys.path` — the same borrowing `test_test_selection.py` already
@@ -67,6 +73,62 @@ from test_implement_executor import (
 
 RUFF = ("ruff", "check", ".")
 SUITE = ("python3", "-m", "pytest", "autoloop/tests")
+
+
+# ---- reading the cache policy off an argv (val-08) --------------------------
+#
+# An advisory pytest run relocates pytest's cache instead of disabling it, so
+# the argv it launches differs from the verdict run's in exactly three tokens
+# plus an optional `--lf`. These read that difference rather than spelling it,
+# and the rerun set is taken from `validation.RERUN_SELECTION_FLAGS` because a
+# check written `"--lf" not in argv` passes on `--last-failed`.
+
+
+def pairs(argv):
+    return set(zip(argv, argv[1:]))
+
+
+def rerun_flags(argv) -> set[str]:
+    return {token for token in argv if token in RERUN_SELECTION_FLAGS}
+
+
+def cache_dir_of(argv):
+    """The path a `-o cache_dir=...` in `argv` names, or None."""
+    for index, token in enumerate(argv):
+        if token == "-o" and index + 1 < len(argv):
+            value = argv[index + 1]
+            if value.startswith(f"{CACHE_DIR_INI}="):
+                return value.split("=", 1)[1]
+    return None
+
+
+def without_cache_policy(argv) -> tuple[str, ...]:
+    """`argv` with every token that expresses a CACHE POLICY removed.
+
+    Used where two runs are compared for being the same command: the cache
+    policy is the one respect in which an advisory run and a verdict run are
+    meant to differ, and a comparison that ignored it wholesale would also stop
+    noticing a changed path or a changed marker. So the difference is subtracted
+    here and asserted positively at the call site.
+    """
+    kept: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "-p" and index + 1 < len(argv) and argv[index + 1] == "no:cacheprovider":
+            index += 2
+            continue
+        if token == "-o" and index + 1 < len(argv) and argv[index + 1].startswith(
+            f"{CACHE_DIR_INI}="
+        ):
+            index += 2
+            continue
+        if token in RERUN_SELECTION_FLAGS:
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return tuple(kept)
 
 
 def _init_repo(root: Path, branch: str) -> Path:
@@ -127,6 +189,29 @@ class RecordingRunner:
             stderr = err
 
         return Proc()
+
+
+class CacheWritingRunner(RecordingRunner):
+    """A `RecordingRunner` that also does the ONE thing real pytest does which
+    the rerun gate depends on: a FAILING pytest run leaves a `lastfailed` in the
+    cache directory it was handed.
+
+    Needed because `AdvisoryValidation` asks the CACHE whether the last run
+    recorded any failures rather than inferring it from the exit code, so a stub
+    that writes nothing is — correctly — answered "no failures recorded, run
+    everything". Modelling the write is what lets a fake-runner test reach the
+    `--lf` path at all, and the tests that use the plain `RecordingRunner`
+    instead are the ones grading the refusal.
+    """
+
+    def __call__(self, argv, **kwargs):
+        proc = super().__call__(argv, **kwargs)
+        cache = cache_dir_of(tuple(argv))
+        if cache and proc.returncode != 0:
+            recorded = Path(cache) / "v" / "cache" / "lastfailed"
+            recorded.parent.mkdir(parents=True, exist_ok=True)
+            recorded.write_text('{"autoloop/tests/test_x.py::test_y": true}', "utf-8")
+        return proc
 
 
 class ExplodingRunner:
@@ -275,6 +360,14 @@ def test_the_advisory_run_and_the_executors_own_run_launch_the_same_thing(
     strictly larger on a round that narrowed. That direction is pinned in
     `test_test_selection.py::test_the_authoritative_run_is_never_wider_than_an_advisory_one`;
     what is pinned HERE is that both ends read the same two functions.
+
+    Since val-08 (2026-08-31) the two differ in ONE respect and the equality is
+    taken modulo exactly that: the advisory run relocates pytest's cache
+    (`-o cache_dir=<temp>`, replacing `-p no:cacheprovider`) so the agent's
+    confirm step can use it, and the verdict run does not. `without_cache_policy`
+    removes those tokens from both sides, so this still fails on any OTHER
+    divergence — a different path, a different marker, a different worker count
+    — and the cache halves are asserted POSITIVELY below rather than ignored.
     """
     (worker_repo / "backend").mkdir()
     task = make_task(validation=(RUFF, SUITE), validation_cwd="backend")
@@ -303,8 +396,23 @@ def test_the_advisory_run_and_the_executors_own_run_launch_the_same_thing(
     executor._advisory_for(task, worker_git(worker_repo)).run()
     advisory = [(call["argv"], call["cwd"]) for call in runner.calls][len(authoritative):]
 
-    assert advisory == authoritative
+    assert [
+        (without_cache_policy(argv), cwd) for argv, cwd in advisory
+    ] == [(without_cache_policy(argv), cwd) for argv, cwd in authoritative]
     assert authoritative[0][1] == str(worker_repo / "backend")
+
+    # And the one respect in which they DO differ, asserted rather than elided:
+    # the verdict run keeps the cache off, the advisory run moves it out of the
+    # worker repo, and neither carries a rerun flag on a first run.
+    verdict_pytest = [argv for argv, _cwd in authoritative if "pytest" in argv]
+    agent_pytest = [argv for argv, _cwd in advisory if "pytest" in argv]
+    assert verdict_pytest and agent_pytest
+    assert all(("-p", "no:cacheprovider") in pairs(argv) for argv in verdict_pytest)
+    assert all(not rerun_flags(argv) for argv in verdict_pytest + agent_pytest)
+    for argv in agent_pytest:
+        cache = cache_dir_of(argv)
+        assert cache is not None and "no:cacheprovider" not in argv
+        assert not Path(cache).is_relative_to(worker_repo)
 
 
 def test_the_result_is_text_naming_what_ran_and_how_it_went(tmp_path):
@@ -2254,3 +2362,517 @@ def test_an_unoffered_round_still_says_not_offered_whatever_the_counters_hold(
     assert "NOT OFFERED" in note
     assert "UNANSWERED" not in note
     assert "could not" in note
+
+
+# ---- 11: the round's pytest cache — kept, but written ELSEWHERE -------------
+#
+# val-08 (2026-08-31). `validation.NO_CACHE_ARGS` disabled pytest's cache plugin
+# because a failing run wrote `.pytest_cache/` into the worker tree the gate was
+# about to inspect. That is a write-LOCATION problem: `cache_dir` is an ini
+# option taking an absolute path, so the cache can be KEPT and put outside the
+# tree — and with it kept, the confirm step of "run, see the failure, fix it,
+# confirm" can be `--lf` instead of a second full suite.
+#
+# Five properties are graded here, and the FIRST one is graded against a REAL
+# pytest process on a REAL repository rather than against a fake runner. That is
+# the one claim where a stub proves nothing: whether pytest writes into the tree
+# is a fact about pytest.
+
+#: 12 tests that pass and one that does not — enough that `--lf` selecting only
+#: the failure is visible in pytest's own count line and not a coincidence.
+FIXTURE_SUITE = "".join(
+    [f"def test_ok_{n}():\n    assert True\n\n" for n in range(12)]
+    + ["def test_it_fails():\n    assert 1 == 2\n"]
+)
+
+#: `-n 0` because this file's claim is about the CACHE, not about xdist, and one
+#: worker per core for thirteen trivial tests is startup cost with no signal in
+#: it. `-n` being declared is also what stops `effective_validation_command`
+#: injecting `-n auto`. It still requires pytest-xdist to be installed, and that
+#: is deliberately NOT skipped around: `validation.PARALLEL_ARGS` already treats
+#: xdist as present in the interpreter the loop invokes (without it EVERY task
+#: fails validation at once), so a missing plugin should fail loudly here rather
+#: than silently skip the one test that grades this task's central claim.
+#: `-p no:randomly` explicitly, because handing pytest a path outside the
+#: checkout moves ROOTDIR there and `pytest.ini` is never read — the lesson
+#: `test_per_test_selection.py` records.
+NESTED_PYTEST = (
+    "python3", "-m", "pytest", "test_suite.py", "-q", "-n", "0", "-p", "no:randomly",
+)
+
+
+@pytest.fixture
+def nested_env(monkeypatch):
+    """The environment the child pytest runs under. Two edits, both load-bearing.
+
+    `PYTEST_*` is stripped so the child is not a worker of the session that
+    spawned it — the lesson `test_per_test_selection.py` records, where the
+    inherited xdist environment seeded numpy out of range.
+
+    `PYTHONDONTWRITEBYTECODE` is set because the tests below compare the whole
+    tree, and a `__pycache__/` for the fixture suite would otherwise be the
+    difference they detect. MEASURED, not assumed: without it those assertions
+    fail naming `__pycache__/test_suite.cpython-*.pyc`. Excluding bytecode with
+    an env var rather than with a `.gitignore` in the fixture repo is deliberate
+    — the fixture has NO `.gitignore`, so the comparison still catches every
+    other file pytest could write, `.pytest_cache/` very much included. (The real
+    repository does gitignore both, which makes these tests strictly stricter
+    than the gate they model.)
+
+    `run_validation_commands` builds its subprocess environment from `os.environ`
+    minus the validation allowlist, so patching the parent's is how both reach
+    the child. A fixture rather than a line in each test, because forgetting
+    either produces a failure in the CHILD that reads like a defect in the code.
+    """
+    for key in [name for name in os.environ if name.startswith("PYTEST_")]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+
+
+def committed_fixture_suite(worker_repo: Path) -> str:
+    """Write the fixture suite, commit it, and return the CLEAN `git status`."""
+    (worker_repo / "test_suite.py").write_text(FIXTURE_SUITE, encoding="utf-8")
+    run_git(worker_repo, "add", "-A")
+    run_git(worker_repo, "commit", "-q", "-m", "a suite with one failing test")
+    return run_git(worker_repo, "status", "--porcelain", "-uall")
+
+
+# ---- 11a: the tree stays clean, proven against a real failing run -----------
+
+
+def test_a_failing_validation_run_leaves_the_worker_tree_byte_identical(
+    worker_repo, tmp_path, nested_env
+):
+    """REQUIREMENT 1, and the whole reason the cache was switched off at all.
+
+    A REAL pytest run, really FAILING — which is when the cache is written — in
+    a REAL git repository, launched through the production
+    `run_validation_commands` rather than by hand. The assertion is on the TREE:
+    `git status --porcelain -uall` compared byte for byte across the run. A check
+    spelled `assert ".pytest_cache" not in ...` would pass just as well if pytest
+    had started writing somewhere else, and would say nothing about the question
+    the post-commit gate actually asks.
+
+    Both halves are asserted, and the second is what keeps the first honest: if
+    `python3` on PATH had no pytest, the run would fail without ever reaching a
+    test, the tree would be clean for the wrong reason, and this would pass
+    vacuously. The cache file existing at the chosen path is the proof that
+    pytest really ran and really wrote its cache — elsewhere.
+    """
+    before = committed_fixture_suite(worker_repo)
+    assert before == "", "the fixture repo must start clean for this to mean anything"
+    cache = tmp_path / "ptcache"
+
+    ok, summary = run_validation_commands(
+        (NESTED_PYTEST,), worker_repo, pytest_cache_dir=cache
+    )
+    after = run_git(worker_repo, "status", "--porcelain", "-uall")
+
+    assert not ok, f"the fixture suite must FAIL for this test to grade anything: {summary}"
+    assert "test_it_fails" in summary, f"pytest never reached the test: {summary}"
+    assert (cache / "v" / "cache" / "lastfailed").is_file(), (
+        "pytest wrote no cache, so this run could not have dirtied the tree "
+        f"either and proves nothing: {sorted(cache.rglob('*')) if cache.exists() else cache}"
+    )
+    assert after == before, f"a failing validation run changed the worker tree: {after!r}"
+    assert not (worker_repo / ".pytest_cache").exists()
+
+
+def test_a_rerun_really_selects_only_what_failed(worker_repo, tmp_path, nested_env):
+    """What the cache BUYS, measured on pytest's own count line rather than on a
+    clock: the full run reports 12 passed beside the failure, and the `--lf`
+    rerun over the same cache reports the failure alone.
+
+    A wall-clock assertion would be the flakiest test in this suite — thirteen
+    trivial tests are dominated by interpreter startup — so what is pinned here
+    is the SELECTION, which is the thing `--lf` is bought for. The tree is
+    checked across both runs for the same reason as above: the rerun writes the
+    cache too.
+    """
+    before = committed_fixture_suite(worker_repo)
+    cache = tmp_path / "ptcache"
+
+    _ok, full = run_validation_commands(
+        (NESTED_PYTEST,), worker_repo, pytest_cache_dir=cache
+    )
+    _ok2, rerun = run_validation_commands(
+        (NESTED_PYTEST,), worker_repo, pytest_cache_dir=cache, rerun_last_failed=True
+    )
+
+    assert "12 passed" in full, f"the full run did not run the whole file: {full}"
+    assert "12 passed" not in rerun, f"the rerun was not narrowed at all: {rerun}"
+    assert "test_it_fails" in rerun, f"the rerun lost the failure itself: {rerun}"
+    assert "--lf" in rerun, "the summary must name the flag the run really carried"
+    assert run_git(worker_repo, "status", "--porcelain", "-uall") == before
+
+
+# ---- 11b: one cache per ROUND, outside every worker repo --------------------
+
+
+def test_two_tasks_advisory_runs_never_share_a_cache(main_repo, worker_repo):
+    """REQUIREMENT 3. One task's `lastfailed` steering another task's rerun is a
+    CORRECTNESS problem, not a performance one — the second round would silently
+    skip tests it had never run.
+
+    Both halves are asserted: the two directories differ, AND neither is inside
+    the worker repo. The second is what catches a later simplification to
+    `repo_root / ".pytest_cache"`, which would pass the first.
+    """
+    runner = RecordingRunner()
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(),
+        validation=(RUFF, SUITE),
+        command_runner=runner,
+    )
+    caches = []
+    for task_id in ("alpha", "beta"):
+        service = executor._advisory_for(make_task(task_id=task_id), worker_git(worker_repo))
+        service.run()
+        caches.append(service.cache_dir)
+        service.discard_cache()
+
+    assert all(cache is not None for cache in caches)
+    assert caches[0] != caches[1]
+    for cache in caches:
+        assert not cache.is_relative_to(worker_repo)
+        assert not cache.is_relative_to(main_repo)
+    # And the paths really reached the launcher, rather than being computed and
+    # then not used.
+    launched = [call["argv"] for call in runner.calls if "pytest" in call["argv"]]
+    assert {cache_dir_of(argv) for argv in launched} == {str(cache) for cache in caches}
+
+
+def test_two_rounds_of_the_SAME_task_do_not_share_a_cache_either(main_repo, worker_repo):
+    """REQUIREMENT 4, and the half a task-keyed directory would get wrong. A
+    `lastfailed` recorded against a DIFFERENT base is worse than no cache: it is
+    a rerun list for a tree that no longer exists. The lifetime is one ROUND, and
+    it is enforced by the directory being minted per `AdvisoryValidation` rather
+    than by anything remembering to clean up."""
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(),
+        validation=(SUITE,),
+        command_runner=RecordingRunner(),
+    )
+    task = make_task(task_id="same-task")
+    seen = []
+    for _round in range(2):
+        service = executor._advisory_for(task, worker_git(worker_repo))
+        service.run()
+        seen.append(service.cache_dir)
+        service.discard_cache()
+
+    assert seen[0] != seen[1]
+    assert all(not cache.exists() for cache in seen), "the sweep removed both"
+
+
+def test_the_round_sweeps_its_cache_and_never_reopens_one_afterwards(
+    worker_repo, tmp_path
+):
+    """`discard_cache()` runs in the same `finally` as the rendezvous sweep. A
+    run served after it — the abandoned-watcher case §9 already models — must
+    NOT mint a fresh directory, which would be residue created by the sweep."""
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=worker_repo,
+        command_runner=RecordingRunner(),
+        cache_root=tmp_path,
+    )
+    service.run()
+    created = service.cache_dir
+    assert created is not None and created.exists()
+
+    service.discard_cache()
+    assert not created.exists()
+    assert service.cache_dir is None
+
+    service.run()
+    assert service.cache_dir is None, "a swept round re-created its cache directory"
+
+
+def test_the_channel_creates_no_cache_for_a_round_with_no_pytest_command(
+    worker_repo, tmp_path
+):
+    """A `ruff`-only round has nothing to write a pytest cache and nothing to
+    read one, so it makes no directory and its argv is what it always was."""
+    root = tmp_path / "cacheroot"
+    root.mkdir()
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(RUFF,), cwd=worker_repo, command_runner=runner, cache_root=root
+    )
+    service.run()
+
+    assert service.cache_dir is None
+    assert service.cache_error == ""
+    assert [call["argv"] for call in runner.calls] == [RUFF]
+    assert not list(root.iterdir()), "a round with nothing to cache made a directory"
+
+
+# ---- 11c: FAIL CLOSED — no cache means today's behaviour, and it says so ----
+
+
+@pytest.mark.parametrize(
+    "broken",
+    ["missing", "a-file"],
+    ids=["directory-does-not-exist", "path-is-a-regular-file"],
+)
+def test_an_uncreatable_cache_falls_back_to_todays_behaviour_and_reports_it(
+    worker_repo, tmp_path, broken
+):
+    """REQUIREMENT 5. Every way of not having a directory must land on exactly
+    the pre-val-08 command — `-p no:cacheprovider`, no `--lf` — and must SAY so,
+    because a channel that silently narrowed a run and reported it as ordinary
+    is the fail-open this whole feature has to avoid.
+
+    Two shapes, neither of which depends on the test's uid: a root that does not
+    exist, and a root that is a regular file. A `chmod`-based unwritable case
+    would pass vacuously for root.
+    """
+    root = tmp_path / broken
+    if broken == "a-file":
+        root.write_text("not a directory", encoding="utf-8")
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=worker_repo, command_runner=runner, cache_root=root
+    )
+
+    text = service.run()
+    argv = runner.calls[0]["argv"]
+
+    assert service.cache_dir is None
+    assert service.cache_error, "a fallback nothing can name is a fallback nothing reports"
+    assert ("-p", "no:cacheprovider") in pairs(argv)
+    assert cache_dir_of(argv) is None
+    assert not rerun_flags(argv)
+    assert "pytest cache could not be used" in text
+    assert "PASSED" in text, "the run itself still happened and still answered"
+
+
+def test_a_temp_root_inside_the_tree_is_refused_and_leaves_nothing_there(worker_repo):
+    """`tempfile.mkdtemp` obeys `TMPDIR`, so "outside the worker repo" is an
+    operator-settable value rather than a property of the code. A temp root
+    pointed INTO the tree would put the cache back exactly where 2026-08-03
+    found it, so it is refused — and the directory that was created before the
+    refusal is removed, because a cache this declined to use must not be left
+    sitting in the tree the gate inspects."""
+    inside = worker_repo / "tmp"
+    inside.mkdir()
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=worker_repo, command_runner=runner, cache_root=inside
+    )
+
+    text = service.run()
+
+    assert service.cache_dir is None
+    assert "inside the tree being validated" in service.cache_error
+    assert list(inside.iterdir()) == [], "a refused cache directory was left in the tree"
+    assert ("-p", "no:cacheprovider") in pairs(runner.calls[0]["argv"])
+    assert "pytest cache could not be used" in text
+
+
+def test_a_cache_failure_can_never_leave_a_rerun_behind(worker_repo, tmp_path):
+    """The sharpest form of the same rule, and the one an ordinary fallback test
+    would miss: the FIRST run fails, which is exactly the state that would earn a
+    `--lf` confirm — and with no cache the second run must still be FULL.
+
+    A `--lf` with the cacheprovider disabled is not merely narrow, it is
+    `exit 4` on an unrecognised argument before a test runs, which the agent
+    would read as a broken suite. The guarantee is structural rather than
+    remembered: `validation.effective_validation_command` injects the flag only
+    inside the branch that turned the cache on.
+    """
+    runner = RecordingRunner(returncodes=(1, 1))
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=worker_repo,
+        command_runner=runner,
+        cache_root=tmp_path / "missing",
+    )
+
+    service.run()
+    second = service.run()
+
+    assert service.last_run_ok is False
+    assert service.last_run_was_rerun is False
+    for call in runner.calls:
+        assert not rerun_flags(call["argv"])
+        assert ("-p", "no:cacheprovider") in pairs(call["argv"])
+    assert "RERUN" not in second
+
+
+# ---- 11d: the VERDICT run is untouched -------------------------------------
+
+
+def test_the_verdict_run_carries_no_rerun_flag_and_no_relocated_cache(
+    main_repo, worker_repo
+):
+    """REQUIREMENT 2, driven through a real round in which the agent's OWN runs
+    did get a cache and did get `--lf`. Asserting the verdict run's argv in a
+    round where nothing ever used the feature would grade nothing.
+
+    `--lf` knows only what failed LAST time and cannot see what a fix newly
+    broke, so it is an advisory instrument and nothing else. Checked against
+    every spelling of every rerun flag, because `"--lf" not in argv` passes on
+    `--last-failed`.
+    """
+    runner = CacheWritingRunner(returncodes=(1, 0, 0), stdout="", stderr="boom\n")
+    agent = None
+
+    def factory(root):
+        nonlocal agent
+        agent = RendezvousAgentRunner(
+            worker_repo=root, asks=2, write_files={"feature.py": "x = 1\n"}
+        )
+        return agent
+
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(SUITE,), command_runner=runner
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert len(runner.calls) == 3, "two advisory runs and the executor's own"
+    first, second, verdict = (call["argv"] for call in runner.calls)
+
+    # The agent's runs: cache relocated on both, `--lf` on the confirm only.
+    assert cache_dir_of(first) is not None and not rerun_flags(first)
+    assert cache_dir_of(second) is not None and rerun_flags(second) == {"--lf"}
+    assert not Path(cache_dir_of(first)).is_relative_to(worker_repo)
+
+    # The verdict run: exactly the argv this round would have launched before
+    # val-08 existed. Asserted as an EQUALITY rather than as three absences —
+    # the flags are inserted after the `pytest` token, so a rewrite that moved
+    # them would satisfy every "not in" and still change what ran.
+    assert verdict == ("python3", "-m", "pytest", "-n", "auto",
+                       "-p", "no:cacheprovider", "autoloop/tests")
+    assert not rerun_flags(verdict)
+    assert cache_dir_of(verdict) is None
+    # And it selects what it always selected: the same tests as a FULL advisory
+    # run, differing only in the cache policy.
+    assert without_cache_policy(verdict) == without_cache_policy(first)
+
+
+# ---- 11e: a narrowed PASS is never reported as a full one -------------------
+
+
+def test_a_rerun_pass_is_disclosed_to_the_agent_and_to_the_reviewer(
+    worker_repo, tmp_path
+):
+    """The one direction this channel otherwise never goes: a `--lf` run is
+    NARROWER than the run that grades the round. It is bought with disclosure in
+    both places a reader looks — the agent's own answer, and the round's summary
+    — and both are written from the flag this module really passed, never from
+    the run's output or the agent's report.
+
+    "its last run PASSED" about a three-test rerun is the same sentence that got
+    port-05 round 1 refused one level down: true of a run that does not answer
+    the question the reader is asking.
+    """
+    runner = CacheWritingRunner(returncodes=(1, 0))
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=worker_repo,
+        command_runner=runner,
+        cache_root=tmp_path,
+    )
+    service.expose()
+
+    first, second = service.run(), service.run()
+
+    assert "FAILED" in first and "RERUN" not in first
+    assert "PASSED" in second
+    assert "RERUN" in second and "--lf" in second
+    assert "NOT a green suite" in second
+    assert service.last_run_was_rerun is True
+
+    note = service.note()
+    assert "last run PASSED" in note
+    assert "`--lf`" in note and "NOT a full-suite result" in note
+
+
+def test_a_full_run_is_never_caveated_as_a_rerun(worker_repo, tmp_path):
+    """The other direction, which a one-sided test would miss: a first run, and
+    a run following a PASS, are both FULL and must carry no caveat at all —
+    warning about a narrowing that did not happen is its own misreport."""
+    runner = RecordingRunner(returncodes=(0, 0))
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=worker_repo, command_runner=runner, cache_root=tmp_path
+    )
+    service.expose()
+
+    first, second = service.run(), service.run()
+
+    assert "RERUN" not in first and "RERUN" not in second
+    assert service.last_run_was_rerun is False
+    assert "--lf" not in service.note()
+    assert all(not rerun_flags(call["argv"]) for call in runner.calls)
+
+
+def test_the_rerun_caveat_survives_into_the_rounds_own_summary(worker_repo, tmp_path):
+    """`note()` is what the REVIEWER reads, and the caveat has to be in that
+    string rather than only in the answer the agent saw. Read off `_reruns` — the
+    flag this module passed — which is the same provenance rule §6 pins for the
+    rest of `note()`."""
+    runner = CacheWritingRunner(returncodes=(1, 0))
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=worker_repo, command_runner=runner, cache_root=tmp_path
+    )
+    service.expose()
+    service.run()
+    service.run()
+
+    note = service.note()
+
+    assert "NOT a full-suite result" in note
+    assert "ran the suite 2 time(s)" in note
+
+
+def test_a_failed_run_that_recorded_no_failures_earns_no_rerun(worker_repo, tmp_path):
+    """"The last run failed" and "there is a list of what failed" are DIFFERENT
+    claims, and `--lf` needs the second. The gap between them is real and has
+    three causes, each of which would be a defect if `--lf` fired anyway:
+
+    * `ruff` failed and `run_validation_commands` stopped before pytest, so the
+      cache is untouched and `--lf` would run everything while the answer called
+      it a rerun;
+    * the target repository's own `pytest.ini` disables the cacheprovider in
+      `addopts` — a FILE, invisible to an argv rewrite — making `-o cache_dir=`
+      inert and `--lf` an `exit 4` on an unrecognised argument;
+    * pytest moves where it keeps the list.
+
+    All three look identical from here: no `lastfailed`. This is the refusal, and
+    the sibling tests above use `CacheWritingRunner` precisely because the plain
+    stub lands in this case.
+    """
+    runner = RecordingRunner(returncodes=(1, 0))
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=worker_repo, command_runner=runner, cache_root=tmp_path
+    )
+    service.expose()
+
+    service.run()
+    second = service.run()
+
+    assert service.cache_dir is not None, "the cache itself was fine; the LIST was absent"
+    assert service.last_run_was_rerun is False
+    assert "RERUN" not in second
+    assert all(not rerun_flags(call["argv"]) for call in runner.calls)
+    assert "--lf" not in service.note()
+
+
+def test_the_description_warns_the_agent_before_it_ever_sees_a_rerun():
+    """The brief is the only place the agent learns the rule in time to act on
+    it, and `_advisory_instruction` renders this string verbatim — so the
+    sentence a future tool transport publishes and the sentence the agent reads
+    stay one string."""
+    description = advisory_tool_descriptor(max_calls=3)["description"]
+
+    assert "--lf" in description
+    assert "NARROWER" in description
+    assert "never 'the suite is green'" in description
+    assert description in implement_executor._advisory_instruction(3)
