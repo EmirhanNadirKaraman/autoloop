@@ -4644,8 +4644,40 @@ class Orchestrator:
                         named_binding,
                     )
                     return
-        state.policy_denials = 0
+        # THE CLEAR HAPPENS AFTER THE DISPATCH, and that ordering is the whole
+        # of policy-01. `authorize_directive` ALLOWING a directive is not the
+        # same as the loop ACTING on it: `_dispatch` refuses a retired decision
+        # and the retired legacy git path itself, and so do `_dispatch_recut`,
+        # `_dispatch_executor` and every push-time check under them — all of
+        # them through `_handle_policy_denial`, which spends the very counter a
+        # clear placed HERE had just zeroed. A reviewer repeating ONE refused
+        # directive therefore drew a fresh budget every round and the cap never
+        # bound: 71 consecutive `legacy_git_path_retired` denials in 14 minutes
+        # on 2026-08-31, each counted as the first, ended only by the reviewer
+        # changing its own mind. The sibling denial at the gate above sits on
+        # the other side of this line, which is exactly why `ask_user` — refused
+        # by `authorize_directive` — always did exhaust the budget while this
+        # never could.
+        #
+        # The value from before the dispatch is what tells the two apart, and it
+        # is the only signal that can: every writer of `state.policy_denials`
+        # reachable from a dispatch — `_handle_policy_denial`,
+        # `_handle_review_mismatch` and `_dispatch_plan`'s rejected-plan branch
+        # — INCREMENTS it, and none of them resets, so "unchanged" means "no
+        # refusal was raised" and nothing else. A dispatch that RAISES leaves
+        # the streak standing, which is the same direction: nothing was acted on
+        # there either.
+        denials_before_dispatch = state.policy_denials
         self._dispatch(directive)
+        if state.policy_denials and state.policy_denials == denials_before_dispatch:
+            # The directive was acted on, so the run of refused directives ends
+            # here. SAVED, because the dispatch has already written this state
+            # and an in-memory-only clear would let a restart resume a streak
+            # the reviewer has since broken. The truthiness test buys nothing
+            # but the redundant save in the ordinary case (the counter is
+            # already zero); correctness rests on the equality alone.
+            state.policy_denials = 0
+            self._store.save(state)
 
     def _record_wanted_decision(self, directive: Directive, resp: LastResponse) -> None:
         """Count and record a `wanted_decision`, and do nothing else with it.
