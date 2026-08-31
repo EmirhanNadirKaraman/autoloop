@@ -41,12 +41,21 @@ unrecognised alike — becomes a `CodexProtocolError`, which is a `BrowserError`
 and therefore already on the ordinary retryable failure budget.
 
 `RateLimitedError` is deliberately NOT raised for the transient case, even
-though it owns the back-off budget: its handler
-(`orchestrator._classify_rate_limit_state`) probes a held browser page and then
-counts CDP page targets, and a codex deployment whose Chrome window is closed
-answers that probe with ZERO targets and parks `loop_fatal` on
-`browser_unattachable`. That trades one false park for another. `codex_cli`
-makes the same choice for the same reason (`docs/AUTOLOOP.md` §5d).
+though it owns the back-off budget. That budget is graded on evidence about a
+PAGE THE LOOP HOLDS — `orchestrator._classify_rate_limit_state` tells two
+worlds apart (`throttled` and `cleared`), asks both of the held page and dials
+nothing — and a codex run has no page at all: `_handle_rate_limited` skips the
+classifier for it, records `throttled` with "this run drives no browser" as the
+evidence, then spends `policy.max_rate_limit_backoffs` consecutive waits before
+parking. That is a wait budget graded on evidence this transport cannot
+produce; the retryable path below needs none. `codex_cli` makes the same
+choice for the same reason (`docs/AUTOLOOP.md` §5d), so NO codex transport
+raises `RateLimitedError` today. What holds that is the absence itself — no
+module under `autoloop/codex/` raises it, which is a grep, not an assertion.
+`orchestrator._handle_rate_limited` and `test_transport_fault_recovery.py:944`
+both NAME this module as the source of the claim, in a comment and in a test
+docstring; neither is a guard, so read them as cross-references and re-check the
+grep before relying on it.
 
 Every unrecognised failure is logged with a bounded, secret-free digest, for the
 same reason `quota.py` logs its stderr tail: the first real exhaustion in
@@ -122,9 +131,9 @@ MESSAGE_CHARS = 400
 class CodexProtocolError(BrowserError):
     """The app-server answered with a failure this client cannot act on.
 
-    A `BrowserError` so the orchestrator's existing failure routing applies
-    unchanged — the transport is broken or the server refused, which is the
-    same class of event as a browser fault and belongs on the same budget.
+    A `BrowserError`, so the orchestrator's existing failure routing applies
+    unchanged: the transport is broken or the server refused, which is that
+    hierarchy's own class of event and belongs on the same budget.
     `code` and `error_type` are carried as fields rather than only inside the
     message so a caller can branch without parsing prose.
 
@@ -354,7 +363,9 @@ def classify(
             f"app-server refused with {error_type_of(error)}"
             f"{where}. Codex shares an agentic pool with ChatGPT Work and "
             "ChatGPT for Excel; ordinary ChatGPT conversations draw on a "
-            "separate quota, which is why the browser fallback can still run."
+            "separate quota. The two codex seats, codex_cli and "
+            "codex_app_server, spend the SAME allowance, so a handover "
+            "between those two waits on the same reset."
         )
     code = error.get("code") if isinstance(error, Mapping) else None
     if verdict == RATE_LIMITED:
