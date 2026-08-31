@@ -1908,6 +1908,74 @@ def test_a_label_with_no_retirement_stamp_reads_as_unorderable():
     assert merge_sweep._retirement_stamp(Path("t-2026081OT000000Z.json")) == "", "not digits"
 
 
+def _copy(label):
+    """One archived copy, as far as the ordering rules are concerned: they read
+    the FILENAME and nothing else, so no file need exist."""
+    return merge_sweep._ArchivedCopy(Path(f"t-{label}.json"), {"task_id": "t"})
+
+
+def test_archived_generations_come_back_NEWEST_FIRST():
+    """`_archived_generations` is the one place the ordering rules live, and it
+    now has two callers wanting different amounts of the same list: ancestry
+    wants the first element, the archived-filename scan walks it. The ORDER is
+    therefore the property, asserted here directly rather than through a sweep.
+    """
+    copies = [
+        _copy("published-20260810T000000Z"),
+        _copy("published-20260812T000000Z"),
+        _copy("published-20260811T000000Z"),
+    ]
+
+    generations, why_not = merge_sweep._archived_generations(copies)
+
+    assert why_not == ""
+    assert [c.name for [c] in generations] == [
+        "t-published-20260812T000000Z.json",
+        "t-published-20260811T000000Z.json",
+        "t-published-20260810T000000Z.json",
+    ]
+    assert merge_sweep._newest_generation(copies)[0] == generations[0], (
+        "the newest generation is the first element and nothing else"
+    )
+
+
+def test_two_retirements_in_ONE_second_are_one_generation_holding_both():
+    """`utcnow_iso` writes seconds, so a tie is representable and there is no
+    way to tell which came last. Both stay in one generation and every caller
+    then requires them to agree — splitting them into two would make one of
+    them "newer" by an accident of directory order."""
+    generations, why_not = merge_sweep._archived_generations([
+        _copy("merged-as-abc1234-20260812T000000Z"),
+        _copy("reconciled-as-def5678-20260812T000000Z"),
+    ])
+
+    assert why_not == ""
+    assert [len(g) for g in generations] == [2]
+
+
+def test_one_UNSTAMPED_copy_refuses_every_generation_and_not_just_its_own():
+    """The fail-open the scan could have introduced: dropping the copy that
+    cannot be placed and ordering the rest would answer from a generation that
+    may not be the newest. All or nothing, and the unplaceable file is named."""
+    generations, why_not = merge_sweep._archived_generations([
+        _copy("reconciled-as-abc1234-20260810T000000Z"),
+        _copy("released-by-operator"),
+    ])
+
+    assert generations == []
+    assert "cannot be put in order" in why_not
+    assert "t-released-by-operator.json" in why_not
+
+
+def test_a_SINGLE_copy_is_one_generation_however_its_label_reads():
+    """One retirement has nothing to be ordered against, which is what keeps a
+    record retired before the stamp existed answerable at all."""
+    generations, why_not = merge_sweep._archived_generations([_copy("published")])
+
+    assert why_not == ""
+    assert [c.name for [c] in generations] == ["t-published.json"]
+
+
 def test_a_publication_that_stopped_being_confirmed_is_not_an_auto_merge_slug():
     """`UNCONFIRMED` is minted here, not returned by `auto_merge`: nothing
     reached `AutoMerger.attempt`, so borrowing one of its outcomes would report
