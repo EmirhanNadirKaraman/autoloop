@@ -1604,8 +1604,21 @@ def test_the_authoritative_run_is_never_wider_than_an_advisory_one(tmp_path):
     assert "test selection: SUBSET" in outcome.validation, "this round narrowed"
 
     # The advisory run took the resolved list WHOLE: the configured pytest
-    # command verbatim, whole-tree path and all.
-    assert SUITE in advisory
+    # command's whole-tree path, with no file ever named.
+    #
+    # Asserted on the SELECTION rather than on argv equality since val-08
+    # (2026-08-31): an advisory pytest run relocates pytest's cache to a
+    # per-round directory outside the worker repo (`-o cache_dir=<temp>` in
+    # place of `-p no:cacheprovider`), so its argv is no longer byte-identical
+    # to the configured command. Which tests it selects — the whole claim here —
+    # did not move, and the cache placement is graded in
+    # `test_agent_self_validation.py` §11.
+    advisory_pytest = [argv for argv in advisory if "pytest" in argv]
+    assert len(advisory_pytest) == 1
+    assert "suite" in advisory_pytest[0], "the advisory run kept the whole-tree path"
+    assert not [token for token in advisory_pytest[0] if token.endswith(".py")], (
+        "the advisory run named individual files, so it was narrowed after all"
+    )
     assert RUFF in advisory
     # The authoritative run did not — and every path it DID target lives under
     # the path the advisory command ran, which is what "never wider" means for a

@@ -9,7 +9,11 @@ how those commands run are easy to lose and expensive to lose in production:
     round and nothing fails, so nothing would report it.
   * `-p no:cacheprovider` — a failing test writes `.pytest_cache/` into the
     worker repo, and the gate after validation refuses a tree validation
-    dirtied. Losing this turns one refusal into two (2026-08-03).
+    dirtied. Losing this turns one refusal into two (2026-08-03). Since val-08
+    a caller may instead pass a `cache_dir` OUTSIDE the tree, which holds the
+    same property with the cache kept; the last section of this file covers
+    that path and the first case in it is the guard that the default has not
+    moved.
   * the `isolated` marker: selected by exactly one dedicated command (
     `pytest.ini` deselects it from every default run) and never handed an
     xdist worker, since the marker means "this test needs its own process".
@@ -34,6 +38,8 @@ from pathlib import Path
 
 from autoloop.config import load_config
 from autoloop.validation import (
+    CACHE_DIR_INI,
+    RERUN_SELECTION_FLAGS,
     SAFE_VALIDATION_BINARIES,
     effective_validation_command,
     effective_validation_commands,
@@ -389,3 +395,206 @@ def test_the_shipped_list_needs_no_repair_at_run_time():
         "validation.effective_validation_command (the runtime is not the thing "
         "to change here; nothing runs serially either way)"
     )
+
+
+# ---- val-08: the cache is RELOCATED for an advisory run, never disabled ------
+#
+# `-p no:cacheprovider` is still the default and is still what every VERDICT run
+# carries — the first two cases below are the regression guard for that. What is
+# added is a `cache_dir` a caller may pass, which moves pytest's cache OUT of the
+# tree being graded instead of switching the plugin off, and a `rerun_last_failed`
+# that only means anything once it is on.
+#
+# These are argv tests. The tree-level proof — a REAL failing pytest run under a
+# relocated cache leaves the worker repo byte-identical — needs a real repository
+# and lives in `test_agent_self_validation.py`.
+
+CACHE = "/tmp/autoloop-val08-test-cache"
+
+#: A pytest command shaped like the SHIPPED ones: it spells out both flags the
+#: runtime would otherwise inject. Everything about the replacement rule below
+#: is about this shape, because it is the only one production ever runs — a rule
+#: that only fired on a command WITHOUT `-p no:cacheprovider` would pass every
+#: synthetic test here and be inert on every real deployment.
+SHIPPED_SHAPE = (
+    "python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto",
+    "-p", "no:cacheprovider",
+)
+
+
+def ini_overrides(argv) -> set[str]:
+    """Every `-o name=value` this argv sets, in any of pytest's spellings."""
+    found = set()
+    for index, token in enumerate(argv):
+        if token in ("-o", "--override-ini") and index + 1 < len(argv):
+            found.add(argv[index + 1])
+        elif token.startswith("--override-ini="):
+            found.add(token[len("--override-ini="):])
+        elif token.startswith("-o") and len(token) > 2 and not token.startswith("--"):
+            found.add(token[2:])
+    return found
+
+
+def rerun_flags(argv) -> set[str]:
+    """Every cache-driven reselection flag in `argv`, whatever its spelling.
+
+    Read off `RERUN_SELECTION_FLAGS` rather than spelled here: a check written
+    as `"--lf" not in argv` passes on `--last-failed`, which is the shape of
+    hole this whole set exists to close.
+    """
+    return {token for token in argv if token in RERUN_SELECTION_FLAGS}
+
+
+def test_the_default_still_disables_the_cache_everywhere():
+    """The 2026-08-03 property, unconditional on the path nothing passes a cache
+    to. This is the regression guard for requirement 6: pass no `cache_dir` and
+    every pytest command is exactly what it was."""
+    for argv in effective_validation_commands(LEGACY_SERIAL):
+        if not is_pytest(argv):
+            continue
+        assert ("-p", "no:cacheprovider") in pairs(argv)
+        assert not ini_overrides(argv)
+        assert not rerun_flags(argv)
+
+
+def test_a_cache_dir_replaces_the_flag_that_would_make_it_inert():
+    """The load-bearing case, and the one a smaller rule would fail.
+
+    Every SHIPPED pytest command spells `-p no:cacheprovider` out — the fixed
+    point `test_the_shipped_list_needs_no_repair_at_run_time` asserts. With the
+    plugin off, `cache_dir` does nothing and `--lf` is an unrecognised argument
+    that exits 4, so a rule that deferred to the existing flag would leave the
+    feature working only on commands production does not run.
+    """
+    argv = effective_validation_command(SHIPPED_SHAPE, cache_dir=CACHE)
+    assert ("-p", "no:cacheprovider") not in pairs(argv)
+    assert "no:cacheprovider" not in argv
+    assert f"{CACHE_DIR_INI}={CACHE}" in ini_overrides(argv)
+    assert ("-n", "auto") in pairs(argv), "the worker count must be untouched by this"
+    assert "autoloop/tests" in argv, "the command's own test paths must survive"
+
+
+def test_the_attached_spelling_of_the_disabling_flag_is_removed_too():
+    """`-pno:cacheprovider` is the same instruction as `-p no:cacheprovider`, and
+    a survivor would silently switch the relocated cache back off."""
+    argv = effective_validation_command(
+        ("pytest", "tests/", "-q", "-n", "0", "-pno:cacheprovider"), cache_dir=CACHE
+    )
+    assert "-pno:cacheprovider" not in argv
+    assert f"{CACHE_DIR_INI}={CACHE}" in ini_overrides(argv)
+
+
+def test_a_rerun_cannot_be_asked_for_without_a_cache():
+    """FAIL CLOSED, structurally. `--lf` is served by the cacheprovider plugin,
+    so `--lf` next to `-p no:cacheprovider` is `exit 4` before a test runs. The
+    injection therefore sits INSIDE the branch that turned the cache on: asking
+    for a rerun with no cache is not an error to handle, it is a state that
+    cannot be reached."""
+    argv = effective_validation_command(SHIPPED_SHAPE, rerun_last_failed=True)
+    assert not rerun_flags(argv)
+    assert ("-p", "no:cacheprovider") in pairs(argv)
+    assert argv == tuple(SHIPPED_SHAPE), "with no cache this must be a no-op"
+
+
+def test_a_rerun_with_a_cache_adds_exactly_one_lf():
+    argv = effective_validation_command(
+        SHIPPED_SHAPE, cache_dir=CACHE, rerun_last_failed=True
+    )
+    assert rerun_flags(argv) == {"--lf"}
+    assert argv.count("--lf") == 1
+    assert f"{CACHE_DIR_INI}={CACHE}" in ini_overrides(argv)
+
+
+def test_no_second_rerun_flag_is_added_on_top_of_one_already_there():
+    """Whatever spelling a caller wrote, this adds nothing beside it — two
+    reselection flags is a command whose meaning nobody wrote down."""
+    for flag in sorted(RERUN_SELECTION_FLAGS):
+        argv = effective_validation_command(
+            ("pytest", "tests/", "-q", "-n", "0", flag),
+            cache_dir=CACHE,
+            rerun_last_failed=True,
+        )
+        assert rerun_flags(argv) == {flag}, f"{flag} collected a companion"
+
+
+def test_a_command_that_names_its_own_cache_dir_is_left_exactly_as_written():
+    """An operator who has said where their cache goes has said it, in any of
+    pytest's four spellings. Nothing is injected then — not `-o cache_dir`, and
+    not `-p no:cacheprovider` either, which would disable the location they
+    chose — and no `--lf` is added to a command this did not set up."""
+    for declaration in (
+        ("-o", "cache_dir=/elsewhere"),
+        ("-ocache_dir=/elsewhere",),
+        ("--override-ini", "cache_dir=/elsewhere"),
+        ("--override-ini=cache_dir=/elsewhere",),
+    ):
+        argv = ("pytest", "tests/", "-q", "-n", "auto") + declaration
+        assert effective_validation_command(
+            argv, cache_dir=CACHE, rerun_last_failed=True
+        ) == argv, f"{declaration} was not respected"
+
+
+def test_an_operator_cache_dir_is_still_disabled_when_no_cache_is_asked_for():
+    """The verdict path is unchanged for that command too: with no `cache_dir`
+    passed, `-p no:cacheprovider` is injected exactly as it was before val-08,
+    so the tree-cleanliness rule does not depend on what an operator wrote."""
+    argv = effective_validation_command(("pytest", "tests/", "-q", "-n", "0",
+                                         "-o", "cache_dir=/elsewhere"))
+    assert ("-p", "no:cacheprovider") in pairs(argv)
+
+
+def test_normalization_with_a_cache_is_idempotent():
+    """A second pass must not collect a second `-o cache_dir`, a second `--lf`,
+    or — the dangerous one — a `-p no:cacheprovider` on top of the cache the
+    first pass turned on."""
+    once = effective_validation_commands(
+        LEGACY_SERIAL, cache_dir=CACHE, rerun_last_failed=True
+    )
+    twice = effective_validation_commands(
+        once, cache_dir=CACHE, rerun_last_failed=True
+    )
+    assert twice == once
+    for argv in once:
+        if not is_pytest(argv):
+            continue
+        assert "no:cacheprovider" not in argv
+        assert argv.count("--lf") == 1
+        assert len(ini_overrides(argv)) == 1
+
+
+def test_the_isolated_command_stays_serial_under_a_cache():
+    """The marker means "this test needs its own process". Relocating the cache
+    must not change which run gets an xdist worker."""
+    isolated = ("python3", "-m", "pytest", "autoloop/tests", "-q", "-m", "isolated",
+                "-p", "no:cacheprovider")
+    argv = effective_validation_command(isolated, cache_dir=CACHE)
+    assert "-n" not in argv
+    assert f"{CACHE_DIR_INI}={CACHE}" in ini_overrides(argv)
+
+
+def test_a_non_pytest_command_is_untouched_by_a_cache():
+    for argv in (("ruff", "check", "."), ("npx", "vitest", "run"),
+                 ("python3", "-c", "import pytest")):
+        assert effective_validation_command(
+            argv, cache_dir=CACHE, rerun_last_failed=True
+        ) == argv
+
+
+def test_the_cache_reaches_the_real_launcher_and_the_summary(tmp_path):
+    """Asserted on what was HANDED to the launcher, not on what the caller
+    meant: the agent reads `summary`, so the flags its run carried have to be
+    visible there rather than inferred."""
+    runner, seen = recording_runner()
+    _ok, summary = run_validation_commands(
+        LEGACY_SERIAL,
+        tmp_path,
+        command_runner=runner,
+        pytest_cache_dir=CACHE,
+        rerun_last_failed=True,
+    )
+    launched = [argv for argv in seen if is_pytest(argv)]
+    assert launched and all(
+        f"{CACHE_DIR_INI}={CACHE}" in ini_overrides(argv) for argv in launched
+    )
+    assert all("no:cacheprovider" not in argv for argv in launched)
+    assert f"{CACHE_DIR_INI}={CACHE}" in summary and "--lf" in summary

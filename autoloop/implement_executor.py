@@ -268,12 +268,49 @@ the tree, so anything left behind is picked up as changed work — whereas the
 executor's own run happens after that read. Both rendezvous paths are swept in a
 `finally` around the agent call itself, so every reader downstream (the
 failure-path `_partial_work`, the cleanup pass, the status read) sees a tree with
-no trace of the channel. VERIFIED: `.gitignore` lists neither `.ruff_cache` nor
-`.pytest_cache` (2026-08-23), and pytest's is already suppressed for every pytest
-command by `validation.NO_CACHE_ARGS`. NOT verified without a shell: whether
-`ruff check` really leaves a `.ruff_cache/` that `git status -uall` reports here
-— that one is a property of the commands, not of this channel, and it would show
-up as an unexpected `changed_paths` entry rather than as a wrong verdict.
+no trace of the channel.
+
+CORRECTED 2026-08-31 (val-08), because the sentence that stood here is false in
+this checkout and was quoted as evidence: it read "VERIFIED: `.gitignore` lists
+neither `.ruff_cache` nor `.pytest_cache` (2026-08-23)". This repository's
+`.gitignore` lists BOTH — `.pytest_cache/` at line 51 and `.ruff_cache/` at
+line 207 — so neither would be reported by `git status --porcelain -uall` here at
+all. That claim was verified against the PRE-SPLIT repository; the extraction on
+2026-08-27 brought a standard Python `.gitignore` with it, and nothing re-checked
+the sentence. Read as: the residue risk from either cache is SMALLER in this
+checkout than the paragraph above assumes, not larger. Nothing is changed on the
+strength of it — `validation.NO_CACHE_ARGS` remains the default for every run,
+and whether it is still load-bearing HERE is a separate question this task was
+told not to reopen. What val-08 did instead is stop relying on the flag being
+present at all for the advisory path (see below) and pin the property on the
+TREE, in a test that builds a fixture repository with no `.gitignore` and so
+cannot be fooled by an ignore rule either way.
+
+Pytest's own cache used to be handled by suppressing the plugin outright
+(`validation.NO_CACHE_ARGS`) and is now handled by RELOCATING it (val-08,
+2026-08-31): an advisory run passes `cache_dir=<a per-round temp directory>`, so
+the cache is kept — which is what makes `--lf` possible at all — and is written
+outside every worker repo. The property the residue trap needs is unchanged and
+is now pinned by a test that drives a REAL failing pytest run through
+`run_validation_commands` and compares `git status --porcelain -uall` byte for
+byte across it (`test_agent_self_validation.py`), rather than by a comment
+asserting a flag is present. Every fallback — the directory could not be created,
+could not be written, or has been swept — goes back to `NO_CACHE_ARGS`, so there
+is no state in which the tree can be dirtied by this.
+
+WHAT THE CACHE BUYS, and the one asymmetry it introduces. The channel exists to
+close "run, see the failure, fix it, confirm" inside `ADVISORY_VALIDATION_MAX_CALLS`
+runs; with a cache, the CONFIRM step is `--lf` — only what failed — instead of a
+second full suite. The asymmetry is that a `--lf` run is NARROWER than the
+executor's verdict run, which is the direction this module otherwise never goes.
+It is made safe by disclosure rather than by hope, in three places that all read
+the flag this module really passed and never the agent's account of itself: the
+run's own first line, `AdvisoryValidation.note()` (so the reviewer is never told
+a bare "last run PASSED" about a three-test rerun), and
+`advisory_tool_descriptor`'s description, which is the brief the agent reads
+before it ever sees one. `--ff` and `--sw` are deliberately NOT used: `--sw` does
+not compose with `-n auto`, and `--ff` is a separate policy question about run 1
+rather than the confirm step this closes.
 
 **The agent is bounded by SILENCE, not by elapsed time** (2026-08-14). The
 write-capable runner this module builds carries a `stall.WorkerTreeProbe`, so
@@ -346,6 +383,7 @@ from .validation import (
     NOT_RUN,
     TEST_SELECTION_REACHABLE,
     TestSelection,
+    has_pytest_command,
     run_validation_commands,
     select_validation_commands,
 )
@@ -962,6 +1000,41 @@ ADVISORY_ZERO_CALL_RETURNS = 1
 #: The name a transport publishes the zero-argument call under.
 ADVISORY_TOOL_NAME = "run_validation"
 
+#: The prefix of the per-ROUND pytest cache directory (val-08, 2026-08-31).
+#:
+#: WHY A CACHE AT ALL. `validation.NO_CACHE_ARGS` disabled pytest's cache
+#: plugin outright because a failing run wrote `.pytest_cache/` into the worker
+#: tree the post-commit gate was about to inspect. But `cache_dir` is an ini
+#: option that takes an absolute path, so the tree stays clean with the feature
+#: ON — and with it on, the confirm step of "run, see the failure, fix it,
+#: confirm" (this channel's whole purpose, inside a budget of
+#: `ADVISORY_VALIDATION_MAX_CALLS` runs against a suite that takes minutes) can
+#: be `--lf` instead of a second full suite.
+#:
+#: WHY PER ROUND, AND WHERE THE LIFETIME IS ENFORCED. One `AdvisoryValidation`
+#: exists per `_run_implementation` call, and the directory is made by
+#: `tempfile.mkdtemp` under it — so it is UNIQUE, is created empty, is shared by
+#: that round's runs and by nothing else, and lives outside every worker repo.
+#: Sharing one across tasks would let one round's `lastfailed` decide which
+#: tests another round re-runs, which is a correctness problem and not a
+#: performance one; sharing one across ROUNDS of the same task would be the
+#: staleness problem — a `lastfailed` recorded against a different base.
+#:
+#: The lifetime claim is therefore UNREACHABILITY, not deletion, and that is the
+#: stronger form: `discard_cache()` removes the directory in the same `finally`
+#: that sweeps the rendezvous, but even a round killed before it runs leaks only
+#: an empty-of-meaning temp directory that NO later round can name, because the
+#: next round mints a fresh `mkdtemp` path. A cleanup that can be skipped is not
+#: what the guarantee rests on.
+ADVISORY_CACHE_PREFIX = "autoloop-ptcache-"
+
+#: Characters kept when a task id is folded into that directory name. A task id
+#: is normally `val-08`-shaped, but the name reaches `mkdtemp` and a `/` in it
+#: would be a path separator rather than a label. The id is a LABEL here and
+#: nothing reads it back, so collapsing anything else to `-` is lossless for
+#: every purpose this serves.
+_CACHE_NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
 
 def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> dict:
     """What the zero-argument call IS, in the form a tool transport publishes.
@@ -992,6 +1065,17 @@ def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> 
     the relation that holds in both cases — never wider, MAY be narrower — which
     is still enough for the only inference the agent draws from it: a green
     answer here covers the verdict run rather than having to reproduce it.
+
+    **And that ⊇ has ONE exception since val-08, so the description names it**
+    (2026-08-31). A request that follows a FAILED run is re-run with `--lf`, and
+    a `--lf` run IS narrower than the verdict run — the exact direction the
+    paragraph above calls the fail-open, an agent shown less than what grades it.
+    What makes it safe is that it is never silent: every such answer is stamped
+    as a rerun in its own first line, `AdvisoryValidation.note()` says so in the
+    round's summary rather than reporting a bare "last run PASSED", and this
+    description tells the agent the rule before it ever sees one. A `--lf` PASS
+    means "the tests that were failing now pass", which is what a confirm step
+    is for, and it is not a green suite.
     """
     return {
         "name": ADVISORY_TOOL_NAME,
@@ -1003,10 +1087,17 @@ def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> 
             "nothing you supply can change any of them. The result comes back "
             "to you as text. This run is ADVISORY — the executor runs "
             "validation itself afterwards and that run is the verdict. That "
-            "run is never WIDER than this one: it MAY be narrowed to the tests "
-            "your changed paths reach, and when it cannot narrow it runs this "
-            "same list in full. Either way a green answer here covers it "
-            "rather than reproducing it. At most "
+            "run is never WIDER than a FULL run here: it MAY be narrowed to "
+            "the tests your changed paths reach, and when it cannot narrow it "
+            "runs this same list in full. So a green FULL run here covers it "
+            "rather than reproducing it. ONE EXCEPTION, and the answer always "
+            "says which it is: a request made after a FAILED run MAY be re-run "
+            "with `--lf`, so pytest re-selects what its cache recorded as "
+            "failing instead of the whole list. That is the cheap confirm step "
+            "— but it is NARROWER than the run that grades you, it cannot see "
+            "what your fix newly broke, and a PASS on it means 'those tests "
+            "pass now', never 'the suite is green'. Spend a later run on a "
+            "full pass if the budget allows. At most "
             f"{max_calls} run(s) per round; past that the request executes "
             f"nothing and says {NOT_RUN}, which is not a pass."
         ),
@@ -1042,13 +1133,27 @@ class AdvisoryValidation:
     `test_selection = "full"`, a deleted module, an unretargetable command, a
     selector that raised).
 
-    So the relation is ⊇, not ⊂: an advisory run is never NARROWER than the run
-    that grades the round, and is strictly larger only when that run narrowed.
-    The agent proving green over at least what the executor will execute is the
-    safe direction; the reverse would be the fail-open — an agent shown a
-    narrower run than the verdict's. `advisory_tool_descriptor` states it in
-    that conditional form, because "the executor's run is narrowed" is false on
-    every widened round.
+    So the relation is ⊇, not ⊂: a FULL advisory run is never NARROWER than the
+    run that grades the round, and is strictly larger only when that run
+    narrowed. The agent proving green over at least what the executor will
+    execute is the safe direction; the reverse would be the fail-open — an agent
+    shown a narrower run than the verdict's. `advisory_tool_descriptor` states
+    it in that conditional form, because "the executor's run is narrowed" is
+    false on every widened round.
+
+    **val-08 (2026-08-31) introduces one run that is deliberately on the other
+    side of that relation, and buys the exception with disclosure.** A request
+    made after a FAILED run is re-run with `--lf` — pytest re-selects what its
+    cache recorded as failing — which is the cheap confirm step this channel
+    exists for and IS narrower than the verdict run. Nothing about that is
+    inferred by the reader: `run()` stamps the mode into the answer's first line
+    and appends a caveat spelling out that a `--lf` PASS is not a green suite,
+    `note()` says the same to the reviewer through `_rerun_caveat`, and the
+    descriptor states the rule in the brief. All three read `_reruns` — the flag
+    this object really passed — and none reads the run's output or the agent's
+    report. The FIRST run of a round is always full, and so is any run following
+    a PASS, so the narrow case only ever exists where a full run has already
+    named what is broken.
 
     The ONE case where this run is smaller is the malformed record `_advisory_for`
     guards below: `commands` falls back to `()`, and an empty list answers
@@ -1108,6 +1213,8 @@ class AdvisoryValidation:
         max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
         timeout: float = ADVISORY_VALIDATION_TIMEOUT_SECONDS,
         max_returns: int = ADVISORY_ZERO_CALL_RETURNS,
+        cache_namespace: str = "",
+        cache_root: Path | None = None,
     ):
         # Normalised defensively: an unusable list becomes the EMPTY list,
         # which `run()` answers as NOT_RUN and never as a pass. The round-level
@@ -1135,6 +1242,35 @@ class AdvisoryValidation:
         #: that could not run are counted separately and never land here — a
         #: list that mixed them could not answer "was the last RUN green".
         self._results: list[bool] = []
+        #: Parallel to `_results`: was that run a `--lf` RERUN rather than a
+        #: full one? Kept beside the verdict rather than folded into it because
+        #: they are different facts and only the pair is honest — "PASSED" for a
+        #: rerun of three tests is the misreport that cost port-05 a round, one
+        #: level down.
+        self._reruns: list[bool] = []
+        #: Where this ROUND's pytest cache lives, once something has needed it.
+        #: `None` until then, and `None` forever after a failure to create it or
+        #: after `discard_cache()` — in all three cases a run falls back to
+        #: `validation.NO_CACHE_ARGS`, i.e. to exactly what every run did before
+        #: val-08. See `_ensure_cache`.
+        self._cache_dir: Path | None = None
+        #: Why there is no cache, when there is none for a reason worth telling
+        #: the agent. Empty while a cache exists or has never been asked for.
+        self._cache_error = ""
+        self._cache_namespace = str(cache_namespace or "round")
+        self._cache_root = Path(cache_root) if cache_root is not None else None
+        #: Set by `discard_cache()`. A discarded cache is never re-created: the
+        #: round is over, and a fresh directory made after the sweep would be
+        #: the residue the sweep exists to remove.
+        self._cache_discarded = False
+        #: Is there a pytest command here for a cache to serve? A `ruff`-only
+        #: round makes no directory at all — nothing would write to it and
+        #: nothing would read it. Normalised defensively for the same reason
+        #: `_commands` is: this runs on EVERY round, malformed records included.
+        try:
+            self._wants_cache = has_pytest_command(self._commands)
+        except Exception:  # noqa: BLE001 — a malformed record must not raise here
+            self._wants_cache = False
         self._requests = 0
         self._refused = 0
         self._blocked = 0
@@ -1222,6 +1358,148 @@ class AdvisoryValidation:
         """
         with self._lock:
             self._returns_failed += 1
+
+    # ---- the round's pytest cache ------------------------------------------
+
+    def _ensure_cache(self) -> Path | None:
+        """This round's pytest cache directory, made on first use, or `None`.
+
+        FAIL CLOSED, and this is the whole of requirement 5: every way of not
+        having a directory — it could not be created, it could not be WRITTEN,
+        or the round has already swept it — returns `None`, and `None` sends the
+        run down `validation.NO_CACHE_ARGS`, which is byte-for-byte what every
+        advisory run did before val-08. A cache failure can therefore make a run
+        more expensive and can never make it narrower: `--lf` is injected only
+        inside the branch that turned the cache on
+        (`validation.effective_validation_command`), so there is no state in
+        which a missing cache leaves a rerun flag behind.
+
+        CREATED IS NOT ENOUGH — the probe writes a file and reads it back. A
+        read-only directory and a full filesystem both survive `mkdir` and would
+        then let pytest fail on its own cache write mid-run, which is a failing
+        command the agent would read as a failing test.
+
+        `mkdtemp` rather than a named path: it is unique per call, so two tasks
+        cannot share one and two ROUNDS of the same task cannot either. That
+        uniqueness — not the `discard_cache()` sweep — is what makes a stale
+        `lastfailed` unreachable; see `ADVISORY_CACHE_PREFIX`.
+
+        Never raises. It is called from `run()`, which is called from a
+        transport serving an agent mid-turn.
+        """
+        with self._lock:
+            if self._cache_dir is not None or self._cache_discarded or self._cache_error:
+                return self._cache_dir
+            label = _CACHE_NAME_SAFE.sub("-", self._cache_namespace)[:40] or "round"
+            path: Path | None = None
+            try:
+                root = str(self._cache_root) if self._cache_root is not None else None
+                path = Path(tempfile.mkdtemp(prefix=f"{ADVISORY_CACHE_PREFIX}{label}-", dir=root))
+                # OUTSIDE THE TREE, CHECKED RATHER THAN ASSUMED. `mkdtemp` obeys
+                # `TMPDIR`, so "the system temp directory" is an operator-settable
+                # value, and one pointed inside the checkout would put the cache
+                # back exactly where 2026-08-03 found it. Both directions,
+                # because either nesting is fatal to the same guarantee. This
+                # sees `_cwd`, so a declared `validation_cwd` SUBDIRECTORY is
+                # covered only for a temp root under that subdirectory — the repo
+                # root above it is not known here, and the shipped case (no
+                # declared cwd) has them equal.
+                if path.is_relative_to(self._cwd) or self._cwd.is_relative_to(path):
+                    raise OSError(
+                        f"the temp directory ({path}) is inside the tree being "
+                        "validated, so a cache there would dirty it"
+                    )
+                probe = path / "writable.probe"
+                probe.write_text("ok", encoding="utf-8")
+                if probe.read_text(encoding="utf-8") != "ok":
+                    raise OSError("the cache directory did not read back what was written")
+                probe.unlink()
+            except Exception as exc:  # noqa: BLE001 — see the docstring
+                # Whatever was made before the refusal is removed: a directory
+                # this decided not to use must not be left where the tree check
+                # just said it should not be.
+                if path is not None:
+                    shutil.rmtree(path, ignore_errors=True)
+                self._cache_error = (
+                    f"{type(exc).__name__}: {str(exc).strip() or '(no detail)'}"
+                )
+                return None
+            self._cache_dir = path
+            return path
+
+    def _cache_records_failures(self, cache: Path) -> bool:
+        """Did the last run really leave a rerun list behind?
+
+        `--lf` is asked for on EVIDENCE rather than on inference, and the
+        evidence is pytest's own `lastfailed` under the directory this round
+        gave it. "The last run failed" is not the same claim: three states
+        produce a failed run with nothing recorded, and `--lf` is wrong or
+        harmful in each.
+
+        * **`ruff` failed and pytest never ran.** `run_validation_commands`
+          stops at the first failing command, so the cache is untouched. `--lf`
+          would then run everything (pytest's `--lfnf` default is `all`) while
+          the answer described it as a rerun — a true run described falsely.
+        * **The cacheprovider is disabled somewhere this cannot see** — an
+          `addopts` line in the target repository's `pytest.ini`, which is a
+          file, not an argv, and so is invisible to
+          `validation.effective_validation_command` by design. `-o cache_dir=`
+          is then inert, no `lastfailed` appears, and `--lf` would be an
+          UNRECOGNISED ARGUMENT: `exit 4` before a test runs, which the agent
+          reads as a broken suite and which would burn the rest of its budget.
+        * **pytest changed where it keeps this.** Then the file is not found,
+          this answers False, and the round pays a full run — the direction a
+          wrong answer here has to fail in.
+
+        A read that fails for any reason is False, so absence of evidence is
+        never read as evidence. An empty or `{}` file is False too: pytest
+        clears the list when nothing failed.
+        """
+        try:
+            recorded = (cache / "v" / "cache" / "lastfailed").read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return False
+        return recorded.strip() not in ("", "{}", "[]", "null")
+
+    def discard_cache(self) -> None:
+        """Remove this round's cache directory, if one was ever made.
+
+        Called from the same `finally` that sweeps the rendezvous, and held to
+        the same standard: it must never raise there, because an exception in
+        that block would replace whatever outcome the round had reached. So the
+        removal is `ignore_errors` and a round that never made a directory does
+        nothing at all.
+
+        The guarantee this supports is disclosed accurately in
+        `ADVISORY_CACHE_PREFIX`: it is a tidy-up, NOT the isolation argument. A
+        leaked directory is unreachable by any later round regardless, because
+        every round mints its own `mkdtemp` path.
+        """
+        with self._lock:
+            path, self._cache_dir, self._cache_discarded = self._cache_dir, None, True
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @property
+    def cache_dir(self) -> Path | None:
+        """This round's cache directory, or `None` if there is not one (yet)."""
+        return self._cache_dir
+
+    @property
+    def cache_error(self) -> str:
+        """Why there is no cache, or "" when nothing went wrong."""
+        return self._cache_error
+
+    @property
+    def last_run_was_rerun(self) -> bool:
+        """Was the last EXECUTED run a `--lf` rerun rather than a full one?
+
+        False when nothing ran, which is the safe default: it is only ever used
+        to ADD a caveat, so a wrong `False` under-warns about a run that does
+        not exist while a wrong `True` would caveat a full run into looking
+        partial.
+        """
+        return bool(self._reruns) and self._reruns[-1]
 
     @property
     def exposed(self) -> bool:
@@ -1355,6 +1633,35 @@ class AdvisoryValidation:
                 f"{NOT_RUN} is not a pass — the executor's own run will fail on "
                 "the same directory."
             )
+        # THE RERUN DECISION, made here and from this object's own record plus
+        # the cache's: a request that FOLLOWS a failed run WHOSE FAILURES WERE
+        # RECORDED is the confirm step, and it is the only shape that gets
+        # `--lf`. Four properties fall out of writing it this way rather than as
+        # a flag the caller can set:
+        #
+        #   * no cache, no rerun — `cache` is `None` on every fallback path, and
+        #     `validation.effective_validation_command` injects `--lf` only
+        #     inside the branch that turned the cache on, so a cache failure can
+        #     never leave a narrowing flag behind;
+        #   * the FIRST run of a round is always full, because `_results` is
+        #     empty and there is nothing to confirm yet;
+        #   * a run that follows a PASS is full too, since the cheap question
+        #     ("do the failures pass now?") has no failures to ask about;
+        #   * a failed run that recorded NOTHING is full as well — see
+        #     `_cache_records_failures`, which is the difference between "the
+        #     last run failed" and "there is a list of what failed", and which
+        #     is what keeps `--lf` off a run whose pytest never started.
+        #
+        # `_wants_cache` keeps a `ruff`-only round from making a directory at
+        # all: nothing there writes a pytest cache and nothing reads one, so the
+        # command list such a round launches is byte-identical to before val-08.
+        cache = self._ensure_cache() if self._wants_cache else None
+        rerun = (
+            cache is not None
+            and bool(self._results)
+            and not self._results[-1]
+            and self._cache_records_failures(cache)
+        )
         try:
             ok, summary = run_validation_commands(
                 self._commands,
@@ -1362,24 +1669,70 @@ class AdvisoryValidation:
                 command_runner=self._command_runner,
                 timeout=self._timeout,
                 validation_env=self._validation_env,
+                pytest_cache_dir=cache,
+                rerun_last_failed=rerun,
             )
         except Exception as exc:  # noqa: BLE001 — see the docstring
             self._results.append(False)
+            self._reruns.append(rerun)
             return (
                 "ADVISORY validation could not complete: "
                 f"{type(exc).__name__}: {str(exc).strip() or '(no detail)'}. "
                 "Treat this as a FAILURE, not a pass — nothing was proved."
             )
         self._results.append(bool(ok))
+        self._reruns.append(rerun)
         verdict = "PASSED" if ok else "FAILED"
+        # STAMPED IN THE FIRST LINE, not buried. A `--lf` run is NARROWER than
+        # the executor's own verdict run — the one direction `AdvisoryValidation`
+        # otherwise never goes — so an answer that let it read as a full pass
+        # would be this feature's fail-open. The caveat is written from the flag
+        # that was really passed, never from the run's output.
+        mode = " (RERUN of the last run's failures, `--lf`)" if rerun else ""
+        caveat = ""
+        if rerun:
+            caveat = (
+                "\nTHIS RUN WAS NARROWED. It carried `--lf`, so pytest re-selected "
+                "only the tests its cache recorded as failing on your last run. A "
+                "PASS here means THOSE TESTS pass now; it is NOT a green suite, "
+                "and `--lf` cannot see what your fix newly broke. The executor's "
+                "own run selects afresh and grades the round. Spend a remaining "
+                "run on a full pass if you have one."
+            )
+        elif self._cache_error:
+            caveat = (
+                "\nThis run was FULL. The round's pytest cache could not be used "
+                f"({self._cache_error}), so validation ran exactly as it does "
+                "without one — `-p no:cacheprovider`, no `--lf` — and a later "
+                "request will be a full run too, not a cheap confirm."
+            )
         return (
-            f"ADVISORY validation run {self.runs} of {self._max_calls} — "
-            f"{verdict}.\n{summary}\n"
+            f"ADVISORY validation run {self.runs} of {self._max_calls}{mode} — "
+            f"{verdict}.\n{summary}{caveat}\n"
             "This run is advisory: the executor runs the same commands itself "
             "after you return, and that run is what decides the round."
         )
 
     # ---- what the round reports --------------------------------------------
+
+    def _rerun_caveat(self) -> str:
+        """What `note()` adds when the last completed run was a `--lf` rerun.
+
+        The reviewer reads `note()` as the round's account of whether the work
+        was checked, and "its last run PASSED" for a rerun of three tests is the
+        SAME misreport that cost port-05 round 1 — a sentence true of a run that
+        does not answer the question the reader is asking. Read from
+        `_reruns`, which records the flag this module really passed, never from
+        the run's own output or from anything the agent wrote.
+        """
+        if not self.last_run_was_rerun:
+            return ""
+        return (
+            " That last run carried `--lf`: it re-ran only the tests the round's "
+            "pytest cache recorded as failing, so it is NOT a full-suite result "
+            "and cannot show what the fix newly broke. The executor's own run "
+            "below selects afresh and is the verdict."
+        )
 
     def note(self) -> str:
         """The sentence the round's summary carries about this channel.
@@ -1426,6 +1779,7 @@ class AdvisoryValidation:
                     f" Earlier in the round the suite ran {self.runs} time(s) and "
                     f"the last run to COMPLETE {verdict} — a verdict about the "
                     "tree as it stood then, not about the one being reviewed."
+                    + self._rerun_caveat()
                 )
             else:
                 parts.append(" The suite ran 0 time(s) this round.")
@@ -1447,6 +1801,7 @@ class AdvisoryValidation:
             parts = [
                 f" Agent self-validation: the agent ran the suite {self.runs} "
                 f"time(s); its last run {verdict}."
+                + self._rerun_caveat()
             ]
         if self._returns:
             parts.append(
@@ -3866,6 +4221,14 @@ class ImplementExecutor:
             validation_env=self._validation_env,
             max_calls=self._advisory_max_calls,
             max_returns=self._advisory_zero_call_returns,
+            # A LABEL for the round's pytest cache directory, not a key: the
+            # directory is `mkdtemp`'d, so two rounds of THIS task get different
+            # paths just as two different tasks do. Passing the id makes a
+            # leaked directory legible to whoever finds one in `/tmp`; it is
+            # deliberately not what provides the isolation, because a name-keyed
+            # directory would be shared by every round of one task and would
+            # carry a `lastfailed` recorded against a different base.
+            cache_namespace=str(getattr(task, "id", "") or ""),
         )
 
     def _aborted_outcome(
@@ -4120,6 +4483,14 @@ class ImplementExecutor:
             # record. `stop()` sweeps even when `start()` never ran, which is
             # also what clears residue left by a round that was killed.
             rendezvous.stop()
+            # AFTER `stop()`, which joins a run still in flight — removing the
+            # cache under a live pytest would make it fail on its own cache
+            # write, and that failure would reach the agent as a failing
+            # command. Outside the worker repo either way, so unlike the
+            # rendezvous paths nothing here can show up as an out-of-scope
+            # write; this is tidiness, and the isolation guarantee rests on the
+            # per-round `mkdtemp` path (see `ADVISORY_CACHE_PREFIX`).
+            advisory.discard_cache()
         # EVERY completed invocation's report, in order, and the only text read
         # from here down. A round that was never handed back has exactly one, so
         # this is byte-for-byte `result.raw_text` for it; a round that was handed
@@ -4419,11 +4790,17 @@ class ImplementExecutor:
         # and decides the status. A green advisory run does not skip it, shorten
         # it or stand in for it — the agent's runs are evidence for the AGENT,
         # and this one is evidence for the reviewer. (The agent's advisory runs
-        # are NOT narrowed: `_advisory_for` binds them before the agent has
+        # are not TEST-SELECTED: `_advisory_for` binds them before the agent has
         # written anything, so there is no changed-path set to select from. This
-        # run is therefore never WIDER than one of those — equal on a widened
-        # round, a strict subset on a narrowed one — which is the safe
-        # direction.) The only
+        # run is therefore never wider than a FULL advisory run — equal on a
+        # widened round, a strict subset on a narrowed one — which is the safe
+        # direction. Since val-08 an advisory run that follows a failed one
+        # carries `--lf` and IS narrower than this one; it is stamped as a rerun
+        # everywhere it is reported, and nothing here reads it.) This run carries
+        # no `--lf`, no `--ff` and no `--sw`, and cannot: `run_validation_commands`
+        # defaults `rerun_last_failed` to False and only `AdvisoryValidation.run`
+        # passes True. It also gets no `cache_dir`, so it still runs under
+        # `validation.NO_CACHE_ARGS` exactly as before. The only
         # things that can keep this from running are the branches above that
         # already decided this round produces NO candidate (a failed agent, an
         # unreadable repo, no files changed, a missing validation directory, and
