@@ -142,8 +142,15 @@ def test_a_workers_root_that_collides_with_the_default_is_refused(checkout, tmp_
 #: the first two are the operator-writable flags that moved out first, the
 #: third is git-tracked source beside the package, and `workers_dir` is the one
 #: read-only path allowed a legacy fallback (see below).
+#:
+#: `notify_state_file` (notify-01, 2026-08-31) is derived FROM `heartbeat_file`
+#: and lives beside it, so it inherits that path's reasons rather than having
+#: its own: it is written from `heartbeat.publish`, i.e. mid-round, and the
+#: escape detector snapshots the checkout — ignored paths included — around
+#: every write-capable agent call.
 EXTERNAL_BY_DESIGN = frozenset(
-    {"pause_file", "heartbeat_file", "seed_tasks_file", "workers_dir"}
+    {"pause_file", "heartbeat_file", "notify_state_file", "seed_tasks_file",
+     "workers_dir"}
 )
 
 
