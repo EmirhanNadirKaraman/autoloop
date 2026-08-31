@@ -80,7 +80,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ..browser.chatgpt import SubmitResult
+from ..conversation import SubmitResult
 from ..errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
 from .quota import (
     DEFAULT_QUOTA_PATTERNS,

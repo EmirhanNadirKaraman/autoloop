@@ -1,72 +1,82 @@
-"""Where the shared transport vocabulary LIVES, and what the move did not change.
+"""Where the shared transport vocabulary LIVES, and what deleting the browser
+transport did not change.
 
 `SubmitResult` and `SendOutcome` are the words every provider speaks: the
 orchestrator branches on both on the codex path, which has no browser in it at
 all. They were defined inside `autoloop/browser/` until brw-17 (2026-08-27) and
-are defined in `autoloop/conversation.py` now, so retiring the browser transport
-takes nothing live with it.
+are defined in `autoloop/conversation.py` now, so retiring that transport took
+nothing live with it.
 
-Nothing in THIS file imports `autoloop.browser` any more either (brw-19b). It
-used to, to prove the package still spoke the moved vocabulary — a claim about
-a package that is being deleted, held in a file whose own job is to prove
-nothing live depends on it.
+`autoloop/browser/` is GONE as of brw-19a (2026-08-31): all seven modules
+unlinked, and the two adapters that still reached `SubmitResult` through
+`browser/chatgpt.py`'s re-export — `autoloop/codex/conversation.py` and
+`autoloop/codex/app_server_conversation.py` — repointed at
+`autoloop.conversation`, where the enum has actually lived since brw-17. This
+file is the proof that it stays gone.
 
-Four claims, and each is here because breaking it fails SILENTLY:
+Five claims, and each is here because breaking it fails SILENTLY:
 
 * **Identity, not equality.** Every caller compares with `is`
   (`orchestrator._submit_request`, `inbox.provider_asker`). Both enums subclass
   `str`, so a SECOND definition of `SubmitResult` would still satisfy
   `== "rejected"` — an equality-based test would stay green while every `is`
-  check in the loop silently went False. The re-export must therefore be the
-  same object, not a copy.
+  check in the loop silently went False. The repointed imports must therefore
+  yield the same object, not a copy.
 * **The values are a STORAGE FORMAT.** `Orchestrator._submit_request` writes
   `SendOutcome.REJECTED.value` to `PendingRequest.last_send_outcome`, which
   lands in `state.json` and is read back on the next start. A renamed value
   misreads a resumed run whose state predates the rename, and nothing raises.
-* **Live modules no longer import a retired transport — none of them, and no
-  exception.** Pinned by reading the source of `autoloop/*.py`, because an
-  import that creeps back is invisible until the package is deleted underneath
-  it. There was ONE allowed import until brw-19b, the orchestrator's CDP
-  page-target probe; it and the recovery that called it are gone, so the
-  allowance is gone with them and the count this file permits is zero.
-  `autoloop/codex/` is still NOT scanned: both adapters there reach
-  `SubmitResult` through `browser/chatgpt.py`'s re-export, that package was
-  outside brw-17's approved scope and outside brw-19b's, and repointing those
-  two lines belongs to whoever owns them. Scanning it would fail on a state
-  this file was told to leave standing.
-* **Nor does the orchestrator ADVISE running one.** The fourth claim, added by
-  brw-19c (2026-08-31): a module path handed to an operator in park text is not
-  an import and never breaks a run, so every guard above passes it — it fails
+* **No PRODUCTION module imports the retired transport — none of them, and no
+  exception.** Pinned by reading the source of every `.py` under `autoloop/`
+  except `autoloop/tests/`, because an import that creeps back is invisible
+  until the package is deleted underneath it. The scan read `autoloop/*.py`
+  alone until brw-19a and deliberately skipped `autoloop/codex/`, whose two
+  adapters were then outside every approved scope; that carve-out is what let
+  the last two live imports sit green under a file whose whole job was to prove
+  there were none. It is gone: the regex below matches `from ..browser.chatgpt
+  import SubmitResult` exactly as it stood, so this scan would have gone red on
+  both lines the day it was widened.
+* **The package ships no module and none can be imported.** The scan above is a
+  statement about IMPORTERS, and would read clean over a tree where every
+  importer was repointed and the seven modules were left standing — which is
+  most of this task's failure mode, not a hypothetical. Asserted separately, on
+  the source files and on `import_module` both, because each alone fails open:
+  a file left on disk that nothing imports yet is still a package waiting to be
+  imported, and an import that fails could be failing for its own reasons.
+* **Nor does the orchestrator ADVISE running one.** Added by brw-19c
+  (2026-08-31): a module path handed to an operator in park text is not an
+  import and never breaks a run, so every guard above passes it — it fails
   later, when someone follows it while their browser is already down. Scanned
-  as source text, over `orchestrator.py` only; the file that still carries the
-  same path in a comment is named under THE GAP below.
+  as source text, over `orchestrator.py` only; the two files that still carry
+  the same path in a COMMENT are named under THE GAP below.
 
-THE GAP THAT LEAVES, named here so it is visible rather than merely unscanned
-(brw-19c, 2026-08-31). Those two lines are
-`autoloop/codex/conversation.py:83` and
-`autoloop/codex/app_server_conversation.py:62`, both
-`from ..browser.chatgpt import SubmitResult`. They are LIVE imports on the
-transports the loop actually runs, so deleting `autoloop/browser/` breaks both
-adapters at import time — and this file stays green while it happens, because
-the scan below deliberately does not read that directory. Repointing them at
-`autoloop.conversation`, where the vocabulary has lived since brw-17, is a
-one-line change each and belongs to whoever deletes the package. It is NOT
-pinned by a test here on purpose: any test asserting those imports exist
-inverts the moment they are fixed, which is the wrong way round for a thing
-that ought to be fixed.
+THE GAP THAT LEAVES, named here so it is visible rather than merely unscanned.
+It is now prose only — no import and no module survives either half of it.
 
-`autoloop/conversation.py:385` is the smaller half of the same gap, and a
-milder one: it spells `python3 -m autoloop.browser.chrome_restart` inside a
-COMMENT that QUOTES the park a `codex_cli` run wrongly wrote on 2026-08-22, as
-the reason `_TRANSPORT_REMEDIES` exists. Nobody is being advised there and
-nothing breaks — but it is the same literal string, it is outside brw-19c's
-approved paths, and that is why the advice scan below reads `orchestrator.py`
-alone rather than the package: widened, it would go red on a line this round
-was not allowed to edit.
+`autoloop/conversation.py:385` spells `python3 -m autoloop.browser.chrome_restart`
+inside a COMMENT that QUOTES the park a `codex_cli` run wrongly wrote on
+2026-08-22, as the reason `_TRANSPORT_REMEDIES` exists. `autoloop/config.py:364`
+names the same module in a comment about what replaced the retired
+`browser.restart_command` example. Nobody is being advised in either, and
+nothing breaks — but they are the same literal string, both files are outside
+brw-19a's approved paths, and that is why the advice scan below reads
+`orchestrator.py` alone rather than the package: widened, it would go red on two
+lines this round was not allowed to edit.
+
+`autoloop/tests/` is deliberately not scanned for imports, here or before. A
+test that imported the package would now fail at COLLECTION with
+`ModuleNotFoundError` — loudly, in the run that introduced it — which is the
+one failure mode a silent-drift scan exists to catch and this one cannot hide.
+`test_conversation_retirement.py` additionally self-checks its own source,
+because it held the last two live test imports.
 """
 
+import importlib
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 import autoloop
 from autoloop.codex import app_server_conversation as codex_app_server_conversation
@@ -76,15 +86,15 @@ from autoloop.conversation import SendOutcome, SubmitResult
 PACKAGE_DIR = Path(autoloop.__file__).resolve().parent
 
 #: Matches an import statement, indented or not, that reaches into the browser
-#: package — by relative path (`from .browser…`, the form the live modules use)
-#: OR by absolute one (`from autoloop.browser…`, `import autoloop.browser…`).
-#: Both, deliberately: brw-17's own DONE MEANS greps for the relative form only,
-#: and a guard that watches one spelling is a guard the other spelling walks
-#: past. Deliberately NOT matched: prose and operator advice naming a module
-#: inside the package as a COMMAND LINE rather than as a dependency. That is
-#: still the right exclusion — such a line is wrong advice, not a broken
-#: import, and the two failures want different guards — but the set it excuses
-#: is now empty in the modules scanned here, and
+#: package — by relative path (`from .browser…` / `from ..browser…`, the forms
+#: the live modules used) OR by absolute one (`from autoloop.browser…`,
+#: `import autoloop.browser…`). Both, deliberately: brw-17's own DONE MEANS
+#: greps for the relative form only, and a guard that watches one spelling is a
+#: guard the other spelling walks past. Deliberately NOT matched: prose and
+#: operator advice naming a module inside the package as a COMMAND LINE rather
+#: than as a dependency. That is still the right exclusion — such a line is
+#: wrong advice, not a broken import, and the two failures want different
+#: guards — but the set it excuses is now empty in the modules scanned here, and
 #: `test_no_operator_advice_in_the_orchestrator_names_the_retired_package` is
 #: the guard that keeps it empty.
 #:
@@ -106,11 +116,42 @@ _BROWSER_IMPORT = re.compile(
     r"^\s*(?:from \.{1,2}|from autoloop\.|import autoloop\.)browser(?:[.\s]|$)"
 )
 
-#: The LAST live import of the browser package, which brw-17 deliberately left
-#: standing and brw-19b removed together with the recovery that called it.
-#: Spelled out rather than described so the inverted test below names the exact
-#: line it refuses, and so a re-add is caught by text as well as by attribute.
+#: The LAST live import of the browser package inside `orchestrator.py`, which
+#: brw-17 deliberately left standing and brw-19b removed together with the
+#: recovery that called it. Spelled out rather than described so the inverted
+#: test below names the exact line it refuses, and so a re-add is caught by text
+#: as well as by attribute.
 _REMOVED_BROWSER_IMPORT = "from .browser.playwright_session import attachable_page_targets"
+
+#: The six submodules brw-19a unlinked, by dotted name. `autoloop.browser`
+#: itself is checked separately: the seventh file is its `__init__.py`, and the
+#: package name has one more way to survive than a module does (see
+#: `test_the_retired_browser_package_ships_no_module_at_all`).
+_RETIRED_MODULES = (
+    "autoloop.browser.chatgpt",
+    "autoloop.browser.chrome_restart",
+    "autoloop.browser.observation",
+    "autoloop.browser.playwright_session",
+    "autoloop.browser.selectors",
+    "autoloop.browser.session",
+)
+
+
+def _production_modules() -> list[Path]:
+    """Every `.py` under `autoloop/` that is not a test and not bytecode.
+
+    A LIST rather than a generator, and asserted about by its callers before it
+    is read: a glob that matched nothing — a moved package, a renamed directory,
+    a `PACKAGE_DIR` computed off the wrong file — reports "clean" about a tree
+    it never opened, which is the fail-open shape this module exists to refuse
+    in other people's code.
+    """
+    return sorted(
+        path
+        for path in PACKAGE_DIR.rglob("*.py")
+        if "tests" not in path.relative_to(PACKAGE_DIR).parts
+        and "__pycache__" not in path.parts
+    )
 
 
 # ---- the vocabulary is defined here, and the codex adapters see THIS object --
@@ -124,9 +165,11 @@ def test_the_vocabulary_is_defined_in_the_transport_neutral_module():
 def test_every_import_path_yields_THE_SAME_enum_object():
     """`is` comparisons are what the orchestrator uses; a copy would pass `==`.
 
-    The two browser spellings were checked here until brw-19b and are not any
-    more: this file no longer imports that package. What the codex adapters
-    reach is unchanged, and that is the half the loop actually runs."""
+    Both codex adapters imported this enum from `browser/chatgpt.py`'s
+    re-export until brw-19a and import it from `autoloop.conversation` now. The
+    assertions are unchanged on purpose: the whole point of the re-export was
+    that it preserved object identity, so a repointing that preserved it too
+    changes nothing here — and one that did NOT would fail exactly here."""
     assert codex_conversation.SubmitResult is SubmitResult
     assert codex_app_server_conversation.SubmitResult is SubmitResult
     assert codex_conversation.SubmitResult.REJECTED is SubmitResult.REJECTED
@@ -167,37 +210,106 @@ def test_both_are_still_str_enums_so_a_persisted_value_compares_equal():
     assert SubmitResult("unconfirmed") is SubmitResult.UNCONFIRMED
 
 
-# ---- no live module imports the retired transport ----------------------------
+# ---- the package itself is gone ----------------------------------------------
 
 
-def test_no_top_level_module_imports_the_browser_package_AT_ALL():
-    """brw-17's DONE MEANS with brw-19b's exception removed, asserted on the
-    source rather than on a symptom.
+def test_the_retired_browser_package_ships_no_module_at_all():
+    """brw-19a's own claim, and the one the import scan below cannot make.
 
-    Reads every `autoloop/*.py` — the package's own live modules, not
-    `autoloop/browser/` (which may import itself), not `autoloop/codex/` (see
-    the module docstring) and not `autoloop/tests/`.
+    Two independent spellings, because each alone fails open:
 
-    The population is asserted BEFORE the scan, in this same function: a glob
-    that matched nothing (a moved package, a renamed directory) would report
-    "clean" about a tree it never read, which is the fail-open shape this test
-    exists to catch in other people's code. It is load-bearing here in a way it
-    was not before: with no allowed import left, an empty scan and a clean tree
-    produce the identical empty offender list."""
-    scanned = sorted(PACKAGE_DIR.glob("*.py"))
-    assert len(scanned) > 20, f"the scan read almost nothing — {PACKAGE_DIR} is wrong"
-    assert (PACKAGE_DIR / "orchestrator.py") in scanned, "the module that held the last one"
+    * **On disk.** A module left standing that nothing imports YET still passes
+      every import scan in this file — it is a package waiting to be imported,
+      not a package that is gone.
+    * **Through the import system.** A file can be absent from
+      `autoloop/browser/` and the name still resolve, from a stale artefact or
+      from something else on `sys.path` shadowing it. `import_module` is the
+      only check that answers the question a caller actually asks.
+
+    `sys.modules` is checked BEFORE each import, so a module some earlier test
+    in this process already imported is reported as the violation it is rather
+    than quietly satisfying the raises-check from cache.
+
+    The SOURCE FILES are asserted about, never the directory's existence. The
+    executor that performs a deletion unlinks files and leaves the directory
+    behind, and git does not track a directory, so `browser_dir.exists()` would
+    grade a worker tree's leftovers instead of the committed tree — red on a
+    correct change, which is worse than useless.
+    """
+    browser_dir = PACKAGE_DIR / "browser"
+    survivors = sorted(p.name for p in browser_dir.glob("*.py")) if browser_dir.is_dir() else []
+    assert survivors == [], (
+        f"{browser_dir} still ships module source: {survivors} — the browser "
+        "transport was retired in brw-16 and deleted in brw-19a"
+    )
+
+    for name in _RETIRED_MODULES:
+        assert name not in sys.modules, f"{name} was imported by something in this session"
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(name)
+
+    # The package NAME has one survival route a module does not: an emptied
+    # directory left behind by an unlink resolves as a PEP 420 namespace
+    # package, which imports fine and can hold no code. That is acceptable and
+    # is exactly what a worker tree looks like between the deletion and the
+    # commit; a REGULAR package — one with an `__init__.py`, and therefore with
+    # code — is not.
+    try:
+        package = importlib.import_module("autoloop.browser")
+    except ModuleNotFoundError:
+        return
+    assert getattr(package, "__file__", None) is None, (
+        f"autoloop.browser imported as a real package from {package.__file__}"
+    )
+
+
+# ---- no production module imports the retired transport ----------------------
+
+
+def test_no_production_module_imports_the_browser_package_AT_ALL():
+    """brw-17's DONE MEANS with brw-19b's exception removed and brw-19a's
+    carve-out closed, asserted on the source rather than on a symptom.
+
+    Reads every `.py` under `autoloop/` except `autoloop/tests/` —
+    `autoloop/codex/` and `autoloop/audit/` included, where this scan read
+    `autoloop/*.py` alone until brw-19a.
+
+    The population is asserted BEFORE the scan, in this same function, and per
+    SUBTREE rather than only in total: a total that clears its floor while
+    `codex/` contributes nothing is precisely the state the old carve-out
+    described, and it must not be reachable by accident from a rename. With no
+    allowed import left anywhere, an empty scan and a clean tree produce the
+    identical empty offender list, so the floors are the only thing separating
+    them.
+    """
+    scanned = _production_modules()
+    top_level = [path for path in scanned if path.parent == PACKAGE_DIR]
+    codex = [path for path in scanned if path.parent.name == "codex"]
+    audit = [path for path in scanned if path.parent.name == "audit"]
+    assert len(scanned) > 40, f"the scan read almost nothing — {PACKAGE_DIR} is wrong"
+    assert len(top_level) > 20, "the package's own modules are missing from the scan"
+    assert len(codex) >= 5, "autoloop/codex/ is missing from the scan — the brw-19a carve-out"
+    assert len(audit) >= 5, "autoloop/audit/ is missing from the scan"
+    for sentinel in (
+        "orchestrator.py",
+        "codex/conversation.py",
+        "codex/app_server_conversation.py",
+    ):
+        assert (PACKAGE_DIR / sentinel) in scanned, f"{sentinel} is not being read"
+
     offenders = []
     for module in scanned:
+        rel = module.relative_to(PACKAGE_DIR).as_posix()
         for lineno, line in enumerate(
             module.read_text(encoding="utf-8").splitlines(), start=1
         ):
             if not _BROWSER_IMPORT.match(line):
                 continue
-            offenders.append(f"{module.name}:{lineno}: {line.strip()}")
+            offenders.append(f"{rel}:{lineno}: {line.strip()}")
     assert offenders == [], (
-        "live modules must not import the retired browser transport; move the "
-        f"shared name into conversation.py instead: {offenders}"
+        "production modules must not import the deleted browser transport; the "
+        "shared vocabulary is in conversation.py and the package is gone: "
+        f"{offenders}"
     )
 
 
@@ -229,9 +341,11 @@ def test_no_operator_advice_in_the_orchestrator_names_the_retired_package():
 
     Until brw-19c (2026-08-31) `orchestrator.py` told operators to run
     `python3 -m autoloop.browser.chrome_restart` in two parks and one
-    docstring. That advice costs nothing at import time — it fails when someone
-    FOLLOWS it, with `No module named`, at the one moment it is reached: the
-    browser is already down and the loop has already stopped.
+    docstring. That advice cost nothing at import time — it failed when someone
+    FOLLOWED it, with `No module named`, at the one moment it was reached: the
+    browser already down and the loop already stopped. Since brw-19a the module
+    is not merely retired but deleted, so there is no longer any state of the
+    world in which such a line could work.
 
     Source text rather than a built park, deliberately. Both parks need a
     browser-backed transport and a fault injected at the right step;
@@ -252,7 +366,7 @@ def test_no_operator_advice_in_the_orchestrator_names_the_retired_package():
         if "autoloop.browser" in line
     ]
     assert offenders == [], (
-        "operator-facing text must not name a module inside the retired "
+        "operator-facing text must not name a module inside the deleted "
         f"package; say what to configure or do instead: {offenders}"
     )
 
