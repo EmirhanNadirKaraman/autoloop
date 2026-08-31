@@ -206,26 +206,37 @@ def test_a_healthy_conversation_section_produces_no_notice(tmp_path):
     assert config.migration_notices == ()
 
 
-# ---- 3b. the live-CDP probe is unreachable on a default run -------------------
+# ---- 3b. there is no live-CDP probe left to reach -----------------------------
 
 
-def test_a_default_run_never_probes_the_cdp_endpoint(tmp_path):
+def test_the_orchestrator_holds_no_cdp_probe_at_all(tmp_path):
     """The fail-open the removed conftest fixture used to cover, closed at the
-    source instead.
+    source and then removed at the source.
 
-    `Orchestrator._attachable_page_targets` dials `browser.cdp_url` — a real
-    Chrome on 127.0.0.1:9222 on a developer machine — and it is reached only
-    from `_handle_rate_limited`'s browser arm, which asks
-    `conversation.transport_is_browser_backed` first. With no browser-backed
-    provider registered that arm is unreachable, which is WHY the autouse
-    fixture could go. Asserted by making the probe explode: a run that reaches
-    it fails loudly here rather than quietly opening a socket on whoever's
-    machine runs the suite.
+    Until brw-19b `Orchestrator._attachable_page_targets` dialled
+    `browser.cdp_url` — a real Chrome on 127.0.0.1:9222 on a developer machine.
+    brw-16 argued it was UNREACHABLE on a default run (`_handle_rate_limited`'s
+    browser arm asks `conversation.transport_is_browser_backed` first, and no
+    registered provider answers yes), which is why the autouse fixture could
+    go; brw-19b removed the method and its `autoloop.browser` import outright,
+    so there is no longer a probe to be unreachable.
+
+    Asserted on the CLASS and on the MODULE, not on one instance: an instance
+    check passes for a class attribute that was merely shadowed, and the module
+    check is what fails if the import creeps back in for some other caller. The
+    default run is then driven through the handler anyway, because "the method
+    is gone" and "no socket is opened" are different claims and only the second
+    one is what the fixture protected.
     """
+    from autoloop import orchestrator as orchestrator_module
     from autoloop.errors import RateLimitedError
+    from autoloop.orchestrator import Orchestrator
     from autoloop.state import Phase
 
     from test_orchestrator import build  # noqa: E402 - see conftest sys.path
+
+    assert not hasattr(Orchestrator, "_attachable_page_targets")
+    assert not hasattr(orchestrator_module, "attachable_page_targets")
 
     # The PRODUCTION default, named through the dataclass rather than spelled
     # here, so this test moves with it. `test_orchestrator.build` defaults to a
@@ -235,10 +246,6 @@ def test_a_default_run_never_probes_the_cdp_endpoint(tmp_path):
     assert orch._config.conversation.provider == "codex_cli"
     assert orch._transport_is_browser_backed() is False
 
-    def explode():
-        raise AssertionError("a default run must never dial the CDP endpoint")
-
-    orch._attachable_page_targets = explode
     orch._sleep = lambda seconds: None
     orch.state.phase = Phase.AWAITING.value
 
