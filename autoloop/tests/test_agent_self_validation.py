@@ -215,6 +215,33 @@ class CacheWritingRunner(RecordingRunner):
         return proc
 
 
+def failure_record(cache) -> Path:
+    """Where pytest keeps the list `--lf` selects from, under `cache`.
+
+    Spelled here rather than imported so the tests below fail if the production
+    path ever moves: a clear and an evidence read that agree with each other but
+    not with pytest would leave the gate reading a file nothing writes.
+    """
+    return Path(cache) / "v" / "cache" / "lastfailed"
+
+
+class WatchingCacheRunner(CacheWritingRunner):
+    """`CacheWritingRunner`, plus the one OBSERVATION the provenance gate is
+    about: was a rerun list already on disk when this command launched?
+
+    Recorded per call as `record_at_launch`, because "the stale list was
+    cleared" is a fact about the moment pytest starts and cannot be recovered
+    afterwards — by then the run has either rewritten the file or not.
+    """
+
+    def __call__(self, argv, **kwargs):
+        cache = cache_dir_of(tuple(argv))
+        present = failure_record(cache).exists() if cache else False
+        proc = super().__call__(argv, **kwargs)
+        self.calls[-1]["record_at_launch"] = present
+        return proc
+
+
 class ExplodingRunner:
     def __init__(self):
         self.calls = 0
@@ -3043,3 +3070,191 @@ def test_the_description_warns_the_agent_before_it_ever_sees_a_rerun():
     assert "NARROWER" in description
     assert "never 'the suite is green'" in description
     assert description in implement_executor._advisory_instruction(3)
+
+
+# ---- 11f: only the run that RECORDED the failures may authorise a rerun -----
+#
+# The gate used to be "the last run failed AND the cache holds a list". The
+# second half proves that SOME earlier run recorded failures, never that the run
+# just finished did — and the two come apart on a sequence the loop really
+# produces, because `run_validation_commands` stops at the first failing command
+# and `ruff` runs before pytest. So the list is CLEARED before every run that
+# could write one, and only a run that started with it absent may authorise the
+# next `--lf`.
+
+
+def test_a_run_whose_pytest_never_started_cannot_pass_an_older_runs_failures_on(
+    worker_repo, tmp_path
+):
+    """THE REGRESSION (found in review, 2026-08-31). Three runs, exactly the
+    sequence the old gate got wrong:
+
+      1. `ruff` passes, pytest FAILS and records what failed;
+      2. `ruff` FAILS, so the run stops before pytest and the file is untouched;
+      3. the next request must be a FULL run.
+
+    Under the old gate run 3 read run 1's list — failures from two edits back,
+    recorded before the change that broke `ruff` even existed — was handed
+    `--lf`, and could answer PASS while run 2's failure had never been
+    re-examined. A narrowed pass presented as a confirm step is the fail-open
+    this whole feature has to avoid.
+
+    Both halves are asserted, and the second is what makes the first mean
+    something: run 3 carries no rerun flag, AND the launcher saw NO rerun list
+    on disk when run 3's pytest started — so the pass is a full one rather than
+    a rerun of an empty list, which is what `--lf` degrades to (`--lfnf` defaults
+    to `all`) and which would have looked identical in the answer text.
+    """
+    runner = WatchingCacheRunner(returncodes=(0, 1, 1, 0, 0))
+    service = AdvisoryValidation(
+        commands=(RUFF, SUITE),
+        cwd=worker_repo,
+        command_runner=runner,
+        cache_root=tmp_path,
+        max_calls=3,
+    )
+    service.expose()
+
+    first, second, third = service.run(), service.run(), service.run()
+
+    launched = [call["argv"] for call in runner.calls]
+    pytest_calls = [call for call in runner.calls if "pytest" in call["argv"]]
+    assert len(launched) == 5, f"run 2 must stop at ruff: {launched}"
+    assert len(pytest_calls) == 2, "run 2's pytest never launched, so it recorded nothing"
+
+    # Run 1 recorded the failures; that is what makes run 2 the interesting run
+    # rather than a vacuous one.
+    assert "FAILED" in first and not rerun_flags(pytest_calls[0]["argv"])
+
+    # Run 2 IS stamped as a rerun, because `--lf` really was put on the pytest
+    # command — which then never launched. Nothing claims a narrowed PASS: the
+    # run reports FAILED, and the flag it names is the flag it carried.
+    assert "FAILED" in second and "RERUN" in second
+
+    # Run 3: FULL, and provably not a rerun of a stale list.
+    assert not rerun_flags(pytest_calls[1]["argv"]), (
+        "run 3 was narrowed by failures the run before it never recorded"
+    )
+    assert pytest_calls[1]["record_at_launch"] is False, (
+        "run 3 launched on the list it inherited from run 1"
+    )
+    assert "RERUN" not in third and "PASSED" in third
+    assert service.last_run_was_rerun is False
+    assert "--lf" not in service.note()
+
+
+def test_a_rerun_never_authorises_another_rerun(worker_repo, tmp_path):
+    """The deliberate conservatism, pinned so it is a decision rather than an
+    accident. A `--lf` run cannot clear the list it selects FROM, so no run
+    after one starts with the file provably absent and the confirm step never
+    chains into a second.
+
+    It could not be bought back by comparing the file's bytes across the run:
+    pytest's `LFPlugin.pytest_sessionfinish` writes only `if saved_lastfailed !=
+    self.lastfailed`, so a rerun failing on the SAME tests writes nothing at
+    all, and "unchanged" is then indistinguishable from "pytest never ran". The
+    cost of failing closed is one full run; the cost of guessing is the defect
+    the test above describes.
+    """
+    runner = WatchingCacheRunner(returncodes=(1, 1, 1))
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=worker_repo,
+        command_runner=runner,
+        cache_root=tmp_path,
+        max_calls=3,
+    )
+    service.expose()
+
+    service.run()
+    second = service.run()
+    third = service.run()
+
+    assert [rerun_flags(call["argv"]) for call in runner.calls] == [
+        set(),
+        {"--lf"},
+        set(),
+    ], "the rerun chained past the one run whose provenance was established"
+    assert "RERUN" in second
+    assert "RERUN" not in third
+    assert service.last_run_was_rerun is False
+
+
+def test_a_rerun_list_that_cannot_be_cleared_gives_the_cache_up_and_says_so(
+    worker_repo, tmp_path
+):
+    """FAIL CLOSED when the provenance cannot be ESTABLISHED, not just when it
+    comes out negative.
+
+    A `lastfailed` that will not go away is a directory this round cannot use
+    for the one thing it is for — every later run would be reading a list no run
+    of this round wrote. So the round gives the cache up entirely and lands on
+    the fallback that already existed: no `cache_dir`, `-p no:cacheprovider`, no
+    `--lf`, and an answer that says why. Reusing that path rather than adding a
+    second one is deliberate; a second fallback is a second thing to get wrong.
+
+    The obstruction is a non-empty DIRECTORY where the file goes, which is the
+    cheapest way to make `unlink` fail for a real reason rather than by
+    patching it — a monkeypatched failure would pass just as well if the
+    production code had stopped calling `unlink` at all.
+    """
+    runner = RecordingRunner(returncodes=(1, 1))
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=worker_repo, command_runner=runner, cache_root=tmp_path
+    )
+    service.expose()
+
+    service.run()
+    cache = service.cache_dir
+    assert cache is not None, "the first run must have made a cache to obstruct"
+    blocked = failure_record(cache)
+    blocked.mkdir(parents=True)
+    (blocked / "occupied").write_text("not going anywhere", encoding="utf-8")
+
+    second = service.run()
+
+    assert service.cache_dir is None
+    assert not cache.exists(), "a cache this round refused to use must not be left behind"
+    assert "could not be cleared" in service.cache_error
+    assert cache_dir_of(runner.calls[-1]["argv"]) is None
+    assert ("-p", "no:cacheprovider") in pairs(runner.calls[-1]["argv"])
+    assert not rerun_flags(runner.calls[-1]["argv"])
+    assert "could not be used" in second and "no `--lf`" in second
+
+
+def test_a_request_that_executed_nothing_leaves_the_evidence_where_it_was(
+    tmp_path,
+):
+    """The other side of the rule, which a one-sided reading would break: the
+    conjuncts are about the preceding EXECUTED run, and a request that executed
+    NOTHING is not one.
+
+    Here the middle request is refused because the working directory has gone —
+    it launches no command, so it neither records failures nor destroys the
+    evidence the run before it recorded. The confirm step the agent is owed
+    survives it. Reading `NOT_RUN` as "the last run recorded nothing" would
+    quietly widen every round that hit a transient refusal; reading it as a
+    failed run would be worse still, since nothing failed.
+    """
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    runner = WatchingCacheRunner(returncodes=(1, 0))
+    service = AdvisoryValidation(
+        commands=(SUITE,),
+        cwd=tree,
+        command_runner=runner,
+        cache_root=tmp_path,
+        max_calls=3,
+    )
+    service.expose()
+
+    service.run()
+    tree.rmdir()
+    blocked = service.run()
+    tree.mkdir()
+    third = service.run()
+
+    assert NOT_RUN in blocked and len(runner.calls) == 2, "the middle request ran nothing"
+    assert rerun_flags(runner.calls[-1]["argv"]) == {"--lf"}
+    assert "RERUN" in third
+    assert service.runs == 2, "a request that executed nothing is not a run"
