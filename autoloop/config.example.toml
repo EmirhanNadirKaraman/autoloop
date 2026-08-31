@@ -559,6 +559,71 @@ audit_report_glob = "docs/AUDIT_*.md"
 # is refused rather than read as that opt-out, as above.
 audit_charters_file = "docs/audit_charters.toml"
 
+[notify]
+# Email you when the loop's STATUS CHANGES, sent by the loop itself from
+# heartbeat.publish — the one chokepoint every status update already passes
+# through, so a new call site cannot forget to notify.
+#
+# WHAT IT COVERS, AND WHAT IT CANNOT. Read this before you rely on it. The mail
+# is a SELF-REPORT, so it covers exactly what the loop KNOWS: a park, a block,
+# a pause, a clean stop, and task/phase transitions. It does NOT cover the loop
+# having HUNG, CRASHED or been KILLED — a loop in that state sends no mail for
+# the same reason it writes no heartbeat, and no timer, thread or subprocess
+# inside the loop can fix that. Only something OUTSIDE the process sees silence:
+# that is scripts/autoloop_health_notify.sh, which reads the heartbeat file and
+# nothing else, and it is why that script exists. Mail arriving means the loop
+# is alive. Mail NOT arriving means nothing at all.
+#
+# WHEN IT SENDS: on a CHANGE of (status, phase, task id, decision) against the
+# last one observed, which is persisted beside the heartbeat file — so a
+# restart does not re-send the state it already sent. Observed cadence is one
+# change every 15-45 minutes. `publish` is called from the hot loop, and an
+# unchanged tuple costs one file read and sends nothing.
+#
+# WHAT IT COSTS WHEN IT BREAKS: nothing that can end a round. Every failure is
+# swallowed and logged to stderr, one send is attempted and never retried, and
+# timeout_seconds below is a hard bound on that attempt.
+#
+# OFF by default. An unconfigured loop must not try to send.
+enabled = false
+# Who gets the mail, and who it is from. Required when enabled = true.
+recipient = ""
+sender = ""
+# The SMTP server. 587 with tls = "starttls", or 465 with tls = "ssl".
+host = ""
+port = 587
+# "starttls" or "ssl". There is deliberately NO "none": authentication is
+# mandatory (below), so a cleartext session would put your password on the wire.
+tls = "starttls"
+# The SMTP account. Required when enabled = true — a send with no credential is
+# REFUSED, never quietly attempted unauthenticated.
+username = ""
+#
+# THE PASSWORD IS NOT IN THIS FILE, and there is no key for it: `password = ...`
+# here is refused at load with the remedy. Name WHERE the password lives, using
+# exactly one of the two settings below.
+#
+#   * password_env — the name of an environment variable in the loop's own
+#     environment (launchd: an EnvironmentVariables entry, or a wrapper that
+#     exports it). Nothing writes it to disk.
+#   * password_file — a path to a file whose FIRST LINE is the password. Keep it
+#     outside the checkout and readable only by you (`chmod 600`).
+#
+# Unset, empty, blank or unreadable is not a fallback: the send is refused with
+# a message on stderr saying which source was empty. The password is never
+# logged, never written to the heartbeat, and never included in an error string.
+password_env = ""
+password_file = ""
+# The hard bound on ONE send, in seconds, and the entire cost of a dead SMTP
+# server: the attempt is abandoned at this point, the round continues, and
+# nothing is retried. At most 60; a few seconds is the intended shape.
+timeout_seconds = 10.0
+# WHICH statuses mail. All five by default — the task and phase transitions
+# inside "running" are the cadence above. For attention-only mail, narrow it to
+# ["parked", "blocked", "paused"]. An EMPTY list is refused: it would read as
+# configured while sending nothing; use enabled = false to switch mail off.
+statuses = ["running", "paused", "parked", "blocked", "stopped"]
+
 [paths]
 # Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).
 state_dir = ".autoloop"
