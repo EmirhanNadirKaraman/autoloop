@@ -14,6 +14,12 @@ from pathlib import Path
 import tomllib
 
 from .errors import ConfigError
+from .notify import (
+    NOTIFY_DEFAULT_STATUSES,
+    NOTIFY_STATUS_VOCABULARY,
+    NOTIFY_TLS_MODES,
+    NOTIFY_TLS_STARTTLS,
+)
 from .policy import PolicyConfig
 from .stall import DEFAULT_CEILING_SECONDS, DEFAULT_STALL_SECONDS
 from .validation import TEST_SELECTION_MODES, TEST_SELECTION_REACHABLE
@@ -480,6 +486,75 @@ class AutonomyConfig:
     max_recovery_attempts: int = 2
 
 
+#: The longest `[notify].timeout_seconds` this loop will accept. The round pays
+#: this wait whenever the SMTP server stops answering, so it is bounded here
+#: rather than left to an operator's typo: a notification is an accessory and
+#: must never be able to hold a round for minutes. "A few seconds" is the shape;
+#: a minute is the outer limit that still reads as one.
+MAX_NOTIFY_TIMEOUT_SECONDS = 60.0
+
+#: Config keys that would put the SMTP password in this file. Refused BY NAME,
+#: with the remedy, rather than as a generic unknown key — a secret typed into a
+#: tracked file is the one mistake here whose cost is not recoverable by fixing
+#: the config afterwards.
+NOTIFY_SECRET_KEYS = ("password", "smtp_password", "pass")
+
+
+@dataclass(frozen=True)
+class NotifyConfig:
+    """`[notify]` — email the operator when the loop's status CHANGES.
+
+    OFF BY DEFAULT, and that default is the compatibility contract: with this
+    section absent — which is every config file written before it existed — the
+    loop reads nothing, writes nothing and sends nothing.
+
+    WHAT IT COVERS, stated here because discovering the limit late is the
+    failure this section invites. The mail is a SELF-REPORT sent from inside
+    `heartbeat.publish`, so it covers exactly the statuses the loop KNOWS: a
+    park, a block, a pause, a clean stop, and task/phase transitions. It does
+    NOT and cannot cover the loop having HUNG, CRASHED or been KILLED — such a
+    loop sends nothing at all, exactly as it writes no heartbeat. Only something
+    outside the process can see silence, which is what
+    `scripts/autoloop_health_notify.sh` is for. Mail arriving means the loop is
+    alive; mail not arriving means nothing.
+
+    THE PASSWORD IS NOT HERE, and there is no key for it — see
+    `NOTIFY_SECRET_KEYS`. This file is tracked by git in the deployments that
+    keep it that way and lives under the gitignored state dir in the rest; a
+    secret belongs in neither. `password_env` names an environment variable and
+    `password_file` names a file, exactly one of them, and an absent or blank
+    value REFUSES the send rather than falling back to an unauthenticated one.
+    """
+
+    #: The flag. False means the whole section is inert.
+    enabled: bool = False
+    #: Who gets the mail, and who it comes from. Required when `enabled`.
+    recipient: str = ""
+    sender: str = ""
+    #: The SMTP server. Required when `enabled`.
+    host: str = ""
+    port: int = 587
+    #: `"starttls"` (default, port 587) or `"ssl"` (port 465). There is
+    #: deliberately no `"none"`: authentication is mandatory, so a cleartext
+    #: session would put the password on the wire.
+    tls: str = NOTIFY_TLS_STARTTLS
+    #: The SMTP account. Required when `enabled` — an unauthenticated send is
+    #: refused rather than substituted for a missing password.
+    username: str = ""
+    #: WHERE the password is, never the password. Exactly one when `enabled`.
+    password_env: str = ""
+    password_file: str = ""
+    #: The hard bound on one send, in seconds. The round pays it at most once
+    #: per status change, and never more than `MAX_NOTIFY_TIMEOUT_SECONDS`.
+    timeout_seconds: float = 10.0
+    #: Which statuses mail. All five by default — the task/phase transitions
+    #: inside `running` are the cadence this was sized for. Narrow it to
+    #: `["parked", "blocked", "paused"]` for attention-only mail. An EMPTY list
+    #: is refused: it reads as configured while sending nothing, which is the
+    #: shape of a guard that has quietly switched itself off.
+    statuses: tuple[str, ...] = NOTIFY_DEFAULT_STATUSES
+
+
 #: What the unconfigured `[paths].state_dir` is called, as a SIBLING of
 #: `workers_root` (port-01, 2026-08-23). Everything writable the loop keeps
 #: between steps — `state.json`, `tasks.json`, the lock, the transcript, the
@@ -817,6 +892,11 @@ class AutoloopConfig:
     #: comment gives: the positional meaning of everything before it must not
     #: move.
     projects: tuple[Path, ...] = ()
+    #: `[notify]` — operator email on a status CHANGE (notify-01, 2026-08-31).
+    #: Default OFF, so every `AutoloopConfig(...)` built directly (the whole
+    #: test suite, `doctor`) sends nothing without naming the field. Appended
+    #: after `projects` for the reason that field's own comment gives.
+    notify: NotifyConfig = NotifyConfig()
 
     @property
     def state_file(self) -> Path:
@@ -910,6 +990,19 @@ class AutoloopConfig:
         if self.workers_root is not None:
             return Path(self.workers_root).expanduser().parent / "heartbeat.json"
         return self.state_dir / "heartbeat.json"
+
+    @property
+    def notify_state_file(self) -> Path:
+        """What `[notify]` last OBSERVED — beside the heartbeat, and derived
+        from it so the two can never live in different places.
+
+        Beside rather than under `state_dir` for the heartbeat's own two
+        reasons: `escape_detector` snapshots the checkout mid-round, and a file
+        written there would read as an agent escaping its worker repo. It is
+        what makes the deduplication survive a restart — without it the loop
+        would re-send the state it already sent every time it started.
+        """
+        return self.heartbeat_file.with_name("notify_state.json")
 
     # ---- produce-then-review collaborators (Autoloop v1 CLI wiring) --------
     #
@@ -1024,7 +1117,7 @@ class AutoloopConfig:
 
 _SECTIONS = {
     "browser", "policy", "paths", "conversation", "codex", "executor", "audit",
-    "repo", "autonomy", "projects",
+    "repo", "autonomy", "projects", "notify",
 }
 
 
@@ -1419,6 +1512,165 @@ def _load_projects_section(data: dict) -> tuple[Path, ...]:
     return tuple(resolved)
 
 
+def _load_notify_section(data: dict) -> NotifyConfig:
+    """`[notify]`, validated. Absent means `NotifyConfig()` — i.e. OFF, which is
+    every config file written before this section existed.
+
+    Everything here is checked at LOAD time and nothing at send time, with one
+    deliberate exception: the password itself, which lives in an environment
+    variable or a file and is resolved by `notify._resolve_credentials` when a
+    mail is actually sent. That split is the point — a value that must not be in
+    this file cannot be validated from it, and a loop that refused to START
+    because a mail server was misconfigured would have let an accessory take
+    down the thing it is accessory to.
+
+    The refusals below are all of the same kind: a `[notify]` section that reads
+    as configured must not be able to do nothing (an empty `statuses`), send in
+    the clear (`tls = "none"`), or send unauthenticated (a missing username or
+    password source).
+    """
+    raw = data.get("notify", {})
+    # Shape first, exactly as `_load_repo_section` and `_load_projects_section`
+    # do it: a malformed section gets this loader's own error naming the section.
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[notify] must be a table, got {raw!r} — write it as a section "
+            '(`[notify]` followed by `key = "value"` lines), not as a bare key'
+        )
+    notify_data = dict(raw)
+
+    # BEFORE `_check_keys`, so a password typed into this file is met with the
+    # reason rather than with a generic "unknown key". The VALUE is never
+    # echoed: repeating a secret into an error message that lands in a log is
+    # the same leak wearing a different hat.
+    for secret_key in NOTIFY_SECRET_KEYS:
+        if secret_key in notify_data:
+            raise ConfigError(
+                f"notify.{secret_key} is not a setting and must never be one — "
+                "this file is not the place for the SMTP password. Name where "
+                "the password lives instead: notify.password_env = "
+                '"AUTOLOOP_SMTP_PASSWORD" (an environment variable) or '
+                'notify.password_file = "~/.autoloop/smtp-password" (a file '
+                "readable only by you). Then remove this key and rotate the "
+                "password, which has been in a file on disk."
+            )
+    _check_keys("notify", notify_data, {f.name for f in dataclasses.fields(NotifyConfig)})
+
+    if "enabled" in notify_data and not isinstance(notify_data["enabled"], bool):
+        # Refused rather than coerced, exactly as `autonomy.enabled` is: the
+        # truthy reading of a string would turn sending ON for an operator who
+        # typed it wrong, which is the one direction this flag must not fail in.
+        raise ConfigError(
+            "notify.enabled must be a boolean (true/false), got "
+            f"{notify_data['enabled']!r}"
+        )
+
+    for key in (
+        "recipient", "sender", "host", "tls", "username", "password_env",
+        "password_file",
+    ):
+        if key in notify_data and not isinstance(notify_data[key], str):
+            raise ConfigError(f"notify.{key} must be a string, got {notify_data[key]!r}")
+
+    # Header injection: `sender` and `recipient` become mail headers verbatim,
+    # and a newline in one of them appends headers of the attacker's choosing.
+    # Refused here, where it is one check, rather than escaped at every render.
+    for key in ("recipient", "sender"):
+        value = str(notify_data.get(key, "") or "")
+        if any(ch in value for ch in "\r\n") or value.strip() != value:
+            raise ConfigError(
+                f"notify.{key} must be a single unpadded address with no line "
+                f"breaks, got {value!r}"
+            )
+
+    if "port" in notify_data:
+        port = notify_data["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ConfigError(
+                f"notify.port must be an integer between 1 and 65535, got {port!r}"
+            )
+
+    if "tls" in notify_data and notify_data["tls"] not in NOTIFY_TLS_MODES:
+        # "none" gets its own sentence: it is the value an operator reaches for
+        # against a local relay, and the reason it is refused is not obvious
+        # from a list of accepted values.
+        extra = (
+            " Cleartext SMTP is not offered: authentication is mandatory here, "
+            "so a session without TLS would put your password on the wire and "
+            "make the whole point of notify.password_env moot."
+            if str(notify_data["tls"]).strip().lower() in ("none", "off", "")
+            else ""
+        )
+        raise ConfigError(
+            "notify.tls must be one of "
+            + ", ".join(f'"{mode}"' for mode in NOTIFY_TLS_MODES)
+            + f", got {notify_data['tls']!r}." + extra
+        )
+
+    if "timeout_seconds" in notify_data:
+        timeout = notify_data["timeout_seconds"]
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ConfigError(
+                f"notify.timeout_seconds must be a positive number, got {timeout!r}"
+            )
+        if timeout > MAX_NOTIFY_TIMEOUT_SECONDS:
+            raise ConfigError(
+                f"notify.timeout_seconds must be at most {MAX_NOTIFY_TIMEOUT_SECONDS} "
+                f"seconds, got {timeout!r} — the round pays this wait whenever the "
+                "SMTP server stops answering, and a notification must never be able "
+                "to hold one for minutes"
+            )
+
+    if "statuses" in notify_data:
+        statuses = notify_data["statuses"]
+        if not isinstance(statuses, list) or not all(isinstance(s, str) for s in statuses):
+            raise ConfigError(
+                "notify.statuses must be a list of strings, e.g. "
+                '["parked", "blocked", "paused"]'
+            )
+        unknown = [s for s in statuses if s not in NOTIFY_STATUS_VOCABULARY]
+        if unknown:
+            raise ConfigError(
+                f"notify.statuses names statuses the loop never publishes: {unknown} "
+                "— valid values are "
+                + ", ".join(f'"{s}"' for s in NOTIFY_STATUS_VOCABULARY)
+            )
+        if not statuses:
+            raise ConfigError(
+                "notify.statuses is empty, which would read as configured while "
+                "sending nothing — set enabled = false to switch notification off, "
+                "so the intent is stated in one place"
+            )
+        notify_data["statuses"] = tuple(statuses)
+
+    notify = NotifyConfig(**notify_data)
+    if not notify.enabled:
+        # Everything below is about being able to SEND. A disabled section is
+        # inert, so an incomplete one is not an error — that is what lets an
+        # operator leave a half-filled section in place while they get the
+        # credential sorted out.
+        return notify
+
+    for key in ("recipient", "sender", "host", "username"):
+        if not getattr(notify, key).strip():
+            raise ConfigError(
+                f"notify.{key} is required when notify.enabled = true (got "
+                f"{getattr(notify, key)!r}). An unauthenticated send is never "
+                "substituted for a missing credential, so username is required "
+                "too; set enabled = false if you do not want mail."
+            )
+    sources = [k for k in ("password_env", "password_file") if getattr(notify, k).strip()]
+    if len(sources) != 1:
+        raise ConfigError(
+            "exactly one of notify.password_env / notify.password_file is "
+            f"required when notify.enabled = true (got {sources or 'neither'}). "
+            "The password itself must never appear in this file; these name "
+            "where it lives. Two sources are refused rather than ordered, so "
+            "there is no question which secret was used."
+        )
+    return notify
+
+
 def load_config(path: Path) -> AutoloopConfig:
     path = Path(path)
     if not path.exists():
@@ -1653,6 +1905,7 @@ def load_config(path: Path) -> AutoloopConfig:
 
     repo, repo_notices = _load_repo_section(data)
     projects = _load_projects_section(data)
+    notify = _load_notify_section(data)
 
     return AutoloopConfig(
         browser=browser,
@@ -1670,4 +1923,5 @@ def load_config(path: Path) -> AutoloopConfig:
         migration_notices=migration_notices + conversation_notices + repo_notices,
         observed_checkout=observed_checkout,
         projects=projects,
+        notify=notify,
     )
