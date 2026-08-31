@@ -294,9 +294,15 @@ outside every worker repo. The property the residue trap needs is unchanged and
 is now pinned by a test that drives a REAL failing pytest run through
 `run_validation_commands` and compares `git status --porcelain -uall` byte for
 byte across it (`test_agent_self_validation.py`), rather than by a comment
-asserting a flag is present. Every fallback — the directory could not be created,
-could not be written, or has been swept — goes back to `NO_CACHE_ARGS`, so there
-is no state in which the tree can be dirtied by this.
+asserting a flag is present. Every fallback goes back to `NO_CACHE_ARGS`, so
+there is no state in which the tree can be dirtied by this: the directory could
+not be created, could not be written, has been swept — or the CONFIGURED command
+says something about the cache that `validation.effective_validation_command`
+cannot rewrite, which is a fourth fallback that lives entirely in that function
+and was added on review (2026-08-31). A configured `cache_dir` is not deferred
+to: a relative one resolves into the worker tree and an absolute one is shared by
+every task, so an advisory run either gets the directory THIS module minted or
+gets none.
 
 "OUTSIDE EVERY WORKER REPO" IS A CHECK, AND ITS SUBJECT IS THE REPOSITORY. The
 first version compared the temp directory against the directory validation RUNS
