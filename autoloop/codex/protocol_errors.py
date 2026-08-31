@@ -37,9 +37,8 @@ misclassification can do here. They are two lists now
 (`DEFAULT_QUOTA_ERROR_CODES` and `DEFAULT_RATE_LIMIT_ERROR_CODES`), 429 lives in
 the second, spent is tested FIRST so an error carrying both reads as spent, and
 only spent reaches `QuotaExhaustedError`. Everything else — transient and
-unrecognised alike — becomes a `CodexProtocolError`, which is a `BrowserError` —
-the transport-fault base class in `errors.py`, still spelled that way — and
-therefore already on the ordinary retryable failure budget.
+unrecognised alike — becomes a `CodexProtocolError`, which is a `BrowserError`
+and therefore already on the ordinary retryable failure budget.
 
 `RateLimitedError` is deliberately NOT raised for the transient case, even
 though it owns the back-off budget. That budget is graded on evidence about a
@@ -57,13 +56,6 @@ module under `autoloop/codex/` raises it, which is a grep, not an assertion.
 both NAME this module as the source of the claim, in a comment and in a test
 docstring; neither is a guard, so read them as cross-references and re-check the
 grep before relying on it.
-
-Until brw-19b (2026-08-31) the reason given here was a third world instead: the
-handler dialled the CDP endpoint through the browser package, counted page
-targets, answered ZERO for a codex deployment whose Chrome window was closed,
-and parked `loop_fatal` on `browser_unattachable`. That probe, that world and
-that package are gone. The choice above is unchanged; what justifies it now is
-evidence aimed at something a codex run does not have, not a false park.
 
 Every unrecognised failure is logged with a bounded, secret-free digest, for the
 same reason `quota.py` logs its stderr tail: the first real exhaustion in
@@ -139,8 +131,7 @@ MESSAGE_CHARS = 400
 class CodexProtocolError(BrowserError):
     """The app-server answered with a failure this client cannot act on.
 
-    A `BrowserError` — the transport-fault base class in `errors.py`, still
-    spelled that way — so the orchestrator's existing failure routing applies
+    A `BrowserError`, so the orchestrator's existing failure routing applies
     unchanged: the transport is broken or the server refused, which is that
     hierarchy's own class of event and belongs on the same budget.
     `code` and `error_type` are carried as fields rather than only inside the
@@ -372,10 +363,9 @@ def classify(
             f"app-server refused with {error_type_of(error)}"
             f"{where}. Codex shares an agentic pool with ChatGPT Work and "
             "ChatGPT for Excel; ordinary ChatGPT conversations draw on a "
-            "separate quota, which no registered seat reaches — codex_cli and "
-            "codex_app_server both spend THIS allowance, so naming the other "
-            "one in conversation.fallback_provider buys no quota, and the "
-            "default (empty, meaning no failover) parks the loop instead."
+            "separate quota. The two codex seats, codex_cli and "
+            "codex_app_server, spend the SAME allowance, so a handover "
+            "between those two waits on the same reset."
         )
     code = error.get("code") if isinstance(error, Mapping) else None
     if verdict == RATE_LIMITED:
