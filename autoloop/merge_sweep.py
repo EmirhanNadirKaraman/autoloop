@@ -333,8 +333,12 @@ it, and three rules in one fixed order, for a candidate this checkout does not
 hold:
 
 1. **The record's own sha**, or — when the live record names none, which is what
-   a re-dispatched stub leaves — the sha in the newest ARCHIVED filename
-   (`<id>-reconciled-as-<sha>-<stamp>.json`, `<id>-merged-as-<sha>-<stamp>.json`).
+   a re-dispatched stub leaves — the sha in the newest ARCHIVED filename that
+   carries one (`<id>-reconciled-as-<sha>-<stamp>.json`,
+   `<id>-merged-as-<sha>-<stamp>.json`). The archived copies are scanned
+   newest-first for a label the pattern applies to, because a LATER retirement
+   under some other label (`-report-recovered-by-operator-<stamp>`) says nothing
+   about the sha and must not hide the one that does — `audit-0001` exactly.
 2. **The commit map**, keyed by that sha. A row mapping to a real commit is
    judged by ancestry exactly as if the record had named it; a row of forty
    zeros means the rewrite PRUNED the commit — it touched no path under
@@ -1158,9 +1162,9 @@ class BacklogSweeper:
         a candidate the object database does not hold.
 
         The order is fixed and each step is tried once: the sha the record
-        names, or the one the newest archived FILENAME names when the record
-        names none; then the commit map; then — only when `merge_commit` — a
-        merge commit on the base head's first-parent chain.
+        names, or the one named by the newest archived FILENAME that carries one
+        when the record names none; then the commit map; then — only when
+        `merge_commit` — a merge commit on the base head's first-parent chain.
 
         `merge_commit` is False on the first pass and True only after the
         publication check has failed, and that is not an optimisation. A task
@@ -1180,7 +1184,11 @@ class BacklogSweeper:
             sha, source, why_not = archived_candidate_sha(
                 self._execution_store.directory, task_id
             )
-            named_by, rule = f"its newest archived record ({source})", RULE_ARCHIVE
+            # Not "its NEWEST archived record": the scan passes over labels the
+            # pattern does not apply to, so the copy that answered is the newest
+            # one NAMING a sha and often not the newest one on disk (audit-0001).
+            # `source` says which it was, and the operator greps this line.
+            named_by, rule = f"its archived record ({source})", RULE_ARCHIVE
             if not sha:
                 tried.append(why_not)
         if sha:
@@ -1666,8 +1674,8 @@ def load_commit_map(repo_root) -> CommitMap:
 
 
 def archived_candidate_sha(executions_dir, task_id: str) -> tuple[str, str, str]:
-    """`(sha, source filename(s), why not)` — the sha the NEWEST archived record
-    for `task_id` names in its own FILENAME.
+    """`(sha, source filename(s), why not)` — the sha named in the FILENAME of
+    the NEWEST archived record for `task_id` WHOSE LABEL CARRIES ONE.
 
     For the four tasks whose live execution record is an empty re-dispatched
     stub (dash-02, pkt-02, pkt-03, audit-0001) this is the only thing on disk
@@ -1675,17 +1683,33 @@ def archived_candidate_sha(executions_dir, task_id: str) -> tuple[str, str, str]
     wrote it into the label — `<id>-reconciled-as-<sha>-<stamp>.json` — and the
     record INSIDE names nothing.
 
+    SCANNED newest-first rather than read off the newest generation alone, which
+    is where merge-09 left `audit-0001` (2026-08-31). Its archive holds
+    `audit-0001-reconciled-as-07b659b-<stamp>.json` and, retired LATER, a
+    `-report-recovered-by-operator-<stamp>` copy that names no sha at all.
+    Inspecting only the newest found nothing and gave up. A label this rule's
+    pattern does not apply to is not evidence that no archived label names the
+    commit — it is a file the question was not asked of — so the scan passes
+    over it and asks the next generation down. Among labels that DO carry a sha
+    the newest still wins, and the scan stops at the first one it finds:
+    stopping only once a sha RESOLVES would let a superseded reconciliation
+    clear a task whose latest one is genuinely outstanding.
+
     The generation rules are not reimplemented here: `_read_record`,
-    `_is_another_tasks_copy` and `_newest_generation` are the same three the
+    `_is_another_tasks_copy` and `_archived_generations` are the same three the
     archive has always been read through, and they are the part nobody
     reconstructs correctly twice. Only the question is new, so only the reading
     of the FILENAME is new.
 
-    Fail-closed twice over. The label must be one of `_ARCHIVED_SHA_LABELS` and
-    must follow this task's own id, so a sibling whose id shares a prefix cannot
-    answer. And when the newest generation is a TIE — two retirements inside the
-    same second — every copy in it must name the same sha, because there is no
-    way to tell which came last.
+    Fail-closed three times over. The label must be one of
+    `_ARCHIVED_SHA_LABELS` and must follow this task's own id, so a sibling
+    whose id shares a prefix cannot answer. An archive that cannot be put in
+    generation order answers nothing at all — skipping the copy that carries no
+    stamp and ordering the rest would be exactly the fail-open the ordering rule
+    exists to refuse. And when a generation is a TIE — two retirements inside
+    the same second — every copy in it must name the same sha, because there is
+    no way to tell which came last; a tie in which one copy names a sha and
+    another names none is refused for the same reason rather than passed over.
     """
     archive = Path(executions_dir) / "archive"
     try:
@@ -1699,21 +1723,39 @@ def archived_candidate_sha(executions_dir, task_id: str) -> tuple[str, str, str]
     ]
     if not copies:
         return "", "", "nothing in its execution archive names a candidate either"
-    newest, why_not = _newest_generation(copies)
-    if not newest:
+    generations, why_not = _archived_generations(copies)
+    if not generations:
         return "", ", ".join(c.name for c in copies), why_not
-    source = ", ".join(c.name for c in newest)
-    shas = [_filename_sha(copy.path, task_id) for copy in newest]
-    if not any(shas):
+    passed_over: list[str] = []
+    for generation in generations:
+        source = ", ".join(c.name for c in generation)
+        shas = [_filename_sha(copy.path, task_id) for copy in generation]
+        if not any(shas):
+            # The pattern does not apply to this retirement's label at all.
+            # Recorded so the reason can name every copy that was looked at, and
+            # passed over so an older label that DOES name a sha still answers.
+            passed_over.append(source)
+            continue
+        if not all(shas) or len(set(shas)) != 1:
+            # Only a TIE reaches this: one copy alone either names a sha or was
+            # passed over above. Two retirements inside one second cannot be
+            # ordered, so a disagreement between them — two shas, or one sha and
+            # one label the pattern does not cover — is the question, not an
+            # answer with a distraction beside it.
+            return "", source, (
+                f"its archived records ({source}) were retired in the same "
+                "second and their filenames do not agree on one sha, so which "
+                "of them describes the retirement cannot be told"
+            )
+        return shas[0], source, ""
+    source = ", ".join(passed_over)
+    if len(passed_over) == 1:
         return "", source, (
             f"its newest archived record ({source}) names no sha in its filename"
         )
-    if not all(shas) or len(set(shas)) != 1:
-        return "", source, (
-            f"its newest archived records ({source}) name different shas in their "
-            "filenames, so which one describes the retirement cannot be told"
-        )
-    return shas[0], source, ""
+    return "", source, (
+        f"none of its archived records ({source}) names a sha in its filename"
+    )
 
 
 def _filename_sha(path: Path, task_id: str) -> str:
@@ -2137,6 +2179,21 @@ def _newest_generation(copies: list[_ArchivedCopy]) -> tuple[list[_ArchivedCopy]
     """The archived record(s) describing the LATEST retirement of one task, or
     `([], why_not)` when the generations cannot be ordered.
 
+    The ordering itself is `_archived_generations`; this is its first element,
+    which is the only one the ancestry question wants. `archived_candidate_sha`
+    wants the rest of the list as well, so the rules live there and neither
+    caller is allowed a variant of them.
+    """
+    generations, why_not = _archived_generations(copies)
+    return (generations[0] if generations else []), why_not
+
+
+def _archived_generations(
+    copies: list[_ArchivedCopy],
+) -> tuple[list[list[_ArchivedCopy]], str]:
+    """Every retirement of one task, NEWEST GENERATION FIRST — or `([], why_not)`
+    when the generations cannot be ordered.
+
     One archived file is one retirement; several are several attempts at the
     same task, describing different commits (see
     `execution_record_ancestry`). Ordering them is therefore the whole
@@ -2147,15 +2204,22 @@ def _newest_generation(copies: list[_ArchivedCopy]) -> tuple[list[_ArchivedCopy]
     ordered against, so a record retired before the stamp existed is still
     answerable. From two upwards every label must carry a stamp, because an
     unstamped one could be the newest and there is no way to tell — the
-    fail-closed answer, matching every other unanswerable question here.
+    fail-closed answer, matching every other unanswerable question here. ALL of
+    them are refused together: dropping the unstamped copy and ordering what is
+    left would answer from a generation that may not be the newest, which is the
+    one reading this refusal exists to prevent.
 
     Ties (two retirements inside the same second — `utcnow_iso` writes seconds)
-    return BOTH, and the caller then requires all of them to be integrated.
-    Same reasoning: with no way to tell which came last, the safe reading is the
-    one that cannot clear an outstanding branch.
+    come back as ONE generation holding both, and a caller then requires all of
+    them to agree. Same reasoning: with no way to tell which came last, the safe
+    reading is the one that cannot clear an outstanding branch.
+
+    The stamps sort as strings because they are fixed-width ASCII with the
+    separators stripped (`_retirement_stamp`), so lexicographic order IS
+    chronological order.
     """
     if len(copies) == 1:
-        return list(copies), ""
+        return [list(copies)], ""
     generations: dict[str, list[_ArchivedCopy]] = {}
     unstamped: list[str] = []
     for copy in copies:
@@ -2172,7 +2236,7 @@ def _newest_generation(copies: list[_ArchivedCopy]) -> tuple[list[_ArchivedCopy]
             "put in order — the newest may be describing work that is still "
             "outstanding; merge it by hand"
         )
-    return generations[max(generations)], ""
+    return [generations[stamp] for stamp in sorted(generations, reverse=True)], ""
 
 
 def _retirement_stamp(path: Path) -> str:
