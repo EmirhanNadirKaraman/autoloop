@@ -2479,6 +2479,49 @@ def test_a_failing_validation_run_leaves_the_worker_tree_byte_identical(
     assert not (worker_repo / ".pytest_cache").exists()
 
 
+def test_a_configured_in_tree_cache_dir_still_leaves_the_tree_byte_identical(
+    worker_repo, tmp_path, nested_env
+):
+    """REQUIREMENT 1 again, against the command shape that broke it (found in
+    review, 2026-08-31).
+
+    The first version of this feature DEFERRED to a `cache_dir` the command
+    already named: it injected nothing at all for such a command — not the
+    caller's location, and not `-p no:cacheprovider` either. So a configured
+    RELATIVE path, which pytest resolves against its rootdir, put
+    `.pytest_cache/` straight back into the worker tree the post-commit gate
+    inspects, with the flag that used to neutralise it now removed. That is the
+    2026-08-03 defect, restored by the change that was supposed to close it.
+
+    A REAL failing pytest run, like the test above and for the same reason:
+    whether pytest writes into the tree is a fact about pytest, and an argv
+    assertion answers a different question. The two halves are the same pair as
+    above — the tree is byte-identical AND the cache landed at the path the
+    caller chose, the second being what stops this passing vacuously on a run
+    that never reached a test.
+    """
+    before = committed_fixture_suite(worker_repo)
+    assert before == "", "the fixture repo must start clean for this to mean anything"
+    cache = tmp_path / "ptcache"
+    configured = NESTED_PYTEST + ("-o", f"{CACHE_DIR_INI}=.pytest_cache")
+
+    ok, summary = run_validation_commands(
+        (configured,), worker_repo, pytest_cache_dir=cache
+    )
+    after = run_git(worker_repo, "status", "--porcelain", "-uall")
+
+    assert not ok, f"the fixture suite must FAIL for this test to grade anything: {summary}"
+    assert "test_it_fails" in summary, f"pytest never reached the test: {summary}"
+    assert (cache / "v" / "cache" / "lastfailed").is_file(), (
+        "the configured location won: pytest's cache did not land where the "
+        f"caller put it ({sorted(cache.rglob('*')) if cache.exists() else cache})"
+    )
+    assert after == before, (
+        f"a configured in-tree cache_dir dirtied the worker tree: {after!r}"
+    )
+    assert not (worker_repo / ".pytest_cache").exists()
+
+
 def test_a_rerun_really_selects_only_what_failed(worker_repo, tmp_path, nested_env):
     """What the cache BUYS, measured on pytest's own count line rather than on a
     clock: the full run reports 12 passed beside the failure, and the `--lf`

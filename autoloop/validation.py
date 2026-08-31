@@ -54,6 +54,24 @@ unrecognised argument that exits 4 before a test runs. So `--lf` can only be
 injected inside the branch that turned the cache ON, and a caller cannot ask for
 one without the other.
 
+**A `cache_dir` a caller passes REPLACES everything the command said about the
+cache, a configured `cache_dir` included** (found in review, 2026-08-31). The
+first version of this deferred to an explicit one — "an operator who has said
+where their cache goes has said it" — and that is wrong twice over. A configured
+RELATIVE path resolves against pytest's rootdir, i.e. INTO the worker tree the
+post-commit gate is about to inspect, and with the disabling flag no longer
+injected beside it that is the 2026-08-03 defect restored in full. A configured
+ABSOLUTE path is worse in the other direction: it is one fixed location, so every
+task's advisory run would read and write one `lastfailed`, and one round's
+failures would decide which tests an unrelated round re-runs. Neither is a
+location an advisory run may use, however explicitly it was written, so an
+advisory run has exactly two outcomes — the directory `AdvisoryValidation` minted
+and validated, or `NO_CACHE_ARGS` with no `--lf` if anything the rewrite could
+not parse still mentions a cache policy. That second arm is the fail-closed one
+and it is a SUBSTRING test (`_mentions_cache_policy`), because a refusal that
+depended on recognising a spelling would be switched off by the first spelling it
+did not recognise.
+
 **HOW FAR a run gets is owned here too** — see `run_validation_commands`'s
 `fail_fast` parameter. A validation run answers "is this approvable?", and the
 FIRST failing command settles that; everything after it is paid for against a
@@ -346,14 +364,19 @@ def _declares_ini(args: Sequence[str], name: str) -> bool:
 
     Covers the four spellings pytest accepts for an override — `-o name=v`,
     `-oname=v`, `--override-ini name=v` and `--override-ini=name=v`. Used for
-    exactly ONE decision: whether a command already carries a `cache_dir`. If it
-    does, the caller's is not applied and the command is left exactly as
-    configured — an operator who has said where their cache goes has said it,
-    and this must not turn into two settings racing over one option.
+    exactly ONE decision, and a much narrower one than it was: AFTER
+    `_without_cache_dir_ini` has removed every `cache_dir` setting that is not
+    the caller's own, is the caller's own already there? If it is, this pass has
+    nothing to add — which is what makes `effective_validation_command`
+    idempotent when a `cache_dir` IS passed.
 
-    That branch is also what makes `effective_validation_command` idempotent
-    when a `cache_dir` IS passed: the second application finds the option this
-    module wrote on the first and adds nothing.
+    It is NOT "does the operator already have a cache_dir, in which case defer to
+    it". That was its job until 2026-08-31 and deferring is precisely what an
+    advisory run must not do; this module's docstring says why. Nor may a
+    REFUSAL rest on it: structural parsing that fails to recognise a spelling
+    returns False, and a guard that quietly answers "nothing to see" on the input
+    it could not read is not a guard. `_mentions_cache_policy` is the substring
+    check that decides fail-closed, and it errs the other way by construction.
     """
     prefix = name + "="
     for index, token in enumerate(args):
@@ -377,8 +400,10 @@ def _declares_rerun_selection(args: Sequence[str]) -> bool:
 def _without_cache_disabled(args: Sequence[str]) -> tuple[str, ...]:
     """`args` with every `-p no:cacheprovider` removed, in both spellings.
 
-    REPLACEMENT, not deference, and the exception to this module's usual rule
-    that an explicit operator flag is never overridden. The shipped
+    REPLACEMENT, not deference — and since 2026-08-31 that is the rule for the
+    WHOLE cache policy rather than an exception carved out for one flag:
+    `_without_cache_dir_ini` does exactly the same to a configured
+    `-o cache_dir=`, for the reasons this module's docstring gives. The shipped
     `config.example.toml` spells `-p no:cacheprovider` out on every pytest line
     — `test_the_shipped_list_needs_no_repair_at_run_time` pins that list as a
     fixed point of this module — so a rule that declined to act when the flag
@@ -390,10 +415,15 @@ def _without_cache_disabled(args: Sequence[str]) -> tuple[str, ...]:
     runs. Moving the cache OUT of the tree holds the property that flag was
     added for (2026-08-03: a failing run must not dirty the tree it grades), so
     this is the same guarantee by a different mechanism rather than a weakening
-    of it — and `test_a_failing_run_leaves_the_worker_tree_byte_identical` is
-    the check, on the tree itself rather than on a directory name.
+    of it — and
+    `test_a_failing_validation_run_leaves_the_worker_tree_byte_identical` is the
+    check, on the tree itself rather than on a directory name. Its neighbour
+    `test_a_configured_in_tree_cache_dir_still_leaves_the_tree_byte_identical`
+    runs the same proof against a command that names its own relative cache.
 
-    Reached ONLY when a caller passed a `cache_dir`. Every other call leaves
+    Reached ONLY when a caller passed a `cache_dir`, and its result may still be
+    DISCARDED — the fail-closed arm of `effective_validation_command` throws the
+    whole rewrite away and keeps the tokens as written. Every other call leaves
     these tokens exactly where they were.
     """
     kept: list[str] = []
@@ -409,6 +439,97 @@ def _without_cache_disabled(args: Sequence[str]) -> tuple[str, ...]:
         kept.append(token)
         index += 1
     return tuple(kept)
+
+
+def _without_cache_dir_ini(args: Sequence[str], keep: str) -> tuple[str, ...]:
+    """`args` with every `cache_dir` ini override removed EXCEPT `keep`.
+
+    The companion of `_without_cache_disabled`, and there for the same reason: a
+    caller that has a validated directory outside the tree is not offering a
+    suggestion. A configured `cache_dir` is REMOVED rather than deferred to,
+    because both kinds are unusable for an advisory run — a relative one lands in
+    the worker tree the gate reads, an absolute one is shared by every task — and
+    because pytest takes the LAST `-o cache_dir=` on the line, so a setting left
+    in place downstream of the injected one would silently win.
+
+    `keep` is the caller's own `cache_dir=<path>` payload, and keeping it in
+    place rather than stripping and re-adding it is what holds idempotence: a
+    second pass finds it where the first pass put it, `_declares_ini` sees it,
+    and nothing is injected or moved.
+
+    Removal is STRUCTURAL — the four spellings pytest accepts — so it cannot eat
+    a token that is not an ini override. The spellings it therefore cannot reach
+    (an argparse short cluster like `-qocache_dir=.x`) are not left to chance:
+    `_mentions_cache_policy` sees them as substrings and the run falls closed.
+    """
+    prefix = CACHE_DIR_INI + "="
+    kept: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-o", "--override-ini") and index + 1 < len(args):
+            if args[index + 1].startswith(prefix) and args[index + 1] != keep:
+                index += 2
+                continue
+        elif token.startswith("--override-ini="):
+            setting = token[len("--override-ini=") :]
+            if setting.startswith(prefix) and setting != keep:
+                index += 1
+                continue
+        elif token.startswith("-o") and not token.startswith("--"):
+            setting = token[2:]
+            if setting.startswith(prefix) and setting != keep:
+                index += 1
+                continue
+        kept.append(token)
+        index += 1
+    return tuple(kept)
+
+
+def _mentions_cache_policy(args: Sequence[str], allow: str) -> bool:
+    """Does anything in `args` still say something about pytest's cache, other
+    than the caller's own `allow` setting (`cache_dir=<path>`)?
+
+    THE FAIL-CLOSED TEST, and deliberately a SUBSTRING one rather than a parse.
+    Everything else in this module reads argv structurally, which is right when
+    the question is "should something be added": a spelling it does not
+    recognise costs an extra flag. It is the wrong shape for a REFUSAL, because
+    an unrecognised spelling then reads as "nothing there" and the guard turns
+    itself off on exactly the input it could not understand.
+
+    Two survivors matter and both are argparse short-option clusters that the
+    structural strips above cannot see:
+
+    * a `cache_dir` setting (`-qocache_dir=.x`). It would out-rank the injected
+      one, since pytest takes the last `-o cache_dir=` on the line — putting the
+      cache wherever the command said, which is the whole defect.
+    * a disabled cacheprovider (`-qpno:cacheprovider`). The relocated cache would
+      be inert AND `--lf` would be an unrecognised argument: `exit 4` before a
+      test runs, which the agent reads as a broken suite and which burns the rest
+      of its three-run budget.
+
+    Any command-line `cache_dir` override must carry the literal `cache_dir=` in
+    one token — pytest splits an `-o` payload on the first `=` and compares the
+    key exactly, so `-o "cache_dir = x"` sets nothing — and any way of switching
+    the plugin off must carry `no:cacheprovider`. So the two substrings are
+    exhaustive over the spellings that can actually change behaviour, and a
+    non-override token that happens to contain one only costs a full run.
+    """
+    for token in args:
+        # The caller's OWN setting, which a second pass sees because the first
+        # pass wrote it. Skipped whole rather than tested arm by arm: a temp root
+        # whose PATH happened to contain `no:cacheprovider` would otherwise make
+        # pass 2 refuse what pass 1 accepted — and refuse it by adding
+        # `-p no:cacheprovider` beside the `--lf` pass 1 had already injected,
+        # which is `exit 4`. Absurd as a path, fatal as a rule.
+        if token == allow:
+            continue
+        if "no:cacheprovider" in token:
+            return True
+        at = token.find(CACHE_DIR_INI + "=")
+        if at >= 0 and token[at:] != allow:
+            return True
+    return False
 
 
 def effective_validation_command(
@@ -436,12 +557,17 @@ def effective_validation_command(
     unchanged, none of which passes either.
 
     `cache_dir` moves pytest's cache to that path instead of switching the
-    plugin off: any `-p no:cacheprovider` in the command is REMOVED (see
-    `_without_cache_disabled` for why removal rather than deference) and
-    `-o cache_dir=<path>` is added in its place. A command that ALREADY declares
-    a `cache_dir` is left entirely alone — the operator's location wins, and no
-    `--lf` is added to it either, so the fallback from an unrecognised setup is
-    always toward today's behaviour.
+    plugin off, and it OVERRIDES whatever the command said about the cache: any
+    `-p no:cacheprovider` is removed (`_without_cache_disabled`), any configured
+    `cache_dir` is removed (`_without_cache_dir_ini`), and `-o cache_dir=<path>`
+    is added in their place. A configured location is not deferred to, because
+    neither kind an operator can write is usable here — see this module's
+    docstring. If anything the two strips could not parse still MENTIONS a cache
+    policy, the rewrite is discarded whole and the command falls back to today's
+    behaviour: the tokens exactly as configured, `-p no:cacheprovider`, no
+    `--lf`. The same fallback covers a `cache_dir` that is not an ABSOLUTE path:
+    pytest resolves a relative one against its rootdir, i.e. into the tree being
+    graded, and `""` resolves to that rootdir itself.
 
     `rerun_last_failed` adds `--lf`. It is honoured ONLY inside the branch that
     turned the cache on, so it cannot produce a command that exits 4 on an
@@ -454,11 +580,29 @@ def effective_validation_command(
         return argv
     args = argv[start + 1 :]
     original = args
-    # Asked for, and not already answered by the command itself.
-    declares_cache_dir = _declares_ini(args, CACHE_DIR_INI)
-    use_cache = cache_dir is not None and not declares_cache_dir
-    if use_cache:
-        args = _without_cache_disabled(args)
+    # ONE expression for the setting, read by the strip, by the injection and by
+    # the fail-closed check. Three spellings of `str(cache_dir)` would agree
+    # today and disagree the first time a caller passes a `Path` where the last
+    # one passed a string — and the symptom would be a second `-o cache_dir` on
+    # the second pass, i.e. an idempotence failure explaining nothing.
+    setting = "" if cache_dir is None else f"{CACHE_DIR_INI}={cache_dir}"
+    use_cache = False
+    # ABSOLUTE OR NOTHING. pytest resolves a relative `cache_dir` against its
+    # ROOTDIR — which for a validation run is the tree being graded — so a
+    # relative one from a caller is the 2026-08-03 defect with extra steps, and
+    # an empty string resolves to the rootdir ITSELF. `AdvisoryValidation` only
+    # ever passes an `mkdtemp` result and so can only pass an absolute path; this
+    # is the guard for every other caller, and it is string arithmetic, which
+    # keeps this function the pure argv rewrite its docstring claims.
+    if cache_dir is not None and Path(cache_dir).is_absolute():
+        candidate = _without_cache_dir_ini(_without_cache_disabled(args), setting)
+        # FAIL CLOSED. The strips are structural and the check is not: whatever
+        # survives them is a spelling this cannot rewrite, and the two outcomes
+        # of ignoring one are a cache back in the worker tree or a `--lf` beside
+        # a disabled plugin. Both are worse than paying for a full run.
+        if not _mentions_cache_policy(candidate, setting):
+            args = candidate
+            use_cache = True
     injected: list[str] = []
     if (
         not _selects_isolated(args)
@@ -467,14 +611,13 @@ def effective_validation_command(
     ):
         injected.extend(PARALLEL_ARGS)
     if use_cache:
-        injected.extend(("-o", f"{CACHE_DIR_INI}={cache_dir}"))
+        # The only `cache_dir` the strip leaves standing is the caller's own, so
+        # finding one here means a previous pass already wrote it — the whole of
+        # this function's idempotence under a cache.
+        if not _declares_ini(args, CACHE_DIR_INI):
+            injected.extend(("-o", setting))
         if rerun_last_failed and not _declares_rerun_selection(args):
             injected.extend(RERUN_FAILED_ARGS)
-    elif cache_dir is not None:
-        # A cache was asked for and the command already names one. Nothing is
-        # injected — not `-p no:cacheprovider` either, which would silently
-        # disable the location the operator chose.
-        pass
     elif not _declares(args, "-p", "no:cacheprovider"):
         injected.extend(NO_CACHE_ARGS)
     if not injected and args == original:

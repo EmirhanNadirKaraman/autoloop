@@ -405,6 +405,13 @@ def test_the_shipped_list_needs_no_repair_at_run_time():
 # tree being graded instead of switching the plugin off, and a `rerun_last_failed`
 # that only means anything once it is on.
 #
+# That `cache_dir` OVERRIDES the command's own cache policy rather than deferring
+# to it (revised 2026-08-31), so three of the cases below are about what happens
+# to a configured `-o cache_dir=`: it is replaced when the rewrite can see it, and
+# the whole rewrite is discarded — back to `-p no:cacheprovider`, no `--lf` — when
+# anything it could not parse still mentions a cache policy. A caller's own
+# relative path falls closed the same way.
+#
 # These are argv tests. The tree-level proof — a REAL failing pytest run under a
 # relocated cache leaves the worker repo byte-identical — needs a real repository
 # and lives in `test_agent_self_validation.py`.
@@ -517,21 +524,100 @@ def test_no_second_rerun_flag_is_added_on_top_of_one_already_there():
         assert rerun_flags(argv) == {flag}, f"{flag} collected a companion"
 
 
-def test_a_command_that_names_its_own_cache_dir_is_left_exactly_as_written():
-    """An operator who has said where their cache goes has said it, in any of
-    pytest's four spellings. Nothing is injected then — not `-o cache_dir`, and
-    not `-p no:cacheprovider` either, which would disable the location they
-    chose — and no `--lf` is added to a command this did not set up."""
+def test_a_configured_cache_dir_is_replaced_by_the_callers_not_deferred_to():
+    """The revision this section was sent back for (2026-08-31).
+
+    Deferring to a configured `cache_dir` — "an operator who has said where their
+    cache goes has said it" — was wrong twice over, and the second reason is the
+    one an argv test can state cleanly:
+
+      * a RELATIVE configured path (`.pytest_cache`, and the shipped default IS
+        relative) resolves against pytest's rootdir, i.e. into the worker tree
+        the gate inspects. Deferring left it enabled AND dropped the
+        `-p no:cacheprovider` that used to neutralise it, which is the
+        2026-08-03 defect restored. The tree-level proof is in
+        `test_agent_self_validation.py`.
+      * an ABSOLUTE configured path is ONE location shared by every task, so two
+        rounds would read one `lastfailed` — requirement 3, and not a property a
+        run can opt out of by being explicit.
+
+    All four spellings pytest accepts, plus the relative shape that is the actual
+    defect: the strip that removes them is structural, and a spelling it missed
+    would leave a setting that pytest ranks ABOVE the injected one, since the
+    LAST `-o cache_dir=` on the line wins.
+    """
     for declaration in (
         ("-o", "cache_dir=/elsewhere"),
         ("-ocache_dir=/elsewhere",),
         ("--override-ini", "cache_dir=/elsewhere"),
         ("--override-ini=cache_dir=/elsewhere",),
+        ("-o", "cache_dir=.pytest_cache"),
     ):
-        argv = ("pytest", "tests/", "-q", "-n", "auto") + declaration
-        assert effective_validation_command(
-            argv, cache_dir=CACHE, rerun_last_failed=True
-        ) == argv, f"{declaration} was not respected"
+        argv = effective_validation_command(
+            ("pytest", "tests/", "-q", "-n", "auto") + declaration,
+            cache_dir=CACHE,
+            rerun_last_failed=True,
+        )
+        assert ini_overrides(argv) == {f"{CACHE_DIR_INI}={CACHE}"}, (
+            f"{declaration} survived alongside the caller's cache"
+        )
+        assert "tests/" in argv, "the command's own test paths must survive"
+        assert rerun_flags(argv) == {"--lf"}
+
+
+def test_a_cache_spelling_that_cannot_be_rewritten_falls_closed():
+    """FAIL CLOSED on the argparse short-option CLUSTERS the structural strips
+    cannot see. `-qocache_dir=.x` is `-q -o cache_dir=.x`, and `-qpno:cacheprovider`
+    is `-q -p no:cacheprovider`; neither is reachable by a rule that looks for a
+    token equal to `-o` or `-p`.
+
+    Left unnoticed, the first out-ranks the injected setting (pytest takes the
+    LAST `-o cache_dir=`) and puts the cache back in the tree; the second makes
+    the relocated cache inert while `--lf` becomes an unrecognised argument —
+    `exit 4` before a test runs, which the agent reads as a broken suite. So the
+    check that decides this is a substring test, and what it produces is exactly
+    today's behaviour: the tokens as written, the plugin off, no `--lf`.
+    """
+    for cluster in ("-qocache_dir=.x", "-qpno:cacheprovider"):
+        argv = effective_validation_command(
+            ("pytest", "tests/", "-n", "0", cluster),
+            cache_dir=CACHE,
+            rerun_last_failed=True,
+        )
+        assert not rerun_flags(argv), f"{cluster} kept a rerun flag"
+        assert f"{CACHE_DIR_INI}={CACHE}" not in ini_overrides(argv)
+        assert ("-p", "no:cacheprovider") in pairs(argv), f"{cluster} was not closed off"
+        assert cluster in argv, "the command's own tokens must survive untouched"
+
+
+def test_a_relative_cache_dir_from_the_CALLER_falls_closed_as_well():
+    """The rule is about WHERE, so it cannot depend on who asked.
+
+    pytest resolves a relative `cache_dir` against its ROOTDIR — the tree being
+    graded — and resolves `""` to that rootdir itself, so a caller handing this a
+    relative path is the 2026-08-03 defect by another route. Only
+    `AdvisoryValidation` passes one in production and it can only pass an
+    `mkdtemp` result, but a guard that holds because today's only caller happens
+    to be careful is not a guard.
+    """
+    for relative in ("", ".", "ptcache", "./.pytest_cache", "~/ptcache"):
+        argv = effective_validation_command(
+            SHIPPED_SHAPE, cache_dir=relative, rerun_last_failed=True
+        )
+        assert argv == tuple(SHIPPED_SHAPE), f"{relative!r} was accepted as a cache"
+        assert not rerun_flags(argv)
+
+
+def test_the_fail_closed_rewrite_is_idempotent_too():
+    """A second pass over a fail-closed command must not collect a second
+    `-p no:cacheprovider`: the marker is still there, so the branch is still
+    taken, and the flag the first pass added is what stops the second."""
+    once = effective_validation_command(
+        ("pytest", "tests/", "-qocache_dir=.x"), cache_dir=CACHE, rerun_last_failed=True
+    )
+    twice = effective_validation_command(once, cache_dir=CACHE, rerun_last_failed=True)
+    assert twice == once
+    assert once.count("no:cacheprovider") == 1
 
 
 def test_an_operator_cache_dir_is_still_disabled_when_no_cache_is_asked_for():
