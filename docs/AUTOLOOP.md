@@ -308,3 +308,576 @@ verb you typed. `os.execv` preserves the pid and the lock is never released
 naming itself, print "already running — nothing to do" and exit: a successful
 handoff that still ends the loop. It is recorded in the `argv` field of
 `self_upgrade_exec`.
+
+---
+
+## Running several tasks at once — the split plan
+
+**Status: a PLAN, not a mechanism.** Nothing in this section is implemented.
+It is the design contract conc-01 was asked to produce, so that the work can be
+authorised as a sequence of independently reviewable candidates instead of one
+change nobody can review. The loop is single-lane today and stays single-lane
+until the last candidate below lands; every candidate before it ships with the
+concurrency setting at `1`, where the loop behaves exactly as it does now.
+
+The prize is measured, not assumed. Over the 126 rounds from 2026-08-22 to
+2026-08-26 the executor took 71.8 of 101.3 wall-clock hours (71%); submit took
+1.6h, packet build 3.1 minutes in total, reviewer wait ~0 because the codex CLI
+is synchronous. A median successful round is 45.5m, of which 37.6m is the
+executor. Everything that is not the executor totals under two hours across four
+days, so N lanes approach a linear speedup in a way no other change on the
+roadmap can. The cost is equally measured and is the reason this is a plan
+rather than a switch: 46 completed tasks took 126 rounds, 2.7 rounds per task,
+and a 4x multiplier multiplies **rework** 4x as well.
+
+### What already exists, and must not be rebuilt
+
+* **Worker repositories are already per task.** `WorkerRepoManager` creates
+  `workers_root/<task_id>` — a genuinely separate `git init` repo with no
+  remote, its own controlled empty hooks directory, seeded by a one-time local
+  `git fetch`. Nothing about the workspace is shared between tasks today.
+* **Execution records are already per task files.** `TaskExecutionStore` writes
+  `executions/<task_id>.json`, and `context._in_flight_counts` loads every one
+  of them rather than assuming a single record.
+* **The merge window already reasons about several candidates at once.**
+  `cli._merge_window_blockers` walks every execution record, names each, and
+  says why it does or does not hold the window — see also
+  `context._merge_window`, which renders that verdict into the review context
+  as `merge_window: open | shut — … | unknown — …`.
+* **The reviewer is not a constraint on the codex transport.** Every turn is a
+  separate subprocess, so concurrent reviews are already possible. Nothing here
+  designs around a shared conversation; a provider that genuinely has one would
+  need its own answer, and none is written here for it.
+* **A loop-owned observed checkout already exists.** esc-02 (2026-08-26) moved
+  the tree `escape_detector` snapshots off the operator's primary checkout onto
+  `worker_env.ObservedCheckout`, resolved from `[paths].observed_checkout` and
+  defaulting beside `workers_root`. This is the single largest piece of the
+  isolation work, and it is already done — what remains is to have one per lane
+  rather than one per loop.
+
+### The filed obstacle #1 has moved, and the plan says why
+
+conc-01's brief states that the escape detector breaks under concurrency
+because "the orchestrator's bookkeeping for the other three lands inside each
+snapshot window, every round". **That mechanism no longer applies.** port-01
+(2026-08-23) moved every writable loop path — `state.json`, `tasks.json`, the
+lock, the transcript, executions, blockers, the publisher repo — out of the
+checkout to a sibling of `workers_root`, and `worker_env.
+validate_observed_checkout` now refuses an observed tree that is nested beneath
+*or contains* the state directory, `workers_root` or either publisher path. The
+orchestrator's own bookkeeping cannot land inside the snapshot window because it
+does not land inside the snapshotted tree at all.
+
+**The real collision is `ObservedCheckout.synchronize`.** It is called once per
+round, strictly before the "before" snapshot, and it runs `git checkout -q -B
+autoloop/observed <target>` plus an `update-ref` pin per commit. With four lanes
+sharing one clone, lane B synchronising to a different commit inside lane A's
+window does not add bookkeeping noise — it rewrites the entire working tree, and
+`diff_snapshots` reports every path in the repository. That is
+`checkout_escape_detected`, loop-fatal, on the first round in which two lanes
+overlap, exactly as the brief predicted but for a different reason. The
+conclusion the brief draws is unchanged and is the one this plan takes: **the
+fix is isolation, not an exclusion list.**
+
+The rejected alternative, recorded so it is not re-proposed: one shared clone
+kept at the latest head, with `OBSERVED_PIN_PREFIX` refs for every lane's base.
+It fails for the same reason, one level up — any merge landing mid-round forces
+a re-synchronisation that lands inside every other lane's window — and it would
+additionally make a single unclean clone fatal to the whole fleet.
+
+### Decision 1 — the isolation boundary is one observed checkout per lane
+
+Each lane gets its own `ObservedCheckout` (`observed-checkout/<lane_id>`, or the
+configured path with the lane id appended) and its own worker repositories,
+which it already had. `escape_detector` brackets **that lane's clone** around
+**that lane's** write-capable agent call. Nothing in `escape_detector.py`
+changes: it names no repository, every function takes the `GitGateway` or root
+it is told to work on, and the exclusion list stays empty.
+
+`worker_env.validate_observed_checkout` must gain one rule, and the rule is the
+whole claim: **a lane's observed checkout must not be nested beneath, and must
+not contain, any other lane's observed checkout.** That is the same
+`_is_nested` test in both directions the function already applies to the state
+dir and `workers_root`, extended to siblings.
+
+`WorkerRepoManager.create` fetches from the lane's own clone, so
+`.git/FETCH_HEAD` inside a worker repo names a tree that lane's own detector
+watches. This is the property esc-02 established and it is what makes the
+per-lane version attributable: an agent that goes looking for "the repo" finds
+its own lane's watched tree, not a sibling's.
+
+Priced honestly: N clones of the repository and N first fetches, each bounded by
+`OBSERVED_GIT_TIMEOUT_SECONDS` (900s). The fetch is from a local path and only
+the first one is a full clone; later rounds fetch the commits they lack.
+
+#### What the new boundary can still fail to catch
+
+The four residuals `escape_detector`'s own docstring records carry over
+unchanged, per lane rather than per loop:
+
+* a **write-then-revert inside the window** — an agent that writes a file and
+  restores it before the "after" snapshot is not caught here or anywhere else in
+  this codebase; closing that needs a real OS sandbox (docs/SECURITY.md S24);
+* **`.git/` internals** — a planted hook, a rewritten `.git/config` or a moved
+  ref in the observed clone is outside the working tree the three `ls-files`
+  categories enumerate, and is not covered;
+* a **forged `.pyc`** whose `(mtime, size)` or PEP 552 header matches its
+  source, which the interpreter would load and `is_derived_bytecode` exempts;
+* **writes into the operator's primary checkout**, which nothing snapshots since
+  esc-02 — the deliberate trade made there, because a tree the operator also
+  writes to produces changes nothing can attribute.
+
+And one residual that is **new under concurrency**, stated rather than papered
+over: **lane A's agent writing into lane B's observed clone or worker repo.**
+Lane B's window brackets that path, so the write is *detected* — but it is
+attributed to B, which is precisely the half of the claim that says a write by
+one lane is not attributed to another. The bound on it is the FETCH_HEAD
+argument above: the only absolute path to a non-worker tree that leaks into a
+worker repo names that lane's own clone, so an agent has to already know a
+sibling lane's absolute path from somewhere else. That is the same out-of-scope
+case esc-02 already concedes for the operator's checkout, one lane over, and it
+is not claimed to be closed. What IS claimed: a lane's own bookkeeping, its own
+synchronisation and its own agent can no longer be confused with another lane's,
+because no two lanes share a tree.
+
+One consequence of this residual is Decision 5's carve-out: an escape stays
+fleet-fatal.
+
+### Decision 2 — one fleet lock, N lane leases, N state files
+
+`LoopLock` is unchanged and stays the single-holder-per-state-dir, fail-closed,
+boot-aware, never-stolen lock it is today. The **fleet supervisor** holds it, and
+at `lanes = 1` the supervisor *is* the loop, so the lock file, its path, its
+adoption rule and `unlock`'s refusal of live locks are byte-identical to today.
+
+Each lane gets:
+
+* its **own state file**. Lane 0 writes literally `state.json`, at the path it
+  writes today; lane *k>0* writes `lanes/<lane_id>/state.json`. That asymmetry
+  is deliberate and is the N=1 criterion made structural — at `lanes = 1` no new
+  file exists and no existing reader moves.
+* its **own lease**, a small record beside its state file carrying pid,
+  hostname, boot-relative `started_at` and a run id, judged live by exactly
+  `LoopLock.is_live`'s rules (foreign host → live; predates boot → dead; pid
+  probe otherwise). Reusing that predicate rather than writing a second one is
+  the same argument `cli._merge_window_blockers` makes about itself: two
+  implementations of "is it alive" drift, and the one that drifts is the one
+  that lets two agents into one lane.
+
+A lane's state machine is otherwise the one that exists: `Phase`, the outbox,
+`PendingRequest`, `PostcommitBinding`, the packet-outstanding phases, the
+failure budgets. Nothing about a single round changes. What is new is that
+`current_task` and `phase` belong to a lane, and **the fleet record carries
+neither** — see Decision 7.
+
+### Decision 3 — overlapping write scopes, answered as correctness
+
+The brief asks for this explicitly, so here is the explicit answer: **overlap is
+handled by the merge protocol, not by the scheduler.** Four steps, none of which
+depends on admission control:
+
+1. A lane's agent works in its own worker repository. A write outside it is
+   what Decision 1's detector *reports* — after the fact, and before anything
+   is committed or reviewed. Nothing here prevents such a write; the detector's
+   own docstring is explicit that it is detection, not a sandbox.
+2. A candidate's diff is gated by `tasks.unauthorized_paths` against that
+   task's own `tasks.effective_approved_paths` before it is committed, exactly
+   as today (`implement_executor`'s pre-commit scope gate). Two lanes with
+   overlapping scope cannot authorise each other's writes, because the check is
+   per diff and per task.
+3. The only way overlap becomes *incorrect* is a merge that lands candidate A
+   and then merges candidate B on an approval taken against the pre-A base:
+   B's diff would apply over text A changed, which no reviewer saw. That is
+   exactly what Decision 6 forbids.
+4. Textual conflict is therefore a **cost**, not an incorrectness. It surfaces
+   as a rebase that will not apply, and it ends in a park that destroys nothing.
+
+**Admission control is an efficiency measure on top of that, and its rule has to
+survive the universal tracker grant.** Every task's `effective_approved_paths`
+is its declared list UNION the six shared documentation trackers, so an overlap
+gate computed over the effective list would find an overlap between any two
+tasks and nothing would ever co-schedule. The gate is therefore computed over
+**declared** `approved_paths` only, and only at **file granularity**:
+
+* **Gates.** Two co-scheduled tasks must not both declare the same *file* entry
+  (an entry not ending in `/`) outside the six universal trackers. A same-file
+  declaration is the strongest advance signal that both lanes will edit the same
+  file, which is the case no resolver handles.
+* **Does not gate: the four append-only trackers** (`docs/SUMMARY.md`,
+  `docs/TESTS.md`, `docs/SECURITY.md`, `docs/COMMON_ERRORS.md`). Every task
+  appends to them by construction, and `note_merge.py` exists to resolve exactly
+  that — conditional on the discipline CLAUDE.md states: one new line, appended
+  at the end, no pre-existing line touched, nothing outside the section, at most
+  `note_merge.MAX_NOTE_LINE_CHARS`. The resolver switches itself off silently
+  when that discipline is broken, so concurrency raises the price of breaking
+  it, and the enabling candidate must say so in the operator docs.
+* **Does not gate: a shared directory entry** such as `autoloop/tests/`, which
+  nearly every task declares. Gating on it would serialise the fleet and buy
+  nothing; two tasks adding different files under it do not conflict.
+* **Does not gate, and is a stated residual: `CLAUDE.md` and `docs/SCHEMA.md`.**
+  They are universally granted, they have no resolver, and a conflict in either
+  deliberately stops a merge because they carry claims that need a human. A task
+  that *declares* one of them explicitly gates like any other file entry; a task
+  that writes one it never declared is the residual. Its cost is bounded: the
+  serialised merge finds the conflict, the second candidate parks, and a human
+  reads two files. That is the designed behaviour of those two trackers, not a
+  new failure mode.
+
+When the gate fires the task **stays queued** — `pending` in the registry,
+untouched, dispatched as soon as the conflicting lane finishes. It is never
+failed, never charged an attempt, and never quarantined.
+
+### Decision 4 — the fleet cap
+
+`[concurrency] lanes = N`, an integer, **default 1**. `load_config` refuses `0`,
+a negative, a non-integer and a value above a hard ceiling with a `ConfigError`,
+in the same style as `[paths]`'s refusals — a fleet size nobody can name is not
+a fleet size to guess at.
+
+When the cap is reached, the scheduler dispatches nothing more. The registry is
+the queue and stays the queue: no second data structure is introduced, the next
+READY task simply is not selected this tick. The reason is recorded once per
+tick in the transcript and shown by `health` and the dashboard, because a fleet
+sitting at its cap and a fleet with nothing to do look identical from outside
+and must not read identically.
+
+`lanes = 1` must remain a supported configuration behaving exactly as today —
+that is the brief's DEGRADE TO ONE bound, and it is how a broken lane gets
+turned off rather than debugged in production.
+
+### Decision 5 — fault isolation, and the one thing that stays fleet-fatal
+
+Today every `loop_fatal` park stops the single loop, and `cli.py` treats a
+missing or unrecognised `park_kind` as `loop_fatal` — fail-closed. The fleet
+splits that vocabulary in two:
+
+* **`lane_fatal`** — this lane stops and parks; the fleet keeps running. Its
+  blocker record names the lane.
+* **`fleet_fatal`** — every lane is stopped at its next safe phase.
+
+The direction of the default does not change: an unrecognised or absent kind is
+**`fleet_fatal`**. Which existing codes move to `lane_fatal` is enumerated by the
+candidate that does the work, against the actual call sites, not guessed here.
+
+**`checkout_escape_detected` stays `fleet_fatal`, deliberately.** It is
+tempting to make it lane-fatal now that the boundary is per-lane and the
+violation is attributable — and that is the wrong direction. The evidence an
+escape produces is precisely "this agent wrote outside the boundary it was
+given", and the nearest things outside that boundary are the other lanes' trees.
+An agent that has demonstrated it writes where it may not is not one to keep
+three neighbours running alongside. This is the fail-closed reading and it is
+the same judgement `escape_detector`'s docstring makes about its own exclusion
+list.
+
+### Decision 6 — merging is serialised and rebase-aware
+
+This is obstacle #3 and the one with a measured history: the brief records
+`task_base_behind_head` as the most common blocker code in this system's
+history, seventeen of them, and on 2026-08-22 three branches cut from one base
+all conflicted nineteen commits later with none mergeable. Four lanes
+manufacture that continuously.
+
+**The blocking fact nobody has written down yet:** today
+`cli._merge_window_blockers` shuts the window whenever *any* execution record
+holds a live candidate bound to the current head — its four exemptions
+(terminal registry state, already published, a retired defect, a base that is
+already a proper ancestor) all describe records that are NOT the in-flight case
+a lane produces. With N lanes, N−1 of them are exactly the case that blocks, so
+under concurrency the merge window as written would essentially never open. The
+predicate is a fleet-wide mutual exclusion, and it has to become a
+per-candidate **obligation**:
+
+> The window may open while candidates are bound to the head, provided every
+> such candidate is carried forward and **re-reviewed** before it can be pushed.
+
+The mechanics already exist and are named rather than rebuilt:
+
+* `_carry_reviewed_candidate_past` merges the moved head INTO the task's own
+  branch so a reviewed candidate survives the base moving. It is the path a
+  concurrent fleet runs on. It bails on a dirty worker tree and on a merge
+  conflict, and **that bail rate is the rework multiplier the brief's gating
+  paragraph is about** — saying so is the point, not a caveat.
+* `_rebase_execution_if_stale` refuses to re-point a record with
+  `review_round > 0` and parks `task_base_behind_head`. It stays the refusal for
+  the cases the carry-forward cannot handle.
+* **Re-review needs no new mechanism, and this is the cheap half of the claim.**
+  A carry-forward or rebase produces a new candidate commit, so
+  `PostcommitBinding.candidate_sha` and `candidate_tree_sha` no longer match what
+  `_dispatch_task_push` re-derives, and `packet_sha256` no longer matches the
+  packet a new review would render. The existing push-time checks refuse the old
+  approval on their own. What the candidate must add is that the record's review
+  round is reset so the loop *asks* for the new review instead of parking.
+
+Serialisation itself: `merge_sweep` already merges under one open window and is
+all-or-nothing. What changes is that each merge inside the sweep moves the base
+for every candidate that is not it, so the sweep must re-evaluate the obligation
+between merges rather than once at the start.
+
+**All of this is gated on `lanes > 1`.** At `lanes = 1` the window predicate
+behaves exactly as it does today — the blanket block — so the existing tests
+that pin it need no edit. This is also why the merge candidate can be built
+early: it needs two execution *records*, which a test writes directly, not two
+live agents.
+
+### Decision 7 — observability: N lanes, truthfully
+
+The brief's rule is the design: reporting the first lane's phase as the system's
+phase would be worse than reporting nothing.
+
+* **`phase` belongs to a lane.** Each lane's state file carries its own; the
+  fleet record carries no `phase` field at all. At `lanes = 1` the only state
+  file is `state.json` and every existing reader sees what it sees today.
+* **`health.check` grows a per-lane pass.** It returns the fleet verdict plus
+  one `Health` per lane, each using the existing `health.VERDICT_CODES`
+  vocabulary. Any word the fleet needs that does not exist yet lives in
+  `health.py` beside the others — the `projects_status` precedent, which added
+  exactly one word (`unknown`) and put it there rather than in a second
+  vocabulary.
+* **The fleet verdict is the most severe lane verdict, never lane 0's by
+  position.** The fleet needs attention if any lane does. At `lanes = 1` the
+  fleet verdict *is* lane 0's verdict, unchanged, which is what keeps the
+  existing exit codes and the existing cron wrappers working.
+* **The dashboard grows a lanes panel** over the same aggregation, kept separate
+  from its front door exactly as `dashboard.projects_status` is, so a later
+  consumer renders the same rows rather than re-deriving them.
+* **The `projects` view's `TASK` column** shows the fleet, not a lane: at
+  `lanes > 1` it reads `3 lanes: brw-19 +2` — the oldest in-flight task and how
+  many others — and never one lane's task as if it were the system's. `—`
+  keeps meaning unreadable and must not be borrowed for "several".
+
+### Decision 8 — a lane that dies mid-round
+
+Most of the recovery already exists per task and is extended per lane rather
+than rebuilt: `worker_repo_is_reusable` decides whether a worker can be resumed
+as is, `WorkerRepoManager.quarantine` moves a failed attempt aside without
+deleting evidence, execution records are per-task files that survive any
+process, `merge_sweep.sweep_on_startup` reconciles the backlog on boot, and
+`health.stranded_fault_rounds` already models a round that stopped mid-flight.
+
+What the fleet adds:
+
+* the supervisor notices a **dead lease** (by `LoopLock.is_live`'s rules) beside
+  a state file that is mid-round, and recovers **that lane only** — its state
+  file, its lease, its clone, its worker repo. No other lane names any of those,
+  which is why the recovery cannot touch them.
+* a dead lane **holding the merge token releases it**. The token is a lease with
+  the same liveness rule, for the same reason: a merge slot held by a dead
+  process is the one shared resource a lane death can strand.
+* a lane whose observed clone is unclean or diverged is **not** silently rebuilt.
+  `ObservedCheckout.synchronize` already refuses and says so; under the fleet
+  that refusal is a lane-fatal park naming that lane's directory, and the other
+  lanes keep running.
+
+### An interaction the scheduler must answer: self-upgrade boundaries
+
+`_self_upgrade_due` offers a replacement only at a `READY` phase with no packet
+in flight. With N lanes running continuously that moment may never arrive, and a
+merged upgrade would sit on disk forever — the silent-no-outcome failure the
+self-upgrade section above exists to end, reintroduced by concurrency.
+
+The answer belongs to the scheduler candidate and is named here so it is not
+discovered late: when an upgrade is pending the supervisor enters a **drain** —
+it admits no new tasks, lets the live lanes finish, and reaches the boundary with
+the whole fleet idle. `os.execv` still replaces one process holding one lock, so
+nothing about the handoff, the token, the one-shot marker or the decline set
+changes.
+
+### The split, in dependency order
+
+Nine candidates. Each is independently reviewable and each leaves the loop
+working; the concurrency setting stays at `1` until the last one.
+
+| # | id | What it lands |
+|---|---|---|
+| 1 | conc-02 | the `[concurrency]` setting and the lane vocabulary; no behaviour change |
+| 2 | conc-03 | rebase-aware, re-reviewed, serialised merge, behind `lanes > 1` |
+| 3 | conc-04 | one observed checkout per lane — the isolation boundary |
+| 4 | conc-05 | per-lane state files and lane leases |
+| 5 | conc-06 | the fleet supervisor: scheduling, admission control, the cap, the drain |
+| 6 | conc-07 | fault isolation: `lane_fatal` vs `fleet_fatal` |
+| 7 | conc-08 | lane death and recovery |
+| 8 | conc-09 | observability: `health` lanes, the dashboard panel, the `projects` column |
+| 9 | conc-10 | turn it on: the N=2 end-to-end acceptance round and the operator docs |
+
+**Why the merge candidate comes second and not last.** Both orderings were
+considered. The brief lists the obstacles hardest-first — isolation, then the
+state machine, then merging — and that is the right order of *difficulty*, not
+of *work*. The merge obligation is the only piece of this that is provable
+without any N>1 fixture at all: an operator merge moves the base identically to a
+sibling lane's merge, so two execution records written by a test exercise the
+whole protocol. It also de-risks the most common blocker code in the system
+before a single lane exists. Isolation follows immediately, because it is the
+one that breaks on the first concurrent round.
+
+#### 1. conc-02 — the concurrency setting and the lane vocabulary
+
+*Claim:* a `lanes` setting exists, is validated, and changes nothing at `1`.
+
+*Scope:* `autoloop/config.py`, `autoloop/config.example.toml`,
+`autoloop/tests/`.
+
+*Tests:* absent `[concurrency]` resolves to 1; `0`, `-1`, `"two"`, a float and a
+value over the ceiling each raise `ConfigError` naming the key; a lane id is
+derived deterministically and is refused as a task id (`validate_task_id`'s
+namespace must not collide with `workers_root`'s entries); the full existing
+suite passes with no test edited.
+
+#### 2. conc-03 — rebase-aware, re-reviewed, serialised merge
+
+*Claim:* a candidate whose base moved is carried forward and re-reviewed, never
+merged or pushed on its old approval; at `lanes = 1` the merge window is
+byte-identical to today's.
+
+*Scope:* `autoloop/cli.py` (`_merge_window_blockers`), `autoloop/auto_merge.py`,
+`autoloop/merge_sweep.py`, `autoloop/orchestrator.py`, `autoloop/tests/`.
+
+*Tests:* with `lanes = 1` and a candidate bound to the head, the window is shut
+with today's reason and today's wording; with `lanes > 1` the window opens and
+each bound candidate is recorded as owing a re-review; after a carry-forward the
+candidate sha and tree sha have moved and `_dispatch_task_push` refuses the old
+`PostcommitBinding`; a carry-forward that conflicts parks
+`task_base_behind_head` and leaves the worker repo and the record intact; a
+sweep of three branches re-evaluates the obligation between merges rather than
+once; the all-or-nothing property of the sweep is unchanged.
+
+#### 3. conc-04 — one observed checkout per lane
+
+*Claim:* each lane's escape detector brackets a tree only that lane writes; a
+genuine escape inside a lane is still detected; a write by one lane is not
+attributed to another.
+
+*Scope:* `autoloop/worker_env.py`, `autoloop/config.py`,
+`autoloop/orchestrator.py`, `autoloop/escape_detector.py` (docstring only),
+`autoloop/tests/`.
+
+*Tests:* two lanes' clones resolve to different directories and
+`validate_observed_checkout` refuses either nested in the other; lane B
+synchronising mid-window produces **no** violation in lane A; a file written
+into lane A's clone during lane A's window is still reported with its path; a
+worker repo created for lane A records lane A's clone in `.git/FETCH_HEAD`; at
+`lanes = 1` the clone path is exactly `[paths].observed_checkout` as resolved
+today.
+
+#### 4. conc-05 — per-lane state files and lane leases
+
+*Claim:* N lanes hold N independent state machines; lane 0 at `lanes = 1`
+writes literally `state.json` at today's path; two processes cannot enter one
+lane.
+
+*Scope:* `autoloop/state.py`, `autoloop/lock.py`, `autoloop/orchestrator.py`,
+`autoloop/cli.py`, `autoloop/tests/`.
+
+*Tests:* at `lanes = 1` no new file appears under the state dir and every
+existing state test passes unedited; at `lanes = 2` each lane's phase advances
+without touching the other's file; a live lease refuses a second entrant; a
+lease predating boot is dead however its pid probes; `unlock` still refuses a
+live fleet lock; a corrupt lease record refuses rather than reading as free.
+
+#### 5. conc-06 — the fleet supervisor
+
+*Claim:* the supervisor owns scheduling across N lanes, enforces the cap and the
+admission rule, and reaches a self-upgrade boundary by draining.
+
+*Scope:* `autoloop/orchestrator.py`, `autoloop/tasks.py`, `autoloop/cli.py`,
+`autoloop/tests/`.
+
+*Tests:* with more READY tasks than lanes, exactly `lanes` are dispatched and
+the rest stay `pending` with no attempt charged; two tasks declaring the same
+file entry are not co-scheduled while two sharing only `autoloop/tests/` and the
+universal trackers are; a pending upgrade stops admission and the boundary is
+reached once the last lane finishes; at `lanes = 1` the dispatch sequence is the
+one the existing continuous-mode tests already pin.
+
+#### 6. conc-07 — fault isolation
+
+*Claim:* a lane-fatal condition stops one lane and no other; an unrecognised
+kind still stops everything.
+
+*Scope:* `autoloop/orchestrator.py`, `autoloop/blockers.py`, `autoloop/cli.py`,
+`autoloop/tests/`.
+
+*Tests:* every existing `loop_fatal` call site is classified explicitly by the
+diff (a table in the candidate's own report); a `lane_fatal` park leaves the
+other lanes advancing; a blocker record names the lane; a park with no kind, or
+an unknown kind, stops the fleet; `checkout_escape_detected` stops the fleet.
+
+#### 7. conc-08 — lane death and recovery
+
+*Claim:* a lane that dies mid-round is recovered without touching the others.
+
+*Scope:* `autoloop/orchestrator.py`, `autoloop/worker_env.py`,
+`autoloop/merge_sweep.py`, `autoloop/health.py`, `autoloop/tests/`.
+
+*Tests:* a lane killed mid-executing is resumed or quarantined on the next tick
+while the other lanes' state files, clones and worker repos are byte-identical
+before and after; a dead lane holding the merge token releases it and a live
+lane then merges; an unclean clone parks that lane and no other; a dead lane
+whose worker repo fails `worker_repo_is_reusable` is quarantined rather than
+reused.
+
+#### 8. conc-09 — observability
+
+*Claim:* `health` and the dashboard report every lane truthfully, and no single
+string is presented as the fleet's phase.
+
+*Scope:* `autoloop/health.py`, `autoloop/dashboard.py`, `autoloop/tests/`.
+
+*Tests:* `health --json` carries one object per lane, each with a code from
+`VERDICT_CODES`; the fleet code is the most severe lane code and is not lane 0's
+by position; at `lanes = 1` the JSON, the text and the exit code are unchanged
+against a snapshot of today's output; a fleet at its cap is distinguishable from
+an idle fleet; the dashboard renders N lanes and takes no lock.
+
+#### 9. conc-10 — turn it on
+
+*Claim:* N tasks are implemented concurrently, each producing an independently
+reviewable candidate, and the candidates reach the base one at a time with none
+stranded.
+
+*Scope:* `autoloop/config.example.toml`, `docs/AUTOLOOP.md`,
+`autoloop/tests/`.
+
+*Tests:* an end-to-end round at `lanes = 2` with a stub executor: two candidates
+produced, two independent reviews, two merges one at a time, the second rebased
+and re-reviewed against the first; the shipped default stays `1`.
+
+### Where each of the brief's required tests is proved
+
+| conc-01 asked for | proved by |
+|---|---|
+| N tasks run concurrently, each an independently reviewable candidate | conc-10, on the mechanisms of conc-04/05/06 |
+| a write by one lane is not attributed to another | conc-04 |
+| a genuine escape inside one lane is still detected | conc-04 |
+| candidates merge one at a time | conc-03 |
+| a base that moved is rebased and re-reviewed, never merged on the old approval | conc-03 |
+| a lane that dies mid-round is recovered without touching the others | conc-08 |
+| N=1 behaves exactly as today, existing tests unchanged | every candidate; see below |
+| health and the dashboard report every lane | conc-09 |
+
+### The acceptance criterion every candidate carries
+
+**At `lanes = 1` the existing suite passes with zero test edits.** Not "passes
+after the obvious updates" — zero. Lane 0 keeps writing literally `state.json`,
+the fleet lock keeps the path and the semantics `LoopLock` has today, the merge
+window keeps today's predicate and today's wording, and `health`'s output is
+unchanged byte for byte. If a candidate finds itself editing an existing test,
+that is the signal that the N=1 path moved, and the right response is to fix the
+candidate rather than the test.
+
+### What this plan does not decide
+
+* **Which existing `loop_fatal` codes become `lane_fatal`.** That is an
+  enumeration against real call sites and belongs to conc-07's diff, not to a
+  guess made here.
+* **The hard ceiling on `lanes`.** It should be measured against the executor's
+  actual concurrency behaviour and the machine, not asserted; conc-02 picks a
+  conservative number and says how it was chosen.
+* **Containers.** The brief offers "a git worktree or a container per task". A
+  container would close the write-then-revert and `.git/`-internals residuals a
+  clone cannot, and it is a different, larger project (docs/SECURITY.md S24). A
+  linked git worktree is explicitly *not* the answer — `worker_env.py`'s module
+  docstring records why: a worktree shares its `.git`, and therefore every
+  remote, hook and credential-relevant config key, with the checkout it came
+  from.
+* **A provider with a shared conversation.** Every codex turn is its own
+  subprocess, so nothing here designs around one.
