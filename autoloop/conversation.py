@@ -327,8 +327,14 @@ _PROVIDERS: dict[str, ConversationFactory] = {
 #: EMPTY since brw-16 (2026-08-25), because no shipped provider drives a
 #: browser any more. The set is populated, exactly as it always was, by
 #: `register_provider(..., browser_backed=True)` — so the orchestrator's
-#: restart/cooldown/unattachable recovery is dormant rather than deleted, and an
-#: adapter that declares itself gets all of it back with no change here.
+#: restart and cooldown recovery is dormant rather than deleted, and an adapter
+#: that declares itself gets it back with no change here. ONE piece of that
+#: recovery is dormant in a stronger sense since brw-19b: the unattachable-
+#: browser path is no longer dispatched to at all, because detecting the state
+#: meant counting CDP page targets through `autoloop/browser/` and the
+#: orchestrator no longer imports that package. A re-registered browser adapter
+#: gets the restart, the cooldown and the fault budget; it does not get that
+#: one back until something supplies an attachability probe again.
 _BROWSER_BACKED: set[str] = set()
 
 

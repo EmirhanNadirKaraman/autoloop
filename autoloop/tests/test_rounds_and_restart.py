@@ -223,18 +223,13 @@ def _browser_orch(tmp_path, policy=None, state=None, **browser_kw):
         browser=dataclasses.replace(orch._config.browser, **browser_kw),
         conversation=ConversationConfig(provider=BROWSER_PROVIDER),
     )
-    # THE probe that dials a socket, stubbed on the instance — the job the
-    # autouse `_no_live_cdp_probe` conftest fixture used to do for the whole
-    # suite before brw-16 removed it. It lives here now because this is one of
-    # the two modules that can still reach `_classify_rate_limit_state`, and a
-    # conftest doing it made every test file under `autoloop/tests/` depend on
-    # `autoloop.orchestrator` (see `conftest.py`).
-    #
-    # None means UNMEASURABLE, the value that leaves the classifier behaving
-    # exactly as it did before the probe existed. Tests about the
-    # classification set their own afterwards; an instance attribute assigned
-    # later simply replaces this one.
-    orch._attachable_page_targets = lambda: None
+    # No probe is stubbed here any more. `_classify_rate_limit_state` used to
+    # dial `browser.cdp_url` for a page-target count and every orchestrator this
+    # helper built had to be blinded first — the job the autouse
+    # `_no_live_cdp_probe` conftest fixture did for the whole suite until
+    # brw-16, and this helper did for this file until brw-19b removed the probe
+    # itself along with the orchestrator's last import of `autoloop/browser/`.
+    # The classifier now asks only the client this test hands it.
     return orch
 
 
@@ -880,9 +875,33 @@ def test_a_park_that_never_SAW_the_modal_says_so_and_sends_the_operator_to_the_b
 # no browser; a probe reported "still rate limited" for four hours. Restarting
 # the profile restored 11 targets immediately.
 #
+# WHAT CHANGED, brw-19b: the DETECTION is gone. Counting page targets meant
+# calling `browser/playwright_session.py`, the orchestrator's last live import
+# of the package brw-19a retires, so `_classify_rate_limit_state` tells apart
+# two worlds now and dispatches to no recovery at all. The RECOVERY is retained
+# and dormant — it is the only emitter of the `browser_unattachable` park code,
+# which `cli._RESOLUTION_PRECONDITIONS` and `test_m1_hardening.py` (neither in
+# brw-19b's scope) still key a recheck on — so the tests below call
+# `_recover_unattachable_browser` DIRECTLY instead of arriving at it through a
+# probe that no longer exists. That is the honest shape: they pin what the
+# retained code does, and the last test in this section pins that nothing
+# reaches it.
+#
 # The no-restart rule above is NOT reversed by any of this: it assumes the
 # browser is usable and merely being refused, and these tests pin the boundary
 # of that assumption. State 1 must behave exactly as it did.
+
+
+#: What `_classify_rate_limit_state` used to hand `_recover_unattachable_
+#: browser` as its third world's evidence, kept verbatim so the direct calls
+#: below describe the state the retained code was written for. It is an INPUT:
+#: assertions about the park quote it explicitly as "the caller's evidence,
+#: requoted", never as proof the loop measured anything.
+UNATTACHABLE_EVIDENCE = (
+    "http://127.0.0.1:9222 answers but lists no attachable page target, so "
+    "there is no page to be throttled (no client is held, so the page itself "
+    "could not be probed)"
+)
 
 
 class _UnattachableClient:
@@ -936,21 +955,19 @@ class _ClearedClient:
 def test_a_throttle_modal_on_an_attachable_page_backs_off_without_restarting(
     tmp_path, monkeypatch
 ):
-    """State 1, unchanged — and asserted against a target count of ZERO, the
-    one reading that authorises a restart everywhere else.
+    """State 1, unchanged by the probe's removal.
 
-    The modal is asked FIRST for exactly this reason: a page that can show it
-    is a page the loop can drive, whatever a transient answer at the CDP
-    endpoint says. Ordering it the other way would make an odd probe restart
-    Chrome in the middle of a genuine account throttle — the response that
-    deepens it."""
+    The modal on a held page was always asked FIRST, before any answer at the
+    CDP endpoint, so this is the one branch the removal provably cannot move:
+    it returned before the count was ever taken. A restart command is
+    configured and its cooldown disabled, so a restart is available to be
+    wrongly taken and is not."""
     orch = _browser_orch(
         tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
     )
     orch.state.phase = Phase.AWAITING.value
     client = _ThrottleAwareClient()
     orch._client = client
-    orch._attachable_page_targets = lambda: 0
     calls = _fake_restart(monkeypatch, returncode=0)
     taken = _sleeps(orch)
 
@@ -962,24 +979,29 @@ def test_a_throttle_modal_on_an_attachable_page_backs_off_without_restarting(
     assert taken == [60.0], "it waits, exactly as before"
 
 
-def test_zero_cdp_targets_restarts_once_and_spends_no_backoff_budget(tmp_path, monkeypatch):
-    """State 3. The restart is a LOCAL recovery — it makes no request of
-    ChatGPT — so it must not spend the budget that bounds waiting on the
-    server, and it must not wait either: there is nothing to outlast."""
+def test_the_retained_recovery_restarts_once_and_spends_no_backoff_budget(
+    tmp_path, monkeypatch
+):
+    """The retained recovery, driven directly. The restart is a LOCAL recovery
+    — it makes no request of ChatGPT — so it must not spend the budget that
+    bounds waiting on the server, and it must not wait either: there is nothing
+    to outlast.
+
+    A restart that reports success is now believed rather than re-probed: the
+    re-probe was the second `_attachable_page_targets` call site brw-19b
+    removed, and an unmeasurable endpoint already counted as recovered there."""
     orch = _browser_orch(
         tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
     )
     orch.state.phase = Phase.AWAITING.value
     client = _UnattachableClient()
     orch._client = client
-    # Dead, then eleven targets once the profile has been restarted — the
-    # numbers the incident actually produced.
-    probes = [0, 11]
-    orch._attachable_page_targets = lambda: probes.pop(0)
     calls = _fake_restart(monkeypatch, returncode=0)
     taken = _sleeps(orch)
 
-    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    orch._recover_unattachable_browser(
+        Phase.AWAITING, RateLimitedError("throttled"), UNATTACHABLE_EVIDENCE
+    )
 
     assert len(calls) == 1, "exactly one restart per back-off cycle"
     assert orch.state.rate_limit_backoffs == 0, "no browser fault may spend that budget"
@@ -990,17 +1012,22 @@ def test_zero_cdp_targets_restarts_once_and_spends_no_backoff_budget(tmp_path, m
     assert client.closed is True, "the restart ends the process it was bound to"
     assert orch._client is None
     assert orch.state.phase == Phase.AWAITING.value, "the step is simply re-entered"
-    assert probes == [], "the restart is re-probed, not assumed to have worked"
     events = [event for event, _ in _transcript(orch)]
     assert "browser_unattachable" in events
     assert "browser_reattached" in events
     assert "rate_limited" not in events, "it was never a rate limit"
 
 
-def test_a_restart_that_still_yields_no_targets_parks_naming_the_browser(tmp_path, monkeypatch):
+def test_a_restart_that_does_not_come_back_parks_naming_the_browser(tmp_path, monkeypatch):
     """The four-hour failure, closed. An operator reading "rate limited" while
     the real problem is a dead browser waits for a limit that does not exist —
-    so once one restart has not helped, the loop stops and says BROWSER."""
+    so once one restart has not helped, the loop stops and says BROWSER.
+
+    "Has not helped" is now the restart COMMAND failing rather than a re-probe
+    finding nothing: with no probe left, a command that reports success is
+    taken at its word. Every operator-facing word of the park is unchanged, and
+    this is the case that emits `browser_unattachable` — the code
+    `cli._RESOLUTION_PRECONDITIONS` keys its recheck on."""
     blockers = BlockerStore(tmp_path / "blockers")
     orch = _browser_orch(
         tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
@@ -1008,11 +1035,12 @@ def test_a_restart_that_still_yields_no_targets_parks_naming_the_browser(tmp_pat
     orch._blocker_store = blockers
     orch.state.phase = Phase.AWAITING.value
     orch._client = _UnattachableClient()
-    orch._attachable_page_targets = lambda: 0  # still nothing to attach to
-    calls = _fake_restart(monkeypatch, returncode=0)
+    calls = _fake_restart(monkeypatch, returncode=1)  # the restart itself fails
     taken = _sleeps(orch)
 
-    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    orch._recover_unattachable_browser(
+        Phase.AWAITING, RateLimitedError("throttled"), UNATTACHABLE_EVIDENCE
+    )
 
     assert len(calls) == 1, "one restart, then a verdict — never a restart loop"
     assert taken == []
@@ -1025,7 +1053,12 @@ def test_a_restart_that_still_yields_no_targets_parks_naming_the_browser(tmp_pat
     assert parked.code == "browser_unattachable"
     assert parked.code != "rate_limited", "the whole point of the task"
     assert "BROWSER" in parked.question, "named as the cause, not the throttle"
-    assert "no attachable page" in parked.question
+    assert "nothing can attach to a page" in parked.question, "the park's own words"
+    assert UNATTACHABLE_EVIDENCE in parked.question, (
+        "the caller's evidence is requoted verbatim — an INPUT to this call, "
+        "asserted as such and not as something the loop measured"
+    )
+    assert "ran and failed" in parked.question, "and the restart outcome is named"
     assert "chrome_restart" in parked.question, "and the operator is told what to run"
     # `autoloop start` prints `blocker.question[:160]`. Ordered
     # evidence-first, that view spends the whole summary on measurements and
@@ -1039,11 +1072,10 @@ def test_a_restart_that_still_yields_no_targets_parks_naming_the_browser(tmp_pat
 def test_the_episode_gets_ONE_restart_even_with_the_cooldown_disabled(tmp_path, monkeypatch):
     """The bound is per back-off cycle, not only per cooldown window.
 
-    With `restart_cooldown_seconds = 0` the cooldown refuses nothing, and each
-    restart here reports success while the re-probe still finds no page — so
-    without a per-episode bound this is a restart loop thrashing Chrome, the
-    exact failure the cooldown exists to prevent, arriving through the one
-    path that had disabled it."""
+    With `restart_cooldown_seconds = 0` the cooldown refuses nothing, so
+    without a per-episode bound a browser that keeps failing to come back is a
+    restart loop thrashing Chrome — the exact failure the cooldown exists to
+    prevent, arriving through the one path that had disabled it."""
     blockers = BlockerStore(tmp_path / "blockers")
     orch = _browser_orch(
         tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
@@ -1051,10 +1083,11 @@ def test_the_episode_gets_ONE_restart_even_with_the_cooldown_disabled(tmp_path, 
     orch._blocker_store = blockers
     orch.state.phase = Phase.AWAITING.value
     orch._client = _UnattachableClient()
-    orch._attachable_page_targets = lambda: 0
-    calls = _fake_restart(monkeypatch, returncode=0)
+    calls = _fake_restart(monkeypatch, returncode=1)
 
-    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    orch._recover_unattachable_browser(
+        Phase.AWAITING, RateLimitedError("throttled"), UNATTACHABLE_EVIDENCE
+    )
     assert len(calls) == 1
 
     # The first call parked; this models the loop being sent back into the
@@ -1062,12 +1095,14 @@ def test_the_episode_gets_ONE_restart_even_with_the_cooldown_disabled(tmp_path, 
     # spend a second restart on a browser that just failed to come back.
     orch.state.phase = Phase.AWAITING.value
     orch._client = _UnattachableClient()
-    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    orch._recover_unattachable_browser(
+        Phase.AWAITING, RateLimitedError("throttled"), UNATTACHABLE_EVIDENCE
+    )
 
     assert len(calls) == 1, "one restart per episode, cooldown or no cooldown"
-    assert all(
-        blocker.code == "browser_unattachable" for blocker in blockers.all_blockers()
-    )
+    recorded = blockers.all_blockers()
+    assert recorded, "`all()` over an empty list is True — the population first"
+    assert all(blocker.code == "browser_unattachable" for blocker in recorded)
     spent = [
         data for event, data in _transcript(orch) if event == "browser_unattachable"
     ]
@@ -1079,8 +1114,8 @@ def test_a_completed_step_ends_the_episode_so_a_LATER_dead_browser_gets_its_own_
 ):
     """The other half of the per-episode bound, and the one that was missing.
 
-    State 3 deliberately does not increment `rate_limit_backoffs`, so the
-    ordinary sequence — zero targets, restart, a normal step that completes —
+    This recovery deliberately does not increment `rate_limit_backoffs`, so the
+    ordinary sequence — dead browser, restart, a normal step that completes —
     ends with that counter still 0. While the one-restart guard was cleared
     only inside `if rate_limit_backoffs:` it therefore stayed true for the rest
     of the process, and the NEXT unattachable browser, hours later and
@@ -1095,14 +1130,14 @@ def test_a_completed_step_ends_the_episode_so_a_LATER_dead_browser_gets_its_own_
     )
     orch.state.phase = Phase.AWAITING.value
     orch._client = _UnattachableClient()
-    probes = [0, 11]  # dead, then alive once the profile has been restarted
-    orch._attachable_page_targets = lambda: probes.pop(0)
     calls = _fake_restart(monkeypatch, returncode=0)
     _sleeps(orch)
 
-    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    orch._recover_unattachable_browser(
+        Phase.AWAITING, RateLimitedError("throttled"), UNATTACHABLE_EVIDENCE
+    )
     assert len(calls) == 1
-    assert probes == [], "the restart genuinely restored a page"
+    assert orch.state.phase == Phase.AWAITING.value, "recovered, so nothing parked"
 
     # An ordinary step now completes. The phase was left untouched by the
     # recovery, so this is the step the loop was already in — and the counter
@@ -1115,8 +1150,9 @@ def test_a_completed_step_ends_the_episode_so_a_LATER_dead_browser_gets_its_own_
     # client, nothing to attach to again.
     orch.state.phase = Phase.AWAITING.value
     orch._client = _UnattachableClient()
-    orch._attachable_page_targets = lambda: 0
-    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    orch._recover_unattachable_browser(
+        Phase.AWAITING, RateLimitedError("throttled"), UNATTACHABLE_EVIDENCE
+    )
 
     assert len(calls) == 2, "a new episode gets its own restart, not a spent one"
     assert orch.state.rate_limit_backoffs == 0, (
@@ -1174,25 +1210,48 @@ def test_a_composer_that_will_not_take_a_click_is_not_a_clear(tmp_path):
     assert orch.state.rate_limit_backoffs == 1
 
 
-def test_an_endpoint_that_cannot_be_measured_never_restarts(tmp_path, monkeypatch):
-    """Unmeasurable is not evidence. A browser that genuinely cannot be
-    reached raises `BrowserError` from the next step and gets the restart path
-    built for it, on its own budget — so a probe that answers nothing must
-    leave this handler behaving exactly as it did before the probe existed."""
+def test_a_rate_limit_never_reaches_the_unattachable_recovery_any_more(
+    tmp_path, monkeypatch
+):
+    """THE removal, asserted three ways, because each way alone fails open.
+
+    * The probe is GONE from the class, so no test in this tree can dial
+      127.0.0.1:9222 by forgetting to stub it, and no caller can be added back
+      without adding an import too.
+    * The classifier answers only `throttled`/`cleared`, on a BROWSER-BACKED
+      provider and with nothing held — the exact state that used to reach the
+      third world through an unaskable page.
+    * The handler behaves as an unmeasurable endpoint always made it behave:
+      it backs off, it does not restart, and it writes no
+      `browser_unattachable` record. A restart command is configured and its
+      cooldown disabled, so a restart is available to be taken wrongly.
+    """
     orch = _browser_orch(
         tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
     )
+    assert not hasattr(orch, "_attachable_page_targets")
+    assert not hasattr(type(orch), "_attachable_page_targets")
+
     orch.state.phase = Phase.AWAITING.value
     orch._client = None  # nothing held, so the page cannot be asked either
-    orch._attachable_page_targets = lambda: None
     calls = _fake_restart(monkeypatch, returncode=0)
     taken = _sleeps(orch)
+
+    assert orch._transport_is_browser_backed() is True, "the arm that used to probe"
+    classification, evidence = orch._classify_rate_limit_state()
+    assert classification == "throttled"
+    assert "could not be probed" in evidence
+    assert "attachable" not in evidence, "no page count is claimed or measured"
 
     orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
 
     assert calls == []
     assert orch.state.rate_limit_backoffs == 1
     assert taken == [60.0]
+    assert orch.state.phase == Phase.AWAITING.value, "it backed off, it did not park"
+    events = [event for event, _ in _transcript(orch)]
+    assert "browser_unattachable" not in events
+    assert "rate_limited" in events
 
 
 def test_the_transcript_says_rate_limited_not_browser_error(tmp_path):
