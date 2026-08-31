@@ -716,15 +716,16 @@ def test_continuous_mode_restart_resumes_the_saved_phase(tmp_path, monkeypatch):
 
 
 def test_doctor_reports_the_complete_v1_configuration(tmp_path):
+    """Unchanged in substance by brw-19c (2026-08-31), and that is the point
+    worth stating: this test used to hand `DoctorProbes` a CDP probe that
+    raised and a playwright that was absent, purely so the sweep could reach
+    the checks below without the machine's real browser deciding the outcome.
+    Neither knob exists now — `doctor` grades no browser — so the DEFAULT
+    bundle reaches exactly the same v1 checks with nothing stubbed."""
     repo_root, _origin = real_repo_with_origin(tmp_path)
     config = make_config(tmp_path)
 
-    def probe_cdp(url):
-        raise OSError("no CDP in this test")
-
-    results = run_doctor(
-        config, repo_root, probes=DoctorProbes(probe_cdp=probe_cdp, playwright_present=lambda: False)
-    )
+    results = run_doctor(config, repo_root, probes=DoctorProbes())
     names = {r.name: r for r in results}
     for expected in (
         "branch_policy",
@@ -734,6 +735,9 @@ def test_doctor_reports_the_complete_v1_configuration(tmp_path):
         "publisher_url_drift",
     ):
         assert expected in names, sorted(names)
+    # No browser check is produced, so nothing here depends on whether a Chrome
+    # happens to be listening on this machine.
+    assert not {"cdp", "playwright"} & set(names), sorted(names)
     assert names["worker_isolation"].status == "ok", names["worker_isolation"].detail
     assert names["hooks_dirs"].status == "ok", names["hooks_dirs"].detail
     assert names["publisher"].status == "ok", names["publisher"].detail

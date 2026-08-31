@@ -38,6 +38,17 @@ class BrowserConfig:
     `conversation_url` therefore DEFAULTS to `""` rather than being required.
     That is the whole of the configuration half of brw-16's claim: a config with
     no `[browser]` section at all constructs this dataclass and loads.
+
+    UNCHANGED BY brw-19c (2026-08-31), deliberately. That task removed the last
+    live readers of these values outside the orchestrator — `doctor`'s CDP,
+    playwright, conversation-URL and rotation checks — and stopped this file
+    naming any module inside the browser package. It removed no KEY and no
+    DEFAULT: every field below is still accepted, still shape-checked, and
+    still readable by an adapter someone registers. A retirement that deleted
+    keys would turn "upgrade and keep going" into "edit this file first",
+    which is the one cost the whole `[browser]` compatibility story exists to
+    avoid, and it would do so to a config file that is not in this repository
+    and cannot be migrated by this commit.
     """
 
     #: The one persistent chat a browser adapter would drive. Empty is normal
@@ -80,15 +91,22 @@ class BrowserConfig:
     poll_interval_seconds: float = 2.0
     stability_seconds: float = 3.0
     #: Command run to restart the browser after a session loss. Empty
-    #: disables auto-restart, which is the pre-existing behaviour.
+    #: disables auto-restart, which is the pre-existing behaviour and the
+    #: default.
     #:
     #: Declared by the operator rather than inferred: the loop knows only
     #: a `cdp_url`, not which Chrome process owns it, and a loop that
     #: pattern-matched process lists could kill the wrong browser. An
-    #: explicit command also makes the blast radius reviewable — see
-    #: `autoloop/browser/chrome_restart.py` (the shipped implementation,
-    #: `["python3", "-m", "autoloop.browser.chrome_restart"]`), which matches
-    #: one profile by its --user-data-dir EXACTLY and nothing else.
+    #: explicit command also makes the blast radius reviewable.
+    #:
+    #: WHOLLY THE OPERATOR'S since brw-19c (2026-08-31). This used to point at
+    #: a shipped implementation inside the retired browser package; that
+    #: package is being removed, so no value here is supplied or recommended
+    #: by the loop any more. The KEY is unchanged — still accepted, still
+    #: shape-checked, still run by `cli._repair_browser` exactly as written —
+    #: because a live config may already declare a working command of its own,
+    #: and refusing one at load would break every command on a deployment
+    #: nobody has migrated yet.
     restart_command: tuple[str, ...] = ()
     #: Minimum seconds between restart attempts. Without it a genuinely
     #: dead transport becomes a restart loop.
@@ -324,22 +342,39 @@ MIGRATED_TIMEOUT_KEY = "audit_agent_timeout_seconds"
 #: The shell helper retired on 2026-08-16 (brw-08), kept here as ONE spelling
 #: shared by the tombstone that replaced it and the tests that pin this path.
 #:
-#: `load_config` deliberately does NOT act on it. A `restart_command` still
-#: naming the script keeps loading, exactly as written, for the length of the
-#: transition — the live `.autoloop/config.toml` is not in this repository, so
-#: refusing here would make every command (`status`, `doctor`, `run`, the
-#: recovery commands) fail on an unmigrated deployment the moment this branch
-#: merged, taking away the tooling the operator would use to recover. The
-#: compatibility boundary is the tombstone at `scripts/restart_autoloop_chrome.sh`
-#: instead: ordinary commands keep working, and only an actual browser restart
-#: fails — non-zero, with the replacement line on stderr. Re-adding a refusal
-#: here belongs to a later cleanup, once live configs have been migrated.
+#: `load_config` deliberately does NOT act on it, and brw-19c (2026-08-31) did
+#: not change that. A `restart_command` still naming the script keeps loading,
+#: exactly as written, for the length of the transition — the live
+#: `.autoloop/config.toml` is not in this repository, so refusing here would
+#: make every command (`status`, `doctor`, `run`, the recovery commands) fail
+#: on an unmigrated deployment the moment this branch merged, taking away the
+#: tooling the operator would use to recover. The compatibility boundary is the
+#: tombstone that replaced the script — `scripts/restart_autoloop_chrome.sh` in
+#: the deployment that ships one, which this package does not — so ordinary
+#: commands keep working and only an actual browser restart fails, non-zero and
+#: with a replacement line on stderr. Re-adding a refusal here belongs to a
+#: later cleanup, once live configs have been migrated.
 RETIRED_RESTART_SCRIPT = "restart_autoloop_chrome.sh"
-#: The module that replaced it, spelled exactly as it goes in the config.
-RESTART_COMMAND_REPLACEMENT = ("python3", "-m", "autoloop.browser.chrome_restart")
+
+#: A SHAPE, not a recommendation: the argv list `browser.restart_command` has
+#: to be, with a placeholder where the operator's own command goes.
+#:
+#: This replaces `RESTART_COMMAND_REPLACEMENT`, which brw-19c (2026-08-31)
+#: deleted. That constant held `("python3", "-m",
+#: "autoloop.browser.chrome_restart")` — the module that replaced the retired
+#: shell script — and the browser package holding it is itself being removed,
+#: so it named a command that will not run. It was never imported anywhere
+#: (only quoted, in one test comment), and printing a dead module path in the
+#: one message an operator sees when their config is malformed is worse than
+#: printing no path at all: it reads as advice.
+#:
+#: DELETED rather than re-pointed because there is nothing left to point at.
+#: No shipped implementation replaces it, and inventing a plausible-looking
+#: one would be the same failure with a different string.
+RESTART_COMMAND_EXAMPLE = ("/path/to/your-restart-command",)
 
 
-def _restart_command_toml(command: tuple[str, ...] = RESTART_COMMAND_REPLACEMENT) -> str:
+def _restart_command_toml(command: tuple[str, ...] = RESTART_COMMAND_EXAMPLE) -> str:
     """`restart_command = [...]`, ready to paste. A config error is plausibly
     the only thing the operator sees — `cli.main` prints `error: <exc>` and
     nothing else — so it carries the literal line rather than a pointer to a
