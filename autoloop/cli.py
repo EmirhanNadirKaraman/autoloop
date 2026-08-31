@@ -804,9 +804,9 @@ def _sweep_backlog_on_startup(config: AutoloopConfig) -> bool:
 #: What the preflight subprocess imports. Deliberately the modules a fresh
 #: `python -m autoloop` loads on the way to its first decision — `policy` is the
 #: one the 2026-08-18 measurement names — and deliberately NOT a walk of the
-#: whole package: `browser.playwright_session` and the codex client have
-#: optional third-party dependencies, so a machine without them would fail
-#: every preflight and silently disable this feature for good.
+#: whole package: the codex client (and, until it was retired, the browser
+#: transport) has optional third-party dependencies, so a machine without them
+#: would fail every preflight and silently disable this feature for good.
 PREFLIGHT_MODULES = (
     "autoloop",
     "autoloop.policy",
@@ -3312,13 +3312,53 @@ def _cmd_blockers(args: argparse.Namespace) -> int:
 #: straight back into the same wall — this time with the blocker marked
 #: resolved, so the queue would understate what is actually wrong.
 #: Each maps to a precondition that is RE-CHECKED at answer time.
+
+#: The transport recheck. Named `_precondition_browser` for the four codes it
+#: still answers for (`login_expired`, `submission_ambiguous`,
+#: `git_failure_budget_exhausted`, `browser_unattachable`); what it actually
+#: senses is whichever transport is CONFIGURED.
+#:
+#: The whitelist below is why. brw-19c (2026-08-31) removed doctor's `cdp`,
+#: `playwright`, `conversation_url` and rotation checks, and a filter left
+#: naming only checks doctor cannot emit is a guard that switches ITSELF off:
+#: an empty `bad` list reads as "the environment is healthy", so any answer
+#: text would resolve a `login_expired` blocker without anything being
+#: rechecked — Autoloop M1 finding #7, one function over. So:
+#:
+#: * `primary_live` is the load-bearing member now. `doctor._probe_live` builds
+#:   the configured adapter and calls `attach()`, which is what a login
+#:   expiry, an unreachable transport or a missing binary actually shows up in.
+#: * `provider` and `codex_command` are cheap corroboration. `codex_command` is
+#:   absent unless a codex seat is configured, and an absent name is simply not
+#:   in `results` — the filter reads what doctor produced, never a fixed list.
+#: * `cdp` and `playwright` are KEPT although `run_doctor` no longer produces
+#:   either. They cost nothing (a name absent from `results` matches nothing),
+#:   and `test_blockers.py`'s whitelist tests — outside brw-19c's approved
+#:   paths — stub `run_doctor` and assert both still hold a blocker shut. They
+#:   are dead weight to re-point when that file is next touched, NOT evidence
+#:   that this command still grades a browser.
+#: * `browser_live` (renamed away on 2026-08-01) and `conversation_url` (gone
+#:   with the checks above) are dropped: neither can ever appear, and a name
+#:   that can never appear is indistinguishable from a check that always passes.
+_BROWSER_PRECONDITION_CHECKS = (
+    "primary_live",
+    "provider",
+    "codex_command",
+    "cdp",
+    "playwright",
+)
+
+
 def _precondition_browser(config) -> str:
     from .doctor import DoctorProbes, run_doctor
     results = run_doctor(config, Path.cwd(), probes=DoctorProbes())
-    bad = [r for r in results if r.status != "ok" and r.name in
-           ("cdp", "playwright", "provider", "conversation_url", "browser_live")]
+    bad = [
+        r
+        for r in results
+        if r.status != "ok" and r.name in _BROWSER_PRECONDITION_CHECKS
+    ]
     if bad:
-        return "browser/login checks still failing: " + ", ".join(
+        return "transport/login checks still failing: " + ", ".join(
             f"{r.name} ({r.detail})" for r in bad)
     return ""
 
@@ -3352,10 +3392,11 @@ def _precondition_protected(config) -> str:
 def _precondition_worker_environment_drift(config) -> str:
     """Dedicated recheck for `worker_environment_drift` — previously
     mismapped to `_precondition_browser` (Autoloop M1 finding #7), whose
-    doctor probes (cdp/playwright/provider/conversation_url/browser_live)
-    never look at git hooks or worker isolation at all, so ANY answer text
-    resolved this blocker regardless of whether the environment it describes
-    was still broken. Reuses the SAME primitives `doctor.py`'s
+    doctor checks (`_BROWSER_PRECONDITION_CHECKS`, the transport and the
+    provider registration) never look at git hooks or worker isolation at
+    all, so ANY answer text resolved this blocker regardless of whether the
+    environment it describes was still broken. Reuses the SAME primitives
+    `doctor.py`'s
     `worker_isolation` check and `orchestrator.py`'s own environment-drift
     detection are built on (`worker_env.validate_workers_root` /
     `verify_worker_isolation`) — a throwaway probe worker repo is created
@@ -3909,7 +3950,15 @@ def _repair_browser(config) -> tuple[str, bool]:
     """Restart the browser only if CDP does not answer, and only via the
     operator-declared command — the loop knows a `cdp_url`, not which Chrome
     owns it, and pattern-matching process lists is how an automation takes
-    down someone's everyday browser."""
+    down someone's everyday browser.
+
+    KEPT by brw-19c (2026-08-31), which removed the browser checks from
+    `doctor`. Everything this runs is the OPERATOR's:
+    `browser.restart_command` is empty unless someone declared it, and an
+    empty one is reported rather than guessed at. So this names no module in
+    this package and cannot break when one is deleted — unlike a preflight
+    that graded a transport nothing can select. It stays until an operator
+    with a declared command is migrated off it."""
     try:
         _default_probe_cdp(f"{config.browser.cdp_url}/json/version")
         return ("browser      CDP answering", True)

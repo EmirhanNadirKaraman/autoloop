@@ -10,13 +10,23 @@
 #     unread. Every key is still accepted and still validated; none of them is
 #     required, including conversation_url. Upgrading a running deployment does
 #     not mean editing a file first — delete the section when convenient, or
-#     never.
+#     never. brw-19c (2026-08-31) removed the last preflight that graded any of
+#     those values and did NOT remove a single key.
 #   * If you register a browser-backed adapter of your own
 #     (`conversation.register_provider(name, factory, browser_backed=True)`),
 #     the section and every timeout, restart and rate-limit setting in it come
 #     back exactly as they were — see autoloop/config.py's BrowserConfig for the
-#     full list of keys and their defaults. Nothing about the recovery machinery
-#     was removed; only the one registration was.
+#     full list of keys and their defaults. The orchestrator's restart, cooldown
+#     and rate-limit recovery is untouched and still reads them.
+#
+# What you must SUPPLY yourself, if you do that: the browser DRIVER. The
+# implementation this project shipped is being removed, so browser.cdp_url has
+# to point at a browser you launched and browser.restart_command has to be your
+# own command — the loop neither ships nor recommends one, and an empty
+# restart_command simply means "no auto-restart", exactly as it always did.
+# `python -m autoloop doctor` no longer probes CDP or imports playwright, so it
+# reports nothing about a browser either way; `python -m autoloop start` still
+# runs a declared restart_command when the CDP endpoint is silent.
 
 [policy]
 max_iterations = 20
@@ -24,10 +34,11 @@ max_consecutive_failures = 3
 # INERT since brw-15 (2026-08-25) removed conversation rotation, and doubly so
 # since brw-16 removed the [browser] section this sentence names: nothing spends
 # this budget any more and a wedged conversation simply parks. The key is still
-# accepted, and `state.rotations` / `doctor`'s rotation line still read it, so it
-# is left here rather than becoming an unknown-key refusal on an existing config.
-# It used to bound how many times ONE run could abandon a wedged conversation for
-# a fresh chat in browser.project_url.
+# accepted and `PolicyEngine.check_rotation_budget` still reads it, so it is left
+# here rather than becoming an unknown-key refusal on an existing config. It used
+# to bound how many times ONE run could abandon a wedged conversation for a fresh
+# chat in browser.project_url. `doctor` reported the budget until brw-19c
+# (2026-08-31) and no longer reports anything about a browser at all.
 max_conversation_rotations = 1
 # How many times ONE run may hand the reviewer role to
 # conversation.fallback_provider after an exhausted allowance. One is enough:

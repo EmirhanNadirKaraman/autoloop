@@ -1,28 +1,56 @@
 """Doctor preflight with every boundary mocked: no Chrome, no network, no
-playwright — and proof that it never submits a message."""
+playwright — and proof that it never submits a message.
 
+brw-19c (2026-08-31) is the follow-up the note here used to promise. Until it,
+`doctor.py` keyed three checks — `conversation_url`,
+`conversation_active`/`conversation_rotations` and `project_url` — on the
+LITERAL provider name `browser_chatgpt`, unregistered since brw-16
+(2026-08-25), plus two UNCONDITIONAL probes (`cdp`, `playwright`) and a
+`primary_live` skip that read them. All six are gone. What the tests below now
+pin is the shape of their absence, which is the part that can regress
+silently:
+
+* naming the retired provider buys no special handling of any kind — no URL
+  check, no rotation report, and no `skip` standing in for a probe that was
+  never made;
+* a healthy repository passes with no browser anywhere on the machine, which
+  is the whole point: the old `cdp` probe failed on every such machine and
+  took `exit_code` to 1 with it;
+* `[browser]` config values are still ACCEPTED and are simply never graded.
+"""
+
+import dataclasses
 import json
 import socket
 
 import pytest
 
-from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
+from autoloop.config import (
+    RETIRED_BROWSER_PROVIDER,
+    AutoloopConfig,
+    BrowserConfig,
+    ConversationConfig,
+)
 from autoloop.doctor import DoctorProbes, exit_code, run_doctor
 from autoloop.errors import LoginExpiredError
 from autoloop.lock import LoopLock
 from autoloop.policy import PolicyConfig
 
 URL = "https://chatgpt.com/c/valid-id-123"
-#: `doctor.py` still keys three checks — `conversation_url`,
-#: `conversation_active`/`conversation_rotations`, and `project_url` — on this
-#: LITERAL provider name, and so does the `primary_live` skip when CDP or
-#: playwright is unavailable. brw-16 (2026-08-25) unregistered that provider, so
-#: those branches are unreachable on a real deployment and the default
-#: `ConversationConfig()` no longer selects them. `doctor.py` was outside brw-16's
-#: approved paths and is unchanged, so the branches still exist and are still
-#: worth covering — the tests below name the retired provider explicitly to
-#: reach them, rather than being deleted. Removing those checks is a follow-up.
-BROWSER_PROVIDER_CHECKS = "browser_chatgpt"
+
+#: Every check name `doctor.py` produced for a browser and no longer does.
+#: Asserted as a SET against the whole result list rather than one name at a
+#: time, so a branch restored under any one of them fails here.
+REMOVED_CHECKS = frozenset(
+    {
+        "cdp",
+        "playwright",
+        "conversation_url",
+        "conversation_active",
+        "conversation_rotations",
+        "project_url",
+    }
+)
 
 
 class FakeConversation:
@@ -73,15 +101,12 @@ def make_config(tmp_path, provider=None, **policy) -> AutoloopConfig:
     )
 
 
-def probes(conversation=None, cdp_ok=True, playwright=True) -> DoctorProbes:
-    def probe_cdp(url):
-        if not cdp_ok:
-            raise OSError("connection refused")
-        return json.dumps({"Browser": "Chrome/126"})
-
+def probes(conversation=None) -> DoctorProbes:
+    """The one boundary left. `probe_cdp`/`playwright_present` were arguments
+    here until brw-19c and are gone with the fields they set: a helper that
+    still accepted them would let a test believe it had stubbed a check that
+    no longer exists."""
     return DoctorProbes(
-        probe_cdp=probe_cdp,
-        playwright_present=lambda: playwright,
         conversation_factory=(lambda: conversation) if conversation else None,
     )
 
@@ -119,16 +144,16 @@ def test_all_green(tmp_path):
     conversation = FakeConversation()
     results = run_doctor(make_config(tmp_path), tmp_path, probes(conversation))
     named = by_name(results)
-    # `conversation_url` is deliberately NOT in this list any more: `doctor.py`
-    # adds it only for the retired `browser_chatgpt` provider, which the default
-    # config no longer selects (brw-16). Its own coverage moved to `url_check`
-    # below, which names that provider explicitly.
     for check in (
         "config", "state_dir", "lock", "workers_root", "worker_isolation", "hooks_dirs",
-        "publisher", "publisher_url_drift", "cdp", "playwright", "provider",
-        "primary_live",
+        "publisher", "publisher_url_drift", "provider", "primary_live",
     ):
         assert named[check].status == "ok", (check, named[check].detail)
+    # THE brw-19c claim, on the run that is meant to be green: this machine has
+    # no Chrome and no playwright, and the sweep says nothing about either.
+    # Before brw-19c the `cdp` probe was a real HTTP dial and this same tree
+    # exited 1 unless the operator's dedicated browser happened to be up.
+    assert REMOVED_CHECKS.isdisjoint(named), sorted(REMOVED_CHECKS & set(named))
     assert exit_code(results) == 0
     # non-destructive: opened but NEVER submitted
     assert conversation.opened == 1
@@ -149,28 +174,92 @@ def test_git_identity_and_protected_branch_warning(tmp_path):
     assert "DENIED" in named["branch_policy"].detail
 
 
-def test_cdp_unreachable_fails_and_skips_live(tmp_path):
-    # The skip is keyed on the retired provider NAME, so this config names it —
-    # see `BROWSER_PROVIDER_CHECKS`. With any other provider a silent CDP
-    # endpoint says nothing about the seat and the probe is simply attempted.
+# ---- the removed browser checks, pinned by their absence ---------------------
+
+
+def test_the_retired_provider_gets_no_browser_checks_of_its_own(tmp_path):
+    """A config still naming `browser_chatgpt` LOADS (that compatibility is
+    `test_browser_provider_removed.py`'s subject) and reaches doctor. What it
+    must not reach is a URL-shape check, a rotation report or a rotation
+    target: those were keyed on this literal name, and a name is not a
+    capability. The config below still carries a full-looking browser URL, so
+    the absence is about the CHECKS and not about there being nothing to
+    check."""
     results = run_doctor(
-        make_config(tmp_path, provider=BROWSER_PROVIDER_CHECKS), tmp_path,
-        probes(cdp_ok=False),
+        make_config(tmp_path, provider=RETIRED_BROWSER_PROVIDER),
+        tmp_path,
+        probes(FakeConversation()),
     )
     named = by_name(results)
-    assert named["cdp"].status == "fail"
-    # Renamed 2026-08-01: the single `browser_live` check became per-seat
-    # (`primary_live` / `fallback_live`), so an unverified fallback is visible.
-    assert named["primary_live"].status == "skip"
+
+    assert REMOVED_CHECKS.isdisjoint(named), sorted(REMOVED_CHECKS & set(named))
+    assert named["provider"].status == "fail", "it is still an unregistered name"
+
+
+def test_an_unbuildable_seat_fails_rather_than_skipping(tmp_path):
+    """The fail-open the removed `skip` was: `primary_live` reported `skip`
+    for `browser_chatgpt` whenever CDP or playwright was unavailable, so the
+    ONE check that actually opens a transport answered "not asked" on exactly
+    the machines where the answer mattered. With no probes to consult, the
+    real factory is used and its refusal is reported as the failure it is.
+
+    Runs with NO `conversation_factory`, deliberately: a stubbed factory would
+    prove the assertion about the stub."""
+    results = run_doctor(
+        make_config(tmp_path, provider=RETIRED_BROWSER_PROVIDER), tmp_path, probes()
+    )
+    named = by_name(results)
+
+    assert named["primary_live"].status == "fail"
+    assert RETIRED_BROWSER_PROVIDER in named["primary_live"].detail
+    assert "unknown conversation provider" in named["primary_live"].detail
     assert exit_code(results) == 1
 
 
-def test_playwright_missing_fails(tmp_path):
-    results = run_doctor(make_config(tmp_path), tmp_path, probes(playwright=False))
-    assert by_name(results)["playwright"].status == "fail"
+def test_a_leftover_browser_section_is_accepted_and_never_graded(tmp_path):
+    """The compatibility half, from doctor's side. Every `[browser]` value an
+    unmigrated config can still carry — including ones the removed checks
+    would have called malformed — passes through the sweep without producing
+    a single result about them."""
+    config = AutoloopConfig(
+        browser=BrowserConfig(
+            conversation_url="https://chatgpt.com/c/REPLACE-ME",  # the old placeholder failure
+            project_url="not-a-project-url-at-all",  # the old project_url failure
+            cdp_url="http://127.0.0.1:1",  # nothing has ever listened here
+            restart_command=("/path/to/your-restart-command",),
+        ),
+        policy=PolicyConfig(),
+        state_dir=tmp_path / ".al",
+        workers_root=tmp_path.parent / f"{tmp_path.name}-workers_root",
+    )
+
+    results = run_doctor(config, tmp_path, probes(FakeConversation()))
+    named = by_name(results)
+
+    # The sweep RAN, asserted before anything is asserted about what it did not
+    # produce: all three checks below are over `results`, and all three are
+    # vacuously true of an empty one. "Never graded" has to mean the sweep
+    # looked and said nothing, not that there was no sweep.
+    assert named["config"].status == "ok", named["config"].detail
+    assert "primary_live" in named, sorted(named)
+    assert REMOVED_CHECKS.isdisjoint(named), sorted(REMOVED_CHECKS & set(named))
+    assert not [r for r in results if "REPLACE-ME" in r.detail]
+    assert not [r for r in results if "127.0.0.1:1" in r.detail]
 
 
-def test_logged_out_browser_fails(tmp_path):
+def test_the_probe_bundle_no_longer_offers_a_browser_knob(tmp_path):
+    """Asserted on the dataclass rather than on a sweep: a `DoctorProbes` that
+    still ACCEPTED `probe_cdp` would let `cli._precondition_browser` and every
+    future caller believe they were injecting a check that no longer runs —
+    a stub with nothing behind it is the quietest kind of dead guard."""
+    fields = {f.name for f in dataclasses.fields(DoctorProbes)}
+
+    assert fields == {"conversation_factory"}
+    with pytest.raises(TypeError):
+        DoctorProbes(probe_cdp=lambda url: "{}")
+
+
+def test_logged_out_provider_fails(tmp_path):
     conversation = FakeConversation(login_expired=True)
     results = run_doctor(make_config(tmp_path), tmp_path, probes(conversation))
     named = by_name(results)
@@ -201,58 +290,12 @@ def test_stale_lock_reported_as_failure(tmp_path):
     assert "unlock" in named["lock"].detail
 
 
-def url_check(tmp_path, url):
-    # Names the retired provider deliberately: `doctor.py`'s URL-shape check is
-    # keyed on that literal, so the default config would produce no
-    # `conversation_url` result at all and this helper would KeyError rather
-    # than assert anything. See `BROWSER_PROVIDER_CHECKS`.
-    config = AutoloopConfig(
-        browser=BrowserConfig(conversation_url=url),
-        policy=PolicyConfig(),
-        state_dir=tmp_path / ".al",
-        conversation=ConversationConfig(provider=BROWSER_PROVIDER_CHECKS),
-    )
-    return by_name(run_doctor(config, tmp_path, probes(FakeConversation())))[
-        "conversation_url"
-    ]
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://chatgpt.com/c/6a6a6bd5-b3d4-83ed-b404-731450216bf2",
-        # Project-scoped conversation — the form chatgpt.com Projects actually
-        # produce, and what the real engineering-review conversation uses.
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77"
-        "/c/6a6a6bd5-b3d4-83ed-b404-731450216bf2",
-        # Custom-GPT scoped, and a trailing query string.
-        "https://chatgpt.com/g/g-abc123/c/def456",
-        "https://chatgpt.com/c/def456?model=gpt-5",
-        "https://chatgpt.com/c/def456/",
-    ],
-)
-def test_accepted_conversation_urls(tmp_path, url):
-    assert url_check(tmp_path, url).status == "ok"
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://example.com/not-chatgpt",
-        "https://chatgpt.com/",
-        # A project root is not a conversation.
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77",
-        "http://chatgpt.com/c/def456",  # not https
-        "https://chatgpt.com/c/",  # no conversation id
-    ],
-)
-def test_rejected_conversation_urls(tmp_path, url):
-    assert url_check(tmp_path, url).status == "fail"
-
-
-def test_placeholder_conversation_url_fails(tmp_path):
-    # Shape-valid but obviously unset — caught before the regex so the message
-    # names the real problem.
-    check = url_check(tmp_path, "https://chatgpt.com/c/REPLACE-ME")
-    assert check.status == "fail"
-    assert "placeholder" in check.detail
+#: The URL-shape checks that lived here — five accepted forms, five rejected
+#: ones and the `REPLACE-ME` placeholder — went with `doctor.py`'s
+#: `_CHATGPT_URL` / `_CHATGPT_PROJECT_URL` regexes in brw-19c. They graded
+#: `browser.conversation_url` for the retired `browser_chatgpt` seat only, and
+#: nothing navigates to that value any more. Their replacement is
+#: `test_the_retired_provider_gets_no_browser_checks_of_its_own` and
+#: `test_a_leftover_browser_section_is_accepted_and_never_graded` above: the
+#: claim is no longer "this URL is well formed" but "no URL is judged, and a
+#: config carrying a malformed one still loads and still passes".
