@@ -210,8 +210,11 @@ class FakeClient:
         self.attach_errors: list[Exception] = []
         self.submit_errors: list[Exception] = []
         self.submit_result = submit_result
-        #: Mirrors BrowserChatGPT.send_attempted — False until Send is clicked.
-        #: The orchestrator reads it to decide whether a resend is provably safe.
+        #: The optional `send_attempted` capability of the transport protocol:
+        #: False until the adapter has actually tried to send. The orchestrator
+        #: reads it to decide whether a resend is provably safe. Described by
+        #: the protocol rather than by the one adapter that used to implement
+        #: it, since that adapter is being retired (brw-19c, 2026-08-31).
         self.send_attempted = False
 
     def attach(self):

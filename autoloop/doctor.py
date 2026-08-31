@@ -2,10 +2,18 @@
 
 Checks configuration, state dir, lock, git identity, branch policy, worker
 isolation, controlled hooks directories, publisher configuration, publisher
-URL snapshot drift, CDP reachability, Playwright, provider registration,
-conversation URL shape, and (when the browser stack is actually reachable)
-that the conversation opens logged-in with resolvable composer/message
-selectors. It NEVER submits a message.
+URL snapshot drift, provider registration, the Codex reviewer's binary and
+confinement, and that each configured seat's adapter opens. It NEVER submits
+a message.
+
+NO BROWSER CHECKS since brw-19c (2026-08-31). Until then this command probed
+the CDP endpoint, imported playwright, and — for the literal provider name
+`browser_chatgpt` — checked a conversation URL's shape, the rotation budget
+and the rotation target. brw-16 (2026-08-25) unregistered that provider, so
+every one of those branches was unreachable on a real deployment, and the two
+unconditional probes FAILED (exit 1) on any machine without a dedicated Chrome
+— a preflight that cries wolf about a transport the loop cannot select is worse
+than no preflight, because operators learn to ignore its exit code.
 
 "Non-destructive" means never irreversible and never touching the real
 conversation or the target repo's own history — it does create/remove a
@@ -15,16 +23,14 @@ the same category of side effect as the existing state-dir-writable probe
 file.
 
 Every external boundary is injectable (DoctorProbes) so the whole command is
-unit-testable without Chrome, playwright, or a network.
+unit-testable without a network.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import re
 import shutil
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -34,7 +40,6 @@ from .errors import AutoloopError, BrowserError, LoginExpiredError
 from .git_gateway import GitGateway
 from .lock import LoopLock
 from .policy import PolicyEngine
-from .state import StateStore
 from .publisher import (
     Publisher,
     provision_publisher_repo,
@@ -44,21 +49,6 @@ from .publisher import (
 )
 from .validation_env import load_validation_env, validate_validation_env_path
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
-
-# A conversation URL is either a plain `/c/<id>` or a project- / GPT-scoped
-# `/g/<slug>/c/<id>` (chatgpt.com Projects put the conversation under the
-# project). Both are valid targets; only the `/c/<id>` part identifies the
-# conversation, and the loop navigates to whatever full URL is configured.
-_CHATGPT_URL = re.compile(
-    r"^https://chatgpt\.com(?:/g/[A-Za-z0-9_-]+)?/c/[A-Za-z0-9_-]+/?(?:[?#].*)?$"
-)
-
-# A project URL, the rotation target: the `/g/<slug>` prefix on its own or with
-# chatgpt.com's `/project` landing suffix. Deliberately NOT allowed to match a
-# `/c/<id>` conversation — rotating "into" an existing chat is not a rotation.
-_CHATGPT_PROJECT_URL = re.compile(
-    r"^https://chatgpt\.com/g/[A-Za-z0-9_-]+(?:/project)?/?(?:[?#].*)?$"
-)
 
 
 def _is_within(candidate: Path, root: Path) -> bool:
@@ -74,19 +64,20 @@ def _is_within(candidate: Path, root: Path) -> bool:
     return True
 
 
-def _probe_live(add, name, provider_name, config, probes, cdp_ok, playwright_ok):
+def _probe_live(add, name, provider_name, config, probes):
     """Open one provider's conversation read-only and report what resolved.
 
-    Never submits. Skips rather than fails when a provider's prerequisites are
-    unavailable, so a missing codex binary does not mask a healthy browser (or
-    the reverse) — the point of probing both is to learn about each one
-    independently.
+    Never submits. Each seat is probed independently, so a fault in one is
+    never read as a verdict on the other.
+
+    Nothing is SKIPPED here any more (brw-19c): the one skip this had was for
+    the retired `browser_chatgpt` seat when CDP or playwright was unavailable,
+    and both of those probes are gone with it. A provider whose prerequisites
+    are missing now FAILS with the adapter's own error, which is the honest
+    answer for a transport the loop would really try to build.
     """
     factory = probes.conversation_factory
     if factory is None:
-        if provider_name == "browser_chatgpt" and not (cdp_ok and playwright_ok):
-            add(name, "skip", f"{provider_name}: skipped — CDP or playwright unavailable")
-            return
 
         def factory():
             return create_conversation(provider_name, config)
@@ -122,19 +113,6 @@ def _probe_live(add, name, provider_name, config, probes, cdp_ok, playwright_ok)
                 pass
 
 
-def _read_state_quietly(config: AutoloopConfig):
-    """The session state, or None if there is none or it cannot be read.
-
-    `doctor` is the command you run when things are already broken, so a
-    corrupt or unreadable state file must not stop it from reporting everything
-    else — the other checks are exactly what diagnoses that corruption.
-    """
-    try:
-        return StateStore(config.state_file).load()
-    except (AutoloopError, OSError):
-        return None
-
-
 @dataclass(frozen=True)
 class CheckResult:
     name: str
@@ -143,20 +121,24 @@ class CheckResult:
 
 
 def _default_probe_cdp(url: str, timeout: float = 3.0) -> str:
+    """A one-shot read of a CDP endpoint.
+
+    `doctor` stopped calling this in brw-19c (2026-08-31) — see the module
+    docstring. It stays HERE, rather than moving or going away, because
+    `cli._repair_browser` imports it by this name from this module and
+    `cli._default_probe_cdp` is the seam `start`'s tests patch. `start` may
+    still restart an operator-declared browser; the preflight no longer
+    grades one.
+    """
     with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - local CDP
         return response.read(200).decode("utf-8", "replace")
 
 
-def _default_playwright_present() -> bool:
-    return importlib.util.find_spec("playwright") is not None
-
-
 @dataclass
 class DoctorProbes:
-    probe_cdp: Callable[[str], str] = _default_probe_cdp
-    playwright_present: Callable[[], bool] = field(
-        default_factory=lambda: _default_playwright_present
-    )
+    #: The ONE external boundary left. `probe_cdp` and `playwright_present`
+    #: were fields here until brw-19c and are gone with the checks that read
+    #: them: a probe nothing calls is a knob that suggests a check exists.
     conversation_factory: Callable | None = None  # defaults to the real provider
 
 
@@ -398,28 +380,10 @@ def run_doctor(
     except AutoloopError as exc:
         add("publisher_url_drift", "fail", str(exc))
 
-    # 10. CDP endpoint
-    cdp_ok = False
-    cdp_url = config.browser.cdp_url.rstrip("/") + "/json/version"
-    try:
-        payload = probes.probe_cdp(cdp_url)
-        cdp_ok = True
-        add("cdp", "ok", f"{cdp_url} reachable ({payload.strip()[:60]}...)")
-    except Exception as exc:
-        add(
-            "cdp",
-            "fail",
-            f"{cdp_url} unreachable ({exc}) — launch the dedicated profile with "
-            "--remote-debugging-port",
-        )
-
-    # 11. playwright
-    playwright_ok = bool(probes.playwright_present())
-    add(
-        "playwright",
-        "ok" if playwright_ok else "fail",
-        "importable" if playwright_ok else "not installed — pip install -r autoloop/requirements.txt",
-    )
+    # 10./11. CDP endpoint and playwright — REMOVED in brw-19c (2026-08-31).
+    # Both graded a browser stack no registered provider can select, and both
+    # ran unconditionally, so `doctor` exited 1 on every machine without a
+    # dedicated Chrome. See the module docstring.
 
     # 12. provider registration
     provider = config.conversation.provider
@@ -428,67 +392,13 @@ def run_doctor(
     else:
         add("provider", "fail", f"'{provider}' not registered ({available_providers()})")
 
-    # 13. conversation URL shape (browser_chatgpt only)
-    if provider == "browser_chatgpt":
-        if "REPLACE-ME" in config.browser.conversation_url:
-            add(
-                "conversation_url",
-                "fail",
-                "still the config.example.toml placeholder — set "
-                "browser.conversation_url to your real conversation",
-            )
-        elif _CHATGPT_URL.match(config.browser.conversation_url):
-            add("conversation_url", "ok", config.browser.conversation_url)
-        else:
-            add(
-                "conversation_url",
-                "fail",
-                f"'{config.browser.conversation_url}' does not look like "
-                "https://chatgpt.com/c/<id> or "
-                "https://chatgpt.com/g/<project>/c/<id>",
-            )
-
-        # 13b. which conversation is ACTUALLY live, and how much rotation
-        # budget is left. The config is only the starting point: after a
-        # rotation the state is authoritative, and an operator debugging a run
-        # needs to know which chat to open.
-        state = _read_state_quietly(config)
-        if state is None:
-            add("conversation_active", "ok", "no session state yet — the config URL will be used")
-        else:
-            drifted = state.conversation_url != config.browser.conversation_url
-            add(
-                "conversation_active",
-                "warn" if drifted else "ok",
-                f"{state.conversation_url}"
-                + (" (state has moved past the config — a rotation was recorded)" if drifted else ""),
-            )
-            cap = config.policy.max_conversation_rotations
-            add(
-                "conversation_rotations",
-                "warn" if state.rotations >= cap else "ok",
-                f"{state.rotations}/{cap} used this run"
-                + (" — the next unusable conversation will park, not rotate"
-                   if state.rotations >= cap else ""),
-            )
-
-        # 13c. rotation target
-        project_url = config.browser.project_url
-        if not project_url:
-            add(
-                "project_url",
-                "warn",
-                "unset — conversation rotation is disabled; a wedged chat will "
-                "park for you instead of moving to a fresh one",
-            )
-        elif _CHATGPT_PROJECT_URL.match(project_url):
-            add("project_url", "ok", project_url)
-        else:
-            add(
-                "project_url",
-                "fail",
-                f"'{project_url}' does not look like https://chatgpt.com/g/<project>[/project]",
-            )
+    # 13./13b./13c. conversation URL shape, the live conversation and the
+    # rotation target — REMOVED in brw-19c (2026-08-31). All three were keyed
+    # on the literal provider name `browser_chatgpt`, unregistered since brw-16
+    # (2026-08-25), so no real deployment could reach any of them; the rotation
+    # they reported on was itself removed by brw-15. `browser.conversation_url`
+    # and `browser.project_url` are still ACCEPTED by the loader — see
+    # `config.BrowserConfig` — they are simply no longer graded.
 
     # 13d. Codex reviewer, when either seat uses it. The live probe below
     # constructs the adapter but cannot prove the binary works without spending
@@ -532,18 +442,17 @@ def run_doctor(
         else:
             add("codex_sandbox", "ok", " ".join(config.codex.sandbox_args))
 
-    # 14. live conversation checks: login + conversation + selectors. Never
+    # 14. live conversation checks: the adapter opens and reports. Never
     # submits.
     #
-    # BOTH providers are probed, not just the configured primary. An
-    # unverified fallback is not a fallback: with Codex primary, checking only
-    # `conversation.provider` means the browser profile's login is first tested
-    # at the moment the allowance runs out — the worst possible time to learn
-    # it expired three days ago.
+    # BOTH seats are probed, not just the configured primary. An unverified
+    # fallback is not a fallback: checking only `conversation.provider` means
+    # the other seat is first tested at the moment the allowance runs out —
+    # the worst possible time to learn it stopped working three days ago.
     fallback = config.conversation.fallback_provider
-    _probe_live(add, "primary_live", provider, config, probes, cdp_ok, playwright_ok)
+    _probe_live(add, "primary_live", provider, config, probes)
     if fallback and fallback != provider:
-        _probe_live(add, "fallback_live", fallback, config, probes, cdp_ok, playwright_ok)
+        _probe_live(add, "fallback_live", fallback, config, probes)
     elif fallback == provider and fallback:
         add(
             "fallback_live",
