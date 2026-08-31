@@ -298,6 +298,17 @@ asserting a flag is present. Every fallback — the directory could not be creat
 could not be written, or has been swept — goes back to `NO_CACHE_ARGS`, so there
 is no state in which the tree can be dirtied by this.
 
+"OUTSIDE EVERY WORKER REPO" IS A CHECK, AND ITS SUBJECT IS THE REPOSITORY. The
+first version compared the temp directory against the directory validation RUNS
+in, which is the same path in the shipped case and is a SUBDIRECTORY of the repo
+whenever a task declares a `validation_cwd` — leaving a `TMPDIR` in a sibling of
+that subdirectory accepted and inside the tree the post-commit gate reads.
+`AdvisoryValidation` therefore takes the worker-repo root as well
+(`_advisory_for` passes `git.repo_root`) and `_ensure_cache` refuses on either
+tree, in either nesting direction, over resolved paths as well as written ones —
+`is_relative_to` follows no symlinks, so a linked `TMPDIR` is lexically outside
+the checkout and physically inside it.
+
 WHAT THE CACHE BUYS, and the one asymmetry it introduces. The channel exists to
 close "run, see the failure, fix it, confirm" inside `ADVISORY_VALIDATION_MAX_CALLS`
 runs; with a cache, the CONFIRM step is `--lf` — only what failed — instead of a
@@ -1036,6 +1047,33 @@ ADVISORY_CACHE_PREFIX = "autoloop-ptcache-"
 _CACHE_NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def _path_forms(path: Path) -> tuple[Path, ...]:
+    """`path` as written, plus `path` with every symlink resolved.
+
+    `Path.is_relative_to` is string arithmetic: it compares the parts it is
+    given and follows nothing. So a `TMPDIR` pointing at a SYMLINK whose target
+    is inside the checkout is lexically outside it and physically inside — and
+    the nesting test in `AdvisoryValidation._ensure_cache` is about where bytes
+    LAND, which is the physical answer.
+
+    Both forms are returned rather than only the resolved one, and every
+    comparison there runs over the cross product, so a refusal is reached if
+    EITHER form nests. That direction is deliberate: an extra refusal costs a
+    round the cache and falls back to `validation.NO_CACHE_ARGS`, while a missed
+    one puts `.pytest_cache/` back in the tree a gate is about to inspect.
+
+    A path that cannot be resolved at all (a symlink loop raises `RuntimeError`
+    on some platforms) yields just the written form, so this never raises into
+    the caller's `except` and never silently drops the comparison it was asked
+    to make.
+    """
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return (path,)
+    return (path,) if resolved == path else (path, resolved)
+
+
 def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> dict:
     """What the zero-argument call IS, in the form a tool transport publishes.
 
@@ -1215,6 +1253,7 @@ class AdvisoryValidation:
         max_returns: int = ADVISORY_ZERO_CALL_RETURNS,
         cache_namespace: str = "",
         cache_root: Path | None = None,
+        repo_root: Path | None = None,
     ):
         # Normalised defensively: an unusable list becomes the EMPTY list,
         # which `run()` answers as NOT_RUN and never as a pass. The round-level
@@ -1259,6 +1298,22 @@ class AdvisoryValidation:
         self._cache_error = ""
         self._cache_namespace = str(cache_namespace or "round")
         self._cache_root = Path(cache_root) if cache_root is not None else None
+        #: The WORKER REPOSITORY, which is the tree the post-commit gate
+        #: inspects and therefore the tree the cache has to stay out of. It is a
+        #: separate value from `_cwd` because a task declaring a
+        #: `validation_cwd` runs its commands in a SUBDIRECTORY of it: a temp
+        #: root in a sibling of that subdirectory is outside `_cwd`, inside the
+        #: repository, and dirties exactly what the gate reads (found in review,
+        #: 2026-08-31 — the first version of this checked `_cwd` alone).
+        #:
+        #: Defaults to `cwd`, which is what the two are in the shipped case (no
+        #: declared `validation_cwd`), so an omitted argument is never WIDER
+        #: than the check this replaced. That default is also the only fail-open
+        #: surface here, so it is pinned rather than trusted: `_advisory_for` is
+        #: the one production caller and always passes the real root, and
+        #: `test_the_executor_passes_the_repo_root_so_a_declared_cwd_cannot_widen_the_check`
+        #: fails the moment it stops.
+        self._repo_root = Path(repo_root) if repo_root is not None else Path(cwd)
         #: Set by `discard_cache()`. A discarded cache is never re-created: the
         #: round is over, and a fresh directory made after the sweep would be
         #: the residue the sweep exists to remove.
@@ -1361,6 +1416,26 @@ class AdvisoryValidation:
 
     # ---- the round's pytest cache ------------------------------------------
 
+    def _tree_forms(self) -> tuple[Path, ...]:
+        """Every tree a cache directory must not land inside, in every form.
+
+        TWO trees, not one. `_cwd` is where the commands RUN and `_repo_root` is
+        the WORKER REPOSITORY the post-commit gate inspects; a task that declares
+        a `validation_cwd` puts the first strictly below the second, and it is
+        the second the guarantee is about. Both are kept because neither implies
+        the other: a temp root under `_cwd` is inside the repository too, and one
+        in a sibling of `_cwd` is not inside `_cwd` at all.
+
+        Each is expanded through `_path_forms`, and duplicates are dropped so the
+        shipped case (the two equal, neither a symlink) costs one comparison.
+        """
+        forms: list[Path] = []
+        for root in (self._cwd, self._repo_root):
+            for form in _path_forms(root):
+                if form not in forms:
+                    forms.append(form)
+        return tuple(forms)
+
     def _ensure_cache(self) -> Path | None:
         """This round's pytest cache directory, made on first use, or `None`.
 
@@ -1384,6 +1459,12 @@ class AdvisoryValidation:
         uniqueness — not the `discard_cache()` sweep — is what makes a stale
         `lastfailed` unreachable; see `ADVISORY_CACHE_PREFIX`.
 
+        OUTSIDE EVERY WORKER TREE, checked against `_tree_forms()` — the working
+        directory AND the repository root, resolved as well as as-written. The
+        directory `mkdtemp` already made is removed before the refusal returns,
+        because a cache this declined to use must not be left sitting in the tree
+        the check just objected to.
+
         Never raises. It is called from `run()`, which is called from a
         transport serving an agent mid-turn.
         """
@@ -1398,13 +1479,24 @@ class AdvisoryValidation:
                 # OUTSIDE THE TREE, CHECKED RATHER THAN ASSUMED. `mkdtemp` obeys
                 # `TMPDIR`, so "the system temp directory" is an operator-settable
                 # value, and one pointed inside the checkout would put the cache
-                # back exactly where 2026-08-03 found it. Both directions,
-                # because either nesting is fatal to the same guarantee. This
-                # sees `_cwd`, so a declared `validation_cwd` SUBDIRECTORY is
-                # covered only for a temp root under that subdirectory — the repo
-                # root above it is not known here, and the shipped case (no
-                # declared cwd) has them equal.
-                if path.is_relative_to(self._cwd) or self._cwd.is_relative_to(path):
+                # back exactly where 2026-08-03 found it.
+                #
+                # Against BOTH the working directory and the WORKER REPOSITORY,
+                # in BOTH nesting directions, over BOTH the written and the
+                # resolved form of every path (`_path_forms`). Each of those
+                # three is a way the first version of this check was wrong or
+                # would have been: `_cwd` alone misses a temp root in a sibling
+                # of a declared `validation_cwd`, which is outside the directory
+                # the commands run in and inside the tree the gate reads; a
+                # lexical comparison misses a symlinked `TMPDIR`; and the reverse
+                # direction is kept because either nesting is fatal to the same
+                # guarantee, even though `mkdtemp` cannot in fact produce it.
+                trees = self._tree_forms()
+                if any(
+                    form.is_relative_to(tree) or tree.is_relative_to(form)
+                    for form in _path_forms(path)
+                    for tree in trees
+                ):
                     raise OSError(
                         f"the temp directory ({path}) is inside the tree being "
                         "validated, so a cache there would dirty it"
@@ -4229,6 +4321,12 @@ class ImplementExecutor:
             # directory would be shared by every round of one task and would
             # carry a `lastfailed` recorded against a different base.
             cache_namespace=str(getattr(task, "id", "") or ""),
+            # The WORKER REPOSITORY, which is NOT `cwd` whenever the task
+            # declares a `validation_cwd`: the cache must stay out of the whole
+            # repository the post-commit gate inspects, not merely out of the
+            # subdirectory the commands happen to run in. Passed even on the
+            # fallback path above, where `cwd` is already the root.
+            repo_root=git.repo_root,
         )
 
     def _aborted_outcome(
