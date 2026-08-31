@@ -700,14 +700,17 @@ def test_answer_refuses_unknown_and_already_resolved(tmp_path, monkeypatch):
     operator's dedicated Chrome happened to be answering):
 
     * `git_failure_budget_exhausted` carries a `_RESOLUTION_PRECONDITIONS`
-      entry, `_precondition_browser`, which runs a REAL doctor sweep — an HTTP
-      probe of `browser.cdp_url` plus a playwright import. With no browser up
-      that check fails, `_cmd_answer` returns 1 at the precondition and never
-      reaches `resolve()` at all, so the first answer is never recorded and the
-      second call has nothing to refuse. Neutralised BY NAME (rather than by
-      swapping the blocker to a precondition-free code) so the scenario stays
-      the one the test describes; `DoctorProbes.probe_cdp` binds its default at
-      class-creation time, so patching the module global does not reach it.
+      entry that senses the MACHINE. It was `_precondition_browser`, which ran a
+      real doctor sweep (an HTTP probe of `browser.cdp_url` plus a playwright
+      import), so with no browser up `_cmd_answer` returned 1 at the
+      precondition and never reached `resolve()` — the first answer was never
+      recorded and the second call had nothing to refuse. Since brw-19d it is
+      `_precondition_git_health`, which asks git about `Path.cwd()`: cheaper and
+      no longer browser-shaped, but still a real environmental read this test
+      makes no claim about, and one whose verdict depends on where pytest was
+      invoked from. Neutralised BY NAME either way (rather than by swapping the
+      blocker to a precondition-free code) so the scenario stays the one the
+      test describes.
     * `_load_tasks` falls back to the repository's real `autoloop/seed_tasks.
       json` when `tasks.json` is absent. A registry written under `tmp_path`
       keeps the requeue half reading this test's own state directory."""
@@ -747,24 +750,24 @@ def test_answer_refuses_unknown_and_already_resolved(tmp_path, monkeypatch):
 
 
 # =============================================================================
-# 7b. the browser precondition, exercised WITHOUT a browser (test-02)
+# 7b. the TRANSPORT precondition, exercised without a transport (test-02,
+#     re-pointed by brw-19d)
 #
-# `_precondition_browser` is the one recheck in `_RESOLUTION_PRECONDITIONS` that
-# senses the machine: it calls `doctor.run_doctor` with the DEFAULT
-# `DoctorProbes`, whose `probe_cdp` really dials `browser.cdp_url` over HTTP.
+# `_precondition_transport_live` is the recheck in `_RESOLUTION_PRECONDITIONS`
+# that senses the SEAT: it calls `doctor.run_doctor` with the default
+# `DoctorProbes`, which builds the configured adapter and calls `attach()`.
 # THREE codes route to it — `login_expired`, `submission_ambiguous` and
-# `git_failure_budget_exhausted` — and until now only the third was exercised
-# anywhere, by the test above, which neutralises the entry by name. So the
-# other two answered no question at all: whether the CLI honours the recheck
-# was untested, and any test that reached them would have dialled
-# 127.0.0.1:9222 for real and passed or failed on whether the operator's Chrome
-# happened to be up.
+# `browser_unattachable`. Until test-02 only `git_failure_budget_exhausted` was
+# exercised anywhere (by the test above, which neutralises its entry by name),
+# so the transport-shaped codes answered no question at all; and until brw-19d
+# the git code was routed here too, which is the mismapping the last section
+# below pins the removal of.
 #
 # The seam patched here is `doctor.run_doctor` itself, NOT `DoctorProbes`.
 # Stubbing the probes leaves the sweep real, and a real sweep resolves its
-# repo_root as `Path.cwd()` and clones a throwaway probe worker repo — trading
-# an HTTP dial for a slower reach at a checkout these tests do not own.
-# `_precondition_browser` does its `from .doctor import ...` INSIDE the
+# repo_root as `Path.cwd()` and clones a throwaway probe worker repo — a slow
+# reach at a checkout these tests do not own.
+# `_precondition_transport_live` does its `from .doctor import ...` INSIDE the
 # function, so the module attribute is re-read on every call and the patch is
 # seen. Pattern borrowed from `test_playwright_driver.py`'s `_urlopen` stub.
 # =============================================================================
@@ -790,7 +793,7 @@ def _stub_doctor(monkeypatch, results):
     return calls
 
 
-def _browser_blocker(store, code, task_id="t1"):
+def _transport_blocker(store, code, task_id="t1"):
     blocker = Blocker(
         id=store.next_id(task_id),
         task_id=task_id,
@@ -805,32 +808,52 @@ def _browser_blocker(store, code, task_id="t1"):
     return blocker
 
 
-_CDP_DOWN = (
-    ("cdp", "fail", "http://127.0.0.1:9222/json/version unreachable (connection refused)"),
-    ("playwright", "ok", "importable"),
+#: The rows a live seat produces. Both REQUIRED rows are present and `ok`, plus
+#: the optional codex corroboration, which is what a codex-seated deployment's
+#: real sweep looks like.
+_SEAT_LIVE = (
     ("provider", "ok", "codex_cli"),
+    ("primary_live", "ok", "codex_cli: constructed (no message probe exposed)"),
+    ("codex_command", "ok", "codex -> /usr/local/bin/codex"),
 )
-_BROWSER_UP = (
-    ("cdp", "ok", "http://127.0.0.1:9222/json/version reachable"),
-    ("playwright", "ok", "importable"),
+#: The seat is registered but will not open — a login expiry, an unreachable
+#: endpoint, a missing binary: whatever `doctor._probe_live` catches.
+_SEAT_UNAVAILABLE = (
     ("provider", "ok", "codex_cli"),
+    ("primary_live", "fail", "codex_cli: logged out: session cookie expired"),
+    ("codex_command", "ok", "codex -> /usr/local/bin/codex"),
+)
+#: The seat NAMES a provider nothing registers (the state `browser_chatgpt`
+#: leaves a config in since brw-16). `primary_live` is deliberately `ok` here so
+#: the arm is decided by provider registration ALONE.
+_PROVIDER_UNREGISTERED = (
+    ("provider", "fail", "'browser_chatgpt' not registered (['codex_cli'])"),
+    ("primary_live", "ok", "browser_chatgpt: constructed (no message probe exposed)"),
+)
+#: A sweep that answered neither required question. Not a hypothetical: this is
+#: what the OLD whitelist saw after brw-19c removed four of its five names, and
+#: it read the empty result as "healthy".
+_NO_TRANSPORT_ROWS = (
+    ("config", "ok", "parsed"),
+    ("lock", "ok", "free"),
 )
 
 
 @pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
-def test_a_browser_backed_blocker_refuses_an_answer_while_the_browser_is_down(
+def test_a_transport_blocker_refuses_an_answer_while_the_seat_is_unusable(
     tmp_path, monkeypatch, capsys, code
 ):
-    """Answer text is not evidence. With the CDP endpoint down the answer must
-    be refused, the record must stay OPEN and unanswered, and the operator must
-    be told WHICH check failed — a bare refusal reads as the tool being broken.
+    """Answer text is not evidence. With the seat refusing to open, the answer
+    must be refused, the record must stay OPEN and unanswered, and the operator
+    must be told WHICH row failed — a bare refusal reads as the tool being
+    broken.
     """
     config_path = write_config_toml(tmp_path)
     config = load_config(config_path)
     TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
     store = BlockerStore(config.blockers_dir)
-    blocker = _browser_blocker(store, code)
-    calls = _stub_doctor(monkeypatch, _CDP_DOWN)
+    blocker = _transport_blocker(store, code)
+    calls = _stub_doctor(monkeypatch, _SEAT_UNAVAILABLE)
 
     assert cli._cmd_answer(
         Namespace(config=config_path, blocker_id=blocker.id, text="I logged back in")
@@ -838,8 +861,8 @@ def test_a_browser_backed_blocker_refuses_an_answer_while_the_browser_is_down(
 
     out = capsys.readouterr().out
     assert "NOT resolved" in out
-    assert "cdp" in out, "the refusal must name the check that is still failing"
-    assert "connection refused" in out
+    assert "primary_live" in out, "the refusal must name the row that is still failing"
+    assert "session cookie expired" in out
     assert len(calls) == 1, "the precondition really ran the doctor sweep"
     # ...and it handed doctor a probe bundle rather than quietly checking nothing.
     assert calls[0][2] is not None
@@ -849,7 +872,7 @@ def test_a_browser_backed_blocker_refuses_an_answer_while_the_browser_is_down(
 
 
 @pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
-def test_a_browser_backed_blocker_resolves_once_the_browser_is_back(
+def test_a_transport_blocker_resolves_once_the_seat_is_live_again(
     tmp_path, monkeypatch, capsys, code
 ):
     """The other direction, and the one that catches a precondition being
@@ -859,11 +882,11 @@ def test_a_browser_backed_blocker_resolves_once_the_browser_is_back(
     config = load_config(config_path)
     TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
     store = BlockerStore(config.blockers_dir)
-    blocker = _browser_blocker(store, code)
-    calls = _stub_doctor(monkeypatch, _BROWSER_UP)
+    blocker = _transport_blocker(store, code)
+    calls = _stub_doctor(monkeypatch, _SEAT_LIVE)
 
     assert cli._cmd_answer(
-        Namespace(config=config_path, blocker_id=blocker.id, text="chrome is up again")
+        Namespace(config=config_path, blocker_id=blocker.id, text="the seat is back")
     ) == 0
 
     out = capsys.readouterr().out
@@ -874,46 +897,281 @@ def test_a_browser_backed_blocker_resolves_once_the_browser_is_back(
     assert len(calls) == 1, "resolving without consulting the environment is the bug"
     answered = store.load(blocker.id)
     assert answered.resolved_at is not None
-    assert answered.answer == "chrome is up again"
+    assert answered.answer == "the seat is back"
+
+
+@pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
+def test_an_unregistered_provider_holds_a_transport_blocker_shut_on_its_own(
+    tmp_path, monkeypatch, capsys, code
+):
+    """PROVIDER REGISTRATION is load-bearing by itself, not a passenger of the
+    live probe.
+
+    The sweep here reports `primary_live` OK and only `provider` failing — the
+    shape a config still naming the retired `browser_chatgpt` produces once
+    something has registered a stand-in under that name, and the shape a
+    precondition that only ever looked at `primary_live` would clear. A seat the
+    loop cannot select is not a seat, so this must refuse."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _transport_blocker(store, code)
+    _stub_doctor(monkeypatch, _PROVIDER_UNREGISTERED)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="looks fine to me")
+    ) == 1
+    out = capsys.readouterr().out
+    assert "NOT resolved" in out
+    assert "provider" in out
+    assert "not registered" in out
+    assert store.load(blocker.id).resolved_at is None
+
+
+@pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
+def test_a_sweep_that_answers_neither_required_question_holds_the_blocker_shut(
+    tmp_path, monkeypatch, capsys, code
+):
+    """THE fail-open this section exists for, and the one the predecessor
+    whitelist actually had.
+
+    `_BROWSER_PRECONDITION_CHECKS` filtered `status != "ok" and name in <tuple>`
+    over whatever doctor produced, so a sweep containing NONE of its names gave
+    an empty `bad` list and cleared the blocker — a guard reading its own
+    missing evidence as good news. The required tuple must instead refuse and
+    say what was absent."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _transport_blocker(store, code)
+    _stub_doctor(monkeypatch, _NO_TRANSPORT_ROWS)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="nothing to see here")
+    ) == 1
+    out = capsys.readouterr().out
+    assert "NOT resolved" in out
+    assert "primary_live" in out and "provider" in out
+    assert store.load(blocker.id).resolved_at is None
+
+
+@pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
+def test_a_sweep_that_raises_holds_the_blocker_shut(tmp_path, monkeypatch, capsys, code):
+    """A preflight that blew up verified nothing, so it must clear nothing —
+    and it must do so as a refusal rather than as a traceback out of `answer`,
+    which an operator reads as "the tool is broken, try again" rather than as
+    "your blocker is still open"."""
+    import autoloop.doctor as doctor
+
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _transport_blocker(store, code)
+
+    def exploding_run_doctor(config, repo_root, probes=None):
+        raise RuntimeError("workers_root vanished mid-sweep")
+
+    monkeypatch.setattr(doctor, "run_doctor", exploding_run_doctor)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="just resolve it")
+    ) == 1
+    out = capsys.readouterr().out
+    assert "NOT resolved" in out
+    assert "workers_root vanished mid-sweep" in out
+    assert store.load(blocker.id).resolved_at is None
 
 
 @pytest.mark.parametrize(
     "failing,expected_rc",
     [
-        # OUTSIDE the whitelist: a stale lock says nothing about the browser.
+        # OUTSIDE the graded rows: a stale lock says nothing about the seat.
         (("lock", "fail", "stale lock"), 0),
-        # INSIDE it, and deliberately NOT `cdp` — the check covered by the two
-        # tests above. A second whitelist member has to refuse too.
-        (("playwright", "fail", "not installed"), 1),
+        # INSIDE them, and deliberately NOT `primary_live` — the row covered by
+        # the tests above. A second graded row has to refuse too.
+        (("provider", "fail", "'nope' not registered ([])"), 1),
+        # The OPTIONAL row: graded when present, so it refuses too.
+        (("codex_command", "fail", "'codex' is not on PATH"), 1),
     ],
 )
-def test_only_a_browser_check_holds_a_browser_blocker_shut(
+def test_only_a_transport_row_holds_a_transport_blocker_shut(
     tmp_path, monkeypatch, failing, expected_rc
 ):
-    """The filter is a whitelist of names, and BOTH arms are needed to say so.
+    """The filter is a list of names, and every arm is needed to say so.
 
     One arm alone is not a test: an unrelated failing check resolving is also
     what a filter that had been inverted, widened to every check, or deleted
-    outright would produce on some input. The pair discriminates — same
-    command, same blocker, same otherwise-clean sweep, one failing check each,
-    opposite outcomes — so a filter that stopped distinguishing the two fails
-    here whichever way it broke.
+    outright would produce on some input. The set discriminates — same command,
+    same blocker, same otherwise-clean sweep, one failing check each, opposite
+    outcomes — so a filter that stopped distinguishing them fails here whichever
+    way it broke. The third arm is the OPTIONAL row: absent is allowed, present
+    and failing is not, and that asymmetry is the only thing separating
+    "optional" from "ignored".
     """
     config_path = write_config_toml(tmp_path)
     config = load_config(config_path)
     TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
     store = BlockerStore(config.blockers_dir)
-    blocker = _browser_blocker(store, "login_expired")
-    # `_BROWSER_UP` minus the check this arm is failing, plus the failure —
+    blocker = _transport_blocker(store, "login_expired")
+    # `_SEAT_LIVE` minus the check this arm is failing, plus the failure —
     # otherwise the same name would appear twice with two statuses.
-    clean = tuple(r for r in _BROWSER_UP if r[0] != failing[0])
+    clean = tuple(r for r in _SEAT_LIVE if r[0] != failing[0])
     _stub_doctor(monkeypatch, (*clean, failing))
 
     assert cli._cmd_answer(
-        Namespace(config=config_path, blocker_id=blocker.id, text="chrome is up again")
+        Namespace(config=config_path, blocker_id=blocker.id, text="the seat is back")
     ) == expected_rc
     resolved = store.load(blocker.id).resolved_at is not None
     assert resolved is (expected_rc == 0)
+
+
+@pytest.mark.parametrize(
+    "fallback_row,expected_rc",
+    [
+        # WARN is what `run_doctor` emits when no fallback is configured, and
+        # again when the fallback names the primary. Refusing on it would wedge
+        # every single-seat deployment permanently.
+        (("fallback_live", "warn", "no conversation.fallback_provider configured"), 0),
+        # FAIL means a fallback IS configured and would not open. The loop runs
+        # real rounds on that seat after a quota failover, so a `login_expired`
+        # raised there must not be cleared by the primary seat's health.
+        (("fallback_live", "fail", "codex_cli: logged out: session cookie expired"), 1),
+    ],
+)
+def test_a_dead_fallback_seat_holds_a_transport_blocker_shut_but_an_absent_one_does_not(
+    tmp_path, monkeypatch, fallback_row, expected_rc
+):
+    """The third grading tier, and it needs both arms for the same reason the
+    whitelist test does: refusing on `warn` and refusing on `fail` are the same
+    code path unless something distinguishes them, and only one of them is
+    correct. `primary_live` and `provider` are OK on both arms, so the verdict
+    is decided by the fallback row alone."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _transport_blocker(store, "login_expired")
+    _stub_doctor(monkeypatch, (*_SEAT_LIVE, fallback_row))
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="the seat is back")
+    ) == expected_rc
+    assert (store.load(blocker.id).resolved_at is not None) is (expected_rc == 0)
+
+
+def test_an_absent_optional_row_does_not_hold_a_transport_blocker_shut(
+    tmp_path, monkeypatch
+):
+    """The companion to the third arm above, and the reason `codex_command` is
+    not in the REQUIRED tuple: `run_doctor` emits it only for a codex seat, so
+    a non-codex deployment's sweep legitimately has no such row. Requiring it
+    would refuse those deployments forever — the fail-closed-with-no-exit that
+    is worse than the fail-open it would be guarding against."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _transport_blocker(store, "login_expired")
+    no_codex = tuple(r for r in _SEAT_LIVE if r[0] != "codex_command")
+    _stub_doctor(monkeypatch, no_codex)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="the seat is back")
+    ) == 0
+    assert store.load(blocker.id).resolved_at is not None
+
+
+# =============================================================================
+# 7c. `git_failure_budget_exhausted` is INDEPENDENT of transport health
+#     (brw-19d)
+#
+# It was routed to the transport recheck, which made a git question
+# unanswerable while the reviewer seat was down and clearable while git was
+# still broken. The pair below is the whole claim: one sweep, one dead seat,
+# two codes, opposite answers.
+# =============================================================================
+
+
+def test_git_failure_budget_answers_while_the_transport_is_dead(
+    tmp_path, monkeypatch, capsys
+):
+    """THE discriminating pair. Same dead-seat sweep, same command, same
+    working tree: `login_expired` must refuse and `git_failure_budget_exhausted`
+    must resolve.
+
+    Either half alone proves nothing. A precondition table that refused both
+    would look correct to the first assertion, and one that cleared both would
+    look correct to the second — only the split says the two codes read
+    different evidence. The git code's independence is asserted a third way as
+    well: the doctor sweep must not be consulted for it at all, so a future
+    routing that merely IGNORED the transport rows while still paying for the
+    probe would still fail here."""
+    repo_root = real_repo(tmp_path)
+    monkeypatch.chdir(repo_root)
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    transport = _transport_blocker(store, "login_expired")
+    git_budget = _transport_blocker(store, "git_failure_budget_exhausted")
+    calls = _stub_doctor(monkeypatch, _SEAT_UNAVAILABLE)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=transport.id, text="it is fine now")
+    ) == 1
+    assert store.load(transport.id).resolved_at is None
+    assert len(calls) == 1
+    capsys.readouterr()
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=git_budget.id, text="the index lock is gone")
+    ) == 0
+    out = capsys.readouterr().out
+    assert f"blocker {git_budget.id} resolved." in out
+    assert store.load(git_budget.id).answer == "the index lock is gone"
+    assert len(calls) == 1, (
+        "the git recheck must not consult the transport sweep at all — a second "
+        "call means it is still reading the seat's health"
+    )
+
+
+def test_git_failure_budget_refuses_while_git_itself_is_unusable(
+    tmp_path, monkeypatch, capsys
+):
+    """The other half of "independent", and the half that keeps this from being
+    a removal dressed as a fix: dropping the entry would also let the test above
+    pass, and would clear the blocker on answer text alone.
+
+    Answered from a checkout whose `.git` points nowhere — so the refusal is
+    produced by the gateway's own failure rather than by a string this test
+    supplied. A BROKEN gitlink rather than a bare empty directory on purpose:
+    git walks UP for a repository, so "no `.git` here" would silently depend on
+    no ancestor of `tmp_path` being one, and this refuses at the link itself."""
+    not_a_repo = tmp_path / "broken_checkout"
+    not_a_repo.mkdir()
+    (not_a_repo / ".git").write_text("gitdir: /definitely/not/here\n", encoding="utf-8")
+    monkeypatch.chdir(not_a_repo)
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _transport_blocker(store, "git_failure_budget_exhausted")
+    calls = _stub_doctor(monkeypatch, _SEAT_LIVE)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="git is fine, honest")
+    ) == 1
+    out = capsys.readouterr().out
+    assert "NOT resolved" in out
+    assert "git is still not usable" in out
+    still_open = store.load(blocker.id)
+    assert still_open.resolved_at is None and still_open.answer is None
+    # A LIVE seat does not clear it either: the two conditions are unrelated in
+    # both directions, which is what "independent" has to mean.
+    assert calls == []
 
 
 # =============================================================================

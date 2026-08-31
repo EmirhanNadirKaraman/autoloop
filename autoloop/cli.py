@@ -3313,53 +3313,184 @@ def _cmd_blockers(args: argparse.Namespace) -> int:
 #: resolved, so the queue would understate what is actually wrong.
 #: Each maps to a precondition that is RE-CHECKED at answer time.
 
-#: The transport recheck. Named `_precondition_browser` for the four codes it
-#: still answers for (`login_expired`, `submission_ambiguous`,
-#: `git_failure_budget_exhausted`, `browser_unattachable`); what it actually
-#: senses is whichever transport is CONFIGURED.
+#: The doctor rows the TRANSPORT recheck REQUIRES: "is the seat the loop would
+#: actually use live?" (`primary_live`) and "is the provider it names
+#: registered?" (`provider`). Two explicit questions, named by the rows
+#: `doctor.run_doctor` emits them under, replacing the browser-shaped whitelist
+#: this used to be (brw-19d, 2026-08-31).
 #:
-#: The whitelist below is why. brw-19c (2026-08-31) removed doctor's `cdp`,
-#: `playwright`, `conversation_url` and rotation checks, and a filter left
-#: naming only checks doctor cannot emit is a guard that switches ITSELF off:
-#: an empty `bad` list reads as "the environment is healthy", so any answer
-#: text would resolve a `login_expired` blocker without anything being
-#: rechecked — Autoloop M1 finding #7, one function over. So:
+#: REQUIRED means PRESENT **and** `ok`, and the presence half is the whole
+#: reason this is a separate tuple. Its predecessor,
+#: `_BROWSER_PRECONDITION_CHECKS`, filtered `status != "ok" and name in <tuple>`
+#: over whatever doctor happened to produce, so a tuple naming only rows doctor
+#: no longer emits yields an EMPTY `bad` list — which reads as "the environment
+#: is healthy" and clears a `login_expired` blocker on answer text having
+#: verified nothing at all. That tuple was already four fifths of the way there:
+#: `browser_live` was renamed away on 2026-08-01 and brw-19c (2026-08-31)
+#: removed `cdp`, `playwright` and `conversation_url`, leaving `primary_live`
+#: alone holding every transport blocker shut. A guard that switches ITSELF off
+#: when its evidence disappears is Autoloop M1 finding #7 one function over, and
+#: demanding presence is what makes the disappearance loud instead of silent.
 #:
-#: * `primary_live` is the load-bearing member now. `doctor._probe_live` builds
-#:   the configured adapter and calls `attach()`, which is what a login
-#:   expiry, an unreachable transport or a missing binary actually shows up in.
-#: * `provider` and `codex_command` are cheap corroboration. `codex_command` is
-#:   absent unless a codex seat is configured, and an absent name is simply not
-#:   in `results` — the filter reads what doctor produced, never a fixed list.
-#: * `cdp` and `playwright` are KEPT although `run_doctor` no longer produces
-#:   either. They cost nothing (a name absent from `results` matches nothing),
-#:   and `test_blockers.py`'s whitelist tests — outside brw-19c's approved
-#:   paths — stub `run_doctor` and assert both still hold a blocker shut. They
-#:   are dead weight to re-point when that file is next touched, NOT evidence
-#:   that this command still grades a browser.
-#: * `browser_live` (renamed away on 2026-08-01) and `conversation_url` (gone
-#:   with the checks above) are dropped: neither can ever appear, and a name
-#:   that can never appear is indistinguishable from a check that always passes.
-_BROWSER_PRECONDITION_CHECKS = (
+#: Both rows are emitted UNCONDITIONALLY by `run_doctor` — `provider` at its
+#: check 12, `primary_live` at check 14 — so requiring them cannot wedge a
+#: deployment that is merely configured differently. That is not restated here
+#: as a promise: `test_doctor.py::test_doctor_emits_every_required_transport_
+#: precondition_row` derives it from a REAL sweep, so removing either row from
+#: doctor fails there rather than quietly disarming this check.
+_TRANSPORT_PRECONDITION_CHECKS = (
     "primary_live",
     "provider",
+)
+
+#: Rows that corroborate the required two WHEN THEY EXIST and are legitimately
+#: absent otherwise. `codex_command` is emitted only when a codex seat is
+#: configured (`run_doctor` check 13d), so it is graded on status alone — which
+#: is exactly why it must not sit in the required tuple, where "absent" would
+#: have to mean "refuse".
+_TRANSPORT_PRECONDITION_OPTIONAL_CHECKS = (
     "codex_command",
-    "cdp",
-    "playwright",
+)
+
+#: The THIRD tier, and the reason there are three: rows graded ONLY when they
+#: come back `fail`. `warn` is tolerated, and so is absence.
+#:
+#: `fallback_live` needs exactly that. It is a SEAT — the loop really does run
+#: rounds on it after a quota failover — so a `login_expired` raised while the
+#: loop was on the fallback would be cleared by a healthy `primary_live` alone:
+#: a recheck aimed one seat over from the park, which is the failure
+#: `_precondition_checkout_clean`'s docstring describes one tree over. But it
+#: cannot be REQUIRED `ok` either, because `run_doctor` reports it `warn` when
+#: no fallback is configured and `warn` again when the fallback names the
+#: primary — so requiring `ok` would hold every single-seat deployment's
+#: transport blockers shut permanently, a refusal no operator action could
+#: clear, which is a worse failure than the fail-open being closed.
+#:
+#: `fail` is the one status that is neither of those: doctor emits it only for
+#: a fallback that is genuinely configured and genuinely would not open, which
+#: is an environmental fault an operator can actually fix (or unconfigure).
+_TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS = (
+    "fallback_live",
 )
 
 
-def _precondition_browser(config) -> str:
-    from .doctor import DoctorProbes, run_doctor
-    results = run_doctor(config, Path.cwd(), probes=DoctorProbes())
-    bad = [
-        r
-        for r in results
-        if r.status != "ok" and r.name in _BROWSER_PRECONDITION_CHECKS
+def _precondition_transport_live(config) -> str:
+    """The transport recheck behind `login_expired`, `submission_ambiguous` and
+    `browser_unattachable`: can the loop reach a USABLE SEAT right now?
+
+    Answered by the two required doctor rows above plus any optional
+    corroboration that exists — never by anything browser-shaped, which since
+    brw-19a/brw-19c is a stack no registered provider can select.
+
+    Fails closed four ways, and each is a way a recheck in this file has
+    actually been observed to fail open:
+
+      * a required row that is MISSING refuses, naming what was absent. An
+        answer must not be cleared by a sweep that did not answer the question.
+      * a required (or present optional) row that is not `ok` refuses, naming
+        it and its detail — a bare refusal reads as the tool being broken.
+      * a fail-only row that came back `fail` refuses, so a park raised on the
+        FALLBACK seat is not cleared by the primary seat's health.
+      * a sweep that RAISES refuses. Nothing was verified, so nothing is
+        cleared; the exception type and message are reported rather than
+        propagated so the operator gets the same "NOT resolved" shape as the
+        other three.
+
+    NECESSARY, NOT SUFFICIENT for one of its three codes, and said out loud:
+    `submission_ambiguous` means "acceptance is unknown", and a seat that opens
+    proves the seat opens, never that the ambiguous turn was accepted. Only
+    another request could establish that, and a precondition is a question. The
+    property is unchanged from the browser whitelist this replaces; what changes
+    is that the seat now has to be genuinely reachable before the operator's own
+    judgement about the duplicate is allowed to stand.
+
+    Only `""` clears the blocker, and `""` is returned from exactly one place.
+    """
+    try:
+        from .doctor import DoctorProbes, run_doctor
+
+        results = run_doctor(config, Path.cwd(), probes=DoctorProbes())
+        # Indexed inside the try as well: a sweep that came back as something
+        # other than a list of `CheckResult` has not answered either, and a
+        # `TypeError`/`AttributeError` escaping here would be a traceback where
+        # every other failure is a refusal.
+        produced = {r.name: r for r in results}
+    except Exception as exc:
+        return (
+            "the transport preflight could not be run, so nothing was verified: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    missing = [name for name in _TRANSPORT_PRECONDITION_CHECKS if name not in produced]
+    if missing:
+        return (
+            "the transport preflight produced no verdict for "
+            + ", ".join(missing)
+            + " — that evidence is required to clear this blocker, so it stays "
+            "open rather than resolving on a sweep that never looked (doctor "
+            "reported: " + (", ".join(sorted(produced)) or "nothing at all") + ")"
+        )
+    graded = (
+        *_TRANSPORT_PRECONDITION_CHECKS,
+        *_TRANSPORT_PRECONDITION_OPTIONAL_CHECKS,
+    )
+    bad = [produced[n] for n in graded if n in produced and produced[n].status != "ok"]
+    bad += [
+        produced[n]
+        for n in _TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS
+        if n in produced and produced[n].status == "fail"
     ]
     if bad:
         return "transport/login checks still failing: " + ", ".join(
             f"{r.name} ({r.detail})" for r in bad)
+    return ""
+
+
+def _precondition_git_health(config) -> str:
+    """Recheck for `git_failure_budget_exhausted` — the ONE code brw-19d moved
+    OFF the transport check.
+
+    `state.consecutive_failures` past `policy.max_consecutive_failures` outside
+    `ready`/`delivering` is a statement about GIT, and until now it was answered
+    by the browser/transport sweep: an operator needed a live reviewer seat
+    before they could close a question about a repository, and a live seat was
+    accepted as evidence that the repository had recovered. That is Autoloop M1
+    finding #7's shape (`worker_environment_drift` mismapped to the browser
+    check) pointing both ways at once — the recheck could neither confirm nor
+    deny the condition it guarded. A logged-out seat is not a reason to hold a
+    git question open, and a logged-in one is not a reason to close it.
+
+    So this asks git, in the checkout the loop was invoked in, through the same
+    `GitGateway`/`PolicyEngine` pair the orchestrator uses: read the branch and
+    the head. A repository that cannot answer those refuses the answer.
+
+    NECESSARY, NOT SUFFICIENT, and said out loud rather than implied. The
+    operations that spent the budget may have run in a worker repository or
+    against a remote, and reaching either from here would mean doing work — a
+    precondition is a question (see `_precondition_observed_checkout`, which
+    refuses to re-run `synchronize` for the same reason).
+    `_precondition_checkout_clean` aims at `config.observed_checkout` because
+    the tree the loop refuses to build on is the one its park is about; this
+    check deliberately does not, because `consecutive_failures` is charged for
+    gateway calls against the primary checkout. What is guaranteed is the
+    narrow, free half: an answer given while git itself is unusable here is
+    refused, and this blocker is never cleared without git having been asked a
+    real question.
+    """
+    # Resolved INSIDE the try and remembered, never re-read in the handler: a
+    # deleted working directory makes `Path.cwd()` itself raise, and a handler
+    # that called it again would turn a refusal into a traceback.
+    location = "the current directory"
+    try:
+        cwd = Path.cwd()
+        location = str(cwd)
+        git = GitGateway(cwd, PolicyEngine(config.policy))
+        git.current_branch()
+        git.head_sha()
+    except Exception as exc:
+        return (
+            f"git is still not usable in {location} ({type(exc).__name__}: "
+            f"{exc}) — the failures that spent the budget have not cleared"
+        )
     return ""
 
 
@@ -3391,9 +3522,10 @@ def _precondition_protected(config) -> str:
 
 def _precondition_worker_environment_drift(config) -> str:
     """Dedicated recheck for `worker_environment_drift` — previously
-    mismapped to `_precondition_browser` (Autoloop M1 finding #7), whose
-    doctor checks (`_BROWSER_PRECONDITION_CHECKS`, the transport and the
-    provider registration) never look at git hooks or worker isolation at
+    mismapped to the transport recheck (`_precondition_transport_live`, then
+    named `_precondition_browser`; Autoloop M1 finding #7), whose doctor rows
+    (`_TRANSPORT_PRECONDITION_CHECKS`, the live seat and the provider
+    registration) never look at git hooks or worker isolation at
     all, so ANY answer text resolved this blocker regardless of whether the
     environment it describes was still broken. Reuses the SAME primitives
     `doctor.py`'s
@@ -3565,9 +3697,14 @@ def _precondition_checkout_escape_detected(config) -> str:
 #: `git_failure_budget_exhausted`) and `push_refused_protected` (previously
 #: never emitted at all) did.
 _RESOLUTION_PRECONDITIONS = {
-    "login_expired": _precondition_browser,
-    "submission_ambiguous": _precondition_browser,
-    "git_failure_budget_exhausted": _precondition_browser,
+    "login_expired": _precondition_transport_live,
+    "submission_ambiguous": _precondition_transport_live,
+    # brw-19d: NOT the transport recheck, which is what this was until now.
+    # `git_failure_budget_exhausted` is a git question, and gating it on a live
+    # reviewer seat made it unanswerable while the transport was down and
+    # clearable while git was still broken. `_precondition_git_health` asks git
+    # instead; see its docstring for what that does and does not prove.
+    "git_failure_budget_exhausted": _precondition_git_health,
     "publisher_url_drift": _precondition_publisher_url,
     # `changeset_publisher_required` (`Orchestrator._dispatch_changeset_push`)
     # fires when `self._publisher is None` — unreachable through
@@ -3578,15 +3715,19 @@ _RESOLUTION_PRECONDITIONS = {
     # real publisher url snapshot exists and matches the live remote — the
     # closest existing recheck to "a publisher is actually configured".
     "changeset_publisher_required": _precondition_publisher_url,
-    # `browser_unattachable` (brw-11): the CDP endpoint answers but there is no
-    # page to attach to, so the loop had no browser at all. Unlike its sibling
+    # `browser_unattachable` (brw-11): the seat answered but there was nothing
+    # to attach to, so the loop had no transport at all. Its only emitter,
+    # `Orchestrator._recover_unattachable_browser`, is DORMANT since brw-19b —
+    # nothing calls it — but the code is still in the source the m1 walk reads,
+    # and an entry is what keeps it out of "resolvable by answer text alone" if
+    # anything ever reaches it again. Unlike its sibling
     # `rate_limited` — which deliberately has NO entry, because the only recheck
     # that could establish whether a server-side limit still holds is another
     # request against it — this one is recheckable locally and for free, and an
-    # answer given while the window is still closed just re-parks. Reuses the
-    # browser check: its `cdp`/`browser_live` probes are exactly "can something
-    # attach to this endpoint".
-    "browser_unattachable": _precondition_browser,
+    # answer given while the seat is still unattachable just re-parks. Reuses
+    # the transport recheck: `primary_live` calls the adapter's own `attach()`,
+    # which is literally the question this code is raised by.
+    "browser_unattachable": _precondition_transport_live,
     "worker_environment_drift": _precondition_worker_environment_drift,
     "worker_isolation_violation": _precondition_worker_environment_drift,
     "push_refused_protected": _precondition_protected,

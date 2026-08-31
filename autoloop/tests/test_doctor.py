@@ -249,14 +249,101 @@ def test_a_leftover_browser_section_is_accepted_and_never_graded(tmp_path):
 
 def test_the_probe_bundle_no_longer_offers_a_browser_knob(tmp_path):
     """Asserted on the dataclass rather than on a sweep: a `DoctorProbes` that
-    still ACCEPTED `probe_cdp` would let `cli._precondition_browser` and every
-    future caller believe they were injecting a check that no longer runs —
-    a stub with nothing behind it is the quietest kind of dead guard."""
+    still ACCEPTED `probe_cdp` would let `cli._precondition_transport_live` and
+    every future caller believe they were injecting a check that no longer runs
+    — a stub with nothing behind it is the quietest kind of dead guard."""
     fields = {f.name for f in dataclasses.fields(DoctorProbes)}
 
     assert fields == {"conversation_factory"}
     with pytest.raises(TypeError):
         DoctorProbes(probe_cdp=lambda url: "{}")
+
+
+# ---- the rows `cli`'s transport precondition depends on ----------------------
+
+
+def test_doctor_emits_every_required_transport_precondition_row(tmp_path):
+    """`cli._precondition_transport_live` REFUSES to clear `login_expired`,
+    `submission_ambiguous` or `browser_unattachable` unless every name in
+    `cli._TRANSPORT_PRECONDITION_CHECKS` came back from a real sweep. That is
+    the fail-closed direction, but it is only useful if doctor actually emits
+    those rows — a required name doctor never produces would refuse those
+    blockers forever, with no operator action able to clear them.
+
+    So the coverage is DERIVED from the tuple and from a live `run_doctor`,
+    never restated as a literal list here. Removing `primary_live` or `provider`
+    from doctor fails here; renaming one and updating only cli fails here too.
+    The sweep runs against a repository with no browser and no network, which
+    is the deployment shape brw-19c made the normal one."""
+    from autoloop.cli import (
+        _TRANSPORT_PRECONDITION_CHECKS,
+        _TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS,
+    )
+
+    init_repo(tmp_path)
+    results = run_doctor(make_config(tmp_path), tmp_path, probes(FakeConversation()))
+    named = by_name(results)
+
+    assert _TRANSPORT_PRECONDITION_CHECKS, "an empty required tuple grades nothing"
+    missing = set(_TRANSPORT_PRECONDITION_CHECKS) - set(named)
+    assert not missing, f"required rows doctor does not emit: {sorted(missing)}"
+
+    # The fail-only tier is unconditional too — `fallback_live` is added on
+    # every branch of check 14, including the no-fallback one this config takes
+    # — so a name there that doctor cannot produce is the same dead guard,
+    # merely quieter about it.
+    unproducible = set(_TRANSPORT_PRECONDITION_FAIL_ONLY_CHECKS) - set(named)
+    assert not unproducible, f"fail-only rows doctor does not emit: {sorted(unproducible)}"
+    assert named["fallback_live"].status == "warn", (
+        "the no-fallback default must be WARN — if doctor ever made it `fail`, "
+        "every single-seat deployment's transport blockers would jam shut"
+    )
+
+
+def test_doctor_emits_the_optional_transport_rows_when_their_seat_is_configured(tmp_path):
+    """The optional half, pinned for the reason `cdp` and `playwright` are a
+    cautionary tale: a name graded "only when present" is indistinguishable
+    from a name that can never be present, and the second one grades nothing
+    while looking exactly like the first.
+
+    `codex_command` is emitted by `run_doctor` only for a codex seat, so the
+    config here configures one. `_probe_live` is stubbed, so this asserts the
+    ROW exists — not that any binary does."""
+    from autoloop.cli import _TRANSPORT_PRECONDITION_OPTIONAL_CHECKS
+
+    results = run_doctor(
+        make_config(tmp_path, provider="codex_cli"), tmp_path, probes(FakeConversation())
+    )
+    named = by_name(results)
+
+    missing = set(_TRANSPORT_PRECONDITION_OPTIONAL_CHECKS) - set(named)
+    assert not missing, (
+        "optional rows no configuration can produce are dead weight, not "
+        f"corroboration: {sorted(missing)}"
+    )
+
+
+def test_the_unregistered_provider_row_is_the_one_the_precondition_reads(tmp_path):
+    """Provider registration is a SEPARATE signal from the live probe, and the
+    precondition treats it as one. The evidence it reads is this row, produced
+    here by a real sweep over a config naming the retired provider: `fail`,
+    under the name `cli._TRANSPORT_PRECONDITION_CHECKS` demands.
+
+    Pinned in doctor rather than only in `test_blockers.py` because that file
+    stubs the sweep — a stub proves the CLI honours a verdict, never that
+    doctor still produces one."""
+    from autoloop.cli import _TRANSPORT_PRECONDITION_CHECKS
+
+    results = run_doctor(
+        make_config(tmp_path, provider=RETIRED_BROWSER_PROVIDER),
+        tmp_path,
+        probes(FakeConversation()),
+    )
+    named = by_name(results)
+
+    assert "provider" in _TRANSPORT_PRECONDITION_CHECKS
+    assert named["provider"].status == "fail"
+    assert RETIRED_BROWSER_PROVIDER in named["provider"].detail
 
 
 def test_logged_out_provider_fails(tmp_path):
