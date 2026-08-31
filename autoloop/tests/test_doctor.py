@@ -234,8 +234,15 @@ def test_a_leftover_browser_section_is_accepted_and_never_graded(tmp_path):
     )
 
     results = run_doctor(config, tmp_path, probes(FakeConversation()))
+    named = by_name(results)
 
-    assert REMOVED_CHECKS.isdisjoint(by_name(results))
+    # The sweep RAN, asserted before anything is asserted about what it did not
+    # produce: all three checks below are over `results`, and all three are
+    # vacuously true of an empty one. "Never graded" has to mean the sweep
+    # looked and said nothing, not that there was no sweep.
+    assert named["config"].status == "ok", named["config"].detail
+    assert "primary_live" in named, sorted(named)
+    assert REMOVED_CHECKS.isdisjoint(named), sorted(REMOVED_CHECKS & set(named))
     assert not [r for r in results if "REPLACE-ME" in r.detail]
     assert not [r for r in results if "127.0.0.1:1" in r.detail]
 

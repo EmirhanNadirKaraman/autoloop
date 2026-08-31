@@ -189,11 +189,23 @@ def test_an_unknown_key_in_that_section_is_still_refused(tmp_path):
         load_config(write_config(tmp_path, '[browser]\nconversaton_url = "typo"'))
 
 
-def test_a_malformed_restart_command_in_that_section_is_still_refused(tmp_path):
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"restart.sh"',  # a bare string — not a list at all
+        "[1, 2]",  # a list whose ELEMENTS are wrong, which the outer
+        '["ok", 2]',  # `isinstance(cmd, list)` alone would wave through
+    ],
+    ids=["not-a-list", "no-strings", "one-non-string"],
+)
+def test_a_malformed_restart_command_in_that_section_is_still_refused(tmp_path, value):
+    """Ignored is not UNCHECKED, on the one `[browser]` key that is still READ
+    (`cli._repair_browser` runs it). Both halves of the shape check are
+    exercised: a value that is not a list, and lists whose elements are not
+    strings — the second is the shape that would otherwise reach
+    `subprocess.run` as an argv holding an int."""
     with pytest.raises(ConfigError, match="list of strings"):
-        load_config(
-            write_config(tmp_path, '[browser]\nrestart_command = "restart.sh"')
-        )
+        load_config(write_config(tmp_path, f"[browser]\nrestart_command = {value}"))
 
 
 # ---- 2b. the restart command, after the shipped implementation went away ------
@@ -218,6 +230,11 @@ def test_the_pasteable_example_names_no_module_in_this_package(tmp_path):
     assert "restart_command = [" in message, "still paste-ready"
     assert "autoloop.browser" not in message
     assert "autoloop." not in message, "no module in this package is named at all"
+    # Emptied to `()`, the example would render as `restart_command = []` — a
+    # line that still satisfies every assertion above while naming no command
+    # at all, and the loop below would then check nothing. The negative checks
+    # are the ones with teeth here, so the thing they read has to be non-empty.
+    assert RESTART_COMMAND_EXAMPLE, "an empty example makes the loop below vacuous"
     for token in RESTART_COMMAND_EXAMPLE:
         assert token in message
 
