@@ -1187,9 +1187,13 @@ class AdvisoryValidation:
 
     **val-08 (2026-08-31) introduces one run that is deliberately on the other
     side of that relation, and buys the exception with disclosure.** A request
-    made after a FAILED run is re-run with `--lf` — pytest re-selects what its
-    cache recorded as failing — which is the cheap confirm step this channel
-    exists for and IS narrower than the verdict run. Nothing about that is
+    made after a failed run THAT ITSELF RECORDED WHAT FAILED is re-run with
+    `--lf` — pytest re-selects that run's own list — which is the cheap confirm
+    step this channel exists for and IS narrower than the verdict run. The three
+    conjuncts behind "that itself recorded" are stated at the decision site in
+    `run()`; the one review had to add is that the list is CLEARED before every
+    run that could write one, so a run whose pytest never started cannot pass an
+    older run's failures on to the next request. Nothing about that is
     inferred by the reader: `run()` stamps the mode into the answer's first line
     and appends a caveat spelling out that a `--lf` PASS is not a green suite,
     `note()` says the same to the reviewer through `_rerun_caveat`, and the
@@ -1293,6 +1297,14 @@ class AdvisoryValidation:
         #: rerun of three tests is the misreport that cost port-05 a round, one
         #: level down.
         self._reruns: list[bool] = []
+        #: MAY THE NEXT REQUEST CARRY `--lf`? Set after every executed run and by
+        #: nothing else — see `run()`, which states the three conjuncts. It exists
+        #: because "the cache holds a rerun list" is not the same claim as "the
+        #: run that just finished wrote one" (found in review, 2026-08-31): a run
+        #: whose ruff failed before pytest leaves an EARLIER run's list sitting
+        #: there untouched, and a gate that only read the file authorised a `--lf`
+        #: on failures two edits old. False until a run earns it.
+        self._rerun_authorized = False
         #: Where this ROUND's pytest cache lives, once something has needed it.
         #: `None` until then, and `None` forever after a failure to create it or
         #: after `discard_cache()` — in all three cases a run falls back to
@@ -1447,9 +1459,10 @@ class AdvisoryValidation:
 
         FAIL CLOSED, and this is the whole of requirement 5: every way of not
         having a directory — it could not be created, it could not be WRITTEN,
-        or the round has already swept it — returns `None`, and `None` sends the
-        run down `validation.NO_CACHE_ARGS`, which is byte-for-byte what every
-        advisory run did before val-08. A cache failure can therefore make a run
+        the round has already swept it, or `_abandon_cache` gave it up because
+        the rerun list could not be cleared — returns `None`, and `None` sends
+        the run down `validation.NO_CACHE_ARGS`, which is byte-for-byte what
+        every advisory run did before val-08. A cache failure can therefore make a run
         more expensive and can never make it narrower: `--lf` is injected only
         inside the branch that turned the cache on
         (`validation.effective_validation_command`), so there is no state in
@@ -1525,8 +1538,83 @@ class AdvisoryValidation:
             self._cache_dir = path
             return path
 
+    @staticmethod
+    def _failure_record(cache: Path) -> Path:
+        """Where pytest keeps the list `--lf` re-selects from.
+
+        ONE spelling of this path, read by the clear and by the evidence test.
+        Two copies would agree today and disagree the first time pytest moved it
+        — and the disagreement would be silent in the dangerous direction: a
+        clear that missed the file and an evidence test that found it is exactly
+        the stale-list authorisation this whole mechanism exists to refuse.
+        """
+        return cache / "v" / "cache" / "lastfailed"
+
+    def _clear_failure_record(self, cache: Path) -> bool:
+        """Remove any rerun list, so a list found AFTER this run is THIS run's.
+
+        THE PROVENANCE BIND (found in review, 2026-08-31). Reading `lastfailed`
+        proves that SOME earlier run recorded failures, never that the run just
+        finished did — and the difference is a real three-run sequence: run 1
+        reaches pytest and records failures; run 2 fails in `ruff`, so
+        `run_validation_commands` stops before pytest and the file is untouched;
+        run 3 then reads run 1's list, is handed `--lf`, and can report a
+        NARROWED PASS while run 2's failure was never re-examined. Clearing the
+        file first closes that: after a cleared run, the file exists only if that
+        run's own pytest put it there.
+
+        Returns True only when the file is PROVABLY absent afterwards — an
+        `unlink` that raised, or a path still there when asked, is False, and
+        False costs the round its `--lf` rather than granting one on unproven
+        evidence. Never raises: `run()` calls it while serving an agent mid-turn.
+
+        Called only on a run that is NOT itself a rerun. A `--lf` run has to READ
+        this file, so clearing before one would empty the very list it selects
+        from (pytest's `--lfnf` default then runs everything, described as a
+        rerun). That is why a rerun never authorises another rerun — see `run()`.
+        """
+        recorded = self._failure_record(cache)
+        try:
+            recorded.unlink()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            return False
+        try:
+            return not recorded.exists()
+        except OSError:
+            return False
+
+    def _abandon_cache(self, reason: str) -> None:
+        """Give this ROUND's cache up for `reason`, and fall back to today's run.
+
+        The state left behind is exactly `_ensure_cache`'s own failure state — no
+        directory, a `_cache_error` explaining why — so every downstream branch
+        already handles it: `_ensure_cache` returns `None` for the rest of the
+        round (its `_cache_error` guard), `run()` passes no `cache_dir` and no
+        `--lf`, and the answer carries the fallback caveat that already exists.
+        One fallback path, not a second one that would need its own tests.
+
+        **Takes `self._lock`, so it must be called only from `run()`'s body** —
+        never from inside `_ensure_cache`, which holds that lock for its whole
+        body. The lock is not reentrant and the deadlock would present as a round
+        hanging to the 600s cap with nothing failing, which is the worst failure
+        shape available in this file.
+        """
+        with self._lock:
+            path, self._cache_dir = self._cache_dir, None
+            self._cache_error = reason
+            self._rerun_authorized = False
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
     def _cache_records_failures(self, cache: Path) -> bool:
         """Did the last run really leave a rerun list behind?
+
+        ONE OF TWO CONJUNCTS, and the weaker one: it says a list is THERE, while
+        `_clear_failure_record` is what says the run that just ran is the run that
+        put it there. Both are required at the assignment in `run()`; this alone
+        was the defect found in review on 2026-08-31.
 
         `--lf` is asked for on EVIDENCE rather than on inference, and the
         evidence is pytest's own `lastfailed` under the directory this round
@@ -1554,7 +1642,7 @@ class AdvisoryValidation:
         clears the list when nothing failed.
         """
         try:
-            recorded = (cache / "v" / "cache" / "lastfailed").read_text(encoding="utf-8")
+            recorded = self._failure_record(cache).read_text(encoding="utf-8")
         except (OSError, ValueError):
             return False
         return recorded.strip() not in ("", "{}", "[]", "null")
@@ -1575,6 +1663,10 @@ class AdvisoryValidation:
         """
         with self._lock:
             path, self._cache_dir, self._cache_discarded = self._cache_dir, None, True
+            # The authorisation dies with the directory it was about. Nothing
+            # runs after the sweep today, so this changes no behaviour here — it
+            # keeps the flag from outliving its evidence if anything ever does.
+            self._rerun_authorized = False
         if path is not None:
             shutil.rmtree(path, ignore_errors=True)
 
@@ -1731,35 +1823,64 @@ class AdvisoryValidation:
                 f"{NOT_RUN} is not a pass — the executor's own run will fail on "
                 "the same directory."
             )
-        # THE RERUN DECISION, made here and from this object's own record plus
-        # the cache's: a request that FOLLOWS a failed run WHOSE FAILURES WERE
-        # RECORDED is the confirm step, and it is the only shape that gets
-        # `--lf`. Four properties fall out of writing it this way rather than as
-        # a flag the caller can set:
+        # THE RERUN DECISION. `--lf` is carried by this run IF AND ONLY IF there
+        # is a cache AND the immediately preceding EXECUTED run:
+        #
+        #   (i)   started with `lastfailed` provably ABSENT — this run's own
+        #         `_clear_failure_record` had removed it and confirmed it gone;
+        #   (ii)  ended NOT GREEN; and
+        #   (iii) left a NON-EMPTY `lastfailed` behind (`_cache_records_failures`).
+        #
+        # Everything else is a FULL run. That is the whole rule, and (i) is what
+        # review added on 2026-08-31: without it the file only proved that SOME
+        # earlier run had recorded failures, so a run that failed in `ruff`
+        # before pytest passed its predecessor's list along and the run after it
+        # was narrowed to failures two edits old.
+        #
+        # Properties that fall out of writing it here rather than as a flag a
+        # caller can set:
         #
         #   * no cache, no rerun — `cache` is `None` on every fallback path, and
         #     `validation.effective_validation_command` injects `--lf` only
         #     inside the branch that turned the cache on, so a cache failure can
         #     never leave a narrowing flag behind;
-        #   * the FIRST run of a round is always full, because `_results` is
-        #     empty and there is nothing to confirm yet;
-        #   * a run that follows a PASS is full too, since the cheap question
+        #   * the FIRST run of a round is always full: nothing has been executed,
+        #     so `_rerun_authorized` is still its initial False;
+        #   * a run that follows a PASS is full too, by (ii) — the cheap question
         #     ("do the failures pass now?") has no failures to ask about;
-        #   * a failed run that recorded NOTHING is full as well — see
-        #     `_cache_records_failures`, which is the difference between "the
-        #     last run failed" and "there is a list of what failed", and which
-        #     is what keeps `--lf` off a run whose pytest never started.
+        #   * a failed run that recorded NOTHING is full as well, by (iii);
+        #   * A RERUN NEVER AUTHORISES ANOTHER RERUN. A `--lf` run cannot clear
+        #     the file it selects from, so (i) is unreachable after one. It could
+        #     not be replaced by "did the bytes change": pytest's
+        #     `LFPlugin.pytest_sessionfinish` writes only `if saved_lastfailed !=
+        #     self.lastfailed`, so a rerun failing on the SAME tests writes
+        #     nothing, and "unchanged" is then indistinguishable from "pytest
+        #     never ran". Indistinguishable means fail closed, so the round pays
+        #     for a full run — which is the safe direction, and the only cost is
+        #     that a confirm step does not chain into a second one.
         #
         # `_wants_cache` keeps a `ruff`-only round from making a directory at
         # all: nothing there writes a pytest cache and nothing reads one, so the
         # command list such a round launches is byte-identical to before val-08.
         cache = self._ensure_cache() if self._wants_cache else None
-        rerun = (
-            cache is not None
-            and bool(self._results)
-            and not self._results[-1]
-            and self._cache_records_failures(cache)
-        )
+        rerun = cache is not None and self._rerun_authorized
+        # (i), established BEFORE the run rather than assumed after it. Called
+        # only on a non-rerun run — see `_clear_failure_record`. A clear that
+        # cannot be proved gives the ROUND's cache up: the directory is unusable
+        # for the one thing it is for, and abandoning it lands on the fallback
+        # that already exists (no `cache_dir`, `-p no:cacheprovider`, no `--lf`,
+        # and a caveat saying so) instead of running on with a stale list nothing
+        # may read. Outside `_ensure_cache`, which holds `_lock` — see
+        # `_abandon_cache`.
+        cleared = False
+        if cache is not None and not rerun:
+            cleared = self._clear_failure_record(cache)
+            if not cleared:
+                self._abandon_cache(
+                    "the round's record of what failed could not be cleared, so "
+                    "no later rerun could be tied to the run that recorded it"
+                )
+                cache = None
         try:
             ok, summary = run_validation_commands(
                 self._commands,
@@ -1773,6 +1894,9 @@ class AdvisoryValidation:
         except Exception as exc:  # noqa: BLE001 — see the docstring
             self._results.append(False)
             self._reruns.append(rerun)
+            # Nothing is known about how far this got, so nothing it may have
+            # left behind is evidence. Fail closed: the next request runs FULL.
+            self._rerun_authorized = False
             return (
                 "ADVISORY validation could not complete: "
                 f"{type(exc).__name__}: {str(exc).strip() or '(no detail)'}. "
@@ -1780,6 +1904,19 @@ class AdvisoryValidation:
             )
         self._results.append(bool(ok))
         self._reruns.append(rerun)
+        # THE THREE CONJUNCTS, in the order the comment above states them, and
+        # written HERE — the only place — so the next request cannot be
+        # authorised by anything but the run that just finished. The early
+        # returns above (over budget, no commands, no working directory) execute
+        # nothing and deliberately leave this flag alone: the preceding EXECUTED
+        # run is still the preceding executed run, and a refused request is not
+        # evidence against it.
+        self._rerun_authorized = (
+            cache is not None
+            and cleared
+            and not ok
+            and self._cache_records_failures(cache)
+        )
         verdict = "PASSED" if ok else "FAILED"
         # STAMPED IN THE FIRST LINE, not buried. A `--lf` run is NARROWER than
         # the executor's own verdict run — the one direction `AdvisoryValidation`
