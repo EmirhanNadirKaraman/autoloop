@@ -59,7 +59,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from ..browser.chatgpt import SubmitResult
+from ..conversation import SubmitResult
 from ..errors import BrowserError, ResponseTimeoutError
 from ..packet import diff_part_id
 from .app_server import AppServerClient
