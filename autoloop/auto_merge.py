@@ -143,14 +143,37 @@ DISABLED = "disabled"                # policy.auto_merge_enabled is false
 #: inert for the whole night the same way.
 LOOP_CODE_PREFIX = "autoloop/"
 
-#: `PendingUpgrade.status`, in the order one record moves through them. A
-#: record only ever leaves `pending` by being SETTLED (or cleared), which is
-#: what makes the exec one-shot — see `UpgradeStore`.
+#: TWO statuses a live record moves through, and three names that are OUTCOMES
+#: only. `pending` -> `execed` is the whole of the state machine, and `execed`
+#: is what makes the exec one-shot — see `UpgradeStore`.
 UPGRADE_PENDING = "pending"            # a merge changed loop code; not acted on yet
 UPGRADE_EXECED = "execed"              # the `os.execv` did not return: a successor is running
+
+#: The three ways a boundary ends without a handoff. Each names a transcript
+#: entry (`self_upgrade_<outcome>`) and `cli._self_upgrade_at_boundary`'s
+#: return value — and NONE of them is written into `status` any more. A refused
+#: handoff is a fact about the process that refused it: on 2026-08-27 one
+#: launch could not hand off at 08:13:47 and the next exec'd the same record at
+#: 08:15:30. Settling them (as this file did until 2026-08-31) left
+#: `orchestrator._self_upgrade_due` — which only ever offers `pending` — with
+#: nothing to offer, so the merged code sat on disk with nothing left to run
+#: it. They are still READ as statuses, because a state dir written by an
+#: older build can hold one, and "not pending" is the right answer for those.
 UPGRADE_PREFLIGHT_FAILED = "preflight_failed"   # the merged tree does not import
 UPGRADE_UNAPPLICABLE = "unapplicable"  # the merged checkout is not the running tree
 UPGRADE_EXEC_FAILED = "exec_failed"    # nothing was replaced; this process carries on
+
+#: The fourth: a process reached the boundary and is not one that may hand off
+#: at all (the single-round `run` path — see `cli._run_locked`). Same rule as
+#: the three above and the same reason; it is named apart from them because
+#: nothing about the merged tree was judged to reach it.
+UPGRADE_DEFERRED = "deferred"
+#: And the fifth: the boundary was reached and there was no `pending` record
+#: left to act on by the time the decision site read it. Returned as `"none"`
+#: by `cli._self_upgrade_at_boundary` (its callers compare against that
+#: literal), and logged so that no boundary can end without an entry saying
+#: what became of it.
+UPGRADE_NONE = "none"
 
 
 @dataclass
@@ -278,10 +301,18 @@ class PendingUpgrade:
     paths: list
     status: str
     recorded_at: str
-    #: When the record left `pending`, and why. `detail` carries the preflight
-    #: error when there is one — the whole point of a failed preflight is that
-    #: it is REPORTED rather than fatal.
+    #: When the record left `pending` — which today only `execed` does, so an
+    #: empty `settled_at` on a `pending` record is the ordinary case however
+    #: many boundaries have already refused it.
     settled_at: str = ""
+    #: The last thing that happened to this record, prefixed with the outcome
+    #: that happened (`preflight_failed: rc=1 SyntaxError…`). Written by
+    #: `cli._carry_on_upgrade` on a boundary that did not hand off, and left in
+    #: place while the record stays `pending`: the whole point of a failed
+    #: preflight is that it is REPORTED rather than fatal, and an operator
+    #: reading the state dir should not have to reach for the transcript to see
+    #: why a pending upgrade has not happened yet. Evidence, never re-derived
+    #: from — no code branches on it.
     detail: str = ""
 
 
@@ -320,6 +351,32 @@ class UpgradeStore:
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
+
+
+def upgrade_bound_sha(record: PendingUpgrade | None) -> str:
+    """The `base_sha` a boundary's bounds can be keyed on, or `""` when the
+    record carries nothing usable.
+
+    ONE predicate, three readers — `orchestrator._self_upgrade_due`,
+    `cli._self_upgrade_at_boundary` and `cli._defer_self_upgrade` — because
+    they are asking the same question, and a second copy of the answer is a
+    second answer the first time one of them moves. Every bound in this design
+    is keyed on that sha (the per-process decline, `_run_continuous`'s
+    `answered_upgrades`, the one-shot on `execed`), so "usable" means exactly
+    what those uses need and nothing more: a non-empty `str`.
+
+    `isinstance` and not just truthiness, because `UpgradeStore.load` builds
+    the record with `PendingUpgrade(**data)` and coerces nothing — the field
+    holds whatever JSON was in the file. A `dict`, an `int` or `null` there
+    raises TypeError on the `[:12]` slices the exec path prints; a `list`
+    raises it on `set.add`. Either one is raised AFTER `self_upgrade_boundary`
+    has been logged and before any outcome entry, which is precisely the
+    boundary-then-silence this whole path exists to end. A record that fails
+    here is refused at the boundary — an outcome, with an entry — rather than
+    acted on, and is left exactly as it is for a reader to fix.
+    """
+    sha = record.base_sha if record is not None else ""
+    return sha if isinstance(sha, str) and sha else ""
 
 
 def loop_code_paths(paths) -> list:
