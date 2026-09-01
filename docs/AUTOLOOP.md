@@ -1169,3 +1169,88 @@ candidate rather than the test.
   from.
 * **A provider with a shared conversation.** Every codex turn is its own
   subprocess, so nothing here designs around one.
+
+---
+
+## What the codex CLI actually prints, and where the verdict comes from
+
+**`codex exec` stdout is a rendered transcript, not a reply.** Captured on this
+machine on 2026-08-17, one review turn came back as a separator rule, a `user`
+role marker with the prompt echoed under it, four `hook:` lines, a `codex` role
+marker with the answer under it, two more `hook:` lines, `tokens used`, a count
+— and then the answer A SECOND TIME as the run's closing summary. The adapter
+did `reply = result.stdout.strip()` and handed the whole of that to the
+contract, which answered
+
+    ContractError: invalid_json: the reply is not exactly one JSON value
+
+so the `codex_cli` provider could not return a verdict at all.
+
+**The contract was not the thing that was wrong.** It refuses prose plus a bare
+object, and it refuses a second object, deliberately: with a directive that can
+authorize a commit or a push, "guess which one they meant" is not an acceptable
+rule, and two identical objects today are two *different* objects the first day
+a hook prints something unexpected. Nothing about it was relaxed. What changed
+is the input it is given: `autoloop/codex/reply.py` isolates the reviewer's own
+message — the lines after a `codex` marker, up to the first line of transcript
+furniture (another role marker, a `hook:` line, `tokens used`, or a rule of
+dashes) — and the adapter hands the contract that and nothing else.
+
+**Three things follow, and they are the operational shape of it.**
+
+* The trailing duplicate is excluded *structurally*: it sits after `tokens
+  used`, which closes the message. This is not "take the last object" and not
+  "de-duplicate identical objects" — the first is the position rule the contract
+  refuses, and the second reads two copies that happen to agree as agreement.
+* The echoed prompt is excluded structurally too, and that is the half that
+  matters most. The prompt comes back under the `user` marker, and the prompt
+  carries the response contract and, in the captured shape, an example
+  directive. Text the loop *sent*, read back as the reviewer's answer, would be
+  an approval nobody gave.
+* Stdout from which no message can be isolated is a **failed invocation**, never
+  a defaulted decision: `submit` returns REJECTED and writes
+  `codex_invocation_failed` with a note saying which way it happened — nothing
+  on stdout, a marker with no message under it, furniture and nothing else, or
+  two messages.
+
+**Isolation does not mean validation, and this boundary never judges a reply.**
+A reviewer that answers in prose gets its message isolated and then refused by
+the contract, which is right: that draws the corrective re-prompt. Only "no
+message at all" is this layer's failure.
+
+### What you will see
+
+    codex_reply_isolated       counts only — segments, stdout_chars, reply_chars
+    codex_invocation_failed    note: "no reply on stdout" / "no message under any
+                               of them" / "only transcript furniture" /
+                               "refusing to choose a verdict by position"
+
+The isolation record is counts-only on purpose: stdout carries the echoed
+prompt, which is the whole review packet, and the isolated reply already reaches
+the transcript in full under `response_received.raw`. It exists at all because a
+rule that silently discards output cannot be told apart from a rule that never
+fired — the same reason `quota.py` records `suppressed_patterns`.
+
+### Three alternatives, and why none of them was taken
+
+* **Ask codex for a fenced ```json block and extract the fence.** The contract's
+  canonical form, and it would work — when the model complies. It is a rule
+  enforced by prose in a prompt, so the round it is not followed is the round
+  there is no verdict, and the prompt already says "your ENTIRE reply is exactly
+  one fenced JSON block" and still produced the output above. A transport
+  guarantee that depends on model compliance is not a transport guarantee.
+* **Run codex with hooks disabled, or in a machine-readable output mode.** This
+  would remove the decoration at the source, which is better than parsing it —
+  if the flags exist. They are not verifiable from this repository, they are a
+  property of a CLI version rather than of the loop, and the hook lines here
+  come from the operator's own codex configuration. Configured `sandbox_args`
+  already pass through, so an operator who has such a flag can add it, and this
+  boundary keeps working either way: undecorated stdout is passed through
+  unchanged.
+* **Hand the parser everything and let it refuse the ambiguous cases.** Refusal
+  is the contract's job, but the *budget* is wrong. A parse failure spends
+  `policy.max_parse_retries` (2) and parks the loop `parse_budget_exhausted`,
+  which is loop_fatal. A rejected invocation is bounded at one resend and then a
+  park (`orchestrator._step_submission_rejected`), and it says in its own record
+  that the CLI printed two messages — which is an operator's problem, not a
+  reviewer's, and re-prompting the reviewer about it would fix nothing.
