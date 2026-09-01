@@ -175,6 +175,51 @@ UPGRADE_DEFERRED = "deferred"
 #: what became of it.
 UPGRADE_NONE = "none"
 
+#: The fleet size every merge-protocol decision in this package is gated on,
+#: and what `concurrency_lanes` answers when nothing configures one. ONE lane is
+#: today's loop exactly: the merge window blanket-blocks on any candidate bound
+#: to the head, a carry-forward preserves the reviewed candidate sha, and no
+#: push is refused for a base that moved. Every widening is `> 1` only.
+DEFAULT_LANES = 1
+
+
+def concurrency_lanes(config) -> int:
+    """How many lanes this deployment runs, as the merge protocol reads it.
+
+    ONE reader of the setting, shared by `cli._merge_window_blockers`,
+    `Orchestrator` and `merge_sweep`, for the reason `_merge_window_blockers`
+    gives about itself: three copies of "is this a fleet" agree the day they are
+    written and disagree the first time the key moves, and the copy that drifts
+    is the one that opens the merge window on a deployment that never asked for
+    a fleet.
+
+    **Asked with `getattr`, and that is not defensive styling.** conc-02 owns
+    the `[concurrency]` section and has not landed here yet, so the attribute
+    may legitimately be absent; and the orchestrators the suite builds by hand
+    (`test_rebase_stale_base.py::_orch`) carry no config at all. Both resolve to
+    `DEFAULT_LANES`, which is today's behaviour in every path that reads this.
+
+    **Every unusable answer is 1, never "assume more".** Absent, `None`, a
+    string, a float, a bool, zero, a negative — all of them mean the strictest
+    merge protocol this package has, which is the one that has been running
+    since before any of this existed. Reading an unparseable setting as a fleet
+    would open the merge window on a loop whose window has always been shut,
+    which is the fail-OPEN direction; `load_config` refuses those values
+    outright anyway, so nothing legitimate arrives here malformed.
+
+    Both shapes the setting could take are probed — a `[concurrency]` section
+    object with its own `lanes`, and a flat `lanes` on the config — because this
+    candidate cannot see which one conc-02 chose, and reading only the other one
+    would silently pin the whole fleet at 1 with every test still green.
+    """
+    section = getattr(config, "concurrency", None)
+    for value in (getattr(section, "lanes", None), getattr(config, "lanes", None)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value >= 1:
+            return value
+    return DEFAULT_LANES
+
 
 @dataclass
 class MergeDeferral:
