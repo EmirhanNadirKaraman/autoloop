@@ -52,23 +52,31 @@ structurally unreachable. Every rotation trigger — a disproven send, a wedged
 conversation, a chat that accepts a turn and never answers — describes a browser
 conversation. There is nothing here to rotate away from.
 
-**The reviewer gets no repository access, and that is the WHOLE confinement
-policy — stated, not implied.** It runs in a dedicated, empty directory outside
-the checkout (`preflight.resolve_working_dir`; `~/.autoloop/codex-workdir` when
-`codex.working_dir` is empty). The prompt is self-contained — every turn
-re-sends its CONTEXT block and the full contract — so the reviewer needs no
-filesystem at all, and a containment that does not depend on knowing a sandbox
-flag's name still holds when the flag is renamed. `codex.sandbox_args` ships
-EMPTY on purpose and passes through on top of this, never instead of it: the
-names cannot be verified from this repository or in CI, and a flag nobody here
-can run is a setting that looks like a control without being one. `doctor` says
-so in as many words rather than promising a sandbox this module does not
-enforce.
+**The confinement is `codex.sandbox_args`, and the working directory is not
+one.** This module used to say the opposite — that the reviewer got no
+repository access because it ran in a dedicated empty directory outside the
+checkout — and that claim was false. `cwd` chooses where a process STARTS. It
+refuses nothing: not an absolute path, not `..`, not a subprocess, not a read
+of `~/.ssh`. A reviewer with no sandbox flag is unconfined wherever it starts.
 
-The directory is dedicated rather than the home directory for a measured
-reason: codex declines to run outside a TRUSTED directory, `~` is not one, and
-trusting `~` to fix that would hand the reviewer every file the operator owns.
-One empty directory, trusted once, keeps codex's own check as a live guard.
+So the policy is a flag list, it ships set (`sandbox.DEFAULT_SANDBOX_ARGS`,
+`--sandbox read-only`), and `run` REFUSES to launch when it does not name an
+enforceable mode — an unconfined seat fails here and at `doctor`'s preflight
+rather than reviewing. What this repository can honestly claim about it is two
+things: the flags are PRESENT in the argv `subprocess.run` receives, between
+`command` and the prompt, and `doctor`'s preflight proves the configured build
+ACCEPTS them (no codex binary runs here or in CI, so nothing else is
+verifiable). Enforcement is codex's own, and `read-only` refuses writes and
+command execution WITHOUT confining reads — nothing here depends on it doing
+so, because the prompt is self-contained: every turn re-sends its CONTEXT block,
+the full contract and the diff, so the reviewer is never asked to read anything.
+
+The working directory still earns its default. Codex declines to run outside a
+TRUSTED directory, `~` is not one, trusting `~` would hand the reviewer every
+file the operator owns, and a reviewer started inside the checkout is one
+relative path from the tree it is grading. One empty directory, trusted once,
+keeps codex's own repository check a live guard. That is a smaller claim than
+confinement, and it is now made as one.
 
 **Stdout is a transcript, and only one part of it is the reply.** `codex exec`
 prints role markers, hook lines and a token counter around the message, and
@@ -120,6 +128,7 @@ from .quota import (
     failure_digest,
 )
 from .reply import ECHO_ANCHOR_MATCHED, FROM_SEGMENT, isolate_reply
+from .sandbox import DEFAULT_SANDBOX_ARGS, describe_invocation
 
 #: Ceiling on the argv-borne prompt, well under this host's 1 MiB ARG_MAX so
 #: the environment block and the rest of the command line still fit.
@@ -156,7 +165,13 @@ class SubprocessCodexRunner:
         self,
         command: tuple[str, ...] = ("codex", "exec"),
         *,
-        sandbox_args: tuple[str, ...] = (),
+        # The shipped policy, not an empty tuple: a runner constructed without
+        # one would otherwise be an UNCONFINED reviewer that looks like a
+        # default. `run` still grades whatever arrives here, so passing `()`
+        # explicitly is refused rather than quietly replaced — an operator who
+        # emptied `codex.sandbox_args` gets an error naming the setting, not a
+        # value the loop substituted behind them.
+        sandbox_args: tuple[str, ...] = DEFAULT_SANDBOX_ARGS,
         timeout_seconds: float = 900.0,
         cwd: Path | None = None,
         env: dict | None = None,
@@ -179,6 +194,25 @@ class SubprocessCodexRunner:
         return (*self._command, *self._sandbox_args)
 
     def run(self, prompt: str) -> CodexResult:
+        # THE confinement gate, and it is here rather than in `__init__` on
+        # purpose: this is the last point before the process, so nothing can
+        # construct its way past it, and a caller that only wants to INSPECT a
+        # badly configured runner (`doctor`, a test) still can. An unconfined
+        # policy raises the transport-fault family every codex failure already
+        # arrives as, carrying `describe_invocation`'s own message — which names
+        # the setting, the shipped value and `codex exec --help`.
+        #
+        # Graded over `command` AND `sandbox_args`, because codex sees one argv:
+        # a bypass flag in either key is a bypass, and grading only the key that
+        # is MEANT to carry the policy is how the other one becomes a way round
+        # it.
+        policy = describe_invocation(self._command, self._sandbox_args)
+        if not policy.is_enforceable:
+            raise BrowserError(
+                "refusing to run the codex reviewer unsandboxed. "
+                + policy.detail
+                + " `python -m autoloop doctor` reports this as `codex_sandbox`."
+            )
         argv = (*self._command, *self._sandbox_args, prompt)
         # BEFORE the process, because `subprocess.run` raises the SAME
         # `FileNotFoundError` for a missing cwd as for a missing binary — so

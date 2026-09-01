@@ -12,8 +12,13 @@ Every finding carries four things, or it rots into an untested claim:
 - Git operations run through `GitGateway` behind a policy; force pushes and
   destructive commands are denied rather than merely discouraged.
 - `protected_branches` refuses direct pushes to the base branch.
-- The reviewer gets no repository access: its working directory is outside the
-  checkout and its prompt is self-contained.
+- The reviewer runs under a sandbox policy that is preflighted before a round:
+  `codex.sandbox_args` ships `--sandbox read-only`, and `codex_cli` refuses to
+  launch — runner and `doctor` alike — when it names no enforceable mode. Its
+  prompt is self-contained, so it is never asked to read the checkout. NOT
+  claimed: that it cannot. A read-only sandbox permits reads, enforcement is
+  codex's own, and the working directory (outside the checkout) confines
+  nothing — `cwd` chooses where a process starts.
 - The escape detector brackets every write-capable agent call.
 
 ## Open findings
@@ -37,3 +42,5 @@ _None recorded yet in this repository._
 | 2026-09-01 | prov-01 | `autoloop/codex/reply.py:517` `isolate_reply` — the bound above holds only while the echo is VERBATIM: a build that re-wraps its echo defeats the exact match, leaving the packet's own quoted directive as the single segment. Severity: medium; it carries this round's real `request_id` and `head_sha`, so the stamp gates accept it and an approval nobody made authorizes a push. Verify: a reflowed echo quoting a flush-left same-round directive, with no reviewer message, must be REJECTED. Fixed: `reply.py:474` `_accept` refuses any candidate the prompt contains, literally or on `quota._squeeze`'s basis. |
 | 2026-09-01 | prov-02 | `autoloop/codex/preflight.py:1` — the reviewer's confinement is now STATED rather than implied: `codex.sandbox_args` is empty by policy and containment rests on `working_dir` alone (a dedicated empty directory outside the checkout, plus a self-contained prompt). Severity: informational; nothing is weaker than before — the previous default ran in the HOME directory, which is strictly more exposed than one empty directory — and the older "flag names cannot be verified" note had expired into an implied sandbox nobody enforced. Verify: `doctor`'s `codex_sandbox` row must say `warn` and name the policy, and `codex_workdir` must `fail` for any path inside the checkout. |
 | 2026-09-01 | prov-02 | `autoloop/doctor.py:13d` — NEW LOCAL SIDE EFFECT: the preflight LAUNCHES `codex exec` with a fixed one-line prompt and creates `~/.autoloop/codex-workdir` if absent. Severity: low. No review packet, no repository content and no credential leaves the machine that codex is not already signed into; the prompt is a module constant, the deadline is its own (120s, not `codex.timeout_seconds`), and output reaching a row is bounded and echo-stripped by `quota.failure_digest`. Verify: `DoctorProbes.codex_preflight` must be stubbed in every test that runs a sweep, and no test may spawn the binary. |
+| 2026-09-01 | prov-02 | SUPERSEDES the prov-02 note above and the `Verified strengths` bullet, both corrected: `autoloop/codex/conversation.py:55` claimed the reviewer got no repository access because it ran in a dedicated directory outside the checkout. Severity: medium — a FALSE containment claim, which is worse than a stated gap. `cwd` selects where a process starts and restricts no absolute path, no `..`, no subprocess and no read, so the seat was UNCONFINED while `doctor` reported the empty `codex.sandbox_args` as a deliberate policy. Verify: `codex.sandbox_args = []` must FAIL `doctor` and raise before any process starts. |
+| 2026-09-01 | prov-02 | Fix for the above: `codex.sandbox_args` ships `["--sandbox", "read-only"]`, `autoloop/codex/sandbox.py:185` `describe_sandbox` grades it fail-closed, and `conversation.py:196` `run`, `preflight.py:280` `preflight_codex` and `doctor.py:511` all refuse an unenforceable one. CLAIMED: the flags are present in the reviewer's real argv, and the preflight proves the configured build accepts them. NOT claimed: that a sandbox is enforced (no codex binary runs here or in CI) or that reads are confined — read-only permits them. `codex_app_server` gets no policy; it answers every approval `abort`. |

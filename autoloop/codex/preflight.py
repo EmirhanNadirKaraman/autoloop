@@ -12,6 +12,15 @@ but the repository", and codex REFUSES to run there. So the shipped default
 could not work, every check `doctor` made about it came back `ok`, and the
 first thing that said otherwise was a failed review round.
 
+**A working directory is not a confinement, and this module no longer says it
+is.** `cwd` chooses where a process starts; it refuses nothing — not an
+absolute path, not `..`, not a subprocess. The confinement is
+`codex.sandbox_args`, read as a policy by `sandbox.describe_invocation` —
+across `codex.command` too, since codex sees one argv — and REFUSED here when
+it is not one. What the directory still buys is real but
+small: codex trusts it rather than the operator's home, and a reviewer started
+outside the checkout is not one relative path from the tree it is grading.
+
 **Three separate things live here, and they are separate on purpose.**
 
 * `resolve_working_dir` — the ONE place that decides what an empty
@@ -25,10 +34,20 @@ first thing that said otherwise was a failed review round.
   CONFIGURED one. A default that provisions itself removes a failure mode
   nobody chose; silently creating a mistyped `codex.working_dir` would hide the
   typo instead, so that raises with the path in the message.
-* `preflight_codex` — one trivial invocation, from that directory, with the
-  configured `sandbox_args`, graded on its EXIT CODE. It is what makes
-  "selecting codex_cli is safe" checkable before a round rather than during
-  one.
+* `preflight_codex` — the sandbox policy, then one trivial invocation, from
+  that directory, with the configured `sandbox_args`, graded on its EXIT CODE.
+  It is what makes "selecting codex_cli is safe" checkable before a round
+  rather than during one. An unconfined policy is a `fail` and NO invocation:
+  the check does not launch an unsandboxed reviewer to find out whether an
+  unsandboxed reviewer launches.
+
+**The flags the preflight runs are the flags a review turn runs**, because both
+build their argv the same way from the same setting (`preflight_argv`;
+`conversation.SubprocessCodexRunner.run`). That is the whole of what this
+repository can verify about a sandbox — that the policy is PRESENT, and that
+the configured build ACCEPTS it — since no codex binary runs here or in CI.
+Enforcement is codex's, and `read-only` does not confine reads; see
+`sandbox.py`.
 
 **The success test is `returncode == 0` and nothing else.** The preflight is
 not allowed to look for its own words in the output: `codex exec` echoes the
@@ -72,13 +91,15 @@ from .quota import (
     failure_digest,
 )
 from .reply import isolate_reply
+from .sandbox import describe_invocation
 
 #: Where the reviewer runs when `codex.working_dir` is empty, relative to the
 #: operator's home. A DEDICATED, EMPTY directory rather than the home directory
 #: itself, for two reasons: codex refuses to run in an untrusted directory, and
 #: trusting `~` once would trust every file the operator owns. Trusting one
 #: empty directory keeps codex's own repository check as a live guard instead of
-#: switching it off with `--skip-git-repo-check`.
+#: switching it off with `--skip-git-repo-check`. It is a smaller claim than
+#: confinement, which is `sandbox.py`'s.
 DEFAULT_WORKING_DIR_PARTS: tuple[str, ...] = (".autoloop", "codex-workdir")
 
 #: The preflight's prompt. Fixed, tiny, and deliberately worded so that
@@ -105,6 +126,7 @@ OK = "ok"
 NO_REPLY = "no_reply"
 COMMAND_MISSING = "command_missing"
 COMMAND_UNRESOLVABLE = "command_unresolvable"
+SANDBOX_UNCONFINED = "sandbox_unconfined"
 WORKING_DIR_UNUSABLE = "working_dir_unusable"
 INVOCATION_FAILED = "invocation_failed"
 QUOTA_EXHAUSTED = "quota_exhausted"
@@ -243,8 +265,11 @@ def _subprocess_invocation(argv: tuple[str, ...], cwd: Path) -> PreflightInvocat
 def preflight_argv(codex) -> tuple[str, ...]:
     """The invocation minus the prompt — exactly what a review turn runs.
 
-    Shared with the diagnostics so a `doctor` row can quote the command an
-    operator would have to reproduce, and so a wrong `sandbox_args` is caught
+    `command` then `sandbox_args`, which is the order and the source
+    `SubprocessCodexRunner.run` uses, so the policy the preflight validates is
+    the policy the reviewer gets rather than a second construction that agrees
+    today. Shared with the diagnostics so a `doctor` row can quote the command
+    an operator would have to reproduce, and so a wrong `sandbox_args` is caught
     HERE rather than at the first review: the preflight passes the configured
     flags through unchanged, so a flag this codex build does not accept fails
     the check.
@@ -263,9 +288,14 @@ def preflight_codex(codex, *, run: PreflightRunner | None = None) -> PreflightRe
     1. an empty `command`, or a first word that is not on PATH — reported
        without launching anything, and reported as `fail`, never `skip`. "Not
        attempted" is not evidence that the transport works.
-    2. a working directory that cannot be used — reported with the path.
-    3. the invocation itself. Exit 0 is the pass; a non-zero exit is
-       classified, so a spent allowance is not filed as a broken command.
+    2. a `sandbox_args` that names no enforceable policy — reported without
+       launching anything either. A preflight that ran an UNCONFINED reviewer to
+       prove the seat is usable would be doing the thing the check exists to
+       refuse, and an `ok` would then mean "it works", not "it is safe".
+    3. a working directory that cannot be used — reported with the path.
+    4. the invocation itself, carrying those flags. Exit 0 is the pass; a
+       non-zero exit is classified, so a spent allowance is not filed as a
+       broken command.
     """
     command = tuple(getattr(codex, "command", ()) or ())
     if not command:
@@ -285,6 +315,18 @@ def preflight_codex(codex, *, run: PreflightRunner | None = None) -> PreflightRe
             "codex.command.",
             COMMAND_UNRESOLVABLE,
         )
+
+    # The confinement, before the process rather than after it, and read from
+    # the WHOLE invocation — `codex.command` can carry a bypass flag as easily
+    # as `codex.sandbox_args` can, and codex sees one argv. `is_enforceable` is
+    # false for a policy this loop cannot read as a sandbox — none named, an
+    # unknown mode, or a bypass — and the row carries `describe_invocation`'s
+    # own message, which names the setting, the shipped value and `codex exec
+    # --help`. Nothing is launched: an unsandboxed reviewer is exactly what must
+    # not run here.
+    policy = describe_invocation(command, getattr(codex, "sandbox_args", ()) or ())
+    if not policy.is_enforceable:
+        return PreflightResult("fail", policy.detail, SANDBOX_UNCONFINED)
 
     try:
         workdir = ensure_working_dir(resolve_working_dir(getattr(codex, "working_dir", "")))
@@ -396,6 +438,7 @@ __all__ = [
     "PROBE_ERROR",
     "QUOTA_EXHAUSTED",
     "RATE_LIMITED",
+    "SANDBOX_UNCONFINED",
     "WORKING_DIR_UNUSABLE",
     "PreflightInvocation",
     "PreflightResult",

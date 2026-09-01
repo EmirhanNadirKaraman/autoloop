@@ -1343,28 +1343,73 @@ Three consequences worth stating plainly:
 * **Waiting is the remedy**, and a park is the loop saying so. Adding rounds,
   retries or a second seat spends the same window faster.
 
-### Confinement: `working_dir` alone, said out loud
+### Confinement: the sandbox flags, and what a working directory is not
 
-The reviewer needs no filesystem access at all — every turn's prompt re-sends
-its CONTEXT block, the full contract and the diff — so containment is a
-directory, not a sandbox:
+**A working directory is not a confinement.** This document said it was, and
+that was wrong: `cwd` chooses where a process STARTS and refuses nothing — not
+an absolute path, not `..`, not a subprocess, not a read of `~/.ssh`. A reviewer
+launched with no sandbox flag is unconfined wherever it starts, and the seat was
+described as contained on that basis until prov-02's second round.
 
-* `codex.working_dir` empty means **`~/.autoloop/codex-workdir`**, a dedicated
-  empty directory autoloop creates on first use
-  (`codex/preflight.resolve_working_dir`, the single definition both transports
-  and `doctor` share, so the path `doctor` grades is the path the reviewer
-  gets). A configured directory that does not exist is refused rather than
-  created: a typo must not become the place reviews run.
-* `codex.sandbox_args` ships **empty by policy**, and the policy is that
-  confinement rests on the working directory alone. The older justification —
-  "the flag names cannot be verified" — was true when written and has been
-  narrowed to what is still true: they cannot be verified *from this repository
-  or in CI*, because no codex binary runs there. A flag nobody in this tree can
-  execute is a setting that looks like a control without being one. What changed
-  is the cost of getting it wrong: the preflight below passes exactly these
-  flags to a real invocation, so a flag your build rejects fails a check instead
-  of a review. `--sandbox read-only` is the confinement to add if your build
-  spells it that way (`codex exec --help`).
+The confinement is `codex.sandbox_args`, and it ships set:
+
+* **`codex.sandbox_args = ["--sandbox", "read-only"]`** is the shipped policy.
+  The reviewer answers from a self-contained packet — every turn re-sends its
+  CONTEXT block, the full contract and the diff — so it needs no writes, no
+  commands and no repository. `codex/sandbox.py` reads the value as a policy
+  rather than as "set or not set", and it is FAIL-CLOSED: an empty list, a mode
+  it cannot name, a dangling `--sandbox`, `--full-auto`'s wider
+  `workspace-write` (allowed, with a warning) and a bypass flag are each graded
+  on their own. When several modes are named, the WEAKEST one decides, whatever
+  clap's last-wins rule would do with the argv — nothing here can run the binary
+  to find out, and the safe direction of being wrong is a `fail` an operator
+  clears by deleting a flag.
+* **An unconfined policy is refused, not warned about.** `doctor`'s
+  `codex_sandbox` row fails, the preflight makes no invocation, and
+  `SubprocessCodexRunner.run` raises rather than launching — the last point
+  before the process, so no caller and no construction path gets past it.
+* **The whole invocation is graded, not just the key that should carry it.**
+  `codex.command` and `codex.sandbox_args` are two settings and one argv, so a
+  bypass flag in the command line fails exactly as one in `sandbox_args` does
+  (`sandbox.describe_invocation`). Grading only the second key would have made
+  the first a way round it.
+* **What is actually claimed is narrow, and it is all this repository can
+  claim.** (1) The policy is PRESENT in the invocation, between `command` and
+  the prompt, in the review turn and in the preflight, from that one setting —
+  pinned against the argv `subprocess.run` really receives. (2) `doctor`'s
+  preflight proves the configured build ACCEPTS it, because no codex binary runs
+  in this repository or in CI, so a spelling your build rejects fails a check
+  instead of your first review (`codex exec --help`).
+* **What is NOT claimed.** Enforcement is codex's; nothing here can prove a
+  sandbox held. And `read-only` refuses WRITES and command execution — it does
+  not confine READS. A read-only reviewer may still read the checkout and the
+  operator's home. Nothing in the loop depends on it not doing so.
+
+**Upgrading is one config line.** A `.autoloop/config.toml` written before this
+change carries `sandbox_args = []`, which is now an unconfined seat: `doctor`
+fails it and every review turn raises `refusing to run the codex reviewer
+unsandboxed` until it reads `["--sandbox", "read-only"]`. That break is
+deliberate — the alternative is a loop that keeps reviewing under a policy
+nobody set, which is the state this section used to describe as containment.
+
+`codex.working_dir` still earns its default, as the smaller thing it is:
+
+* Empty means **`~/.autoloop/codex-workdir`**, a dedicated empty directory
+  autoloop creates on first use (`codex/preflight.resolve_working_dir`, the
+  single definition both transports and `doctor` share, so the path `doctor`
+  grades is the path the reviewer gets). A configured directory that does not
+  exist is refused rather than created: a typo must not become the place reviews
+  run.
+* It decides which directory codex TRUSTS (below), and it keeps the reviewer
+  from being started inside the tree it is grading. Neither is confinement.
+
+`codex_app_server` is the other seat, and `codex.sandbox_args` does **not** reach
+it: that setting is `codex exec` argv. That transport selects no sandbox preset
+at all; what it has instead is a property of its own replies — every approval the
+server asks for is answered `abort` (`codex/app_server.py`). Selecting it is
+therefore selecting an unsandboxed reviewer that is refused every command and
+patch it asks to run, which is a different guarantee from `codex_cli`'s and is
+not preflighted.
 
 ### Why the default is one empty directory and not `~`
 
@@ -1399,10 +1444,12 @@ Four rows, only for a configured `codex_cli` seat:
     codex_command     the first word of codex.command resolves on PATH
     codex_workdir     the RESOLVED directory: outside the checkout, and either
                       present or autoloop's own (created on first use)
-    codex_sandbox     set (ok, and passed to the preflight) or consciously
-                      empty (warn, naming the policy and the two flags)
-    codex_preflight   ONE trivial invocation, from that directory, with those
-                      flags — graded on its EXIT CODE
+    codex_sandbox     the POLICY codex.sandbox_args names: read-only (ok),
+                      workspace-write (warn), and fail for none, a bypass or a
+                      mode this loop cannot name
+    codex_preflight   ONE trivial invocation, from that directory, under that
+                      policy — graded on its EXIT CODE, and not attempted at
+                      all when the policy failed
 
 The preflight is the row that answers "could this loop use `codex_cli` right
 now". It is bounded by its own short deadline rather than
@@ -1418,6 +1465,8 @@ Statuses, and why they are not all `fail`:
 
 * `fail` — the command is unresolvable (no invocation attempted, and `fail`
   rather than `skip`: "not asked" is not evidence that the transport works), the
+  sandbox policy is not enforceable (also no invocation: the answer to "is this
+  seat safe" must not be obtained by launching an unsandboxed reviewer), the
   working directory is unusable or inside the repository, the invocation was
   refused for an unclassified reason (the row quotes codex's own bounded,
   echo-stripped output and names both directory remedies), or the probe itself

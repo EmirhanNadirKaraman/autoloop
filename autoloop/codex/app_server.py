@@ -19,14 +19,18 @@ Three things this deliberately does NOT do:
 * **It does not resume.** `thread/resume` is real and is right there in the
   protocol; this client never sends it and holds its thread only in memory, so
   a restarted loop starts a new thread. Durability across restarts is codex-03.
-* **It does not claim a sandbox.** No preset is selected, named or enforced.
-  Containment here is the same containment the subprocess adapter states and
-  can prove: the server runs in the dedicated directory outside the checkout
-  that `preflight.resolve_working_dir` resolves — the same one that seat uses,
-  from the same setting — and every approval the server asks for is answered
-  `abort`, so a turn that tries to run a command or write a patch is refused
-  rather than confined. That is a property of this client's replies, not of a
-  flag whose name nobody verified.
+* **It does not claim a sandbox, and it is not the `codex_cli` policy.** No
+  preset is selected, named or enforced, and `codex.sandbox_args` does NOT
+  reach this transport — that setting is `codex exec` argv, and nothing here
+  passes it or its protocol equivalent, which the committed reference does not
+  settle and which no binary in this tree can be asked. What this client has
+  instead is a property of its own
+  REPLIES: every approval the server asks for is answered `abort`, so a turn
+  that tries to run a command or write a patch is refused rather than confined.
+  The working directory (`preflight.resolve_working_dir`, the same setting the
+  other seat reads) is not confinement either — `cwd` chooses where a process
+  starts and refuses nothing. So: a seat whose containment is a refusal, not a
+  sandbox. `codex_cli` is the seat with a preflighted policy.
 * **It does not read stderr.** The child's stderr goes to `DEVNULL`. Partly
   because an undrained pipe deadlocks a chatty server, and partly because the
   point of the exercise is to classify failures from protocol fields
@@ -124,8 +128,8 @@ class SubprocessAppServer:
         # THE SAME resolution the `codex exec` seat uses
         # (`preflight.resolve_working_dir`), never a second copy of the rule:
         # both seats read one `codex.working_dir`, and a default that meant one
-        # directory here and another there would be a confinement claim about a
-        # path only one of them uses. Unset is a dedicated empty directory
+        # directory here and another there would be a claim about a path only
+        # one of them uses. Unset is a dedicated empty directory
         # outside the checkout — not the home directory, which codex declines
         # to run in unless it is trusted, and trusting it would trust
         # everything the operator owns.
