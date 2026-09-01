@@ -21,10 +21,12 @@ Three things this deliberately does NOT do:
   a restarted loop starts a new thread. Durability across restarts is codex-03.
 * **It does not claim a sandbox.** No preset is selected, named or enforced.
   Containment here is the same containment the subprocess adapter states and
-  can prove: the server runs with `cwd` outside the checkout, and every
-  approval the server asks for is answered `abort`, so a turn that tries to run
-  a command or write a patch is refused rather than confined. That is a
-  property of this client's replies, not of a flag whose name nobody verified.
+  can prove: the server runs in the dedicated directory outside the checkout
+  that `preflight.resolve_working_dir` resolves — the same one that seat uses,
+  from the same setting — and every approval the server asks for is answered
+  `abort`, so a turn that tries to run a command or write a patch is refused
+  rather than confined. That is a property of this client's replies, not of a
+  flag whose name nobody verified.
 * **It does not read stderr.** The child's stderr goes to `DEVNULL`. Partly
   because an undrained pipe deadlocks a chatty server, and partly because the
   point of the exercise is to classify failures from protocol fields
@@ -51,6 +53,7 @@ from typing import Any, Callable, Protocol
 
 from ..errors import BrowserError, ResponseTimeoutError, SessionLostError
 from . import wire
+from .preflight import ensure_working_dir, resolve_working_dir
 from .protocol_errors import (
     DEFAULT_QUOTA_ERROR_CODES,
     DEFAULT_RATE_LIMIT_ERROR_CODES,
@@ -118,11 +121,15 @@ class SubprocessAppServer:
         env: dict | None = None,
     ):
         self._command = tuple(command)
-        # Default to the user's home, never the repository: the reviewer's
-        # prompt is self-contained, so it needs no filesystem, and a cwd
-        # outside the checkout is a containment that can be stated without
-        # knowing any sandbox flag's name.
-        self._cwd = Path(cwd) if cwd else Path.home()
+        # THE SAME resolution the `codex exec` seat uses
+        # (`preflight.resolve_working_dir`), never a second copy of the rule:
+        # both seats read one `codex.working_dir`, and a default that meant one
+        # directory here and another there would be a confinement claim about a
+        # path only one of them uses. Unset is a dedicated empty directory
+        # outside the checkout — not the home directory, which codex declines
+        # to run in unless it is trusted, and trusting it would trust
+        # everything the operator owns.
+        self._cwd = resolve_working_dir(cwd)
         self._env = env
         self._proc: subprocess.Popen | None = None
         self._lines: queue.Queue = queue.Queue()
@@ -137,6 +144,11 @@ class SubprocessAppServer:
     def start(self) -> None:
         if self._proc is not None:
             return
+        # Before the process, for the reason `SubprocessCodexRunner.run` does
+        # it: `Popen` raises `FileNotFoundError` for a missing cwd exactly as it
+        # does for a missing binary, and the message below would then name the
+        # wrong one.
+        cwd = ensure_working_dir(self._cwd)
         try:
             # An argv list, never a shell.
             self._proc = subprocess.Popen(
@@ -150,7 +162,7 @@ class SubprocessAppServer:
                 text=True,
                 encoding="utf-8",
                 bufsize=1,
-                cwd=str(self._cwd),
+                cwd=str(cwd),
                 env=self._env,
             )
         except FileNotFoundError as exc:

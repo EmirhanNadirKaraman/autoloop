@@ -2,9 +2,19 @@
 
 Checks configuration, state dir, lock, git identity, branch policy, worker
 isolation, controlled hooks directories, publisher configuration, publisher
-URL snapshot drift, provider registration, the Codex reviewer's binary and
-confinement, and that each configured seat's adapter opens. It NEVER submits
-a message.
+URL snapshot drift, provider registration, the Codex reviewer's binary,
+confinement and one real trivial invocation, and that each configured seat's
+adapter opens. It NEVER touches the reviewer conversation: nothing here
+submits a review, reads one back, or reconciles one.
+
+THE ONE PROCESS IT STARTS, since prov-02 (2026-09-01), is the codex preflight
+— `codex.preflight.preflight_codex`, a fixed one-line prompt run from the
+configured working directory, bounded by its own short deadline. That is not
+the reviewer conversation and carries no review packet, and it is here because
+the question "could this loop use codex_cli right now" was previously answered
+by two checks that could both pass on a machine where every review would fail:
+the shipped `working_dir` default was the home directory, and codex refuses to
+run there.
 
 NO BROWSER CHECKS since brw-19c (2026-08-31). Until then this command probed
 the CDP endpoint, imported playwright, and — for the literal provider name
@@ -34,6 +44,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .codex.preflight import (
+    PREFLIGHT_STATUSES,
+    default_working_dir,
+    preflight_codex,
+    resolve_working_dir,
+)
 from .config import AutoloopConfig
 from .conversation import available_providers, create_conversation
 from .errors import AutoloopError, BrowserError, LoginExpiredError
@@ -136,10 +152,17 @@ def _default_probe_cdp(url: str, timeout: float = 3.0) -> str:
 
 @dataclass
 class DoctorProbes:
-    #: The ONE external boundary left. `probe_cdp` and `playwright_present`
-    #: were fields here until brw-19c and are gone with the checks that read
-    #: them: a probe nothing calls is a knob that suggests a check exists.
+    #: `probe_cdp` and `playwright_present` were fields here until brw-19c and
+    #: are gone with the checks that read them: a probe nothing calls is a knob
+    #: that suggests a check exists.
     conversation_factory: Callable | None = None  # defaults to the real provider
+    #: The codex preflight (prov-02). Injectable because the default LAUNCHES A
+    #: REAL BINARY from a real directory — the one boundary in this file that
+    #: costs an invocation — and the suite must never do that: codex is not
+    #: installed everywhere the tests run, and where it is, a doctor test would
+    #: spend the operator's allowance. Takes a `CodexConfig`, returns a
+    #: `preflight.PreflightResult`.
+    codex_preflight: Callable | None = None  # defaults to preflight_codex
 
 
 def run_doctor(
@@ -400,10 +423,12 @@ def run_doctor(
     # and `browser.project_url` are still ACCEPTED by the loader — see
     # `config.BrowserConfig` — they are simply no longer graded.
 
-    # 13d. Codex reviewer, when either seat uses it. The live probe below
-    # constructs the adapter but cannot prove the binary works without spending
-    # quota, so what is checkable here is checked here: is it on PATH, and is
-    # it confined.
+    # 13d. Codex reviewer, when either seat uses it. Four rows, and the fourth
+    # is the one that answers the question the other three only circle: the
+    # live probe below constructs the ADAPTER, `codex_command` resolves the
+    # BINARY, `codex_workdir` grades a PATH — and all three passed on a machine
+    # where every review would have failed, because the shipped `working_dir`
+    # default was the home directory and codex declines to run there.
     codex_seats = {provider, config.conversation.fallback_provider} & {"codex_cli"}
     if codex_seats:
         binary = config.codex.command[0] if config.codex.command else ""
@@ -417,30 +442,108 @@ def run_doctor(
                 f"'{binary}' is not on PATH — install the Codex CLI and sign in "
                 "with `codex login`, or change codex.command",
             )
-        workdir = config.codex.working_dir or str(Path.home())
-        inside_repo = _is_within(Path(workdir), repo_root)
-        add(
-            "codex_workdir",
-            "fail" if inside_repo else "ok",
-            f"{workdir}"
-            + (
-                " — INSIDE the repository. The reviewer's prompt is "
+        # The SAME resolution the runners use, so this row can never grade a
+        # directory the reviewer does not get (`codex.preflight`).
+        workdir = resolve_working_dir(config.codex.working_dir)
+        is_default = workdir == default_working_dir()
+        inside_repo = _is_within(workdir, repo_root)
+        exists = workdir.is_dir()
+        if inside_repo:
+            workdir_usable = False
+            add(
+                "codex_workdir",
+                "fail",
+                f"{workdir} — INSIDE the repository. The reviewer's prompt is "
                 "self-contained and it must not be able to read the checkout; "
-                "set codex.working_dir outside it."
-                if inside_repo
-                else " (outside the repository)"
-            ),
-        )
+                "set codex.working_dir outside it.",
+            )
+        elif exists:
+            add(
+                "codex_workdir",
+                "ok",
+                f"{workdir} (outside the repository"
+                + (", autoloop's dedicated directory" if is_default else ", configured")
+                + ")",
+            )
+            workdir_usable = True
+        elif is_default:
+            # Absent and ours: the preflight below creates it, so this is a
+            # statement about what is about to happen, not a fault.
+            add(
+                "codex_workdir",
+                "ok",
+                f"{workdir} does not exist yet — autoloop's dedicated reviewer "
+                "directory, created on first use. Trust it once (`cd` there and "
+                "run `codex`) or codex will refuse to run in it.",
+            )
+            workdir_usable = True
+        else:
+            workdir_usable = False
+            add(
+                "codex_workdir",
+                "fail",
+                f"codex.working_dir points at {workdir}, which does not exist. "
+                "Create it, or correct the setting — a configured directory is "
+                "never created for you, so a typo cannot become the place your "
+                "reviews run.",
+            )
         if not config.codex.sandbox_args:
             add(
                 "codex_sandbox",
                 "warn",
-                "codex.sandbox_args is empty — the reviewer is confined only by "
-                "running outside the repository. Add the CLI's read-only "
-                "sandbox flags once you have confirmed their names.",
+                "codex.sandbox_args is empty, which is the shipped policy and "
+                "not an oversight: confinement rests on codex.working_dir "
+                "ALONE — a dedicated directory outside the checkout, with a "
+                "self-contained prompt — because no flag name can be verified "
+                "from this repository. To add one, `--sandbox read-only` is the "
+                "confinement this loop wants if your build spells it that way "
+                "(`codex exec --help`); the preflight below runs whatever is "
+                "set here, so a flag this build rejects fails that check "
+                "instead of the first review.",
             )
         else:
-            add("codex_sandbox", "ok", " ".join(config.codex.sandbox_args))
+            add(
+                "codex_sandbox",
+                "ok",
+                " ".join(config.codex.sandbox_args)
+                + " — passed to every invocation, including the preflight below",
+            )
+
+        # 13e. THE preflight: one trivial invocation, from that directory, with
+        # those flags. Not attempted when the directory is already refused
+        # above — running the reviewer inside the checkout to find out whether
+        # it runs would be doing the thing being diagnosed — and `fail`, never
+        # `skip`, when it is not attempted: "not asked" is not evidence that
+        # the transport works, which is the fail-open the removed `cdp` skip
+        # was.
+        if not workdir_usable:
+            add(
+                "codex_preflight",
+                "fail",
+                "not attempted — the working directory is unusable; see the "
+                "'codex_workdir' check above",
+            )
+        else:
+            probe = probes.codex_preflight or preflight_codex
+            try:
+                outcome = probe(config.codex)
+                status, detail = outcome.status, outcome.detail
+            except Exception as exc:  # noqa: BLE001 - a sweep reports, never raises
+                status, detail = (
+                    "fail",
+                    f"the codex preflight could not be run, so nothing was "
+                    f"verified: {type(exc).__name__}: {exc}",
+                )
+            if status not in PREFLIGHT_STATUSES:
+                # `exit_code` only looks for "fail", so an unrecognised status
+                # would be counted as a pass. Refused rather than passed
+                # through, and the original is quoted so the fault is visible.
+                status, detail = (
+                    "fail",
+                    f"the codex preflight returned an unrecognised status "
+                    f"{status!r}: {detail}",
+                )
+            add("codex_preflight", status, detail)
 
     # 14. live conversation checks: the adapter opens and reports. Never
     # submits.

@@ -175,17 +175,44 @@ class CodexConfig:
     #: Base invocation. Split from `sandbox_args` so the two can be reasoned
     #: about separately — this is "how do I run it", that is "what may it do".
     command: tuple[str, ...] = ("codex", "exec")
-    #: Flags that confine the reviewer. Deliberately NOT given a permissive
-    #: default: the flag names cannot be verified from this repository, and
-    #: guessing them would produce a setting that looks like a control and is
-    #: not one. `doctor` warns while this is empty. The reviewer is confined
-    #: regardless by running outside the checkout (see `working_dir`).
+    #: Extra flags handed to every invocation, between `command` and the
+    #: prompt. EMPTY BY POLICY, which is a different statement from the empty it
+    #: used to be: **confinement rests on `working_dir` alone**, and this key is
+    #: the operator's way to add to that, not the thing that provides it.
+    #:
+    #: The reason is unchanged in substance and stated in its current form: the
+    #: flag names are not verifiable from this repository or in CI — no codex
+    #: binary runs here — and a flag nobody in this tree can execute is a
+    #: setting that looks like a control without being one. What a wrong value
+    #: costs is now bounded instead of being taken on trust: `doctor`'s
+    #: preflight passes exactly these flags to a real invocation, so a flag this
+    #: build rejects fails the check rather than the first review.
+    #:
+    #: Two values worth knowing, neither of them defaulted:
+    #: `--sandbox read-only` (the confinement this loop wants, if your build
+    #: spells it that way — check `codex exec --help`) and
+    #: `--skip-git-repo-check` (accept an untrusted working directory, which
+    #: switches codex's own guard off; trusting the directory once is better).
+    #: `doctor` warns while this is empty and names both.
     sandbox_args: tuple[str, ...] = ()
     timeout_seconds: float = 900.0
-    #: Where the CLI runs. Empty means the user's home directory — anywhere but
-    #: the repository. The prompt is self-contained, so the reviewer needs no
-    #: filesystem access, and this containment holds without depending on a
-    #: sandbox flag's name.
+    #: Where the CLI runs — THE confinement, so it is the one setting here that
+    #: is load-bearing. Empty means the dedicated, empty directory
+    #: `~/.autoloop/codex-workdir` (`codex.preflight.resolve_working_dir`, which
+    #: `doctor` and both transports share so the graded path is the used one).
+    #:
+    #: It used to mean the HOME DIRECTORY, and that default could not work:
+    #: codex declines to run outside a trusted directory, and `~` is not one
+    #: (measured 2026-08-17 — `Not inside a trusted directory and
+    #: --skip-git-repo-check was not specified`). Trusting `~` to fix it would
+    #: have handed the reviewer every file the operator owns; one empty
+    #: directory, trusted once, keeps codex's own check as a live guard.
+    #:
+    #: The prompt is self-contained, so the reviewer needs no filesystem at all,
+    #: and containment stated this way holds without depending on a sandbox
+    #: flag's name. Never point it inside the repository — `doctor` fails if it
+    #: is. A CONFIGURED directory that does not exist is refused rather than
+    #: created, so a typo does not become a new directory nobody meant.
     working_dir: str = ""
     #: Substrings that identify a SPENT ALLOWANCE in a FAILED invocation — the
     #: window is used up and waiting does not help, so the loop parks or hands
