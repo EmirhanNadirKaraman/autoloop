@@ -24,7 +24,17 @@ naming a path the commit does not hold. Being on disk is not the claim a stamp
 makes: a file can be untracked, staged and never committed, or deleted in HEAD
 and restored locally, and all three are equally present to the working tree. So
 a record is stamped AFTER the thing it points at has been committed, and every
-refusal leaves the tree exactly as it found it.
+refusal of the record contract happens before the first write and leaves the tree
+exactly as it found it.
+
+Each record is then REPLACED — a temp file beside it, renamed over it — so a
+record is its old text or its stamped text and never half of either. Two things
+that follow are not before-the-write and are not pretended to be: a write that
+fails part-way down the list, and the full re-load that confirms what was
+written. Either can leave the run refused with some records stamped and the rest
+on the sentinel. All of them are whole records, the tree still loads, and
+`stamp` writes only what still carries the sentinel — so the answer is always to
+run it again.
 
 **`last_verified_commit` is never typed by hand.** A write-capable agent in this
 loop has no shell and is handed no sha, so a sha in a record an agent wrote

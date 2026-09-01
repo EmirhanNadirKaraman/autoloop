@@ -76,7 +76,19 @@ conversation, a round summary or an implementation write-up.
 * Stamping verifies every pointer BEFORE it writes, verifies the HEAD it read
   like any other commit, and touches only records still on the sentinel — which
   is what makes it re-runnable and keeps a stamp from asserting a verification
-  nobody performed. Every refusal it can raise happens before the first write.
+  nobody performed. Every CONTRACT refusal — a malformed record, an unresolvable
+  stamp or HEAD, an unlistable tree, a pointer the commit does not hold, a file
+  that changed under the run — happens before the first write. Two things do
+  not, and are stated rather than implied: a write that fails part-way down the
+  list, and the full re-load that confirms what was written. See the failure mode
+  below.
+* **A record is replaced, never overwritten in place.** `Path.write_text`
+  truncates the target and then writes into it, so a failure part-way through
+  would leave a file that is neither record; building the text in memory first
+  changes nothing, because the truncation happens on the filesystem afterwards.
+  Each record is written to a temp file beside it, fsync'd, and renamed over the
+  target, so a record is its pre-run text or its stamped text and never a
+  truncation of either.
 
 ## Data flow
 
@@ -91,8 +103,10 @@ reads HEAD through the gateway and resolves it — keeping the tree id the commi
 object already gave it rather than spending a second `rev-parse` on a question
 whose failure mode it just settled — lists that tree once, checks every pending
 record's pointers against it, re-reads every pending file to confirm the
-sentinel is still there, rewrites the single metadata line the parser located,
-and re-loads the tree to confirm what it wrote.
+sentinel is still there, rewrites the single metadata line the parser located —
+each record through a temp file renamed over it — and re-loads the whole tree to
+confirm what it wrote. That last load is deliberately not narrowed to the files
+this run touched: a stamp only its own writer would accept is not a measurement.
 
 ## Tests and decisions
 
@@ -146,6 +160,17 @@ and re-loads the tree to confirm what it wrote.
   files steps over it in silence — the same evasion as the dotted name, by a
   different route. A link that resolves is refused too, because a record
   validated as whatever it points at today is a different record tomorrow.
+* **A stamping run that dies with writes already on disk.** The per-file write
+  is atomic; the SET is not, and the read-back that follows it is a full load
+  that can refuse for any reason the loader can — git becoming unavailable
+  between the two, a record that turned unreadable, a record that disappeared.
+  So a run can end in a refusal with some records stamped and the rest on the
+  sentinel. Every one of those files is a whole record, the tree still loads,
+  and re-running stamps only what still carries the sentinel, which is what
+  makes retrying safe rather than merely idempotent on a healthy tree. A
+  process killed between writing the temp file and renaming it leaves that temp
+  behind; it is named so the loader reports it as ignored rather than refusing
+  the tree as a foreign file, so a crash cannot make the context unloadable.
 * **A vacuous record.** Required sections and non-empty pointers are what stop a
   placeholder from passing; they cannot stop a record whose prose is wrong, and
   no automated check will.

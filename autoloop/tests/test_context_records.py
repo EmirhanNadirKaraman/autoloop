@@ -49,6 +49,20 @@ ONE CLAIM, in four parts, and each part is here because its failure is SILENT:
    other direction is just as wrong: a path the commit holds stamps fine even
    after the worktree loses it.
 
+5. **A record is REPLACED, never overwritten in place, and the run says which of
+   its refusals can land after a write.** `Path.write_text` truncates the target
+   before it writes, so a failure part-way through leaves a file that is neither
+   record — and building the string in memory first does not help, because the
+   truncation happens on the filesystem afterwards. The write protocol is
+   therefore temp file plus `os.replace`, and the tests below fail it at both
+   points (the fsync and the rename) and assert the target is byte-identical to
+   what it was. The set is NOT atomic and the read-back is NOT free of refusals,
+   so both are pinned as they actually behave: a mid-set failure leaves whole
+   records on both sides and a tree that still LOADS, and a repository that goes
+   away between the write and the read-back raises with the file already changed
+   — each followed by the re-run that converges, which is what makes stamping
+   safe to retry rather than merely idempotent on a happy path.
+
 Fixture-first, with the real-repository claims at the bottom — the fixtures say
 WHY each shape is refused, and the bottom section says the rule survives contact
 with this checkout's own records.
@@ -1294,6 +1308,232 @@ def test_stamping_refuses_when_an_already_stamped_record_no_longer_resolves(tmp_
     assert UNKNOWN_SHA in (tmp_path / rel).read_text(encoding="utf-8")
 
 
+# ---- the write protocol, and the refusals that CAN land after a write ---------
+#
+# `Path.write_text` truncates the target and then writes into it, so a failure
+# part-way through leaves a record that is neither the old one nor the new one.
+# Building the text in memory first does not prevent that — the truncation
+# happens on the filesystem, after the string is complete — so the claim under
+# test is the PROTOCOL: a finished temp file renamed over the target. Each test
+# here fails a real step of it and then asserts what the tree holds, including
+# the re-run, because "raises" alone says nothing about whether the run can be
+# retried.
+
+
+def leftovers(root: Path) -> tuple[str, ...]:
+    """Every non-Markdown file under the context tree — a temp file a killed run
+    left behind, and nothing else.
+
+    Swept with `rglob("*")` and filtered in Python for the reason
+    `stamp_refusal` states: a constrained glob literal in evaluated test code
+    makes this file a declared reader of every document it matches.
+    """
+    base = root / CONTEXT_DIR
+    return tuple(
+        sorted(
+            path.name
+            for path in base.rglob("*")
+            if path.is_file() and not path.name.lower().endswith(".md")
+        )
+    )
+
+
+def two_pending(root: Path) -> str:
+    """A repository with TWO pending records, whose write order is known.
+
+    Records load sorted by path, so `features/two.md` is written before
+    `project.md` — which is what lets a failure be aimed at the SECOND write.
+    """
+    make_repo_from_template(root)
+    build_tree(
+        root,
+        {
+            "features/two.md": record_text(
+                id="ctx-fixture-two", source_paths="README.md", test_paths="README.md"
+            ),
+            "project.md": project_record(),
+        },
+    )
+    return "docs/context/features/two.md"
+
+
+class _FlakyGit:
+    """A real gateway that stops answering the moment `mute` is set.
+
+    The one failure that cannot be moved before the writes: a repository that
+    becomes unavailable BETWEEN the rewrite and the read-back that confirms it.
+    """
+
+    def __init__(self, real: GitGateway):
+        self._real = real
+        self.mute = False
+
+    def _answer(self, name: str, *args):
+        if self.mute:
+            raise GitError("git " + name + " failed: the repository went away mid-run")
+        return getattr(self._real, name)(*args)
+
+    def head_sha(self) -> str:
+        return self._answer("head_sha")
+
+    def read_commit(self, oid: str) -> dict:
+        return self._answer("read_commit", oid)
+
+    def object_exists(self, oid: str) -> bool:
+        return self._answer("object_exists", oid)
+
+    def tree_entries(self, tree: str) -> dict:
+        return self._answer("tree_entries", tree)
+
+
+def test_a_successful_run_leaves_no_temp_file_behind(tmp_path):
+    stampable(tmp_path)
+    assert stamp_records(tmp_path).stamped == ("ctx-fixture-one",)
+    assert leftovers(tmp_path) == ()
+
+
+@pytest.mark.parametrize("victim", ["open", "fsync", "replace"])
+def test_a_write_that_fails_leaves_the_record_exactly_as_it_was(tmp_path, monkeypatch, victim):
+    """THE claim `write_text` could not make. Every one of the three steps is
+    failed here: `open` is the read-only tree, `fsync` is where a full disk or a
+    deferred I/O error surfaces, `replace` is the rename itself, and a failure at
+    any of them must leave the record byte-identical to what it was — not
+    truncated, not half a metadata block. The temp file is cleaned up on the way
+    out (and never created in the `open` case, which is also the one that walks
+    the unlink-a-file-that-is-not-there branch), so a failed run leaves nothing
+    behind either.
+
+    `open` is patched on the MODULE and not on `builtins`: a global lookup
+    precedes builtins, so the failure is scoped to the writer under test instead
+    of to every file the interpreter opens while it runs.
+    """
+    rel = stampable(tmp_path)
+    before = (tmp_path / rel).read_text(encoding="utf-8")
+
+    def explode(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    if victim == "open":
+        monkeypatch.setattr(context_records, "open", explode, raising=False)
+    else:
+        monkeypatch.setattr(context_records.os, victim, explode)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "unwritable_record"
+    assert "ctx-fixture-one" in str(excinfo.value)
+    assert (tmp_path / rel).read_text(encoding="utf-8") == before
+    assert leftovers(tmp_path) == ()
+
+    monkeypatch.undo()
+    assert stamp_records(tmp_path).stamped == ("ctx-fixture-one",)
+
+
+def test_a_write_that_fails_midway_leaves_whole_records_and_a_tree_that_still_loads(
+    tmp_path, monkeypatch
+):
+    """The set is NOT written atomically, and this is that stated as behaviour
+    rather than argued away: the first record carries the sha, the second still
+    carries the sentinel, BOTH are complete records the loader accepts, and the
+    re-run finishes the job. A partial stamp must not brick the tree — if it did,
+    the only recovery from a full disk would be hand-editing records."""
+    rel = two_pending(tmp_path)
+    head = head_of(tmp_path)
+    real_write = context_records._write_atomically
+    written: list[Path] = []
+
+    def failing_write(file, text):
+        if written:
+            raise OSError(28, "No space left on device")
+        written.append(file)
+        real_write(file, text)
+
+    monkeypatch.setattr(context_records, "_write_atomically", failing_write)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "unwritable_record"
+    assert "ctx-fixture-one" in str(excinfo.value)
+    assert "ctx-fixture-two" in str(excinfo.value)
+
+    stamped_text = (tmp_path / rel).read_text(encoding="utf-8")
+    assert parse_record(stamped_text, rel).last_verified_commit == head
+    pending_text = (tmp_path / "docs/context/project.md").read_text(encoding="utf-8")
+    assert parse_record(pending_text, "docs/context/project.md").last_verified_commit == UNSTAMPED
+    assert leftovers(tmp_path) == ()
+    assert len(load_context_records(tmp_path).records) == 2
+
+    monkeypatch.undo()
+    second = stamp_records(tmp_path)
+    assert second.stamped == ("ctx-fixture-one",)
+    assert second.already == ("ctx-fixture-two",)
+
+
+def test_git_going_away_after_the_write_raises_with_the_file_already_changed(
+    tmp_path, monkeypatch
+):
+    """The read-back is a FULL load, so it can refuse for any reason the loader
+    can — with the writes already on disk. That is the half of the refusal
+    surface that cannot be moved earlier, and pretending otherwise is what this
+    round is correcting. What must hold instead: the file it wrote is a whole,
+    parseable record carrying the sha, and a later run over a working repository
+    writes nothing and reports it as `already`."""
+    rel = stampable(tmp_path)
+    head = head_of(tmp_path)
+    flaky = _FlakyGit(gateway_for(tmp_path))
+    real_write = context_records._write_atomically
+
+    def write_then_lose_git(file, text):
+        real_write(file, text)
+        flaky.mute = True
+
+    monkeypatch.setattr(context_records, "_write_atomically", write_then_lose_git)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path, git=flaky)
+    assert excinfo.value.code == "unresolvable_commit"
+
+    text = (tmp_path / rel).read_text(encoding="utf-8")
+    assert parse_record(text, rel).last_verified_commit == head
+    assert leftovers(tmp_path) == ()
+
+    monkeypatch.undo()
+    second = stamp_records(tmp_path)
+    assert second.stamped == ()
+    assert second.already == ("ctx-fixture-one",)
+
+
+def test_a_record_that_disappears_after_being_written_is_refused_by_name(tmp_path, monkeypatch):
+    """The read-back looks its records up by id, and a file that is gone by then
+    resolves to nothing. Refused by name — a `KeyError` out of a validator says
+    the validator broke rather than that the tree did."""
+    rel = stampable(tmp_path)
+    real_write = context_records._write_atomically
+
+    def write_then_delete(file, text):
+        real_write(file, text)
+        file.unlink()
+
+    monkeypatch.setattr(context_records, "_write_atomically", write_then_delete)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "stamp_vanished"
+    assert "ctx-fixture-one" in str(excinfo.value)
+    assert not (tmp_path / rel).exists()
+
+
+def test_a_temp_file_left_by_a_killed_run_is_reported_rather_than_refusing_the_tree(tmp_path):
+    """The one artifact this protocol can leave behind — a process killed between
+    creating the temp file and renaming it. Its NAME decides what happens next:
+    `project.md.tmp` would be a `foreign_file` and a crashed stamp would leave the
+    context tree unloadable until a human deleted it, while the dotted,
+    non-Markdown name it actually uses is stepped over and REPORTED."""
+    stampable(tmp_path)
+    stale = context_records._temp_for(tmp_path / "docs" / "context" / "project.md")
+    stale.write_text("half a rec", encoding="utf-8")
+    repository = load_context_records(tmp_path)
+    assert leftovers(tmp_path) == (stale.name,)
+    assert repository.ignored == ("docs/context/" + stale.name,)
+    assert [record.id for record in repository.records] == ["ctx-fixture-one"]
+
+
 # ---- the entry point ----------------------------------------------------------
 
 
@@ -1487,6 +1727,18 @@ def test_the_context_tree_was_not_added_to_the_always_writable_tracker_paths():
     assert len(tasks.TRACKER_PATHS) == 6
     assert not any(entry.startswith(CONTEXT_DIR) for entry in tasks.TRACKER_PATHS)
     assert not any(entry.startswith("docs/context") for entry in tasks.TRACKER_PATHS)
+
+
+def test_no_record_is_written_through_a_call_that_truncates_it_first():
+    """A source-level claim beside the behavioural ones, because the failure it
+    guards against is a one-word regression: `write_text` and `open(path, "w")`
+    on a RECORD truncate the target before writing, which is exactly the
+    half-written file the temp-plus-rename protocol exists to prevent. The
+    behaviour is pinned above; this pins that nobody reintroduced the shortcut
+    beside it."""
+    source = (REPO_ROOT / "autoloop" / "context_records.py").read_text(encoding="utf-8")
+    assert "os.replace(" in source
+    assert ".write_text(" not in source
 
 
 def test_the_module_reaches_the_registrys_validator_rather_than_defining_one():
