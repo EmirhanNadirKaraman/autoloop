@@ -466,7 +466,10 @@ DOCS_ONLY_SELECTED = 20
 #: for the same reason and with the same effect: still the same 20.
 #: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01): it
 #: fakes the invocation boundary and reads no tracker, so still the same 20.
-SUITE_SIZE = 105
+#: 105 -> 106 when ctx-02 added `test_context_records.py` (2026-09-01): it reads
+#: `docs/context/`, never a tracker, and names no tracker path in evaluated
+#: code, so still the same 20.
+SUITE_SIZE = 106
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

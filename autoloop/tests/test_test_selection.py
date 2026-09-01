@@ -588,7 +588,12 @@ FLOOR_AFTER = 16
 #: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01). The
 #: DENOMINATOR again: it fakes the invocation boundary rather than spawning
 #: one, and reads no tracker, so 20 and 24 are unchanged once more.
-SUITE_SIZE = 105
+#: 105 -> 106 when ctx-02 added `test_context_records.py` (2026-09-01). The
+#: DENOMINATOR again: it builds real repositories but spawns no interpreter, and
+#: it deliberately spells no tracker path in evaluated code (see that file's
+#: `test_the_context_tree_was_not_added_to_the_always_writable_tracker_paths`),
+#: so 20 and 24 are unchanged.
+SUITE_SIZE = 106
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
