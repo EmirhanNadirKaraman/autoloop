@@ -10,9 +10,17 @@ python3 -m autoloop.context_records stamp
 ```
 
 `check` validates the whole tree and reports any record whose source or test
-paths have moved. `stamp` does the same and then writes this repository's HEAD
-into every record still carrying the `UNSTAMPED` sentinel, resolving it through
-`GitGateway` — the way every other component in the package asks git.
+paths have moved in the CHECKOUT. `stamp` does the same and then writes this
+repository's HEAD into every record still carrying the `UNSTAMPED` sentinel,
+resolving it through `GitGateway` — the way every other component in the package
+asks git.
+
+Before it writes, `stamp` lists what that COMMIT contains and refuses any record
+naming a path the commit does not hold. Being on disk is not the claim a stamp
+makes: a file can be untracked, staged and never committed, or deleted in HEAD
+and restored locally, and all three are equally present to the working tree. So
+a record is stamped AFTER the thing it points at has been committed, and every
+refusal leaves the tree exactly as it found it.
 
 **`last_verified_commit` is never typed by hand.** A write-capable agent in this
 loop has no shell and is handed no sha, so a sha in a record an agent wrote
@@ -52,4 +60,6 @@ A record POINTS at the document that carries the detail — `docs/SUMMARY.md`
    that no longer exist.
 4. Add the row above. A record the index does not list, by id and by path, is
    refused.
-5. Leave `last_verified_commit: UNSTAMPED` and let `stamp` write it.
+5. Leave `last_verified_commit: UNSTAMPED` and let `stamp` write it — after the
+   paths the record names are committed, since `stamp` checks them against the
+   commit it is about to write and refuses a pointer that only exists on disk.

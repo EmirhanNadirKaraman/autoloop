@@ -61,13 +61,21 @@ conversation, a round summary or an implementation write-up.
   about every non-sentinel value and refuses the record by name when the object
   database does not hold it (`unknown_commit`), when it holds something that is
   not a commit, or when git could not answer at all (`unresolvable_commit`).
-  That last direction is the opposite of `cli._candidate_is_retired`'s, on
-  purpose: accepting a stamp because the repository was unreadable would pass
-  exactly when nothing could check it.
+  That last direction is chosen against `cli._candidate_is_retired`'s and
+  `orchestrator._commit_presence`'s, on purpose: there an unanswered question
+  withholds a DESTRUCTIVE act, so silence is safe; here it would withhold a
+  REFUSAL, and accepting a stamp because the repository was unreadable would
+  pass exactly when nothing could check it.
+* **A stamp is verified against the commit it names.** Every pointer a pending
+  record carries must be in the TREE of the HEAD being written, enumerated with
+  `ls-tree -r` through the gateway — not merely present in the checkout, which
+  is equally true of an untracked file, one staged and never committed, and one
+  deleted in HEAD and restored on disk. Directories are matched too, because
+  `ls-tree -r` lists only blobs while an approved path may end in `/`.
 * Stamping verifies every pointer BEFORE it writes, verifies the HEAD it read
   like any other commit, and touches only records still on the sentinel — which
   is what makes it re-runnable and keeps a stamp from asserting a verification
-  nobody performed.
+  nobody performed. Every refusal it can raise happens before the first write.
 
 ## Data flow
 
@@ -78,9 +86,12 @@ git: every stamped record's commit. Cheapest first, so a tree that fails on
 shape never reaches a subprocess, and a tree with nothing stamped never builds a
 gateway. `stamp_records` loads that tree first (a malformed record, or one
 stamped to a commit nothing resolves, stops the run before anything is written),
-reads HEAD through the gateway and resolves it, checks every pending record's
-pointers, rewrites the single metadata line the parser located, and re-loads the
-tree to confirm what it wrote.
+reads HEAD through the gateway and resolves it — keeping the tree id the commit
+object already gave it rather than spending a second `rev-parse` on a question
+whose failure mode it just settled — lists that tree once, checks every pending
+record's pointers against it, re-reads every pending file to confirm the
+sentinel is still there, rewrites the single metadata line the parser located,
+and re-loads the tree to confirm what it wrote.
 
 ## Tests and decisions
 
@@ -104,6 +115,12 @@ tree to confirm what it wrote.
   loader asks git: a typed value that resolves to nothing is refused by name
   before anything reads the record, and one that happens to name a real commit
   is a review question, which is why a hand-typed sha is refused in review too.
+* **A pointer that exists only in the worktree.** A record written alongside the
+  code it describes names paths that are on disk and not yet in any commit, so
+  stamping it before that code is committed is refused (`unverifiable_record`)
+  rather than recorded as evidence HEAD does not hold. Write the record, commit
+  it with its subject, then stamp — which is the order the seeds in this tree
+  ship in, all on the sentinel.
 * **A stale stamp.** A record stays stamped to the commit it was verified at
   even as HEAD moves; that is the honest reading, but it means a stamp alone
   does not say the record is current. `check` reports moved pointers, and
@@ -111,6 +128,12 @@ tree to confirm what it wrote.
 * **A record hidden as navigation.** `README.md` and `index.md` are not parsed
   as records, so they are checked for the record fence instead — otherwise
   renaming a broken record would move it into the category nothing validates.
+* **A record hidden as a dotfile.** A leading dot is the one thing the contract
+  does not reach, because a record is a `.md` file the index lists and an
+  editor's droppings are not records. The loader RETURNS those names rather than
+  dropping them (`ContextRepository.ignored`) and `check` prints each one, so a
+  file under this tree that nothing validated is still said out loud. It is a
+  report and not a refusal: `.DS_Store` is not a broken record.
 * **A vacuous record.** Required sections and non-empty pointers are what stop a
   placeholder from passing; they cannot stop a record whose prose is wrong, and
   no automated check will.

@@ -32,6 +32,13 @@ script are all behaviour-changing files with no refused suffix, and that set is
 open-ended, so extending the list is not a fix. It swapped a hard control for an
 unenforceable heuristic.
 
+A deployment whose `.autoloop/config.toml` still names the withdrawn key is not
+refused. `config._migrate_retired_tracker_paths` runs BEFORE the unknown-key
+check, consumes `repo.tracker_paths` so it can never reach `RepoConfig`,
+discards the value so it can authorize nothing, and tells the operator both.
+"Not configurable" is therefore enforced by the loader, not by a config that
+fails to parse.
+
 ## How another repository declares its own
 
 By editing the constant. That is not a workaround: `autoloop/` is VENDORED into
