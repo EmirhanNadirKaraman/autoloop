@@ -112,6 +112,10 @@ from .inbox import (
     TaskInbox,
     apply_requests,
     audit_finding_suggestions,
+    decline_finding,
+    promote_finding,
+    read_audit_intake,
+    record_finding_already_done,
     create_draft,
     draft_blockers,
     create_draft_from_file,
@@ -3057,7 +3061,134 @@ def _run_intake(action, args, config: AutoloopConfig, intake_dir: Path, repo: Pa
         )
         return 0
 
+    if action == "audit":
+        return _run_intake_audit(args, config, intake_dir, repo)
+
     raise IntakeError(f"unknown intake action {action!r}")
+
+
+def _print_finding_row(state, finding) -> None:
+    assessment = state.assess(finding)
+    severity = finding.severity or "unlabelled"
+    print(f"{finding.qualified_id}  [{severity} -> priority {finding.priority}]")
+    print(f"  {finding.title}")
+    print(f"  dedupe: {assessment.note}")
+    if finding.affected_files:
+        print(f"  files: {', '.join(finding.affected_files)}")
+
+
+def _run_intake_audit(args, config: AutoloopConfig, intake_dir: Path, repo: Path) -> int:
+    """`intake audit` — drain an audit report into decisions.
+
+    Every subcommand here is safe at ANY moment, including mid-round, and none
+    of them takes a lock. That is deliberate and it is what makes the intake
+    repeatable rather than something you have to stop the loop for: `list` reads
+    files, `done` and `decline` write a ledger OUTSIDE the checkout, and
+    `promote` queues through `TaskInbox`, exactly like `add-task`. None of them
+    asks a model anything, so `refuse_if_round_running` — which exists for
+    questions addressed to a human — has nothing to guard here.
+
+    It never runs an audit and never changes what one looks for.
+    """
+    action = args.audit_cmd
+    state = read_audit_intake(
+        repo,
+        report_glob=config.repo.audit_report_glob,
+        tasks_file=config.tasks_file,
+        intake_dir=intake_dir,
+    )
+    summary = state.summary()
+
+    if action == "list":
+        print(
+            f"report: {summary['report'] or '(none)'} — {summary['total']} finding(s), "
+            f"{summary['outstanding']} OUTSTANDING"
+        )
+        print(
+            f"actioned: {summary['promoted']} promoted, "
+            f"{summary['already_done']} already done, {summary['declined']} declined"
+        )
+        if not state.report.read:
+            print(f"WARNING: no report was read — {state.report.note}")
+        if not state.ledger.read:
+            print(
+                f"WARNING: {state.ledger.note}. NOTHING was filtered, so every "
+                "finding below is listed whether or not it has been actioned, "
+                "and no outcome can be recorded until that file is repaired."
+            )
+        if not state.registry_read:
+            print(
+                f"WARNING: {config.tasks_file} was not read, so 'no task covers "
+                "this' is not asserted below and promotion is refused."
+            )
+        outstanding = state.outstanding()
+        if not outstanding:
+            print(
+                "\nnothing outstanding. That is a statement about "
+                f"{summary['report'] or 'the report'} only — it is not a claim "
+                "that the repository has no problems."
+            )
+            return 0
+        print("")
+        for finding in outstanding:
+            _print_finding_row(state, finding)
+        print(
+            "\nEvery one of these must become exactly one of three things:\n"
+            "  promote  `intake audit promote <id>`            — file a runnable task\n"
+            "  done     `intake audit done <id> --evidence …`  — the tree already satisfies it\n"
+            "  decline  `intake audit decline <id> --reason …` — deliberately not doing it\n"
+            "The dashboard panel shows what is OUTSTANDING, so a recorded "
+            "finding leaves it."
+        )
+        return 0
+
+    finding = state.finding(args.finding)
+    if action == "promote":
+        outcome = promote_finding(
+            finding,
+            state.assess(finding),
+            inbox=TaskInbox(inbox_dir_for(config.workers_root, config.state_dir)),
+            intake_dir=intake_dir,
+            app_test_root=config.repo.app_test_root,
+            app_validation=config.repo.app_validation,
+            loop_validation=config.audit.validation_commands,
+            task_id=args.task_id,
+            priority=args.priority,
+        )
+        print(f"{finding.qualified_id} -> PROMOTED: {outcome.detail}")
+        if outcome.spec:
+            print(f"  approved_paths: {', '.join(outcome.spec['approved_paths'])}")
+            for command in outcome.spec["validation"]:
+                print(f"  validation: {' '.join(command)}")
+            print(f"  queued: {outcome.queued}")
+        print(f"  recorded in {outcome.ledger_path}")
+        return 0
+
+    if action == "done":
+        outcome = record_finding_already_done(
+            finding,
+            repo=repo,
+            intake_dir=intake_dir,
+            checks=args.evidence,
+            note=args.note,
+        )
+        print(f"{finding.qualified_id} -> ALREADY DONE. No task was created.")
+        for line in outcome.evidence:
+            print(f"  re-read from the tree: {line}")
+        print(f"  recorded in {outcome.ledger_path}")
+        return 0
+
+    if action == "decline":
+        outcome = decline_finding(finding, intake_dir=intake_dir, reason=args.reason)
+        print(f"{finding.qualified_id} -> DECLINED: {outcome.detail}")
+        print(
+            f"  recorded in {outcome.ledger_path}. It stays declined across runs "
+            "and is off the dashboard panel; it comes back only if the finding "
+            "itself is re-worded."
+        )
+        return 0
+
+    raise IntakeError(f"unknown intake audit action {action!r}")
 
 
 def _cmd_urgent(args: argparse.Namespace) -> int:
@@ -7488,6 +7619,65 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("key", help="the suggestion key printed by `intake suggest`")
         if name == "accept":
             p.add_argument("--id", default="", help="draft name (defaults to the key)")
+
+    # ---- intake audit: a finding becomes a decision, never a panel row ------
+    # Safe at ANY moment, including mid-round: `list` reads files, `done` and
+    # `decline` write a ledger outside the checkout, and `promote` queues through
+    # the same `TaskInbox` `add-task` uses. None of them asks a model anything,
+    # so none of them is the `ask_user` hazard the three commands above guard
+    # against. It never runs an audit.
+    intake_audit = intake_sub.add_parser(
+        "audit",
+        help=(
+            "turn the newest audit report's findings into decisions: promoted, "
+            "already done, or declined"
+        ),
+    )
+    intake_audit_sub = intake_audit.add_subparsers(dest="audit_cmd", required=True)
+
+    audit_list = intake_audit_sub.add_parser(
+        "list", help="the OUTSTANDING findings, with what already covers each"
+    )
+    add_config(audit_list)
+
+    audit_promote = intake_audit_sub.add_parser(
+        "promote", help="file a runnable task for one finding (queues through the inbox)"
+    )
+    add_config(audit_promote)
+    audit_promote.add_argument("finding", help="the qualified finding id, e.g. db_migrations:db-01")
+    audit_promote.add_argument(
+        "--task-id", default="", help="task id to file it under (default: audit-<finding>)"
+    )
+    audit_promote.add_argument(
+        "--priority", type=int, default=None,
+        help="override the priority derived from the finding's severity",
+    )
+
+    audit_done = intake_audit_sub.add_parser(
+        "done", help="record that the tree already satisfies a finding (creates no task)"
+    )
+    add_config(audit_done)
+    audit_done.add_argument("finding", help="the qualified finding id")
+    audit_done.add_argument(
+        "--evidence", action="append", default=[], required=True,
+        help=(
+            "repeatable, and RE-READ from the tree before anything is recorded: "
+            "'path' (the file exists), 'path:text' (it contains text) or "
+            "'path:!text' (it no longer contains text)"
+        ),
+    )
+    audit_done.add_argument(
+        "--note", default="", help="one sentence on why the tree satisfies it"
+    )
+
+    audit_decline = intake_audit_sub.add_parser(
+        "decline", help="deliberately not doing this one, with a reason, durably"
+    )
+    add_config(audit_decline)
+    audit_decline.add_argument("finding", help="the qualified finding id")
+    audit_decline.add_argument(
+        "--reason", required=True, help="why this is not going to be done"
+    )
 
     intake.set_defaults(func=_cmd_intake)
 

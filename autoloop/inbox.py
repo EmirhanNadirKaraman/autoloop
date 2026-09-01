@@ -144,7 +144,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 #: Fields a CREATION request (`kind: "task"`, or no kind at all) may carry.
@@ -880,9 +880,34 @@ _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 _TASK_HEAD_RE = re.compile(r"^###[ \t]+task:[ \t]*(.*)$")
 #: A finding heading in a rendered audit report:
 #: `#### db_migrations:db-01 — Author a new baseline migration …`
+#:
+#: THE ONE SPELLING of "what is a finding id", used by `parse_audit_findings`
+#: below and — through it — by the dashboard panel as well. There used to be a
+#: second, narrower pattern in `dashboard.py` (`[a-z_]+:[a-z]+-\d+`), and two
+#: spellings is how the id an outcome is RECORDED under and the id a row is
+#: FILTERED on come to disagree: the ledger says the finding was declined and
+#: the panel keeps showing it, with nothing saying why.
+#:
+#: `#{2,4}` rather than `####`: `audit/report.py` writes level four, and the
+#: level is presentation. A heading that is a finding at one depth is a finding
+#: at another.
 _AUDIT_FINDING_RE = re.compile(
-    r"^####[ \t]+([A-Za-z0-9_]+:[A-Za-z0-9_.\-]+)[ \t]+[—–-][ \t]*(.+?)[ \t]*$"
+    r"^#{2,4}[ \t]+([A-Za-z0-9_]+:[A-Za-z0-9_.\-]+)[ \t]+[—–-][ \t]*(.+?)[ \t]*$"
 )
+#: A field bullet under a finding heading, as `audit/report._finding_block`
+#: writes them: `- files: \`a\`, \`b\``. Anything that is not one of these is
+#: skipped rather than guessed at — a wrapped `evidence` continuation line
+#: (`_merge_text` writes `  - also reported as x: …`) does not match, because
+#: the key must be one unbroken lowercase word immediately before the colon.
+_AUDIT_FIELD_RE = re.compile(r"^[ \t]*-[ \t]+([a-z_]+):[ \t]*(.*)$")
+#: The severity bullet, which is the ONE field `_finding_block` writes without a
+#: colon (`- severity **high**, confidence **confirmed**, domain \`x\``), so it
+#: cannot be read by the rule above. Matched on its own rather than by relaxing
+#: that rule, which would start harvesting prose as fields.
+_AUDIT_SEVERITY_RE = re.compile(r"^[ \t]*-[ \t]+severity[ \t]+\*{0,2}([a-z]+)", re.I)
+#: Any markdown heading — where a finding's field bullets STOP.
+_AUDIT_HEADING_RE = re.compile(r"^#{1,6}[ \t]")
+_BACKTICKED_RE = re.compile(r"`([^`]+)`")
 
 
 class IntakeError(Exception):
@@ -2082,13 +2107,23 @@ def _read_json(path: Path):
         return None
 
 
-def audit_finding_suggestions(repo: Path, report_glob: str, registry_text: str):
+def audit_finding_suggestions(
+    repo: Path, report_glob: str, registry_text: str, ledger: "AuditLedger | None" = None
+):
     """Findings in the rendered audit reports that the registry never mentions.
 
     "Unactioned" is answered mechanically and narrowly: the finding's qualified
     id does not appear anywhere in `tasks.json`. That is checkable by the
     operator in one grep, which is the property that matters — a cleverer test
     would be one they could not verify.
+
+    `ledger` is the audit-intake record (`load_audit_intake`). A finding already
+    PROMOTED, recorded ALREADY DONE or DECLINED there is not offered again:
+    without that, declining a finding through `intake audit decline` and being
+    offered the same finding by `intake suggest` the next minute is the same
+    "I said no and it came back" the decline ledger exists to stop, arrived at
+    through the other door. `None` means "no ledger was read", and nothing is
+    filtered — which is the honest answer, not an empty one.
     """
     out: list[WorkSuggestion] = []
     root = Path(repo)
@@ -2111,6 +2146,10 @@ def audit_finding_suggestions(repo: Path, report_glob: str, registry_text: str):
                 continue
             qualified, headline = match.group(1), match.group(2)
             if qualified in registry_text:
+                continue
+            if ledger is not None and ledger.record_for(
+                AuditFinding(qualified_id=qualified, title=_clean_report_text(headline))
+            ):
                 continue
             out.append(
                 WorkSuggestion(
@@ -2257,12 +2296,21 @@ def gather_suggestions(
         registry_text = Path(tasks_file).read_text(encoding="utf-8")
     except OSError:
         registry_text = ""
-    findings = audit_finding_suggestions(repo, report_glob, registry_text)
+    audit_ledger = load_audit_intake(intake_dir)
+    findings = audit_finding_suggestions(
+        repo, report_glob, registry_text, ledger=audit_ledger
+    )
     ready = ready_task_suggestions(tasks_data)
     blocked = open_blocker_suggestions(blockers_dir)
     sources = [
         f"audit reports ({report_glob}): {len(findings)} finding(s) the registry "
-        "never mentions",
+        "never mentions"
+        + (
+            ""
+            if audit_ledger.read
+            else f" — WARNING: {audit_ledger.note}, so findings already actioned "
+            "may be offered again"
+        ),
         (
             f"{tasks_file}: {len(ready)} ready task(s)"
             if tasks_data is not None
@@ -2313,3 +2361,1134 @@ def draft_from_suggestion(intake_dir: Path, suggestion: WorkSuggestion, slug: st
         ]
     )
     return create_draft(intake_dir, slug or slug_for(suggestion.key), idea)
+
+
+# ===========================================================================
+# AUDIT FINDING INTAKE — PROMOTED, ALREADY DONE, or DECLINED. Never a panel.
+# ===========================================================================
+#
+# An audit report is prose. `dashboard.app_tasks` rendered every finding in the
+# newest one as a task-shaped row — an id, a severity, a source file — which is
+# what made the panel read as a backlog while being nothing of the kind:
+# nothing dispatched it, nothing tracked its status, and a priority could not be
+# set because the "priority" was a word in a document. Measured 2026-08-17: 30
+# findings from a report twelve days old, two of them critical, all of them
+# displayed as tracked work.
+#
+# The gap is not detection and it is not the audits. It is a DECISION, recorded
+# somewhere durable. So every finding gets exactly one of three outcomes:
+#
+#   PROMOTED     — a registry task exists for it. Queued through
+#                  `TaskInbox.submit`, the same and only gate `add-task`, the
+#                  dashboard form and `submit_draft` already use; or an EARLIER
+#                  task already covering it, in which case nothing is created.
+#   ALREADY DONE — the current tree satisfies it. Recorded with the checks that
+#                  were RE-READ off disk to prove it, and no task is created.
+#   DECLINED     — deliberately not doing it, with a reason. This outcome has to
+#                  exist: without it every finding stays open forever and the
+#                  panel only grows, which is the state this whole section is
+#                  about.
+#
+# The record lives beside the drafts, OUTSIDE the checkout, for `declines_file`'s
+# reasons exactly: the escape detector snapshots the checkout, and a sibling of
+# the inbox is not eaten by `TaskInbox.drain`. And the DASHBOARD READS IT, so
+# the panel shows what is OUTSTANDING rather than everything the report ever
+# said — that is the half that makes the record worth keeping.
+#
+# NOTHING HERE RUNS AN AUDIT or changes what one looks for. It drains what is
+# already on disk.
+#
+# **Two fail-open shapes this section is written against.** First, an unreadable
+# ledger must never read as "nothing has been recorded": that would silently
+# un-filter the panel, and it would let `record_audit_outcome` overwrite every
+# outcome already stored. `AuditLedger.read` is that distinction, `load_audit_
+# intake` never invents `{}` for a file it could not parse, and writing refuses
+# outright. Second, ALREADY DONE is the outcome a wrong answer buries a real
+# defect under, so it is never inferred: it requires checks this module RE-READS
+# from the tree, and a check whose file is missing or unreadable is a REFUSAL,
+# not a pass.
+
+#: The three outcomes, and the whole vocabulary. A record carrying anything else
+#: is treated as no record at all (`AuditLedger.record_for`) — a hand-edited
+#: `"outcome": "maybe"` leaves its finding OUTSTANDING rather than making it
+#: disappear from the panel under a word nothing understands.
+OUTCOME_PROMOTED = "promoted"
+OUTCOME_ALREADY_DONE = "already_done"
+OUTCOME_DECLINED = "declined"
+AUDIT_OUTCOMES = (OUTCOME_PROMOTED, OUTCOME_ALREADY_DONE, OUTCOME_DECLINED)
+
+#: The report's severity word, as a `Task.priority` integer (ascending; 1
+#: outranks 2). This is the thing the panel could not do: a severity written in
+#: a markdown document is not a priority anything can sort by, and a promoted
+#: task needs one. The mapping is deliberately dull and total — an unrecognised
+#: or absent severity gets `DEFAULT_FINDING_PRIORITY`, which sorts last, rather
+#: than being guessed upward.
+SEVERITY_PRIORITY = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 5}
+DEFAULT_FINDING_PRIORITY = 5
+
+#: Where the loop's OWN code and its OWN suite live, as seen from the repository
+#: root. Used to decide whether a finding is about the application or about the
+#: loop, which is what picks the test root and the validation commands a
+#: promoted task carries. Spelled here rather than configured: it is this
+#: package's own name, and a repository that vendors it cannot move it without
+#: moving this file too.
+LOOP_PACKAGE = "autoloop"
+LOOP_TEST_ROOT = "autoloop/tests/"
+
+#: The ledger's filename, inside the intake directory beside `declined.json`.
+AUDIT_INTAKE_FILENAME = "audit_intake.json"
+
+
+def _utc_stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _clean_report_text(value: str) -> str:
+    """A rendered markdown fragment as one line of plain text.
+
+    Emphasis and backticks removed, whitespace collapsed, bounded. The same
+    treatment `dashboard.app_tasks` gave a title before this module owned the
+    parsing, kept identical so the panel's rows do not change shape.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"[*`]", "", str(value or ""))).strip()[:180]
+
+
+# ---- the report: ONE parser, shared with the dashboard ---------------------
+
+
+@dataclass(frozen=True)
+class AuditFinding:
+    """One finding, as `audit/report._finding_block` rendered it.
+
+    Structured rather than a heading and a severity, because a PROMOTED finding
+    has to become a runnable task and the fields that make it one — the files it
+    names, what would prove the fix — are all in the block already.
+    """
+
+    qualified_id: str
+    title: str
+    source: str = ""
+    severity: str = ""
+    affected_files: tuple[str, ...] = ()
+    evidence: str = ""
+    impact: str = ""
+    acceptance: str = ""
+    #: The report's own suggested validation, as free text. NEVER run and never
+    #: turned into a task's `validation` list: these are shell one-liners
+    #: (`createdb x && alembic upgrade head`), and the loop's validation runner
+    #: takes argv lists restricted to ruff/pytest/python/npm/npx/tsc. Carried
+    #: into the description as guidance for whoever implements it.
+    validation: str = ""
+
+    @property
+    def domain(self) -> str:
+        return self.qualified_id.split(":", 1)[0] if ":" in self.qualified_id else ""
+
+    @property
+    def fingerprint(self) -> str:
+        """Identity of the EVIDENCE this outcome was recorded against.
+
+        Over the qualified id and the title — stable text from a rendered
+        report — and over nothing that moves on its own, exactly as
+        `_fingerprint`'s docstring requires. A re-worded finding therefore
+        reopens rather than staying silently closed under an old decision, and
+        a finding nobody touched stays closed across runs.
+        """
+        return _fingerprint(self.qualified_id, self.title)
+
+    @property
+    def priority(self) -> int:
+        return SEVERITY_PRIORITY.get(self.severity, DEFAULT_FINDING_PRIORITY)
+
+    def as_row(self, source: str = "") -> dict:
+        """The dashboard row. Field-for-field what `app_tasks` returned before
+        this module owned the parsing — `priority` is still the severity WORD,
+        because that is what the panel renders and changing it would be a second
+        change hidden inside this one."""
+        return {
+            "id": self.qualified_id,
+            "priority": self.severity,
+            "title": self.title,
+            "source": source or self.source,
+        }
+
+
+def parse_audit_findings(text: str, source: str = "") -> list[AuditFinding]:
+    """Every finding in one rendered report, in document order.
+
+    THE parser. `dashboard.app_tasks` and the whole of this section read
+    findings through it and through nothing else, so the id an outcome is
+    recorded under is by construction the id the panel filters on.
+
+    Tolerant by design, because it reads a file a human may have edited: a
+    heading with no fields under it still yields a finding (id and title are all
+    the ledger needs), an unrecognised bullet is skipped rather than guessed at,
+    and a duplicate id keeps the FIRST block — the same rule the panel already
+    applied.
+    """
+    out: list[AuditFinding] = []
+    seen: set[str] = set()
+    fields: dict[str, object] | None = None
+
+    def flush() -> None:
+        nonlocal fields
+        if fields is not None:
+            out.append(AuditFinding(**fields))  # type: ignore[arg-type]
+        fields = None
+
+    for line in str(text or "").splitlines():
+        head = _AUDIT_FINDING_RE.match(line)
+        if head:
+            flush()
+            qualified = head.group(1)
+            if qualified in seen:
+                continue
+            seen.add(qualified)
+            fields = {
+                "qualified_id": qualified,
+                "title": _clean_report_text(head.group(2)),
+                "source": source,
+            }
+            continue
+        if fields is None:
+            continue
+        if _AUDIT_HEADING_RE.match(line):
+            # Any other heading ends the block. Without this a finding would
+            # absorb the bullets of whatever section followed it.
+            flush()
+            continue
+        severity_match = _AUDIT_SEVERITY_RE.match(line)
+        if severity_match:
+            word = severity_match.group(1).lower()
+            if word in SEVERITY_PRIORITY:
+                fields["severity"] = word
+            continue
+        field_match = _AUDIT_FIELD_RE.match(line)
+        if not field_match:
+            continue
+        key, value = field_match.group(1), field_match.group(2).strip()
+        if key == "severity":
+            # `- severity: high` — not a shape `report.py` writes, honoured so a
+            # hand-written report still yields a priority instead of sorting last.
+            word = re.match(r"\*{0,2}([a-z]+)", value.lower())
+            if word and word.group(1) in SEVERITY_PRIORITY:
+                fields["severity"] = word.group(1)
+        elif key == "files":
+            paths = _BACKTICKED_RE.findall(value)
+            if not paths:
+                paths = [p.strip() for p in value.split(",")]
+            fields["affected_files"] = tuple(
+                dict.fromkeys(p.strip().strip("`") for p in paths if p.strip())
+            )
+        elif key in ("evidence", "impact", "acceptance", "validation"):
+            # First line only: `evidence` may wrap (`reconcile._merge_text`
+            # appends an attributed second statement), and the continuation
+            # lines are not field bullets. Truncating what is already a citation
+            # costs nothing the report itself does not still hold.
+            fields[key] = value
+    flush()
+    return out
+
+
+def _is_safe_report_glob(pattern: str) -> bool:
+    """Is `pattern` a plain repository-relative glob?
+
+    `load_config` refuses an unsafe one at startup, but both readers here can be
+    handed a value that never went through it — the dashboard reads the raw TOML
+    so it can render against a checkout `load_config` would refuse — and
+    `Path.glob` raises outright on an absolute pattern, which would 500 the page
+    rather than degrade it. Traversal is refused for the obvious reason: a
+    read-only reader has no business reaching outside the checkout it was
+    pointed at.
+    """
+    if pattern.startswith(("/", "~")) or "\\" in pattern:
+        return False
+    return not any(seg in ("", ".", "..") for seg in pattern.split("/"))
+
+
+@dataclass(frozen=True)
+class AuditReport:
+    """The newest report, its findings, and — separately — whether one was READ.
+
+    `read=False` with `findings=()` and `read=True` with `findings=()` are
+    different facts: "no report could be read" versus "a report was read and it
+    holds no findings". Collapsing them is how a panel renders a confident empty
+    list for a repository whose report path is misconfigured.
+    """
+
+    path: Path | None = None
+    source: str = ""
+    text: str = ""
+    findings: tuple[AuditFinding, ...] = ()
+    read: bool = False
+    note: str = ""
+
+
+def newest_audit_report(repo: Path, report_glob: str) -> AuditReport:
+    """The newest audit report BY NAME, parsed. Never raises.
+
+    Newest is newest by NAME (`reverse=True` on the sorted paths), which works
+    because the reports are date-stamped; that is a property of the naming
+    convention rather than of the glob, so a repository whose reports are not
+    date-sortable gets the last one alphabetically rather than a
+    wrong-but-confident "newest". Unchanged from what `app_tasks` did, and it is
+    what makes the CLI and the panel act on the SAME report.
+    """
+    pattern = (report_glob or "").strip()
+    if not pattern:
+        return AuditReport(note="no audit report location is configured ([repo].audit_report_glob is empty)")
+    if not _is_safe_report_glob(pattern):
+        return AuditReport(
+            note=f"the configured audit report glob {pattern!r} is not a plain "
+            "repository-relative pattern, so nothing was read"
+        )
+    try:
+        reports = sorted(Path(repo).glob(pattern), reverse=True)
+    except (OSError, ValueError) as exc:
+        return AuditReport(note=f"the audit report location could not be searched ({exc})")
+    if not reports:
+        return AuditReport(note=f"no file matches {pattern} under {repo}")
+    newest = reports[0]
+    try:
+        text = newest.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        # `ValueError` is `UnicodeDecodeError`: a match that is not UTF-8 text —
+        # a directory named like a report is the `OSError` half. Neither may
+        # escape, because the dashboard calls this on every 2s poll and an
+        # exception here is a 500 rather than a degraded panel.
+        return AuditReport(
+            path=newest,
+            source=newest.name,
+            note=f"{newest} matched but could not be read ({exc})",
+        )
+    return AuditReport(
+        path=newest,
+        source=newest.name,
+        text=text,
+        findings=tuple(parse_audit_findings(text, newest.name)),
+        read=True,
+    )
+
+
+# ---- the ledger: durable, outside the checkout, read by the dashboard -------
+
+
+def audit_intake_file(intake_dir: Path) -> Path:
+    """The outcome ledger — a sibling of the drafts and of `declined.json`.
+
+    NOT inside the inbox directory, for `declines_file`'s reason: `TaskInbox.
+    drain` globs `*.json` there and MOVES anything it cannot parse into
+    `rejected/`, which would eat this file and report a spurious problem line
+    on every drain afterwards.
+    """
+    return Path(intake_dir) / AUDIT_INTAKE_FILENAME
+
+
+@dataclass(frozen=True)
+class AuditLedger:
+    """Recorded outcomes, keyed by qualified finding id — and whether the file
+    behind them was actually READ.
+
+    `read=False` is the whole point of this class existing rather than a bare
+    dict. An unreadable ledger returning `{}` would mean "nothing has been
+    recorded", which un-filters the panel silently and lets a write destroy
+    every outcome already stored. Both consequences are refused instead: the
+    panel says the ledger was not read and shows everything, and
+    `record_audit_outcome` will not write.
+    """
+
+    records: dict = field(default_factory=dict)
+    read: bool = True
+    note: str = ""
+
+    def record_for(self, finding: AuditFinding) -> dict | None:
+        """The outcome recorded for `finding`, or `None`.
+
+        `None` for three different reasons, all of which must leave the finding
+        OUTSTANDING rather than hidden: nothing was ever recorded; something was
+        recorded against DIFFERENT evidence (the finding was re-worded, so the
+        decision was made about another sentence); or the stored outcome is not
+        one this module knows, which is a hand-edited or future file and not a
+        decision this code may act on.
+        """
+        record = self.records.get(finding.qualified_id)
+        if not isinstance(record, dict):
+            return None
+        if record.get("outcome") not in AUDIT_OUTCOMES:
+            return None
+        if record.get("fingerprint") != finding.fingerprint:
+            return None
+        return record
+
+
+def load_audit_intake(intake_dir: Path) -> AuditLedger:
+    """Read the ledger. A file that is ABSENT and one that is UNREADABLE are
+    two different answers — see `AuditLedger`."""
+    path = audit_intake_file(intake_dir)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Nothing recorded yet is a real, known answer: the ledger WAS read.
+        return AuditLedger(records={}, read=True)
+    except (OSError, ValueError) as exc:
+        # `ValueError` is `UnicodeDecodeError` — a ledger that is not UTF-8 text.
+        # It must land here rather than escaping: an exception out of this
+        # function reaches the dashboard's 2s poll.
+        return AuditLedger(records={}, read=False, note=f"{path} could not be read ({exc})")
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return AuditLedger(
+            records={}, read=False, note=f"{path} is not parseable JSON ({exc})"
+        )
+    if not isinstance(data, dict):
+        return AuditLedger(
+            records={}, read=False, note=f"{path} does not hold a JSON object"
+        )
+    return AuditLedger(records=data, read=True)
+
+
+def record_audit_outcome(
+    intake_dir: Path,
+    finding: AuditFinding,
+    outcome: str,
+    *,
+    detail: str,
+    task_id: str = "",
+    evidence: tuple[str, ...] = (),
+) -> Path:
+    """Record ONE outcome, durably. The only writer of the ledger.
+
+    Refuses on an unreadable ledger rather than starting a fresh one: the file
+    is the record of every decision already made, and rewriting it from `{}`
+    would destroy them all to make one write succeed.
+
+    `detail` is required for every outcome, including PROMOTED. An outcome with
+    no account of itself is the panel again, one file further along.
+    """
+    if outcome not in AUDIT_OUTCOMES:
+        raise IntakeError(
+            f"unknown outcome {outcome!r}; expected one of {list(AUDIT_OUTCOMES)}"
+        )
+    if not str(detail or "").strip():
+        raise IntakeError(
+            f"recording {finding.qualified_id} as {outcome} needs a reason or the "
+            "evidence for it — an outcome nobody can check is not a decision"
+        )
+    ledger = load_audit_intake(intake_dir)
+    if not ledger.read:
+        raise IntakeError(
+            f"refusing to write {audit_intake_file(intake_dir)}: {ledger.note}. "
+            "Every outcome already recorded is in that file; overwriting it to "
+            "record one more would destroy them. Repair or move it by hand first."
+        )
+    records = dict(ledger.records)
+    records[finding.qualified_id] = {
+        "outcome": outcome,
+        "fingerprint": finding.fingerprint,
+        "title": finding.title,
+        "source": finding.source,
+        "detail": str(detail).strip(),
+        "task_id": str(task_id or ""),
+        "evidence": [str(item) for item in evidence],
+        "recorded_at": _utc_stamp(),
+    }
+    path = audit_intake_file(intake_dir)
+    _write_atomic(path, json.dumps(records, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def outstanding_findings(
+    findings, ledger: AuditLedger
+) -> tuple[AuditFinding, ...]:
+    """The findings nobody has decided about yet.
+
+    An unread ledger filters NOTHING. Hiding rows on the strength of a file we
+    could not open would make the outstanding list shrink for the one reason
+    that should make it least trustworthy.
+    """
+    if not ledger.read:
+        return tuple(findings)
+    return tuple(f for f in findings if ledger.record_for(f) is None)
+
+
+def audit_intake_summary(report: AuditReport, ledger: AuditLedger) -> dict:
+    """What the panel says under the rows: how many findings there are, how many
+    are outstanding, and what happened to the rest.
+
+    Carries `ledger_read` / `report_read` rather than letting an empty list
+    speak for itself. Once the rows are filtered, EMPTY is the success state —
+    so a note derived from the rows alone would lose the report's name at
+    exactly the moment everything had been actioned.
+    """
+    counts = dict.fromkeys(AUDIT_OUTCOMES, 0)
+    for finding in report.findings:
+        record = ledger.record_for(finding)
+        if record is not None:
+            counts[str(record["outcome"])] += 1
+    return {
+        "report": report.source,
+        "total": len(report.findings),
+        "outstanding": len(outstanding_findings(report.findings, ledger)),
+        "report_read": report.read,
+        "report_note": report.note,
+        "ledger_read": ledger.read,
+        "ledger_note": ledger.note,
+        **counts,
+    }
+
+
+# ---- deduplication: never file work that already shipped -------------------
+
+
+@dataclass(frozen=True)
+class FindingAssessment:
+    """What is already known about a finding, before anyone decides anything.
+
+    Positive-only, and it reports UNCERTAINTY rather than resolving it.
+    `covering_tasks` is asserted only from text actually found in `tasks.json`;
+    `registry_read=False` means the registry could not be read at all, and in
+    that state "no task covers this" is not a claim this makes — it is a
+    question nothing answered.
+    """
+
+    finding: AuditFinding
+    covering_tasks: tuple[str, ...] = ()
+    registry_read: bool = True
+    recorded: dict | None = None
+    #: Every task id the registry already holds. Not about this finding at all —
+    #: it is what stops a promotion minting an id the registry will refuse as a
+    #: duplicate on merge, AFTER the ledger has recorded that a task exists.
+    existing_task_ids: tuple[str, ...] = ()
+
+    @property
+    def note(self) -> str:
+        if not self.registry_read:
+            return (
+                "the task registry was NOT read, so whether a task already covers "
+                "this finding is UNKNOWN — not 'no'"
+            )
+        if self.covering_tasks:
+            return (
+                f"already covered: {', '.join(self.covering_tasks)} name "
+                f"{self.finding.qualified_id} in tasks.json"
+            )
+        return f"no task in tasks.json mentions {self.finding.qualified_id}"
+
+
+def covering_tasks(finding: AuditFinding, tasks_data: object) -> tuple[str, ...]:
+    """Task ids whose own text names this finding's qualified id.
+
+    Mechanical and narrow on purpose: the id appears in the task's id, title or
+    description. That is the same test `audit_finding_suggestions` already
+    applies, it is checkable by the operator in one grep, and a cleverer
+    similarity test would be one they could not verify — which is exactly the
+    property that matters for a check whose job is to stop work being filed
+    twice.
+
+    It cannot see a fix that shipped under a task that never named the finding.
+    That gap is real and is why ALREADY DONE exists as a separate, evidenced
+    outcome rather than being inferred from here.
+    """
+    rows = (tasks_data or {}).get("tasks") if isinstance(tasks_data, dict) else None
+    if not isinstance(rows, list):
+        return ()
+    needle = finding.qualified_id
+    out: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        task_id = str(row.get("id") or "")
+        if not task_id:
+            continue
+        haystack = " ".join(
+            str(row.get(key) or "") for key in ("id", "title", "description")
+        )
+        if needle in haystack and task_id not in out:
+            out.append(task_id)
+    return tuple(out)
+
+
+def registry_task_ids(tasks_data: object) -> tuple[str, ...]:
+    """Every task id in `tasks.json`, in file order. Empty for an unread one —
+    which is why `registry_read` is carried separately and every consumer checks
+    it first."""
+    rows = (tasks_data or {}).get("tasks") if isinstance(tasks_data, dict) else None
+    if not isinstance(rows, list):
+        return ()
+    return tuple(
+        str(row["id"])
+        for row in rows
+        if isinstance(row, dict) and str(row.get("id") or "")
+    )
+
+
+def assess_finding(
+    finding: AuditFinding,
+    tasks_data: object,
+    *,
+    registry_read: bool = True,
+    ledger: AuditLedger | None = None,
+) -> FindingAssessment:
+    return FindingAssessment(
+        finding=finding,
+        covering_tasks=covering_tasks(finding, tasks_data) if registry_read else (),
+        registry_read=registry_read,
+        recorded=ledger.record_for(finding) if ledger is not None else None,
+        existing_task_ids=registry_task_ids(tasks_data) if registry_read else (),
+    )
+
+
+# ---- ALREADY DONE: evidence this module re-reads off the tree --------------
+
+
+@dataclass(frozen=True)
+class EvidenceCheck:
+    """One re-readable claim about the current tree.
+
+    Three forms, and nothing else:
+
+      * `path`          — the file EXISTS.
+      * `path:text`     — the file exists and CONTAINS `text`.
+      * `path:!text`    — the file exists and does NOT contain `text`.
+
+    The third is the one that carries the fail-open, and it is why a missing
+    file is a REFUSAL rather than a pass: a deleted or renamed file makes any
+    needle trivially absent, so "the bug is gone" would be satisfied by the
+    evidence having disappeared.
+    """
+
+    raw: str
+    path: str
+    needle: str = ""
+    negated: bool = False
+
+
+def parse_evidence_check(raw: str) -> EvidenceCheck:
+    """One `--evidence` argument, or `IntakeError` saying what it should be."""
+    text = str(raw or "").strip()
+    if not text:
+        raise IntakeError(
+            "an empty evidence check proves nothing — write `path`, "
+            "`path:text that must be there` or `path:!text that must be gone`"
+        )
+    path, sep, rest = text.partition(":")
+    path = path.strip()
+    if not path:
+        raise IntakeError(f"evidence check {raw!r} names no file")
+    negated = False
+    needle = ""
+    if sep:
+        rest = rest.strip()
+        if rest.startswith("!"):
+            negated = True
+            rest = rest[1:].strip()
+        if not rest:
+            raise IntakeError(
+                f"evidence check {raw!r} names a file and then nothing to look "
+                "for — drop the ':' to mean 'this file exists'"
+            )
+        needle = rest
+    return EvidenceCheck(raw=text, path=path, needle=needle, negated=negated)
+
+
+def _resolve_inside(repo: Path, relative: str) -> Path:
+    """`repo/relative`, refused unless it really lands inside `repo`.
+
+    The path comes from an operator's command line, so containment is checked
+    rather than assumed. It is checked against the RESOLVED tree rather than by
+    a syntactic rule, deliberately, and that is a stronger test than
+    `tasks._validate_approved_path` can make: this function has a repository
+    root in hand, so it catches a symlink that leaves the checkout, which a
+    string check by construction cannot.
+    """
+    if relative.startswith(("/", "~")) or "\\" in relative:
+        raise IntakeError(
+            f"evidence path {relative!r} must be relative to the repository root, "
+            "with '/' separators"
+        )
+    root = Path(repo).resolve()
+    target = (root / relative).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise IntakeError(
+            f"evidence path {relative!r} resolves to {target}, outside the "
+            f"repository at {root} — nothing outside the checkout is evidence "
+            "about it"
+        ) from exc
+    return target
+
+
+def verify_already_done(
+    repo: Path, raw_checks
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    """`(satisfied, confirmed, problems)` — every check RE-READ off the tree.
+
+    This is the function that makes ALREADY DONE an evidenced outcome rather
+    than an assertion. What the operator types is a QUESTION about the tree; the
+    answer comes from reading the file, here, now. Nothing they wrote is
+    recorded as evidence unless reading it agreed.
+
+    FAIL CLOSED at every step. No checks at all is a refusal. A file that does
+    not exist is a refusal — including for a `!needle` check, where absence
+    would otherwise satisfy it for the wrong reason. A file that cannot be
+    decoded or read is a refusal, not a pass. `satisfied` is true only when
+    every check was answered and every answer agreed.
+    """
+    problems: list[str] = []
+    confirmed: list[str] = []
+    checks = [str(item) for item in (raw_checks or ())]
+    if not checks:
+        return False, (), (
+            "ALREADY DONE needs at least one check that can be re-read from the "
+            "tree — without one this is an assertion, not evidence",
+        )
+    for raw in checks:
+        try:
+            check = parse_evidence_check(raw)
+            target = _resolve_inside(repo, check.path)
+        except IntakeError as exc:
+            problems.append(str(exc))
+            continue
+        if not target.is_file():
+            problems.append(
+                f"{check.path}: no such file in the tree — a missing file is not "
+                "evidence that anything was fixed"
+            )
+            continue
+        try:
+            body = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            problems.append(f"{check.path}: could not be read ({exc})")
+            continue
+        if not check.needle:
+            confirmed.append(f"{check.path} exists")
+            continue
+        present = check.needle in body
+        if check.negated and present:
+            problems.append(f"{check.path}: still contains {check.needle!r}")
+        elif not check.negated and not present:
+            problems.append(f"{check.path}: does not contain {check.needle!r}")
+        elif check.negated:
+            confirmed.append(f"{check.path} no longer contains {check.needle!r}")
+        else:
+            confirmed.append(f"{check.path} contains {check.needle!r}")
+    return not problems, tuple(confirmed), tuple(problems)
+
+
+# ---- PROMOTED: a task that can actually run --------------------------------
+
+
+def finding_task_id(finding: AuditFinding) -> str:
+    """`db_migrations:db-01` -> `audit-db-migrations-db-01`.
+
+    Prefixed so a promoted task is recognisable as one at a glance in
+    `tasks.json`, and bounded to the registry's own 64-character slug limit.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", finding.qualified_id.lower()).strip("-")
+    return f"audit-{slug}"[:64].rstrip("-")
+
+
+def usable_scope_paths(paths) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`(usable, refused)` — which of these may be `approved_paths` at all.
+
+    Judged by `tasks._validate_approved_path`, the registry's OWN validator,
+    rather than by a second rule with the same intent. A finding's `files:` line
+    is agent-authored prose and may hold a glob, a range or a sentence; filtering
+    it against anything but the rule the registry will apply on merge would
+    produce a spec that passes here and is refused there, naming a path this
+    module already looked at.
+    """
+    from .errors import TaskGraphError
+    from .tasks import _validate_approved_path
+
+    usable: list[str] = []
+    refused: list[str] = []
+    for entry in paths:
+        candidate = str(entry).strip()
+        try:
+            _validate_approved_path(candidate)
+        except TaskGraphError as exc:
+            refused.append(f"{candidate!r}: {exc}")
+            continue
+        if candidate not in usable:
+            usable.append(candidate)
+    return tuple(usable), tuple(refused)
+
+
+def _is_loop_path(path: str) -> bool:
+    return path == LOOP_PACKAGE or path.startswith(f"{LOOP_PACKAGE}/")
+
+
+def promotion_description(finding: AuditFinding, assessment: FindingAssessment) -> str:
+    lines = [
+        f"From the audit report {finding.source or '(unknown report)'}, finding "
+        f"{finding.qualified_id} (severity {finding.severity or 'unlabelled'}).",
+        "",
+        f"WHAT THE FINDING ASKS FOR: {finding.title}",
+    ]
+    if finding.impact:
+        lines += ["", f"IMPACT AS REPORTED: {finding.impact}"]
+    if finding.evidence:
+        lines += ["", f"EVIDENCE THE AUDIT CITED: {finding.evidence}"]
+    if finding.acceptance:
+        lines += ["", f"ACCEPTANCE CRITERIA FROM THE REPORT: {finding.acceptance}"]
+    if finding.validation:
+        lines += [
+            "",
+            "The report also suggested this check by hand — it is GUIDANCE, not "
+            f"the task's validation, which is declared separately: {finding.validation}",
+        ]
+    lines += [
+        "",
+        "Deduplication checked at promotion time: " + assessment.note + ".",
+        "",
+        "approved_paths are the files the finding names plus the test tree that "
+        "grades them, so the fix can carry its own test. Filed through `python -m "
+        "autoloop intake audit promote`; the outcome is recorded in the audit "
+        "intake ledger, which is what the dashboard panel filters on.",
+    ]
+    return "\n".join(lines)
+
+
+def promotion_spec(
+    finding: AuditFinding,
+    assessment: FindingAssessment,
+    *,
+    app_test_root: str,
+    app_validation,
+    loop_validation,
+    task_id: str = "",
+    priority: int | None = None,
+) -> dict:
+    """The inbox creation request this finding would file. Queues NOTHING.
+
+    **It REFUSES rather than emitting a narrow task**, and that is the point of
+    the function. Measured 2026-08-17, rt-09, rt-13 and rt-14 each had ONE
+    approved path and ZERO validation commands; rt-15 had four paths and no
+    validation. A task shaped like that is not runnable — narrow
+    `approved_paths` caused five separate attempt-ceiling jams on 2026-08-15/16
+    (brw-09 needed `policy.py` it was not allowed to touch), and a packet with no
+    validation evidence is refused by the reviewer, which cost hlth-01 and
+    dash-04 five rounds each. So a spec with fewer than two paths, or with no
+    validation command, is an `IntakeError` naming what is missing.
+
+    THE TEST TREE IS ALWAYS IN SCOPE, and it is where the second path comes
+    from. A finding is satisfied by a change plus the test that proves it, so a
+    scope that excludes the test tree cannot be worked in — and which tree it is
+    is decided mechanically from where the finding's own files live: anything
+    under `autoloop/` is a finding about the loop and gets the loop's suite,
+    everything else is a finding about the application and gets the APP suite
+    (`[repo].app_test_root`, `pytest tests/`). A finding spanning both gets both.
+    """
+    paths, refused = usable_scope_paths(finding.affected_files)
+    if not paths:
+        detail = "; ".join(refused) if refused else "the report names none"
+        raise IntakeError(
+            f"{finding.qualified_id} cannot be promoted: no usable file path to "
+            f"scope the task to ({detail}). Fix the report's `files:` line, or "
+            "record this finding as declined with a reason."
+        )
+    app_root = str(app_test_root or "").strip().rstrip("/")
+    # Classified BEFORE anything is appended. Testing the mutated tuple would
+    # read the test root this function just added as if the finding had named
+    # it, which is a question about our own output rather than about the
+    # finding.
+    is_loop = any(_is_loop_path(p) for p in paths)
+    is_app = any(not _is_loop_path(p) for p in paths)
+    validation: list[tuple[str, ...]] = []
+    if is_loop:
+        paths = paths + (LOOP_TEST_ROOT,)
+        validation += [tuple(str(part) for part in cmd) for cmd in (loop_validation or ())]
+    if is_app:
+        if app_root:
+            paths = paths + (f"{app_root}/",)
+        validation += [tuple(str(part) for part in cmd) for cmd in (app_validation or ())]
+    paths = tuple(dict.fromkeys(paths))
+    validation = [cmd for cmd in dict.fromkeys(validation) if cmd]
+    if len(paths) < 2:
+        raise IntakeError(
+            f"{finding.qualified_id} would be promoted with only {len(paths)} "
+            "approved path — a task that narrow hits the attempt ceiling instead "
+            "of finishing. Configure [repo].app_test_root, or widen the "
+            "finding's `files:` line, before promoting it."
+        )
+    if not validation:
+        raise IntakeError(
+            f"{finding.qualified_id} would be promoted with NO validation "
+            "command, and a packet carrying no validation evidence is refused by "
+            "the reviewer. Configure [repo].app_validation before promoting it."
+        )
+    return {
+        "kind": KIND_TASK,
+        "id": task_id or finding_task_id(finding),
+        "title": finding.title,
+        "description": promotion_description(finding, assessment),
+        "priority": finding.priority if priority is None else int(priority),
+        "approved_paths": list(paths),
+        "validation": [list(cmd) for cmd in validation],
+    }
+
+
+@dataclass(frozen=True)
+class AuditOutcome:
+    """What one intake action did, for the operator and for a test to assert on."""
+
+    finding: AuditFinding
+    outcome: str
+    detail: str
+    ledger_path: Path
+    task_id: str = ""
+    queued: Path | None = None
+    spec: dict | None = None
+    evidence: tuple[str, ...] = ()
+
+
+def promote_finding(
+    finding: AuditFinding,
+    assessment: FindingAssessment,
+    *,
+    inbox: TaskInbox,
+    intake_dir: Path,
+    app_test_root: str,
+    app_validation,
+    loop_validation,
+    task_id: str = "",
+    priority: int | None = None,
+) -> AuditOutcome:
+    """PROMOTE: make sure a task exists for this finding, and record that it does.
+
+    Three ways this goes, and none of them leaves the finding undecided:
+
+      * The registry could not be READ — refuse. Filing a task without being
+        able to check for a duplicate is how work that shipped weeks ago gets
+        recreated, which is the failure `roadmap-01` exists for (on 2026-08-17
+        four pending tasks were found already fully implemented, and two filed
+        tasks were withdrawn as duplicates the same day).
+      * A task already NAMES this finding — record it as promoted UNDER THAT
+        TASK and queue nothing. The finding is actioned, so it leaves the
+        outstanding list; no second task is created.
+      * Otherwise — queue one creation request through `TaskInbox.submit`, the
+        same gate every other route uses, and record it.
+    """
+    if not assessment.registry_read:
+        raise IntakeError(
+            f"refusing to promote {finding.qualified_id}: {assessment.note}. "
+            "Promoting blind is how work that already shipped gets filed a "
+            "second time."
+        )
+    already = assessment.recorded
+    if already is not None and already.get("outcome") == OUTCOME_PROMOTED:
+        # The finding is off the outstanding list, so `intake audit list` will
+        # not offer it — but an operator can still type its id, and the second
+        # run would queue a second creation request for the same work. Refused
+        # here rather than left to the merge: by then the ledger would already
+        # say a task exists, which is the state this whole section exists to
+        # keep honest.
+        raise IntakeError(
+            f"{finding.qualified_id} is already recorded as promoted under "
+            f"{already.get('task_id') or '(no task named)'} "
+            f"({already.get('recorded_at')}) — promoting it again would queue a "
+            "second task for the same finding. Delete that entry from "
+            f"{audit_intake_file(intake_dir)} if the record is wrong."
+        )
+    if assessment.covering_tasks:
+        covering = ", ".join(assessment.covering_tasks)
+        detail = (
+            f"already covered by {covering}, which names {finding.qualified_id} "
+            "in tasks.json — no second task was created"
+        )
+        path = record_audit_outcome(
+            intake_dir,
+            finding,
+            OUTCOME_PROMOTED,
+            detail=detail,
+            task_id=covering,
+        )
+        return AuditOutcome(
+            finding=finding,
+            outcome=OUTCOME_PROMOTED,
+            detail=detail,
+            ledger_path=path,
+            task_id=covering,
+        )
+    spec = promotion_spec(
+        finding,
+        assessment,
+        app_test_root=app_test_root,
+        app_validation=app_validation,
+        loop_validation=loop_validation,
+        task_id=task_id,
+        priority=priority,
+    )
+    if str(spec["id"]) in assessment.existing_task_ids:
+        # `TaskRegistry.add_many` refuses a duplicate id on merge, and by then
+        # this function would have recorded the finding as promoted under a task
+        # that was never created. Refused here instead, naming the remedy.
+        raise IntakeError(
+            f"the registry already holds a task called {spec['id']!r}, so this "
+            "request would be refused on merge — after this finding had been "
+            "recorded as promoted. Pass --task-id to file it under another id, "
+            "or record the finding against the existing task by naming "
+            f"{finding.qualified_id} in that task's description."
+        )
+    # Shape-checked before anything is written, by the same function
+    # `TaskInbox.submit` calls — so a spec that would be refused on the way in
+    # never leaves a "promoted" record behind claiming a task exists.
+    check_request_shape(spec)
+    queued = inbox.submit(spec)
+    detail = (
+        f"queued task {spec['id']} (priority {spec['priority']}) with "
+        f"{len(spec['approved_paths'])} approved path(s) and "
+        f"{len(spec['validation'])} validation command(s)"
+    )
+    path = record_audit_outcome(
+        intake_dir, finding, OUTCOME_PROMOTED, detail=detail, task_id=str(spec["id"])
+    )
+    return AuditOutcome(
+        finding=finding,
+        outcome=OUTCOME_PROMOTED,
+        detail=detail,
+        ledger_path=path,
+        task_id=str(spec["id"]),
+        queued=queued,
+        spec=spec,
+    )
+
+
+def record_finding_already_done(
+    finding: AuditFinding,
+    *,
+    repo: Path,
+    intake_dir: Path,
+    checks,
+    note: str = "",
+) -> AuditOutcome:
+    """ALREADY DONE: the tree satisfies this finding, and here is why.
+
+    Creates NO task. Every check is re-read from the tree by
+    `verify_already_done` first, and a single failed or unanswerable check
+    refuses the whole record — the operator's sentence is never stored as
+    evidence on its own.
+    """
+    satisfied, confirmed, problems = verify_already_done(repo, checks)
+    if not satisfied:
+        raise IntakeError(
+            f"refusing to record {finding.qualified_id} as already done — the "
+            "tree does not agree: " + "; ".join(problems)
+        )
+    detail = "verified against the tree: " + "; ".join(confirmed)
+    if str(note or "").strip():
+        detail = f"{str(note).strip()} — {detail}"
+    path = record_audit_outcome(
+        intake_dir,
+        finding,
+        OUTCOME_ALREADY_DONE,
+        detail=detail,
+        evidence=confirmed,
+    )
+    return AuditOutcome(
+        finding=finding,
+        outcome=OUTCOME_ALREADY_DONE,
+        detail=detail,
+        ledger_path=path,
+        evidence=confirmed,
+    )
+
+
+def decline_finding(
+    finding: AuditFinding, *, intake_dir: Path, reason: str
+) -> AuditOutcome:
+    """DECLINED: deliberately not doing it, with a reason, durably.
+
+    The outcome without which the other two are not enough. A finding that is
+    neither work nor already done — a style opinion, a decision belonging to a
+    human, something the project has chosen not to do — has no other exit, and
+    without one it stays on the panel forever.
+
+    It stays declined across runs, and stops being declined only when the
+    finding's own evidence changes (`AuditFinding.fingerprint`), which is the
+    same "unless its evidence changes" rule `record_decline` already applies to
+    an offered suggestion.
+    """
+    if not str(reason or "").strip():
+        raise IntakeError(
+            f"declining {finding.qualified_id} needs a reason — a finding "
+            "dismissed with no account of why is indistinguishable from one "
+            "nobody read"
+        )
+    path = record_audit_outcome(
+        intake_dir, finding, OUTCOME_DECLINED, detail=str(reason).strip()
+    )
+    return AuditOutcome(
+        finding=finding,
+        outcome=OUTCOME_DECLINED,
+        detail=str(reason).strip(),
+        ledger_path=path,
+    )
+
+
+# ---- the repeatable pass ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuditIntakeState:
+    """Everything one intake pass reads: the report, the ledger, the registry.
+
+    Read ONCE and passed around, so the list an operator sees and the
+    deduplication a promotion is judged against cannot come from two different
+    reads of the same files.
+    """
+
+    report: AuditReport
+    ledger: AuditLedger
+    registry_read: bool = True
+    tasks_data: object = None
+
+    def finding(self, finding_id: str) -> AuditFinding:
+        """Resolve a qualified id against the report. Raises `IntakeError`.
+
+        Looks in EVERY finding, not only the outstanding ones, so a decision can
+        be revisited — re-declining something already declined, or promoting
+        something previously declined — without editing the ledger by hand.
+        """
+        wanted = str(finding_id or "").strip()
+        for item in self.report.findings:
+            if item.qualified_id == wanted:
+                return item
+        if not self.report.read:
+            raise IntakeError(
+                f"no finding {wanted!r}: {self.report.note or 'no report was read'}"
+            )
+        raise IntakeError(
+            f"no finding {wanted!r} in {self.report.source} — run "
+            "`python -m autoloop intake audit list` for the ids it holds"
+        )
+
+    def assess(self, finding: AuditFinding) -> FindingAssessment:
+        return assess_finding(
+            finding,
+            self.tasks_data,
+            registry_read=self.registry_read,
+            ledger=self.ledger,
+        )
+
+    def outstanding(self) -> tuple[AuditFinding, ...]:
+        return outstanding_findings(self.report.findings, self.ledger)
+
+    def summary(self) -> dict:
+        return audit_intake_summary(self.report, self.ledger)
+
+
+def read_audit_intake(
+    repo: Path, *, report_glob: str, tasks_file: Path, intake_dir: Path
+) -> AuditIntakeState:
+    """One read of everything an intake pass needs. Never raises."""
+    data = _read_json(tasks_file)
+    return AuditIntakeState(
+        report=newest_audit_report(repo, report_glob),
+        ledger=load_audit_intake(intake_dir),
+        registry_read=data is not None,
+        tasks_data=data,
+    )

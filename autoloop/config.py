@@ -275,6 +275,18 @@ DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
 #: an unreadable entry at the path is refused; see
 #: `audit.executor.load_charter_domains`.
 DEFAULT_AUDIT_CHARTERS_FILE = "docs/audit_charters.toml"
+#: Where the TARGET repository's APPLICATION test suite lives, and how to run
+#: it. Defaults for `RepoConfig.app_test_root` / `app_validation`, and the exact
+#: pair this repository's own audit findings need: an app finding names files
+#: under `lexy-app/`, and grading it with `autoloop/tests` would run the loop's
+#: suite against a change it says nothing about.
+#:
+#: Read by ONE consumer, `inbox.promotion_spec` — the intake that turns an audit
+#: finding into a runnable task. Nothing else in the loop looks at them.
+DEFAULT_APP_TEST_ROOT = "tests"
+DEFAULT_APP_VALIDATION: tuple[tuple[str, ...], ...] = (
+    ("python3", "-m", "pytest", "tests/", "-q", "-p", "no:cacheprovider"),
+)
 
 
 @dataclass(frozen=True)
@@ -315,7 +327,7 @@ class RepoConfig:
     #: audit report, by name. A glob relative to the repo root; metacharacters
     #: are the point here, unlike in `env_example_file`, so it is checked only
     #: for being relative and traversal-free. Exactly `""` means the dashboard's
-    #: "Language-app tasks" panel stays empty, which is the correct reading for
+    #: "Audit findings" panel stays empty, which is the correct reading for
     #: a repository that files no audit reports — and, as above, only that exact
     #: value; padding is refused rather than read as the opt-out.
     audit_report_glob: str = DEFAULT_AUDIT_REPORT_GLOB
@@ -334,6 +346,26 @@ class RepoConfig:
     #: widen what an agent may do any more than a reviewer's scope can. See
     #: `docs/SECURITY.md` S24.
     audit_charters_file: str = DEFAULT_AUDIT_CHARTERS_FILE
+    #: Where the APPLICATION's test suite lives, relative to the repo root, with
+    #: NO trailing slash (the trailing '/' that makes it a directory prefix is
+    #: added where it is used, because `_repo_relative` refuses an empty final
+    #: segment). Exactly `""` means the repository ships no app suite, and an app
+    #: finding then cannot be promoted at all rather than being promoted with a
+    #: scope too narrow to work in — `inbox.promotion_spec` refuses and says so.
+    app_test_root: str = DEFAULT_APP_TEST_ROOT
+    #: How to run that suite: argv lists, exactly the shape
+    #: `audit.validation_commands` uses, and validated by the same rule.
+    #:
+    #: A COMMAND LIST, not a location, so it does not fit this section's "every
+    #: setting says WHERE to read something" sentence — and it is here anyway,
+    #: with `audit.validation_commands` as the precedent: a command list in the
+    #: config grants nothing, because the validation runner already restricts
+    #: which binaries it will execute, and where a repository keeps its tests is
+    #: not something the loop can infer. Read by `inbox.promotion_spec` and
+    #: nowhere else: it becomes the `validation` a PROMOTED audit finding's task
+    #: declares, so that task is graded against the APP suite rather than the
+    #: loop's.
+    app_validation: tuple[tuple[str, ...], ...] = DEFAULT_APP_VALIDATION
 
 
 #: The key retired on 2026-08-14. An existing config may still name it, and
@@ -1426,7 +1458,12 @@ def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
     notices = _migrate_retired_tracker_paths(repo_data)
     _check_keys("repo", repo_data, {f.name for f in dataclasses.fields(RepoConfig)})
 
-    for key in ("env_example_file", "audit_report_glob", "audit_charters_file"):
+    for key in (
+        "env_example_file",
+        "audit_report_glob",
+        "audit_charters_file",
+        "app_test_root",
+    ):
         if key not in repo_data:
             continue
         value = repo_data[key]
@@ -1464,6 +1501,24 @@ def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
                 "repo.env_example_db_key must be a plain environment-variable name "
                 f"(no padding, no '=', no whitespace), got {key_name!r}"
             )
+
+    if "app_validation" in repo_data:
+        # The SAME shape rule `audit.validation_commands` is held to, spelled
+        # the same way: argv lists of non-empty strings. An empty list is
+        # allowed and means "this repository declares no app suite" — an app
+        # finding is then refused promotion by `inbox.promotion_spec` rather
+        # than promoted with no validation, which is the outcome that costs
+        # rounds.
+        commands = repo_data["app_validation"]
+        if not isinstance(commands, list) or not all(
+            isinstance(c, list) and c and all(isinstance(p, str) and p for p in c)
+            for c in commands
+        ):
+            raise ConfigError(
+                "repo.app_validation must be a list of non-empty string lists, "
+                f"got {commands!r}"
+            )
+        repo_data["app_validation"] = tuple(tuple(c) for c in commands)
 
     return RepoConfig(**repo_data), notices
 
