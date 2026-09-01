@@ -469,7 +469,10 @@ DOCS_ONLY_SELECTED = 20
 #: 105 -> 106 when conc-02 added `test_config_concurrency.py` (2026-09-01):
 #: it loads configs from `tmp_path` strings and reads no tracker, so the same
 #: 20 once more — the DENOMINATOR only.
-SUITE_SIZE = 106
+#: 106 -> 107 when conc-05 added `test_lane_state.py` (2026-09-01): it works
+#: on lane paths and lease records under `tmp_path` and reads no tracker, so
+#: the same 20 once more — the DENOMINATOR only.
+SUITE_SIZE = 107
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

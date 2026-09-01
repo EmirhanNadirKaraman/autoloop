@@ -149,7 +149,7 @@ from .auto_merge import (
     UpgradeStore,
     upgrade_bound_sha,
 )
-from .lock import LoopLock
+from .lock import LaneLease, LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from . import merge_sweep
 from .orchestrator import (
@@ -186,6 +186,7 @@ from .state import (
     StopRepetitionStore,
     abort_flag_file,
     abort_requested,
+    lane_state_file,
     packet_outstanding_reason,
     stop_repetition_file,
     utcnow_iso,
@@ -251,8 +252,20 @@ def load_config(path: Path) -> AutoloopConfig:
     return config
 
 
-def _load_state(config: AutoloopConfig) -> tuple[StateStore, LoopState | None]:
-    store = StateStore(config.state_file)
+def _load_state(
+    config: AutoloopConfig, lane_index: int = 0
+) -> tuple[StateStore, LoopState | None]:
+    """The store and state for ONE lane — lane 0 unless told otherwise.
+
+    Resolved through `state.lane_state_file` rather than `config.state_file`
+    (conc-05). For lane 0 the two are the SAME path — `state_dir/state.json`,
+    byte for byte what every reader of this loop has always seen — so nothing
+    about a single-lane deployment moves; what changes is that the CLI now asks
+    a lane-aware resolver for it, so the fleet supervisor (candidate 5 of
+    docs/AUTOLOOP.md's split plan) has a lane to name here rather than a call
+    site to rewrite.
+    """
+    store = StateStore(lane_state_file(config.state_dir, lane_index))
     state = store.load()
     # An UNSET `browser.conversation_url` is not drift, it is the absence of a
     # configured conversation — the normal shape of a config since brw-16
@@ -1088,6 +1101,7 @@ def _self_upgrade_at_boundary(
     config: AutoloopConfig,
     lock: LoopLock | None,
     args: argparse.Namespace | None = None,
+    lane: "_LaneEntry | None" = None,
 ) -> UpgradeOutcome:
     """Replace this process with a fresh interpreter running the merged tree.
 
@@ -1111,9 +1125,11 @@ def _self_upgrade_at_boundary(
       running the OLD code, which works, and the failure is reported. A bad
       merge must be reported, not fatal.
     * `exec_failed` — the one-shot marker could not be written, the lock could
-      not be armed for the handoff, or `os.execv` itself refused. The lock case
-      is refused rather than risked: the successor would find a live lock (its
-      own pid), fail closed and end the run.
+      not be armed for the handoff, the lane lease could not be released for it,
+      or `os.execv` itself refused. The lock and lane cases are refused rather
+      than risked, and for opposite halves of one reason: the successor would
+      find a live lock (its own pid) or a live lease (its own pid), fail closed
+      and end the run.
 
     THE THREE NON-EXEC OUTCOMES LEAVE THE RECORD `pending` (`_carry_on_upgrade`
     — read its docstring for why, and for the one thing that makes the two
@@ -1132,6 +1148,13 @@ def _self_upgrade_at_boundary(
     `args` is the namespace this process is running under, and is used for one
     thing: rebuilding the successor's command line (`_successor_argv`). None
     means "no flags to carry across", which is the plain `run --continuous`.
+
+    `lane` is the lane this process is working in (`_LaneEntry`), or None for a
+    caller that holds none — every deployment at `lanes = 1`, and every test
+    that drives this function directly. It is used for one thing too, and it is
+    the mirror of what the lock is used for: the lease is RELEASED immediately
+    before the exec, because unlike the lock it cannot survive the replacement,
+    and re-entered if the exec does not happen after all.
     """
     store = UpgradeStore(config.pending_upgrade_file)
     log = TranscriptLogger(config.transcript_file).append
@@ -1281,6 +1304,26 @@ def _self_upgrade_at_boundary(
             execed_on_disk=True,
         )
 
+    # AND THE LANE GOES THE OTHER WAY. The lock is armed so it SURVIVES the
+    # replacement; the lease must not survive it, because it has no adoption of
+    # its own and the successor would find one naming its own pid, read it as
+    # live and refuse to enter its own lane. Released here — after the arming,
+    # so a failure to arm is still decided while the lane is held — and refused
+    # exactly like the arming when it will not go, because a lease left on disk
+    # would end the successor's run just as surely as a live lock would.
+    if lane is not None and not lane.release_for_handoff():
+        lock.clear_exec_handoff()
+        return _carry_on_upgrade(
+            store,
+            record,
+            UPGRADE_EXEC_FAILED,
+            "the lane lease could not be released for the handoff, so the "
+            "replacement was not attempted — its successor would have found a "
+            "lease it must refuse and could not have entered its own lane",
+            log,
+            execed_on_disk=True,
+        )
+
     # The documented launch shape (`python -m autoloop run --continuous`),
     # derived from what this process is DOING rather than from the verb its
     # operator typed — see `_successor_argv`, and `SUCCESSOR_COMMAND` for the
@@ -1327,7 +1370,7 @@ def _self_upgrade_at_boundary(
         # `pending` keeps the sha retryable by the NEXT process — this one is
         # bounded by its own decline — and takes the false confirmation off the
         # table at the same time.
-        return _carry_on_upgrade(
+        outcome = _carry_on_upgrade(
             store,
             record,
             UPGRADE_EXEC_FAILED,
@@ -1336,6 +1379,15 @@ def _self_upgrade_at_boundary(
             log,
             execed_on_disk=True,
         )
+        # AFTER the record is settled and the outcome logged, never before: this
+        # process is about to go on doing lane work with the code it started
+        # with, so it has to be back in its lane — and re-entry can RAISE, which
+        # ends the run. Ordering it second is what keeps that ending from being
+        # the 2026-08-27 silence: whatever happens here, the transcript already
+        # says how the boundary ended.
+        if lane is not None:
+            lane.reenter_after_handoff()
+        return outcome
     return UpgradeOutcome(  # pragma: no cover - execv does not return
         UPGRADE_EXECED, base_sha=base_sha, candidate_sha=record.candidate_sha
     )
@@ -1484,6 +1536,95 @@ def _remaining_steps(max_steps: int | None, spent: int) -> int | None:
     return max(0, max_steps - spent)
 
 
+class _LaneEntry:
+    """Exclusive occupancy of ONE lane for as long as this process works in it
+    — `lock.LaneLease` plus the rule about WHEN one is taken (conc-05).
+
+    Taken around the lane's work in `_cmd_run`, which is where `run` and
+    `start` both end up, and released by unwinding out of the `with`. The fleet
+    supervisor (candidate 5 of docs/AUTOLOOP.md's split plan) is what will hold
+    one of these per lane instead of one per process; nothing else about this
+    changes when it does.
+
+    NOTHING IS TAKEN AT `lanes = 1`, and that is the acceptance criterion made
+    structural rather than asserted: no lease is asked for, so no lease file
+    exists, so "at `lanes = 1` no new file appears under the state dir" cannot
+    be broken by a flag being wrong. Exclusion there is the fleet lock's, which
+    is exactly what it has always been — one holder per state dir, and at one
+    lane the state dir IS the lane.
+
+    `lease` is `None` in three distinct situations and they are deliberately
+    not told apart: a single-lane deployment, a lane not entered yet, and the
+    instant between `release_for_handoff` and the `os.execv` it is releasing
+    for. Every one of them means the same thing to a reader — this object holds
+    nothing on disk right now.
+    """
+
+    def __init__(self, config: AutoloopConfig, lane_index: int = 0):
+        self.config = config
+        self.lane_index = lane_index
+        self.lease: LaneLease | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """Whether this deployment has lanes at all — `[concurrency] lanes > 1`."""
+        return self.config.concurrency.lanes > 1
+
+    def __enter__(self) -> "_LaneEntry":
+        if self.enabled:
+            self.lease = LaneLease(self.config.state_dir, self.lane_index).acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+
+    def release_for_handoff(self) -> bool:
+        """Leave the lane for an `os.execv` that is about to replace this
+        process. Returns whether the lane is now demonstrably free.
+
+        A lease has no adoption of its own (see `lock.LaneLease`): carried
+        across the replacement it would name the successor's own pid, read as
+        live, and the successor would fail closed. So it goes first — and if it
+        will not go, the caller must not exec, which is why this reports rather
+        than raises.
+
+        `False` covers both ways the release can leave the file there: an
+        unlink that failed, and a lease that is no longer ours to remove (the
+        run-id check inside `LaneLease.release`, or a record that has become
+        unreadable). Either way a successor would find a lease it must refuse,
+        so `path.exists()` is checked rather than assumed from the call
+        returning.
+        """
+        if self.lease is None:
+            return True
+        try:
+            self.lease.release()
+        except OSError:
+            return False
+        if self.lease.path.exists():
+            return False
+        self.lease = None
+        return True
+
+    def reenter_after_handoff(self) -> None:
+        """Take the lane back after a handoff that did not happen.
+
+        `os.execv` can raise, and then this process carries on doing lane work
+        with the code it started with — so it has to be back in its lane first.
+        RAISES if it cannot be (`LockHeldError` / `StaleLockError` /
+        `StateCorruptError` out of `acquire`), which ends the run: something
+        else took the lane in the instant the exec was attempted, and carrying
+        on would be the two-processes-in-one-lane this whole mechanism exists
+        to make impossible. A no-op at `lanes = 1` and when the lease is still
+        held, so it is safe to call on any path back from the boundary.
+        """
+        if not self.enabled or self.lease is not None:
+            return
+        self.lease = LaneLease(self.config.state_dir, self.lane_index).acquire()
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir) as lock:
@@ -1507,13 +1648,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
             )
             return 1
         try:
-            if getattr(args, "continuous", False):
-                _validate_continuous_args(args)
-                # The lock travels with it: `_run_continuous` is where the
-                # process may replace itself, and the handoff has to be armed
-                # on the lock this `with` block actually holds.
-                return _run_continuous(args, config, lock)
-            return _run_locked(args, config)
+            # THE LANE, taken before any of this process's lane work and
+            # released by unwinding out of this `with` — including the SIGTERM
+            # path, whose `SystemExit` unwinds through it. Inside the `try` on
+            # purpose: a lane that cannot be entered must still leave the
+            # heartbeat published by the `finally` below, for the reason the
+            # startup-sweep refusal above publishes `PARKED` rather than
+            # returning silently. Lane 0, because until the fleet supervisor
+            # lands (candidate 5) one process is one lane; at `lanes = 1` this
+            # takes nothing at all.
+            with _LaneEntry(config) as lane:
+                if getattr(args, "continuous", False):
+                    _validate_continuous_args(args)
+                    # The lock travels with it: `_run_continuous` is where the
+                    # process may replace itself, and the handoff has to be armed
+                    # on the lock this `with` block actually holds. The lane
+                    # travels for the mirror-image reason — it has to be RELEASED
+                    # before that replacement, and only the object holding it can.
+                    return _run_continuous(args, config, lock, lane)
+                # `_run_locked` never hands off (`_defer_self_upgrade`), so the
+                # single-round path has nothing to hand the lane to.
+                return _run_locked(args, config)
         finally:
             # A CLEAN exit publishes `stopped`, which is how the monitor tells
             # "you stopped it" from "it died". Without this both look identical
@@ -1695,7 +1850,10 @@ CONTINUOUS_POLL_SECONDS = 30.0
 
 
 def _run_continuous(
-    args: argparse.Namespace, config: AutoloopConfig, lock: LoopLock | None = None
+    args: argparse.Namespace,
+    config: AutoloopConfig,
+    lock: LoopLock | None = None,
+    lane: "_LaneEntry | None" = None,
 ) -> int:
     """`run --continuous`: loop the existing phase machine indefinitely,
     working around task-scoped blockers instead of halting on them.
@@ -1749,7 +1907,10 @@ def _run_continuous(
     boundary. This is the ONLY place the process replaces itself, and the
     replacement is `os.execv` in the same pid holding the same lock — see
     `_self_upgrade_at_boundary`, which preflights the merged tree first and
-    keeps running the old code if it does not import.
+    keeps running the old code if it does not import. The `lane` this process
+    is working in travels with the lock for the opposite reason: the lock
+    SURVIVES the replacement and the lane lease must not, so the boundary
+    releases it in the instant before the exec (`_LaneEntry`).
 
     **EXHAUSTION.** Once a clean boundary finds no READY task AND the
     repository fingerprint is unchanged, that used to always mean "sleep and
@@ -1916,7 +2077,15 @@ def _run_continuous(
                 # round offers it, this branch reads a real sha and bounds it.
                 offered = UpgradeStore(config.pending_upgrade_file).load()
                 answered = upgrade_bound_sha(offered)
-                acted = _self_upgrade_at_boundary(config, lock, args)
+                # The lane is passed only when there IS one, so a caller that
+                # holds none makes the same three-argument call it always did.
+                # Not a stylistic preference: `_run_continuous(args, config)`
+                # and `(args, config, lock)` are both supported call shapes, a
+                # `None` fourth argument would say nothing the default does not,
+                # and forwarding one would change a signature that several
+                # callers substitute their own function for.
+                lane_arg = () if lane is None else (lane,)
+                acted = _self_upgrade_at_boundary(config, lock, args, *lane_arg)
                 # `getattr` because this is the branch whose whole job is to
                 # keep the process alive past a boundary: a callee that came
                 # back a bare slug (a future refactor, a test double) must not
