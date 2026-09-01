@@ -59,6 +59,16 @@ containment that does not depend on knowing a sandbox flag's name is
 containment that still holds when the flag is renamed. Configured sandbox
 arguments are passed through on top of that, not instead of it.
 
+**Stdout is a transcript, and only one part of it is the reply.** `codex exec`
+prints role markers, hook lines and a token counter around the message, and
+closes by printing the message a second time. `submit` therefore hands
+`reply.isolate_reply`'s answer to the caller rather than `result.stdout`, and
+an invocation from which no verdict could be isolated is a FAILED invocation —
+never a defaulted decision. The contract is untouched: see `reply.py` for why
+the fix belongs on this side of it, and `docs/AUTOLOOP.md`'s "What the codex CLI
+actually prints" for the three alternatives — asking for a fenced block,
+disabling hooks, letting the parser refuse the ambiguity — that were rejected.
+
 **Every non-zero exit leaves a record, and the prompt cannot classify it.**
 `submit` logs `codex_invocation_failed` on every failure — including the ones
 it does not recognise — and it classifies with `quota.classify`, which is
@@ -88,6 +98,7 @@ from .quota import (
     classify,
     failure_digest,
 )
+from .reply import FROM_SEGMENT, isolate_reply
 
 #: Ceiling on the argv-borne prompt, well under this host's 1 MiB ARG_MAX so
 #: the environment block and the rest of the command line still fit.
@@ -351,12 +362,22 @@ class CodexConversation:
             # not reach the branch above, which parks with no retry path.
             return SubmitResult.REJECTED
 
-        reply = result.stdout.strip()
-        if not reply:
-            # A clean exit with nothing on stdout is a broken invocation, not a
-            # reply. Reporting REJECTED keeps it retryable; calling it CONFIRMED
-            # would hand the contract parser an empty string and spend a parse
-            # retry saying so.
+        # `codex exec` stdout is a rendered TRANSCRIPT, not a reply: role
+        # markers, hook lines, a token counter, and — measured on this machine
+        # — the answer printed a second time as the run's closing summary.
+        # Handing the whole of it to `contract.parse_response` is what made this
+        # provider unable to return a verdict at all (`invalid_json: the reply
+        # is not exactly one JSON value`). `reply.isolate_reply` hands the
+        # contract the reviewer's own message and nothing else; the contract is
+        # unchanged and still decides whether that message is a directive.
+        isolated = isolate_reply(result.stdout)
+        if not isolated.text:
+            # No verdict could be isolated: nothing on stdout, a role marker
+            # with no message under it, or two messages between which choosing
+            # by position is the rule the contract refuses. All three are a
+            # broken invocation, not a reply. Reporting REJECTED keeps it
+            # retryable; calling it CONFIRMED would hand the contract parser
+            # text it must refuse and spend a parse retry saying so.
             self._log(
                 "codex_invocation_failed",
                 failure_digest(
@@ -365,12 +386,29 @@ class CodexConversation:
                     result.stderr,
                     prompt,
                     request_id=request_id,
-                    note="exited 0 with no reply on stdout",
+                    note=isolated.note,
                 ),
             )
             return SubmitResult.REJECTED
 
-        self._responses[request_id] = reply
+        if isolated.source == FROM_SEGMENT:
+            # The boundary is VISIBLE, for the reason `quota.py`'s
+            # `suppressed_patterns` is: a rule that silently discards output is
+            # indistinguishable from a rule that never fired. COUNTS ONLY —
+            # stdout carries the echoed prompt, which is the whole review
+            # packet, and the isolated reply already reaches the transcript in
+            # full under `response_received.raw`.
+            self._log(
+                "codex_reply_isolated",
+                {
+                    "request_id": request_id,
+                    "segments": isolated.segments,
+                    "stdout_chars": isolated.stdout_chars,
+                    "reply_chars": isolated.reply_chars,
+                },
+            )
+
+        self._responses[request_id] = isolated.text
         return SubmitResult.CONFIRMED
 
     def await_response(self, request_id: str) -> str:

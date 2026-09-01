@@ -462,7 +462,9 @@ DOCS_ONLY_SELECTED = 20
 #: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). Only
 #: the DENOMINATOR moved: the new file reads no tracker and spawns nothing, so a
 #: docs-only round still selects the same 20.
-SUITE_SIZE = 103
+#: 103 -> 104 when prov-01 added `test_codex_stdout_verdict.py` (2026-09-01),
+#: for the same reason and with the same effect: still the same 20.
+SUITE_SIZE = 104
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
