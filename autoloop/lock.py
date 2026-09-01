@@ -696,12 +696,14 @@ class LaneLease:
 
         THE EMPTY FILE IS NOT HYPOTHETICAL: `acquire` creates the lease with
         `O_CREAT|O_EXCL` and writes it a moment later, so a process KILLED in
-        that window leaves a zero-byte lease behind. `json.loads("")` raises,
-        which is exactly right — a lease whose owner died before it could say
-        who it was is not a lane anyone may enter on the strength of the file
-        being there. An ordinary I/O failure in that same window no longer
-        reaches here at all: `acquire` removes the file it has just proved it
-        created, so only a killed process leaves one.
+        that window leaves a zero-byte lease behind — or, killed between two
+        partial writes of the record, a truncated one. `json.loads` raises on
+        both, which is exactly right — a lease whose owner died before it could
+        say who it was is not a lane anyone may enter on the strength of the
+        file being there. An ordinary I/O failure in that same window no longer
+        reaches here at all, and neither does a SHORT write: `acquire` writes
+        the record in full or removes the file it has just proved it created,
+        so only a killed process leaves one.
 
         A file that vanishes between the `exists()` and the read is `None`, not
         corrupt: that is a release racing this read, and the lane really is
@@ -786,6 +788,18 @@ class LaneLease:
         breaks the FLEET lock and would not touch this file, so pointing an
         operator at it would be a remedy that silently does nothing.
 
+        THE RECORD IS WRITTEN IN FULL OR NOT AT ALL, and "in full" is a loop
+        rather than one call. `os.write` is a single `write(2)`: it may write
+        FEWER bytes than it is given and return that count, raising nothing.
+        That is not an error path — it is the quiet one, and it would leave a
+        truncated lease that `read` must refuse forever, closing a lane with no
+        process in it while its owner believed it had entered. A call that
+        returns zero has moved nothing at all; it is raised as `OSError`
+        (deliberately that type, so the cleanup below catches it) rather than
+        retried, because retrying a write that cannot progress hangs the lane
+        instead of refusing it. Ownership is claimed only after the last byte
+        and the `fsync`.
+
         A WRITE THAT FAILS TAKES ITS OWN LEASE BACK OFF DISK, and that is the
         one removal in this class that does not read the record first — for the
         reason the class docstring gives about why every other one does.
@@ -831,14 +845,22 @@ class LaneLease:
             ) from None
         try:
             try:
-                os.write(fd, payload)
+                written = 0
+                while written < len(payload):
+                    count = os.write(fd, payload[written:])
+                    if count <= 0:
+                        raise OSError(
+                            f"lane lease {self.path}: wrote {written} of "
+                            f"{len(payload)} bytes and then made no progress"
+                        )
+                    written += count
                 os.fsync(fd)
             finally:
                 os.close(fd)
         except OSError:
-            # Ours by construction (the `O_EXCL` above), never written, and
-            # unreadable if left — see this method's docstring. Best effort on
-            # the unlink itself: the caller is already being told the
+            # Ours by construction (the `O_EXCL` above), never written IN FULL,
+            # and unreadable if left — see this method's docstring. Best effort
+            # on the unlink itself: the caller is already being told the
             # acquisition failed, and a second error about the cleanup would
             # replace the diagnosis with the tidying.
             try:
