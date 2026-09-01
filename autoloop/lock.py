@@ -81,6 +81,12 @@ probe decides the rest — with no possibility of the two drifting apart. That i
 the plan's own argument for reuse (docs/AUTOLOOP.md, "Decision 2"): two
 implementations of "is it alive" drift, and the one that drifts is the one that
 lets two processes into one lane.
+
+`cli._LaneEntry` is what takes one, around the lane's work and only at
+`lanes > 1`; the two locks are never held by the same object, and the one
+place they interact is the self-upgrade handoff, where the fleet lock is armed
+to SURVIVE `os.execv` and the lease is released so that it does not. See
+`LaneLease`'s own docstring for both halves.
 """
 
 from __future__ import annotations
@@ -610,23 +616,31 @@ class LaneLease:
       while it runs. `break_stale` below is the primitive it will call.
     * **An unreadable lease is refused rather than read as free.** See `read`.
 
-    NOTHING IN THIS PACKAGE ACQUIRES ONE YET, and that is not an oversight
-    either. The obvious place — around `cli._cmd_run`'s `with LoopLock(...)` —
-    is the one place it must not go: `_run_continuous` may replace this process
-    with `os.execv` to pick up a merged upgrade, the fleet lock has an entire
-    token-authenticated handoff so that it survives the replacement, and a lane
-    lease has none. Held for the process's lifetime it would be a LIVE lease
-    naming this pid when the successor image asked for it, and the successor
-    would fail closed — a self-upgrade would end the run. The plan puts the
-    lease where that cannot happen: acquired per lane by the fleet supervisor
-    (candidate 5), which reaches an upgrade boundary by DRAINING, with every
-    lane finished and every lease released. So this lands as the mechanism the
-    supervisor takes, exactly as conc-02 landed `[concurrency].lanes` unread.
+    WHO TAKES ONE: `cli._LaneEntry`, wrapped around the lane's own work inside
+    `cli._cmd_run` — after the fleet lock is held, and inside the `try` whose
+    `finally` publishes the heartbeat, so every exit that unwinds releases it.
+    `run` and `start` (which ends in `_cmd_run`) are the only entry points that
+    run a lane today; the fleet supervisor of candidate 5 will hold one of the
+    same objects per lane instead of one per process.
 
-    At `lanes = 1` no lease file is created at all, by nothing more subtle than
-    nobody asking for one — which is what keeps "no new file appears under the
-    state dir" true by construction rather than by a flag that could be wrong.
-    Lane 0's exclusion at one lane is the fleet lock's, and always has been.
+    ONLY AT `lanes > 1`. That gate is the acceptance criterion made structural
+    rather than a flag that could be wrong: at `lanes = 1` nobody asks for a
+    lease, so no lease file is created at all and "no new file appears under the
+    state dir" stays true by construction. Lane 0's exclusion at one lane is the
+    fleet lock's, and always has been.
+
+    THE ONE EXIT THAT DOES NOT UNWIND is `os.execv`, and it is why this class
+    has no handoff of its own and needs none. `cli._self_upgrade_at_boundary`
+    replaces the process to pick up a merged upgrade; the fleet lock survives
+    that by a token-authenticated adoption and a lease has nothing of the sort,
+    so held across the replacement it would be a LIVE lease naming the
+    successor's own pid and the successor would fail closed — a self-upgrade
+    would end the run. The lease is therefore RELEASED in the instant before the
+    exec, immediately after the lock is armed, and the handoff is REFUSED
+    (`exec_failed`, with the lock disarmed again) when it cannot be — the same
+    refusal, for the same reason, as a lock that could not be armed. An
+    `os.execv` that raises re-enters the lane before the loop carries on, and
+    fails closed if the lane is no longer enterable.
 
     NO SIGNAL HANDLERS, unlike `LoopLock`, and that is REQUIRED rather than
     merely economical. `signal.signal` replaces the previous handler: a lease
@@ -681,11 +695,13 @@ class LaneLease:
         whole process group rather than the lease's owner.
 
         THE EMPTY FILE IS NOT HYPOTHETICAL: `acquire` creates the lease with
-        `O_CREAT|O_EXCL` and writes it a moment later, so a process killed in
+        `O_CREAT|O_EXCL` and writes it a moment later, so a process KILLED in
         that window leaves a zero-byte lease behind. `json.loads("")` raises,
         which is exactly right — a lease whose owner died before it could say
         who it was is not a lane anyone may enter on the strength of the file
-        being there.
+        being there. An ordinary I/O failure in that same window no longer
+        reaches here at all: `acquire` removes the file it has just proved it
+        created, so only a killed process leaves one.
 
         A file that vanishes between the `exists()` and the read is `None`, not
         corrupt: that is a release racing this read, and the lane really is
@@ -769,6 +785,18 @@ class LaneLease:
         unlock`, though the exception type's own docstring does: that command
         breaks the FLEET lock and would not touch this file, so pointing an
         operator at it would be a remedy that silently does nothing.
+
+        A WRITE THAT FAILS TAKES ITS OWN LEASE BACK OFF DISK, and that is the
+        one removal in this class that does not read the record first — for the
+        reason the class docstring gives about why every other one does.
+        `O_CREAT|O_EXCL` has just proved this process CREATED the file, so there
+        is no incumbent to steal from and no check-then-act to lose: what is
+        being removed is this call's own failed acquisition, never somebody
+        else's lease. Leaving it would be strictly worse than either outcome the
+        refusals are about — an empty or half-written record that `read` must
+        refuse forever, stranding a lane on an ENOSPC nobody would think to look
+        for. The raise still propagates: a caller that could not take the lane
+        is not in it.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         info = LaneLeaseInfo(
@@ -779,6 +807,9 @@ class LaneLease:
             lane_id=self.lane_id,
             state_dir=str(self.lane_dir),
         )
+        # Rendered BEFORE the file exists, so a record that cannot be encoded
+        # strands nothing: at this point there is no lease on disk to clean up.
+        payload = json.dumps(asdict(info), indent=2).encode("utf-8")
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
@@ -799,10 +830,22 @@ class LaneLease:
                 "file — it breaks the fleet lock.)"
             ) from None
         try:
-            os.write(fd, json.dumps(asdict(info), indent=2).encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            try:
+                os.write(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            # Ours by construction (the `O_EXCL` above), never written, and
+            # unreadable if left — see this method's docstring. Best effort on
+            # the unlink itself: the caller is already being told the
+            # acquisition failed, and a second error about the cleanup would
+            # replace the diagnosis with the tidying.
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            raise
         self._owned = True
         return self
 
