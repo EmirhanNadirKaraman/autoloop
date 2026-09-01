@@ -1239,6 +1239,36 @@ MODAL_SIGHTED = "the throttle modal is up on a page this loop can drive"
 MAX_AWAIT_REPLAYS = 3
 
 
+@dataclass(frozen=True)
+class RepresentedCandidate:
+    """A postcommit review packet that has been rendered and PROVEN bindable,
+    but not yet queued (`Orchestrator._prepare_candidate_representation`).
+
+    It exists as a value because the two halves of the answer to an unbound
+    `push` have to happen in this order and nothing may be half-applied
+    between them: the denial is charged first (and may exhaust the budget and
+    END the run), and only a denial that decided to RE-PROMPT gets to replace
+    the correction with this packet. A packet written into the outbox of a
+    session that then stopped would be sent by whatever resumed it, answering
+    a question the loop had already given up on.
+
+    So preparing it touches no state at all, and `_present_candidate_again` is
+    the only thing that does.
+    """
+
+    #: The record the packet was rendered from, re-read from the execution
+    #: store rather than taken from the `state.task_execution` mirror — that
+    #: mirror is display state, and `_current_pending_postcommit` will
+    #: cross-check the payload against the store anyway.
+    execution: TaskExecution
+    #: The whole of the next request: the refusal's preamble, then the packet.
+    payload: str
+    #: The patch, so `_step_ready` can plan a chunked delivery for it without
+    #: re-reading git — the same field, on the same rule, as
+    #: `_finish_postcommit` sets.
+    packet_diff: str
+
+
 class Orchestrator:
     #: The clock every measured stage duration is read from (prof-01,
     #: 2026-08-20). MONOTONIC, not wall clock: this measures an interval, and
@@ -4841,7 +4871,34 @@ class Orchestrator:
             # is refused through the SAME budget-capped corrective-reprompt
             # machinery as any other policy denial — never silently routed to
             # the executor, which does not understand a git decision.
-            self._handle_policy_denial(directive, self._legacy_git_verdict(decision))
+            #
+            # THE REFUSAL ALONE IS A FIXED POINT, which is what made this branch
+            # reachable 71 times in 14 minutes on 2026-08-31 (postcommit-01).
+            # `policy_denied_payload` is a `failure_recovery` render carrying
+            # none of the candidate's four identifiers, so
+            # `_current_pending_postcommit` binds the NEXT request to nothing
+            # either — and the same approval, sent again about the same
+            # candidate, lands back here. Nothing about the reviewer's reply had
+            # to change for that to repeat; the loop's own re-prompt guaranteed
+            # it.
+            #
+            # So a `push` this loop could still answer properly re-presents the
+            # candidate instead of asking again. The push is STILL refused and
+            # still charged against `max_policy_denials`; what changes is that
+            # the reviewer's next reply answers a real postcommit packet, which
+            # is a request whose approval `_dispatch_task_push` can accept.
+            # Restricted to `push`: `commit` / `commit_and_push` are retired by
+            # DECISION, so no packet could make one of them valid.
+            represented = (
+                self._prepare_candidate_representation()
+                if decision is Decision.PUSH
+                else None
+            )
+            reprompted = self._handle_policy_denial(
+                directive, self._legacy_git_verdict(decision, represented)
+            )
+            if reprompted and represented is not None:
+                self._present_candidate_again(represented)
         else:  # audit / implement / revise
             self._dispatch_executor(directive)
 
@@ -4864,7 +4921,9 @@ class Orchestrator:
             return None
         return task_id, candidate_sha
 
-    def _legacy_git_verdict(self, decision: Decision) -> Verdict:
+    def _legacy_git_verdict(
+        self, decision: Decision, represented: RepresentedCandidate | None = None
+    ) -> Verdict:
         """The refusal for a retired git decision — `commit`, `commit_and_push`,
         or a `push` no review packet binds.
 
@@ -4878,41 +4937,263 @@ class Orchestrator:
         The reviewer had nothing else to say: it was being told its approval was
         invalid, not what would make one valid.
 
-        So when there IS an unpublished candidate on record, the refusal names
-        it and names the one move that produces a packet an approval can bind
-        to. It does not widen anything: the decision is still denied, the
-        retired path is still unreachable, and `revise` goes through
+        FOUR SENTENCES, one per state, because the generic one is honest in
+        only one of them and 2026-08-31 was spent proving it:
+
+        * `commit` / `commit_and_push` — the original sentence, unchanged. The
+          commit the reviewer is asking for does not exist, and the second
+          clause is exactly right: a packet answering an EXISTING candidate is
+          what a valid approval looks like.
+        * `push`, and the candidate has been RE-PRESENTED (`represented` is not
+          `None`) — the approval it must produce is now in front of it, and the
+          sentence says so rather than describing the shape in the abstract.
+        * `push`, an unpublished candidate is on record but could not be
+          re-presented (an unrenderable patch, a worker repository that will not
+          answer) — the 2026-08-20 text: name the candidate and name `revise`,
+          the one move that produces a packet an approval can bind to.
+        * `push`, and there is NOTHING to approve. This is the notify-01 state
+          (2026-08-31): the candidate had been published and merged 32 minutes
+          earlier, so `_dispatch_task_push` had already cleared
+          `state.task_execution` and forgotten its packets. The generic second
+          clause then ASKS FOR AN APPROVAL THAT CANNOT EXIST — there is no
+          outstanding request whose stamps a `push` could copy — and the
+          reviewer spent 71 denials and 24 rephrasings trying to produce it,
+          once even naming "the required integrity stamp" without one to name.
+          So that clause is DROPPED here, and the sentence says instead that no
+          `push` can be valid in this state and what can.
+
+        None of the four widens anything: the decision is still denied and the
+        retired path is still unreachable. `revise` goes through
         `authorize_directive` and the round cap like any other — a task with no
         review round left parks for an operator with the accumulated diff
-        (`_park_round_cap`) instead of looping, which is the outcome this text
-        is trying to reach anyway.
+        (`_park_round_cap`) instead of looping — and a re-presented packet is
+        approved through every check in `_dispatch_task_push`, unchanged.
 
-        The original sentence is kept verbatim and appended to rather than
-        rewritten: it is the answer for `commit` / `commit_and_push`, where
-        there is nothing to re-present because the commit the reviewer is asking
-        for does not exist.
+        The opening clause is byte-identical in all four. It is what an operator
+        greps for and what a `policy_denial_budget_exhausted` stop quotes back
+        as "the last denial".
         """
         reason = (
             "direct commit/push is no longer supported — the orchestrator "
             "commits automatically after implementing (or auditing) a "
-            "task in its own worker repo; the only valid approval is "
-            "`push` with the `reviewed` stamp answering a postcommit or "
-            "operator-changeset review packet"
+            "task in its own worker repo"
         )
-        candidate = self._unpublished_candidate()
-        if decision is Decision.PUSH and candidate is not None:
-            task_id, candidate_sha = candidate
-            reason += (
-                f". An unpublished candidate for task '{task_id}' "
-                f"({candidate_sha[:12]}) IS on record here, but nothing in this "
-                "session binds your approval to a review packet that presented "
-                "it, so this loop cannot publish it and resending `push` will be "
-                "refused the same way. It has to be PRESENTED AGAIN before it "
-                f"can be approved: reply `revise` with task_id '{task_id}' and "
-                "the loop will produce and send a fresh postcommit review "
-                "packet — approve that packet's request_id"
+        approval_shape = (
+            "; the only valid approval is `push` with the `reviewed` stamp "
+            "answering a postcommit or operator-changeset review packet"
+        )
+        if decision is not Decision.PUSH:
+            return Verdict.deny("legacy_git_path_retired", reason + approval_shape)
+        if represented is not None:
+            execution = represented.execution
+            return Verdict.deny(
+                "legacy_git_path_retired",
+                reason + approval_shape + (
+                    ". Your reply answered a request that presented no "
+                    "candidate, so it bound to nothing and nothing was "
+                    f"published. Task '{execution.task_id}' IS still holding "
+                    f"{execution.candidate_sha[:12]} unpublished, so its "
+                    "postcommit review packet has been RE-PRESENTED and is the "
+                    "whole of the next request — approve THAT request: `push` "
+                    "with the `reviewed` stamp copied from its CONTEXT block "
+                    "publishes exactly that commit"
+                ),
             )
-        return Verdict.deny("legacy_git_path_retired", reason)
+        candidate = self._unpublished_candidate()
+        if candidate is not None:
+            task_id, candidate_sha = candidate
+            return Verdict.deny(
+                "legacy_git_path_retired",
+                reason + approval_shape + (
+                    f". An unpublished candidate for task '{task_id}' "
+                    f"({candidate_sha[:12]}) IS on record here, but nothing in "
+                    "this session binds your approval to a review packet that "
+                    "presented it, and this loop could not re-render one, so it "
+                    "cannot publish it and resending `push` will be refused the "
+                    "same way. It has to be PRESENTED AGAIN before it can be "
+                    f"approved: reply `revise` with task_id '{task_id}' and the "
+                    "loop will produce and send a fresh postcommit review "
+                    "packet — approve that packet's request_id"
+                ),
+            )
+        return Verdict.deny(
+            "legacy_git_path_retired",
+            reason + (
+                ". NOTHING IS AWAITING PUBLICATION HERE: this session holds no "
+                "unpublished candidate and no review packet is outstanding, so "
+                "there is no request whose stamps a `push` could copy and NO "
+                "`push` can be valid — another one, however it is worded, will "
+                "be refused identically and the budget for that is small. Work "
+                "this loop has already published was reported to you as "
+                "`pushed <sha>` at the time and needs no second approval. Answer "
+                "the request above on its own terms instead — `implement`, "
+                "`revise`, `audit` or `plan` to move the roadmap, or `stop` if a "
+                "human has to decide something first"
+            ),
+        )
+
+    def _prepare_candidate_representation(self) -> RepresentedCandidate | None:
+        """The postcommit packet for the candidate this session is holding
+        unpublished, rendered and verified bindable — or `None` when there is
+        nothing this loop could put in front of the reviewer.
+
+        **Why re-present rather than explain.** An unbound `push` is refused
+        with a correction, and a correction carries none of the candidate's
+        identifiers — so the request the reviewer answers next binds to nothing
+        either, and the identical approval draws the identical denial. Sending
+        the packet is what makes the very next reply capable of publishing:
+        `_step_ready` binds it through `_current_pending_postcommit` exactly as
+        it binds a first presentation, and the approval to it is authorized by
+        every check in `_dispatch_task_push`, unchanged.
+
+        **MUTATES NOTHING**, including on every refusal path. The denial has to
+        be charged first and may end the run, so this returns a value and
+        `_present_candidate_again` applies it.
+
+        **It is not `_rebuild_task_review_at_head`, deliberately.** That method
+        answers a park, and two of its outcomes are things a REFUSED DIRECTIVE
+        must never be able to cause: `_rebuild_execution_record_at_head`
+        archives the execution record, quarantines the worker and spends a
+        recut, and `_drop_published_push_binding` / `_drop_recordless_push_
+        binding` discard approval pointers. A bare `push` is the least
+        authoritative input this loop takes; it may cause a packet to be sent
+        and nothing else. So every question below that is not answered
+        favourably returns `None` and the reviewer gets the plain refusal —
+        which is the behaviour that predates this method, never a park and
+        never a deletion.
+
+        The five refusals, each the fail-closed reading of an unanswered
+        question: no execution store or no registry row (the packet renders a
+        task's id and title, and inventing either presents a task this loop
+        does not hold); a record that is unreadable, absent, ALREADY PUBLISHED
+        (re-presenting one invites the double-publish
+        `_forget_sent_postcommits_for_task` exists to prevent) or nameless; a
+        worker repository that is unnamed (`Path("")` is this process's own
+        checkout, so the probe would interrogate the wrong repository) or that
+        does not positively confirm the candidate; and a packet that will not
+        render, which includes the over-cap patch (`DiffTooLargeError` is a
+        `GitError`) — that candidate is the reviewer's `split` question, not
+        something to re-present.
+        """
+        candidate = self._unpublished_candidate()
+        if candidate is None:
+            return None
+        task_id, _candidate_sha = candidate
+        if self._execution_store is None or not self._registry.has(task_id):
+            return None
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateError, OSError):
+            return None
+        if execution is None or execution.published_sha or not execution.candidate_sha:
+            return None
+        if not execution.worktree_path:
+            return None
+        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+        # Tri-state, and only a positive answer proceeds: a worker repository
+        # that could not be asked is not one that said yes. Nothing here
+        # DESTROYS anything on a negative answer either, so the stakes are the
+        # opposite way round from `_rebuild_task_review_at_head`'s use of it —
+        # the worst a wrong `None` costs is the refusal the reviewer got before.
+        if self._commit_presence(worktree_git, execution.candidate_sha) is not True:
+            return None
+        try:
+            # `_current_pending_postcommit` reads the TREE as well, and it does
+            # so inside `_step_ready` where nothing catches a raise — so the
+            # object it will need is resolved HERE, where a failure is a
+            # refusal.
+            worktree_git.tree_of(execution.candidate_sha)
+            packet_text, packet_diff = build_review_packet_with_diff(
+                execution, worktree_git, self._registry.get(task_id)
+            )
+        except (GitError, TemplateError, OSError):
+            return None
+        payload = (
+            f"THE CANDIDATE IS RE-PRESENTED — task {task_id}.\n\n"
+            "Your `push` answered a request that presented no candidate, so it "
+            "bound to nothing and nothing was published or lost. Below is the "
+            "postcommit review packet for "
+            f"{execution.candidate_sha[:12]}, the candidate this task is still "
+            "holding unpublished, re-rendered from the committed git objects. "
+            "Answer THIS request.\n\n"
+        ) + TEMPLATES["postcommit_review"].render(
+            task_id=task_id,
+            task_title=self._registry.get(task_id).title,
+            packet=packet_text,
+        )
+        absent = [
+            name
+            for name, value in (
+                ("task_id", task_id),
+                ("task_branch", execution.task_branch),
+                ("base_sha", execution.task_base_sha),
+                ("candidate_sha", execution.candidate_sha),
+            )
+            if not value or value not in payload
+        ]
+        if absent:
+            # The same fail-closed verification `_rebuild_task_review_at_head`
+            # makes, against the check `_step_ready` will actually apply. A
+            # packet already known not to bind would send the reviewer back to
+            # this exact branch one round later, which is the fixed point this
+            # whole method exists to leave.
+            self._log(
+                "postcommit_representation_refused",
+                data={"task_id": task_id, "missing": absent},
+            )
+            return None
+        return RepresentedCandidate(
+            execution=execution, payload=payload, packet_diff=packet_diff
+        )
+
+    def _present_candidate_again(self, represented: RepresentedCandidate) -> None:
+        """Make the prepared packet the next request, replacing the correction
+        `_handle_policy_denial` queued.
+
+        Called ONLY after that denial decided to re-prompt — a denial that
+        exhausted the budget stopped the run, and a packet queued into a
+        stopped session's outbox would be sent by whatever resumed it.
+
+        The ledger entries for the earlier packets are deliberately NOT
+        forgotten (unlike `_rebuild_task_review_at_head`, which drops them
+        because the binding situation it repairs is a confused one). Here they
+        name the same candidate this packet presents, `_approval_packet` is what
+        lets an approval citing one of them publish, and dropping them would
+        remove a valid route to the very approval this method is trying to
+        reach. `_step_ready` records the new request alongside them.
+        """
+        state = self.state
+        # Refreshed from the record, exactly as `_finish_postcommit` does it:
+        # `_current_pending_postcommit` cross-checks the payload against THIS
+        # field and then against the store, so a stale mirror would refuse to
+        # bind the packet just rendered.
+        state.task_execution = asdict(represented.execution)
+        self._replace_outbox(state, represented.payload)
+        # Set AFTER `_replace_outbox` (which clears it) and on the same rule as
+        # `_finish_postcommit`: a patch too large for one message is planned for
+        # chunked delivery instead. The rewrite keeps the four identifiers —
+        # they live in the packet's header, not in the diff — so the binding
+        # verified above survives it.
+        state.outbox_diff = (
+            represented.packet_diff
+            if len(represented.packet_diff.strip()) > DIFF_INCLUDE_MAX_CHARS
+            else None
+        )
+        self._log(
+            "postcommit_represented",
+            data={
+                "task_id": represented.execution.task_id,
+                "candidate_sha": represented.execution.candidate_sha,
+                "review_round": represented.execution.review_round,
+                "packet_chars": len(represented.payload),
+            },
+        )
+        # `_handle_policy_denial` already set this and saved; both are re-stated
+        # because this method is what leaves the loop ready to send, and a
+        # reader should not have to prove the earlier save covered the outbox
+        # this one wrote.
+        state.phase = Phase.READY.value
+        self._store.save(state)
 
     # ---- recut: the reviewer discards an unsalvageable candidate ------------
     #
@@ -11049,13 +11330,19 @@ class Orchestrator:
         directive: Directive,
         verdict,
         binding: PostcommitBinding | None = None,
-    ) -> None:
+    ) -> bool:
         """`binding` is the binding the caller already resolved for this
         response, forwarded to `_carry_postcommit_forward` — see its docstring.
         Only the `push` sites in `_step_executing` have one to pass; every other
         caller (a refused executor decision, a retired decision, the legacy git
         path) resolves none by construction and leaves it `None`, which is
-        byte-for-byte the behaviour they had."""
+        byte-for-byte the behaviour they had.
+
+        Returns True when a corrective re-prompt was queued and False when the
+        denial budget was exhausted and the run ENDED instead. Every caller but
+        one ignores it and is unaffected; `_dispatch`'s legacy-git branch reads
+        it, because writing a re-presented packet into the outbox of a session
+        that has just stopped would hand that packet to whatever resumed it."""
         state = self.state
         state.policy_denials += 1
         self._log(
@@ -11085,7 +11372,7 @@ class Orchestrator:
                 task_id=directive.task_id,
                 detail=f"decision={directive.decision.value} verdict_code={verdict.code}",
             )
-            return
+            return False
         # Same reasoning as `_handle_parse_error`'s carry, and deliberately not
         # a different rule: a denial asks for a different decision about the
         # SAME presented state, and dropping the binding here would leave an
@@ -11096,6 +11383,7 @@ class Orchestrator:
         state.last_response = None
         state.phase = Phase.READY.value
         self._store.save(state)
+        return True
 
     def _handle_review_mismatch(
         self, exc: ContractError, binding: PostcommitBinding | None = None
