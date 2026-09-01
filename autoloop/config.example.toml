@@ -471,6 +471,35 @@ test_selection = "reachable"
 # and blockers.SESSION_CEILING_CODES refuses it the same way a hard halt is
 # refused rather than merely leaving it out of a list.
 #
+# THE FOURTH HALF (halt-04, 2026-09-01): REFUSED WORK goes back to the agent as
+# feedback. post_commit_verification_failed, commit_refused,
+# review_feedback_unchanged, review_packet_build_failed, approved_paths_missing,
+# push_not_descendant and push_tree_mismatch are not transport faults, stale
+# records or spent budgets — each is the loop telling an agent WHY what it
+# produced was refused, and then parking so a human can relay that reason. A
+# refusal is feedback, so each is instead re-dispatched as a `revise` carrying
+# the refusal's own text, verbatim, under a header saying no reviewer wrote it.
+# Measured 2026-08-24: post_commit_verification_failed 7 parks / 14.0h;
+# review_feedback_unchanged 4 parks / 35.4h at a median of 5.92h, the highest of
+# any code.
+#
+# AND IT IS BOUNDED, which is the harder half. Each of the seven allows exactly
+# ONE self-issued revise per task per open blocker, counted on the blocker record
+# itself; the SAME refusal arriving again sets the task aside instead, recognised
+# by a digest stored on that record so it is still recognised after the record is
+# closed. The revise deliberately does not close its own blocker — a round
+# completing means the round ran, not that the refusal cleared — so the record
+# stays open and `python -m autoloop blockers` lists it until it is answered or
+# the task is set aside. Nothing is rolled back, discarded or pushed on this
+# path: a revise continues the same execution record on the same branch, and the
+# round it runs is gated by the same review-round cap, attempt budget and
+# repeated-feedback check a reviewer's revise passes.
+#
+# Two of the seven have a SECOND site that names no task — the changeset arms of
+# push_not_descendant and push_tree_mismatch, since an operator's changeset has
+# no roadmap task. There is nothing to revise there, so those park exactly as
+# they do today.
+#
 # WHAT IT COSTS, since "the loop keeps going" has a price here. A condition that
 # is really loop-wide rather than task-shaped — a git environment broken for
 # every worker, a reviewer refusing everything — walks the backlog setting each
@@ -482,7 +511,9 @@ enabled = false
 
 # A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,
 # never a floor: the effective budget is min(the code's own allowance, this).
-# Set it to 0 to keep the set-aside behaviour with no retries at all; raising it
+# Set it to 0 to keep the set-aside behaviour with no retries at all — that also
+# switches off the halt-03 rebuild and the halt-04 self-issued revise, which is
+# how an operator keeps the set-aside without letting the loop act. Raising it
 # above a code's own number changes nothing, because config may restrain the
 # table and never widen it.
 max_recovery_attempts = 2

@@ -29,6 +29,33 @@ rewrites.
 Status is one of `pending`, `in_progress`, `blocked`, `completed`, `retired`,
 `shipped_elsewhere`, `quarantined`. Only `completed` satisfies a dependency.
 
+## Blocker record
+
+`blockers/<id>.json`, one per blocker, id `blk-<task>-<NNN>` (zero padded, so
+filename order is chronological within a task). `id`, `task_id`, `kind`
+(`task_fatal` | `loop_fatal`), `code`, `question`, `detail`, `phase`,
+`created_at`, `resolved_at`, `answer`, `recurrences`, `last_seen_at`,
+`session_id`, `archived_reason`, `refusal_fingerprint`.
+
+`task_id` is `(loop)` for a blocker tied to no registry task; task ids cannot
+contain parentheses, so the two never collide. `answer` means an operator
+responded; `archived_reason` means the loop closed the record itself and is
+never written into `answer`.
+
+`recurrences` counts how many times the same (task, code, phase) has re-parked,
+and autonomous recovery meters its per-code budget on the sum of it across every
+OPEN record for a (task, code) — deliberately blind to phase, so a fault that
+migrates one phase along keeps spending one allowance.
+
+`refusal_fingerprint` is a digest of one refusal's (code, question, detail),
+written only for the codes autonomous mode answers with a `revise` and read only
+by the repeat guard. Empty on every record written before it existed and on
+every other code, which reads as "no identity to compare" — never as a match.
+
+Readers are tolerant of missing keys (each has a default) and INTOLERANT of
+unreadable ones: a record that fails to decode raises rather than reading as
+absent, because "no blocker" and "a blocker we cannot read" must not look alike.
+
 ## Transcript event
 
 `{"ts", "type", "iteration", "request_id", "data"}`. An operation that records

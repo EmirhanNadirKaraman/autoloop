@@ -311,6 +311,82 @@ handoff that still ends the loop. It is recorded in the `argv` field of
 
 ---
 
+## Refused work goes back as a revise (autonomous mode)
+
+**Off unless you turn it on.** Everything below happens only with
+`[autonomy] enabled = true`; with the section absent — which is every config file
+written before it existed — each of these faults parks for you exactly as it
+always has, and turning the flag back off restores that.
+
+Seven blocker codes are the loop REFUSING what a round produced, and saying why:
+
+| Code | The refusal |
+|---|---|
+| `post_commit_verification_failed` | the commit failed a post-commit check (ancestry, an empty range, a dirty worktree, validation) |
+| `commit_refused` | git refused the commit before it happened |
+| `review_feedback_unchanged` | the reviewer asked for the same change twice, so the executor changed nothing |
+| `review_packet_build_failed` | the candidate passed review and could not be PRESENTED |
+| `approved_paths_missing` | the task carries no `approved_paths`, so no write-capable round may start |
+| `push_not_descendant` | the approved candidate is not a descendant of the task base |
+| `push_tree_mismatch` | the approved candidate's tree is not the tree that was reviewed |
+
+None of them is a decision. The park text already names the fault, and the
+operator's whole step is relaying it to the agent that has to fix it — which is
+why `review_feedback_unchanged` sat at a median of 5.92h, the longest of any
+code, over 4 parks and 35.4h (measured 2026-08-24, 131 resolved records).
+
+**A refusal is feedback, so the loop returns it as feedback.** Instead of
+parking, the task is re-dispatched as a `revise` whose `feedback` is the refusal
+text, verbatim, under one line saying that no reviewer wrote it. Nothing is
+rolled back, discarded or pushed: a `revise` continues the same execution record,
+the same worker repository and the same task branch, so the refused commit stays
+exactly where it is.
+
+**And it happens at most once.** The second occurrence of the same code for the
+same task sets that task aside (`task_fatal`) — the quarantine
+`run --continuous` already works past — rather than issuing another revise. Two
+independent locks carry that:
+
+* the **recurrence meter**, `Blocker.recurrences` summed across every open record
+  for a (task, code). This is the bound, and it does not care what the refusal
+  says — which matters, because refusal text carries commit shas and round
+  numbers and therefore differs between two occurrences of the identical fault;
+* the **refusal digest** on the blocker record, which recognises the SAME refusal
+  even after the record it was first written on has been closed. It can only ever
+  set a task aside sooner.
+
+Three limits you already have compose on top and are unchanged: a self-issued
+revise is refused if its feedback repeats the last round's, it is refused once
+`policy.max_review_rounds` is reached, and it costs an attempt from
+`MAX_TASK_ATTEMPTS` exactly as a reviewer's does.
+
+### What you will see
+
+    autonomous_recovery        action=revise, with the attempt and the budget
+    autonomous_revise_dispatched   the round actually starting
+    autonomous_revise_refused      a revise the loop declined to issue, with why
+
+`same_refusal_repeated` is the guard firing. The other reasons are fall-throughs
+— no task on the record, a task the registry does not hold, a task with no
+approved plan, a refusal with no text, a revise already queued — and every one of
+them parks with the question it always had.
+
+**The blocker stays OPEN while the revise runs**, and that is deliberate rather
+than a leak: a round completing proves the round ran, not that the refusal
+cleared, so closing the record there would refund the meter and let the same
+refusal be resent forever. So `python -m autoloop blockers` lists it throughout;
+answer it as you would any other, or let the repeat set the task aside.
+
+**Two sites are deliberately untouched.** `push_not_descendant` and
+`push_tree_mismatch` are each raised twice — once for a task, once for an
+operator's queued changeset. A changeset has no roadmap task, so there is nothing
+to revise, and that arm parks exactly as it does today.
+
+`max_recovery_attempts = 0` keeps the set-aside and issues no revise at all, if
+you want the quarantine without the extra round.
+
+---
+
 ## Running several tasks at once — the split plan
 
 **Status: a PLAN, not a mechanism.** Nothing in this section is implemented.

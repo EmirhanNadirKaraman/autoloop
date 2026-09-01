@@ -436,7 +436,7 @@ class AuditConfig:
 class AutonomyConfig:
     """`[autonomy]` — how the loop behaves when a fault it already knows the
     remedy for would otherwise park it for a human (halt-02 / halt-03,
-    2026-08-25; halt-01, 2026-08-26).
+    2026-08-25; halt-01, 2026-08-26; halt-04, 2026-09-01).
 
     OFF BY DEFAULT, and the default is the compatibility contract: with this
     section absent — which is every existing config file, since the template is
@@ -446,7 +446,7 @@ class AutonomyConfig:
     here forecloses the current behaviour.
 
     What `enabled` switches on is described by `blockers.AUTONOMOUS_RECOVERIES`,
-    an ALLOWLIST with three parts and NINETEEN codes in total, which cannot
+    an ALLOWLIST with four parts and TWENTY-SIX codes in total, which cannot
     reach `blockers.HARD_HALT_CODES` or `blockers.SESSION_CEILING_CODES` at all:
 
     * `blockers.TRANSPORT_RECOVERIES` (halt-02) — six transport or environment
@@ -462,7 +462,19 @@ class AutonomyConfig:
       aside and continuing. There is nothing to retry for any of them, so each
       carries a budget of 0 and `max_recovery_attempts` cannot affect them: a
       counter that reached its limit is not a transient fault, and the only
-      thing that would change the answer is an operator raising the limit.
+      thing that would change the answer is an operator raising the limit;
+    * `blockers.REFUSED_WORK_RECOVERIES` (halt-04) — seven REFUSALS of work a
+      round produced, answered by returning the refusal to the agent as `revise`
+      feedback and setting the task aside when the SAME refusal comes back.
+
+    **halt-04 adds no setting, and that is the smallest reversible reading.**
+    `enabled` is still the one flag, and `max_recovery_attempts` is still the one
+    ceiling: each of the seven refusal codes carries an allowance of 1, so the
+    effective budget is `min(1, max_recovery_attempts)` and setting that to 0
+    keeps the set-aside while issuing no revise at all — the same escape hatch it
+    already gives the rebuild. A second boolean would have been a switch nobody
+    could describe without repeating this paragraph, and one more default to get
+    wrong.
 
     The SESSION ceiling is the deliberate exclusion, not an omission.
     `iteration_budget_exhausted` counts the run's iterations rather than any
@@ -479,7 +491,9 @@ class AutonomyConfig:
     #: own max_attempts, this)`. So lowering it to 0 keeps the set-aside
     #: behaviour while performing no retries at all — and, since halt-03,
     #: performs no REBUILD either, which is how an operator switches the
-    #: automatic archival off without switching autonomy off. Raising it above
+    #: automatic archival off without switching autonomy off. Since halt-04 it
+    #: also switches the self-issued REVISE off the same way, leaving the
+    #: set-aside. Raising it above
     #: a code's own number changes nothing: a config value can restrain the
     #: table, never widen it. Two by default, matching the largest number the
     #: table actually asks for.
