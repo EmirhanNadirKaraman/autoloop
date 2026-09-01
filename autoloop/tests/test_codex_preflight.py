@@ -210,11 +210,90 @@ def test_the_shipped_default_is_the_one_policy_that_passes():
     dataclass would be exactly the divergence this file exists to catch."""
     assert CodexConfig().sandbox_args == DEFAULT_SANDBOX_ARGS
     assert describe_sandbox(CodexConfig().sandbox_args).status == "ok"
-    # The overclaim a previous round was rejected for, refused in the row
-    # itself: a read-only sandbox refuses writes and permits reads, so a row
-    # that let an operator read it as "the reviewer cannot see the checkout"
-    # would be the same false claim with a flag attached.
-    assert "does NOT confine READS" in describe_sandbox(DEFAULT_SANDBOX_ARGS).detail
+
+
+#: Claims about read-only that codex does NOT give, in the shapes two rounds of
+#: this task have actually written. `read-only` restricts WRITES; it runs
+#: commands inside the sandbox rather than refusing them, and it permits reads.
+#: A row saying otherwise is worse than a row saying nothing: it is the reason
+#: an operator would select this seat, stated as a guarantee.
+RETIRED_OVERCLAIMS = (
+    "command execution are refused",
+    "commands are refused",
+    "refuses command execution",
+    "cannot run commands",
+    "the reviewer cannot see the checkout",
+)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        DEFAULT_SANDBOX_ARGS,
+        ("--sandbox=read-only",),
+        ("-s", "read-only"),
+        ("--skip-git-repo-check", "--sandbox", "read-only"),
+    ],
+)
+def test_the_read_only_row_states_only_what_read_only_actually_does(args):
+    """The correction this round exists for, pinned in the row an operator
+    reads rather than only in the prose above it.
+
+    The first round of this task shipped `--sandbox read-only` with a row
+    saying it refused WRITES AND COMMAND EXECUTION. The writes half is right and
+    the commands half is not: codex's read-only mode runs commands inside the
+    sandbox, restricting what they may write. Overclaiming there is the same
+    defect class as the working-directory claim this file already covers — a
+    control's guarantee asserted wider than the control gives — and it is the
+    more dangerous half, because "the reviewer cannot run anything" is a reason
+    to select the seat.
+
+    Every spelling is checked, not just the shipped tuple: the sentence lives in
+    ONE branch of `describe_sandbox`, and an assertion naming a single spelling
+    would still pass if a later edit fixed only the row it names."""
+    detail = describe_sandbox(args).detail
+
+    # What is true, and therefore what must be SAID: writes restricted, reads
+    # not confined, commands not refused.
+    assert "WRITES are restricted" in detail
+    assert "does NOT confine READS" in detail
+    assert "commands still run" in detail
+    # And what must never be said again.
+    for overclaim in RETIRED_OVERCLAIMS:
+        assert overclaim not in detail, f"read-only does not guarantee: {overclaim}"
+
+
+def test_no_sandbox_row_anywhere_promises_that_commands_are_refused(tmp_path, on_path):
+    """The row is not the only text an operator meets, so the pin is not left on
+    the one branch a reviewer would look at. Every grade `describe_sandbox`
+    produces, and the preflight refusal that quotes it, must be free of the
+    retired claim — including `workspace-write`'s `warn` and the `fail` rows,
+    where "commands are refused" would be false in the other direction too."""
+    graded = [
+        describe_sandbox(args).detail
+        for args in (
+            DEFAULT_SANDBOX_ARGS,
+            ("--sandbox", "workspace-write"),
+            ("--full-auto",),
+            (),
+            ("--yolo",),
+            ("--sandbox", "readonly"),
+            ("--sandbox",),
+        )
+    ]
+    graded.append(preflight_codex(config(tmp_path, sandbox_args=()), run=FakeRun()).detail)
+
+    # A sweep of ABSENCE assertions passes on text that is not there at all, so
+    # the sweep says first that it read something, and that the last item really
+    # is the sandbox refusal rather than a command-unresolvable message that
+    # never reached the branch under test.
+    assert len(graded) == 8
+    assert all(detail.strip() for detail in graded)
+    assert "UNCONFINED" in graded[-1]
+
+    for detail in graded:
+        for overclaim in RETIRED_OVERCLAIMS:
+            assert overclaim not in detail
 
 
 @pytest.mark.parametrize(

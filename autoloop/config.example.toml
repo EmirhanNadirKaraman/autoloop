@@ -108,7 +108,9 @@ command = ["codex", "exec"]
 # this one setting.
 #
 # `--sandbox read-only` because the reviewer answers from a self-contained
-# packet: it needs no writes, no commands and no repository. An empty list here
+# packet: it needs no writes, no commands and no repository. That is what the
+# seat NEEDS, not what the mode refuses — read-only does not refuse commands;
+# see below. An empty list here
 # is NOT a policy — it asks for no sandbox at all — so autoloop REFUSES to run
 # the reviewer under one: `doctor`'s `codex_sandbox` row fails, the preflight
 # makes no invocation, and `SubprocessCodexRunner.run` raises rather than
@@ -121,8 +123,11 @@ command = ["codex", "exec"]
 # autoloop repository or its CI, so nothing else can be verified there — check
 # `codex exec --help` if your build spells them differently, and a flag it
 # rejects fails that check rather than your first review). Enforcement is
-# codex's own, and read-only refuses WRITES and command execution — it does not
-# stop the reviewer READING files. Nothing here depends on it doing so.
+# codex's own, and read-only restricts WRITES. It is NOT a no-command sandbox —
+# the reviewer can still run commands under it, sandboxed rather than refused —
+# and it does not stop it READING files. Whether the mode also closes the
+# network is codex's behaviour and is not verified here, so it is not claimed.
+# Nothing in the loop depends on any of that.
 #
 # `--skip-git-repo-check` can be added alongside: it accepts an untrusted
 # working directory, and it switches codex's own guard off everywhere. Trusting

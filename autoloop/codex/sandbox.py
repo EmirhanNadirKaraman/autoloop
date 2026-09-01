@@ -28,12 +28,21 @@ defect.** Two things, and only these two:
    `codex exec --help`.
 
 **What is NOT claimed.** Enforcement is codex's, not ours: nothing in this tree
-can prove a sandbox held. And `read-only` confines WRITES and command execution
-— it does not confine READS. A read-only reviewer may still read the checkout,
-the operator's home and anything else that account can read. The loop does not
-depend on it not doing so: every turn's prompt carries its own CONTEXT block,
-the contract and the diff, so the reviewer is never asked to read anything. See
-`docs/SECURITY.md` and `docs/AUTOLOOP.md`.
+can prove a sandbox held. And `read-only` is narrower than its name reads. It
+restricts WRITES. It is NOT a no-command sandbox — a read-only reviewer may
+still RUN commands, executed under codex's sandbox rather than refused — and it
+does not confine READS, so it may read the checkout, the operator's home and
+anything else that account can read. Whether the mode also closes the network is
+codex's own behaviour, is not verified from this repository, and is therefore
+claimed nowhere in it. The loop depends on none of that: every turn's prompt
+carries its own CONTEXT block, the contract and the diff, so the reviewer is
+never asked to read or run anything. See `docs/SECURITY.md` and
+`docs/AUTOLOOP.md`.
+
+An earlier round of this task said read-only refused command execution. That was
+false, and the correction is deliberately load-bearing rather than cosmetic: an
+operator choosing this seat because "the reviewer cannot run anything" would be
+choosing it on a guarantee codex does not give.
 
 **Fail-closed, deliberately.** Only a spelling named HERE can produce `ok`.
 An unknown mode, a missing mode, a dangling `--sandbox`, a bypass flag, or a
@@ -57,7 +66,9 @@ from dataclasses import dataclass
 
 #: The shipped policy, and the value `CodexConfig.sandbox_args` defaults to.
 #: `read-only` because the reviewer's job is to read a self-contained packet and
-#: answer: it needs no writes, no commands and no repository at all.
+#: answer: it needs no writes, no commands and no repository at all. That is
+#: what the seat NEEDS — not what the mode refuses; read-only permits commands
+#: and reads, as the module docstring says at length.
 DEFAULT_SANDBOX_ARGS: tuple[str, ...] = ("--sandbox", "read-only")
 
 #: The three modes `codex exec --sandbox` documents, weakest confinement last.
@@ -205,11 +216,12 @@ def describe_sandbox(args) -> SandboxPolicy:
             "ok",
             f"`{shown}` — read-only, and named in every invocation (the review "
             "turn and the preflight, from this one setting). What that buys is "
-            "what codex's own sandbox enforces: writes and command execution "
-            "are refused. It does NOT confine READS — a read-only reviewer may "
-            "still read the checkout and the operator's home — and nothing in "
-            "this loop depends on it doing so: every prompt is self-contained, "
-            "so the reviewer is never asked to read anything.",
+            "what codex's own sandbox enforces: WRITES are restricted. It is "
+            "not a no-command sandbox — commands still run under it, sandboxed "
+            "rather than refused — and it does NOT confine READS, so the "
+            "reviewer may read the checkout and the operator's home. Nothing in "
+            "this loop depends on either: every prompt is self-contained, so "
+            "the reviewer is never asked to read or run anything.",
             modes,
         )
     if mode == WORKSPACE_WRITE:

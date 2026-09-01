@@ -553,14 +553,24 @@ def test_the_graded_working_dir_is_the_one_the_reviewer_actually_gets(tmp_path):
 def test_the_shipped_sandbox_policy_passes_and_is_named_in_the_row(tmp_path):
     """`codex_sandbox` is the confinement row. The default seat is confined, so
     it reads `ok` — and it says what the policy does and does not do, because a
-    row an operator reads as "the reviewer cannot see the checkout" would be the
-    false claim this round exists to remove."""
+    row an operator reads as "the reviewer cannot see the checkout", or as "the
+    reviewer cannot run anything", is a guarantee codex does not give stated
+    where the seat is selected.
+
+    Both halves are asserted HERE and not only in `test_codex_preflight.py`:
+    this is the text an operator actually meets, and doctor composes it
+    (`policy.detail` plus its own sentence) rather than printing it through."""
     named, _ = codex_rows(tmp_path)
     row = named["codex_sandbox"]
 
     assert row.status == "ok"
     assert "--sandbox read-only" in row.detail
+    # What read-only really does: restricts writes, confines neither reads nor
+    # command execution.
+    assert "WRITES are restricted" in row.detail
     assert "does NOT confine READS" in row.detail
+    assert "commands still run" in row.detail
+    assert "command execution are refused" not in row.detail
     assert codex_exit(named, "codex_sandbox") == 0
 
 
