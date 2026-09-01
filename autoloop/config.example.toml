@@ -556,9 +556,11 @@ max_recovery_attempts = 2
 # at load rather than read as one, so the guard is never switched off by a typo.
 env_example_file = ".env.example"
 env_example_db_key = "DB_NAME"
-# Where the dashboard's "Language-app tasks" panel reads the proposed backlog
-# from. A glob relative to the repo root; the NEWEST match by name wins, which
-# works because these reports are date-stamped. The exact empty string leaves
+# Where the dashboard's "Audit findings" panel — and `python -m autoloop intake
+# audit` — read findings from. A glob relative to the repo root; the NEWEST
+# match by name wins, which works because these reports are date-stamped. The
+# panel shows the OUTSTANDING findings only: one that has been promoted,
+# recorded already done or declined leaves it. The exact empty string leaves
 # the panel empty, which is the right reading for a repo that files no audit
 # reports; padding is refused here too, for the same reason.
 audit_report_glob = "docs/AUDIT_*.md"
@@ -592,6 +594,37 @@ audit_report_glob = "docs/AUDIT_*.md"
 # The exact empty string means "never look, always use the built-ins"; padding
 # is refused rather than read as that opt-out, as above.
 audit_charters_file = "docs/audit_charters.toml"
+# Where the APPLICATION's test suite lives, and how to run it. Read by exactly
+# one consumer: `python -m autoloop intake audit promote`, which turns an audit
+# finding into a runnable registry task (docs/AUTOLOOP.md, "Audit finding
+# intake").
+#
+# WHY A PROMOTED TASK NEEDS BOTH. Measured 2026-08-17, the product tasks on the
+# roadmap were not runnable: rt-09, rt-13 and rt-14 each had ONE approved path
+# and ZERO validation commands, and rt-15 had four paths and no validation. A
+# task that narrow hits the attempt ceiling instead of finishing — narrow
+# approved_paths caused five separate ceiling jams on 2026-08-15/16 — and a
+# review packet with no validation evidence is refused by the reviewer, which
+# cost two tasks five rounds each. So intake adds the test tree to every
+# promoted task's scope (a finding is satisfied by a change PLUS the test that
+# proves it) and declares real validation on it.
+#
+# WHICH tree is decided mechanically from the finding's own files: anything
+# under autoloop/ is about the loop and gets autoloop/tests/ with the commands
+# in [audit].validation_commands above; everything else is about the
+# application and gets these two. A finding spanning both gets both.
+#
+# No trailing slash on app_test_root — the '/' that makes it a directory prefix
+# is added where it is used. The exact empty string means this repository ships
+# no application suite; an app finding is then REFUSED promotion, with the
+# reason, rather than promoted with a scope too narrow to work in.
+app_test_root = "tests"
+# argv lists, the same shape as [audit].validation_commands, and restricted to
+# the same binaries by the validation runner. An empty list means the same as an
+# empty app_test_root: refuse to promote rather than file an ungradeable task.
+app_validation = [
+  ["python3", "-m", "pytest", "tests/", "-q", "-p", "no:cacheprovider"],
+]
 
 [notify]
 # Email you when the loop's STATUS CHANGES, sent by the loop itself from

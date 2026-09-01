@@ -398,6 +398,156 @@ you want the quarantine without the extra round.
 
 ---
 
+## Audit finding intake — three outcomes, never a panel
+
+An audit report is prose. Until intake-01 (2026-09-01) the dashboard rendered
+every finding in the newest one as a task-shaped row — an id like
+`db_migrations:db-01`, a severity, a source file — which made the panel read as
+a backlog while being nothing of the kind: nothing dispatched it, nothing
+tracked its status, and a priority could not be set because the "priority" was a
+word in a document. Measured 2026-08-17, it held 30 findings from a report
+twelve days old, 2 critical and 5 high, untouched.
+
+The gap was never detection, and it was never the audits. It was a DECISION,
+recorded somewhere durable. `python -m autoloop intake audit` is that decision,
+and it is repeatable: run it against the newest report as often as you like, and
+what it shows you is only what nobody has decided about yet.
+
+### The three outcomes
+
+Every finding becomes exactly one of these. There is no fourth state, and in
+particular there is no "seen it".
+
+| Outcome | What it means | What it creates |
+|---|---|---|
+| **PROMOTED** | a registry task exists for this finding | one inbox creation request — or nothing at all, when a task already covers it |
+| **ALREADY DONE** | the current tree satisfies it, and here are the checks that prove it | nothing |
+| **DECLINED** | deliberately not doing it, with a reason | nothing |
+
+**DECLINED is not optional and not an afterthought.** Without it a finding that
+is neither work nor already done — a style opinion, a decision belonging to a
+human, something this project has chosen not to do — has no exit at all, so it
+stays open forever and the panel only grows. That is the state this whole
+feature was filed against.
+
+    python -m autoloop intake audit list
+    python -m autoloop intake audit promote db_migrations:db-01
+    python -m autoloop intake audit done db_migrations:db-01 \
+        --evidence 'backend/models.py:CREATE TABLE video' --note "landed under rt-02"
+    python -m autoloop intake audit decline docs_drift:doc-01 --reason "the heading is fine"
+
+All four are safe at any moment, including mid-round, and none of them takes a
+lock: `list` reads files, `done` and `decline` write a ledger OUTSIDE the
+checkout, and `promote` queues through the same `TaskInbox` `add-task` uses.
+None of them asks a model anything, so none of them is the `ask_user` hazard
+`intake ask` / `suggest` / `plan` are guarded against. **None of them runs an
+audit or changes what one looks for.**
+
+### The dashboard panel shows OUTSTANDING findings, not all of them
+
+Say it plainly, because the old panel's whole failure was looking like something
+it was not: the **Audit findings** panel lists the findings of the newest report
+that have NOT been promoted, recorded already done, or declined. A finding
+leaves the panel the moment an outcome is recorded for it. The count under the
+rows says how many there were in total and what happened to the rest
+(`dashboard.audit_findings_panel`), so an empty panel reads as "all actioned"
+rather than as "no report".
+
+Two honest exceptions, both visible on the page rather than silent:
+
+* If the outcome ledger cannot be READ, **nothing is filtered** and the note
+  says so. Hiding rows on the strength of a file we could not open would shrink
+  the list for the one reason that should make it least trustworthy. The same
+  condition refuses any WRITE to that ledger, because the file is every decision
+  already made and rewriting it from scratch to record one more would destroy
+  them.
+* A legacy `| rt-01 | P1 | … |` table row from a pre-2026 report carries no
+  domain, so it has no qualified id and can never be a ledger key. Those rows
+  are shown unconditionally.
+
+### Deduplication, which is the part most likely to go wrong
+
+Some findings are already fixed — by the rt-\* tasks that came out of earlier
+reports, or incidentally since the report was written. Naive promotion recreates
+work that shipped weeks ago; on 2026-08-17 four pending tasks were found already
+fully implemented and retired, and two filed tasks were withdrawn as duplicates
+the same day.
+
+So `promote` asks two questions before it files anything, and **reports
+uncertainty rather than resolving it**:
+
+* *Does a task already name this finding?* Answered from `tasks.json` by the
+  finding's qualified id appearing in a task's id, title or description —
+  checkable by you in one grep, which is the property that matters. When one
+  does, the finding is recorded as PROMOTED **under that task** and no second
+  task is created.
+* *Could the registry be read at all?* If not, promotion is REFUSED. "No task
+  covers this" is not something an unread registry says.
+
+Two more refusals guard the same property from the other side, because a
+finding leaves the outstanding list once it is promoted but its id can still be
+typed: promoting a finding **already recorded as promoted** is refused naming
+the task it went to, and a spec whose id **the registry already holds** is
+refused with `--task-id` as the remedy. The second one matters because
+`TaskRegistry.add_many` would refuse that request on merge — after the ledger
+had recorded that a task exists.
+
+ALREADY DONE is the outcome for a fix that shipped under a task which never
+named the finding — the case the check above cannot see. It is never inferred:
+every `--evidence` argument is a question about the tree that `intake audit
+done` RE-READS off disk before recording anything.
+
+    path              the file exists
+    path:text         the file exists and contains `text`
+    path:!text        the file exists and no longer contains `text`
+
+A check whose file is missing is a REFUSAL, not a pass — including for the
+`!text` form, where a deleted or renamed file would otherwise satisfy "the bug
+is gone" for exactly the wrong reason. An unreadable file, a path resolving
+outside the checkout, and an empty evidence list are all refusals too, and one
+failed check refuses the whole record.
+
+### A promoted task has to be runnable
+
+Measured 2026-08-17, the product tasks on the roadmap were not: rt-09, rt-13 and
+rt-14 each had ONE approved path and ZERO validation commands, and rt-15 had
+four paths and no validation. A task that narrow hits the attempt ceiling
+instead of finishing — narrow `approved_paths` caused five separate ceiling jams
+on 2026-08-15/16, one of them because brw-09 needed a `policy.py` it was not
+allowed to touch — and a review packet carrying no validation evidence is
+refused by the reviewer, which cost hlth-01 and dash-04 five rounds each.
+
+So promotion builds:
+
+* **`approved_paths`** = the files the finding's own `files:` line names, PLUS
+  the test tree that grades them, because a finding is satisfied by a change and
+  the test that proves it. A spec with fewer than two paths is REFUSED with the
+  reason, never filed.
+* **`validation`** = at least one real command, and pointed at the right suite.
+  Which suite is decided mechanically from where the finding's files live:
+  anything under `autoloop/` is about the loop and gets `autoloop/tests/` with
+  `[audit].validation_commands`; everything else is about the APPLICATION and
+  gets `[repo].app_test_root` with `[repo].app_validation` (`pytest tests/`). A
+  finding spanning both gets both. A spec with no validation command is REFUSED.
+* **`priority`** from the severity word — critical 1, high 2, medium 3, low 4,
+  info 5 — which is the thing a panel row could not do.
+
+The report's own `validation:` line is carried into the task DESCRIPTION as
+guidance and is never executed: those are shell one-liners (`createdb x &&
+alembic upgrade head`), and the loop's validation runner takes argv lists
+restricted to ruff/pytest/python/npm/npx/tsc.
+
+### Where the record lives
+
+`<intake_dir>/audit_intake.json`, a sibling of the drafts and of
+`declined.json`, outside the checkout — see `docs/SCHEMA.md` for the shape. A
+decision is recorded against the finding's EVIDENCE (its qualified id and
+title), so it survives every later run unchanged and stops applying only when
+the finding itself is re-worded, which is the same "unless its evidence changes"
+rule `intake decline` already uses for an offered suggestion.
+
+---
+
 ## Running several tasks at once — the split plan
 
 **Status: a PLAN, not a mechanism.** Nothing in this section is implemented.
