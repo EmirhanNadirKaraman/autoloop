@@ -111,11 +111,26 @@ stamp says "these claims were checked at this commit", so moving it forward
 because HEAD moved would assert a verification nobody performed. Re-verifying is
 an edit: put the sentinel back and run the stamp again.
 
+A RECORD IS REPLACED, NEVER OVERWRITTEN IN PLACE. `Path.write_text` truncates
+the target before it writes, so an I/O failure part-way through leaves a file
+that is neither the old record nor the new one; building the whole string in
+memory first does not help, because the truncation happens on the filesystem
+after the string is complete. `_write_atomically` renames a finished temp file
+over the target instead, so each record is the text it had before the run or the
+text the run built and never a truncation of either. What that does NOT make
+atomic is the SET: a failure part-way down the list leaves earlier records
+stamped and later ones on the sentinel, both whole and both loadable, and the
+next run stamps the remainder. Nor is the read-back after those writes free of
+refusals — `stamp_records` says exactly which of its steps can raise with files
+already changed, because "every refusal happens before the first write" was the
+convenient version of that sentence rather than the true one.
+
 Entry point: `python3 -m autoloop.context_records [check|stamp] [root]`.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -940,6 +955,70 @@ def unverifiable_records(repository: ContextRepository) -> tuple[tuple[str, tupl
     return tuple(broken)
 
 
+def _temp_for(file: Path) -> Path:
+    """Where a record's new text is built before it replaces `file`.
+
+    The SAME DIRECTORY, so `os.replace` stays inside one filesystem and is the
+    atomic rename it advertises rather than a copy. The name is deliberately both
+    DOTTED and NON-Markdown: a run killed between creating this file and renaming
+    it leaves the temp behind, and that leftover then falls into the one category
+    `load_context_records` steps over and REPORTS (`ContextRepository.ignored`)
+    instead of the category it refuses the whole tree for. `project.md.tmp` would
+    be a `foreign_file` and a crashed stamp would leave the context tree
+    unloadable until somebody deleted it by hand; `.project.md.<pid>.stamp-tmp`
+    is named out loud by `check` and blocks nothing. The pid keeps two concurrent
+    runs off each other's temp file.
+    """
+    return file.with_name(f".{file.name}.{os.getpid()}.stamp-tmp")
+
+
+def _write_atomically(file: Path, text: str) -> None:
+    """Replace `file` with `text` in one step, or leave it exactly as it was.
+
+    `Path.write_text` TRUNCATES the target and then writes into it, so a failure
+    part-way through — a full disk, a read-only tree, an I/O error — leaves a
+    record that is neither the old one nor the new one, commonly one whose
+    metadata block no longer parses. Building the string in memory first does not
+    prevent that: the truncation happens on the filesystem, after the string is
+    already complete. So the new text goes to a temp file beside the target, is
+    flushed and fsync'd there — which is where a deferred write error surfaces —
+    and only then renamed over the target. A reader sees the record as it was
+    before this run or as this run wrote it, never during.
+
+    NOT fsync'd through to the containing directory entry, unlike
+    `worktask._atomic_write_json`, and that difference is a decision rather than
+    an omission: the marker that writer persists exists to survive a power loss,
+    while a stamp lost to one leaves the record exactly where it started, on the
+    sentinel, and the next `stamp_records` writes it again. The property that has
+    to hold here is that no record is ever half-written, and the rename is what
+    buys it.
+
+    `newline=""` passes the string's own line endings through untranslated, so
+    the LF-only rule `_split_front_matter` enforces does not depend on the
+    platform this runs on.
+
+    Raises `OSError`. The caller turns that into a refusal that names the record
+    and says how much of the run had already landed.
+    """
+    tmp = _temp_for(file)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, file)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            # The temp file is being cleaned up on the way out of a failure that
+            # is about to be raised; losing this one too would replace the real
+            # reason with a second-order one. A leftover is reported by the
+            # loader (see `_temp_for`), not fatal.
+            pass
+        raise
+
+
 def stamp_records(root, git=None) -> Stamp:
     """Move every UNSTAMPED record to the commit this repository's HEAD names.
 
@@ -963,19 +1042,45 @@ def stamp_records(root, git=None) -> Stamp:
        reads the sentinel — ALL of them, still before any write, so a file that
        changed underneath the run cannot be discovered halfway through and leave
        some records stamped and some not;
-    5. rewrite exactly one line per record, the one the parser located;
+    5. rewrite exactly one line per record, the one the parser located, each file
+       replaced through `_write_atomically`;
     6. re-load the tree and confirm each stamped record now reads back at that
        commit, so the run's report is a measurement of the file rather than of
        the intention.
 
-    Steps 1-4 are the whole refusal surface and NONE of them has written a byte:
-    every way this function says no leaves the tree exactly as it found it. What
-    that does NOT cover, stated rather than implied: step 5 writes one file at a
-    time, so a filesystem failure partway through it (a full disk, a read-only
-    tree) can leave earlier records stamped and later ones on the sentinel. Every
-    record's new text is built in memory before the first write, so no individual
-    file is left half-written, and the run is re-runnable — a second one stamps
-    exactly what still carries the sentinel.
+    WHAT HOLDS WHEN THIS RAISES, per step, because the shorter version of this
+    paragraph — "every refusal happens before the first write" — was false:
+
+    * **Steps 1-4 write nothing.** Every contract refusal lives here and leaves
+      the tree exactly as the run found it: a malformed record or one stamped to
+      a commit nothing resolves (`load_context_records`), a HEAD that is not a
+      full sha (`head_unresolved`) or one no object resolves (`unknown_commit`,
+      `unresolvable_commit`), a tree git cannot list (`unreadable_tree`), a
+      pointer that commit does not hold (`unverifiable_record`), and a file that
+      changed under the run (`record_changed_under_stamp`). One refusal in this
+      range is not a `ContextRecordError` at all: `gateway.head_sha()` raises
+      `GitError` straight through. It is still before any write.
+    * **Step 5 is atomic per FILE, not across the set.** `_write_atomically`
+      renames a finished temp file over each record, so a record is its
+      pre-run text or its stamped text and never a truncation of either. A write
+      that fails part-way down the list raises `unwritable_record`, naming the
+      record and how many were stamped before it; those earlier records carry the
+      sha, the rest still carry the sentinel, every one of them is a whole record
+      the loader still accepts, and a re-run stamps what is left.
+    * **Step 6 runs after those writes are on disk**, and it is a FULL load, so
+      it can raise anything the loader can while the files have already changed:
+      git becoming unavailable between the write and the read-back
+      (`unresolvable_commit`), a record that turned unreadable
+      (`unreadable_record`, `undecodable_record`), anything else that changed in
+      the tree meanwhile (`foreign_file`, `symlinked_entry`, `unindexed_record`,
+      `duplicate_record_id` and the rest), a record that disappeared
+      (`stamp_vanished`), and the read-back mismatch the step exists for
+      (`stamp_not_written`). It is deliberately NOT narrowed to re-reading the
+      files this run wrote: a stamp only its own writer would accept is not a
+      measurement. What holds instead is what step 5 guarantees — every file
+      written is a whole record — plus idempotence: run it again against a
+      healthy repository and it writes nothing, reporting those records as
+      `already`.
 
     One gateway for the whole run, passed into both loads, so every question
     this run asks is asked of one repository.
@@ -1013,7 +1118,7 @@ def stamp_records(root, git=None) -> Stamp:
                     "claim a stamp makes, so nothing here is stamped",
                 )
 
-    rewritten: list[tuple[Path, str]] = []
+    rewritten: list[tuple[ContextRecord, Path, str]] = []
     for record in pending:
         file = root / record.path
         lines = _read(file, record.path).split("\n")
@@ -1026,20 +1131,41 @@ def stamp_records(root, git=None) -> Stamp:
                 "was being read and nothing at all is written",
             )
         lines[record.commit_line] = f"last_verified_commit: {head}"
-        rewritten.append((file, "\n".join(lines)))
-    for file, text in rewritten:
-        file.write_text(text, encoding="utf-8")
+        rewritten.append((record, file, "\n".join(lines)))
+
+    done: list[str] = []
+    for record, file, text in rewritten:
+        try:
+            _write_atomically(file, text)
+        except OSError as exc:
+            raise ContextRecordError(
+                "unwritable_record",
+                f"{_label(record.path, record.id)} could not be written ({exc}). "
+                f"{len(done)} record(s) were stamped to {head} before it"
+                + (f" ({', '.join(done)})" if done else "")
+                + ", every other pending record still reads the sentinel, and each file this "
+                "run did write is a whole record — the set is not written atomically, so "
+                "re-running stamps the remainder",
+            ) from exc
+        done.append(record.id)
 
     stamped = tuple(record.id for record in pending)
     if stamped:
         written = load_context_records(root, git=gateway).by_id()
         for record_id in stamped:
-            if written[record_id].last_verified_commit != head:
+            after = written.get(record_id)
+            if after is None:
+                raise ContextRecordError(
+                    "stamp_vanished",
+                    f"context record '{record_id}' was stamped to {head} and is no longer in "
+                    f"{CONTEXT_DIR} when the tree is read back; the file it was written to is "
+                    "gone, so nothing here can say what that stamp says",
+                )
+            if after.last_verified_commit != head:
                 raise ContextRecordError(
                     "stamp_not_written",
-                    f"{_label(written[record_id].path, record_id)} still reads "
-                    f"{written[record_id].last_verified_commit!r} after being stamped to "
-                    f"{head}",
+                    f"{_label(after.path, record_id)} still reads "
+                    f"{after.last_verified_commit!r} after being stamped to {head}",
                 )
     return Stamp(head_sha=head, stamped=stamped, already=already)
 
