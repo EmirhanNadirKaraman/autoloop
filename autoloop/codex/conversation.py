@@ -52,12 +52,32 @@ structurally unreachable. Every rotation trigger — a disproven send, a wedged
 conversation, a chat that accepts a turn and never answers — describes a browser
 conversation. There is nothing here to rotate away from.
 
-**The reviewer gets no repository access.** It runs with `cwd` pointed outside
-the checkout: the prompt is self-contained (every turn re-sends its CONTEXT
-block and the full contract), so the reviewer needs no filesystem at all, and
-containment that does not depend on knowing a sandbox flag's name is
-containment that still holds when the flag is renamed. Configured sandbox
-arguments are passed through on top of that, not instead of it.
+**The confinement is `codex.sandbox_args`, and the working directory is not
+one.** This module used to say the opposite — that the reviewer got no
+repository access because it ran in a dedicated empty directory outside the
+checkout — and that claim was false. `cwd` chooses where a process STARTS. It
+refuses nothing: not an absolute path, not `..`, not a subprocess, not a read
+of `~/.ssh`. A reviewer with no sandbox flag is unconfined wherever it starts.
+
+So the policy is a flag list, it ships set (`sandbox.DEFAULT_SANDBOX_ARGS`,
+`--sandbox read-only`), and `run` REFUSES to launch when it does not name an
+enforceable mode — an unconfined seat fails here and at `doctor`'s preflight
+rather than reviewing. What this repository can honestly claim about it is two
+things: the flags are PRESENT in the argv `subprocess.run` receives, between
+`command` and the prompt, and `doctor`'s preflight proves the configured build
+ACCEPTS them (no codex binary runs here or in CI, so nothing else is
+verifiable). Enforcement is codex's own, and `read-only` restricts WRITES
+without refusing command execution — commands still run under it, sandboxed —
+and without confining reads. Nothing here depends on either, because the prompt
+is self-contained: every turn re-sends its CONTEXT block, the full contract and
+the diff, so the reviewer is never asked to read or run anything.
+
+The working directory still earns its default. Codex declines to run outside a
+TRUSTED directory, `~` is not one, trusting `~` would hand the reviewer every
+file the operator owns, and a reviewer started inside the checkout is one
+relative path from the tree it is grading. One empty directory, trusted once,
+keeps codex's own repository check a live guard. That is a smaller claim than
+confinement, and it is now made as one.
 
 **Stdout is a transcript, and only one part of it is the reply.** `codex exec`
 prints role markers, hook lines and a token counter around the message, and
@@ -101,6 +121,7 @@ from typing import Protocol
 
 from ..conversation import SubmitResult
 from ..errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
+from .preflight import ensure_working_dir, resolve_working_dir, working_dir_is_default
 from .quota import (
     DEFAULT_QUOTA_PATTERNS,
     DEFAULT_RATE_LIMIT_PATTERNS,
@@ -108,6 +129,7 @@ from .quota import (
     failure_digest,
 )
 from .reply import ECHO_ANCHOR_MATCHED, FROM_SEGMENT, isolate_reply
+from .sandbox import DEFAULT_SANDBOX_ARGS, describe_invocation
 
 #: Ceiling on the argv-borne prompt, well under this host's 1 MiB ARG_MAX so
 #: the environment block and the rest of the command line still fit.
@@ -144,7 +166,13 @@ class SubprocessCodexRunner:
         self,
         command: tuple[str, ...] = ("codex", "exec"),
         *,
-        sandbox_args: tuple[str, ...] = (),
+        # The shipped policy, not an empty tuple: a runner constructed without
+        # one would otherwise be an UNCONFINED reviewer that looks like a
+        # default. `run` still grades whatever arrives here, so passing `()`
+        # explicitly is refused rather than quietly replaced — an operator who
+        # emptied `codex.sandbox_args` gets an error naming the setting, not a
+        # value the loop substituted behind them.
+        sandbox_args: tuple[str, ...] = DEFAULT_SANDBOX_ARGS,
         timeout_seconds: float = 900.0,
         cwd: Path | None = None,
         env: dict | None = None,
@@ -152,11 +180,19 @@ class SubprocessCodexRunner:
         self._command = tuple(command)
         self._sandbox_args = tuple(sandbox_args)
         self._timeout = timeout_seconds
-        # Default to the user's home rather than the repository. See the module
-        # docstring: the reviewer has no business reading this checkout, and a
-        # cwd outside it is a containment we can state without knowing the
-        # CLI's sandbox flag names.
-        self._cwd = Path(cwd) if cwd else Path.home()
+        # Resolved by `preflight.resolve_working_dir`, which is also what
+        # `doctor` grades — so the directory the preflight reports on is by
+        # construction the one a review turn gets. An unset `cwd` is a DEDICATED
+        # EMPTY DIRECTORY, never the home directory it used to mean: codex
+        # refuses to run in an untrusted directory, and `~` is both untrusted
+        # and full of the operator's files. See the module docstring.
+        self._cwd = resolve_working_dir(cwd)
+        # PROVENANCE, kept beside the path because the path alone cannot carry
+        # it: an operator who spells the default out has CONFIGURED it, and only
+        # an unset one is autoloop's to create (`preflight.ensure_working_dir`).
+        # Read from the same predicate the resolution above branches on, so the
+        # two can never disagree about which input is the default.
+        self._cwd_is_default = working_dir_is_default(cwd)
         self._env = env
 
     @property
@@ -165,7 +201,35 @@ class SubprocessCodexRunner:
         return (*self._command, *self._sandbox_args)
 
     def run(self, prompt: str) -> CodexResult:
+        # THE confinement gate, and it is here rather than in `__init__` on
+        # purpose: this is the last point before the process, so nothing can
+        # construct its way past it, and a caller that only wants to INSPECT a
+        # badly configured runner (`doctor`, a test) still can. An unconfined
+        # policy raises the transport-fault family every codex failure already
+        # arrives as, carrying `describe_invocation`'s own message — which names
+        # the setting, the shipped value and `codex exec --help`.
+        #
+        # Graded over `command` AND `sandbox_args`, because codex sees one argv:
+        # a bypass flag in either key is a bypass, and grading only the key that
+        # is MEANT to carry the policy is how the other one becomes a way round
+        # it.
+        policy = describe_invocation(self._command, self._sandbox_args)
+        if not policy.is_enforceable:
+            raise BrowserError(
+                "refusing to run the codex reviewer unsandboxed. "
+                + policy.detail
+                + " `python -m autoloop doctor` reports this as `codex_sandbox`."
+            )
         argv = (*self._command, *self._sandbox_args, prompt)
+        # BEFORE the process, because `subprocess.run` raises the SAME
+        # `FileNotFoundError` for a missing cwd as for a missing binary — so
+        # without this a working directory that is not there would be reported
+        # as "the codex CLI was not found", sending the investigation after a
+        # binary that is present. Creates the default directory and refuses a
+        # missing configured one — including one spelled out as the default
+        # path, which is why the provenance travels rather than being inferred
+        # from the path here; see `preflight.ensure_working_dir`.
+        cwd = ensure_working_dir(self._cwd, is_default=self._cwd_is_default)
         started = time.monotonic()
         try:
             proc = subprocess.run(
@@ -173,14 +237,16 @@ class SubprocessCodexRunner:
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
-                cwd=str(self._cwd),
+                cwd=str(cwd),
                 env=self._env,
             )
         except FileNotFoundError as exc:
             raise BrowserError(
                 f"the codex CLI was not found ({self._command[0]!r}). Install it "
-                "and sign in with `codex login`, or set conversation.provider "
-                "back to 'browser_chatgpt'."
+                "and sign in with `codex login`, then check the seat with "
+                "`python -m autoloop doctor`, which resolves this command and "
+                "makes one trivial invocation from the configured working "
+                "directory."
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise ResponseTimeoutError(

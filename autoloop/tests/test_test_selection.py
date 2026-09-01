@@ -585,7 +585,10 @@ FLOOR_AFTER = 16
 #: neither the docs-only selection nor the floor moved with it.
 #: 103 -> 104 when prov-01 added `test_codex_stdout_verdict.py` (2026-09-01),
 #: for the same reason and with the same effect — 20 and 24 are unchanged.
-SUITE_SIZE = 104
+#: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01). The
+#: DENOMINATOR again: it fakes the invocation boundary rather than spawning
+#: one, and reads no tracker, so 20 and 24 are unchanged once more.
+SUITE_SIZE = 105
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

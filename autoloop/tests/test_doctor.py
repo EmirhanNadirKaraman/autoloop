@@ -1,5 +1,12 @@
 """Doctor preflight with every boundary mocked: no Chrome, no network, no
-playwright — and proof that it never submits a message.
+playwright, no codex process — and proof that it never submits a message to the
+reviewer conversation.
+
+That last qualifier is prov-02's (2026-09-01), and it is a real narrowing: the
+sweep now makes ONE trivial codex invocation of its own (`codex_preflight`),
+which is not the reviewer conversation and carries no review packet. It is the
+second injectable boundary in `DoctorProbes` and is stubbed by `probes()` in
+every test here — see that helper for why the default cannot be the real one.
 
 brw-19c (2026-08-31) is the follow-up the note here used to promise. Until it,
 `doctor.py` keyed three checks — `conversation_url`,
@@ -25,10 +32,14 @@ import socket
 
 import pytest
 
+from autoloop import doctor
+from autoloop.codex import preflight
+from autoloop.codex.preflight import PreflightResult, default_working_dir
 from autoloop.config import (
     RETIRED_BROWSER_PROVIDER,
     AutoloopConfig,
     BrowserConfig,
+    CodexConfig,
     ConversationConfig,
 )
 from autoloop.doctor import DoctorProbes, exit_code, run_doctor
@@ -84,7 +95,7 @@ class FakeConversation:
         self.closed = True
 
 
-def make_config(tmp_path, provider=None, **policy) -> AutoloopConfig:
+def make_config(tmp_path, provider=None, codex=None, **policy) -> AutoloopConfig:
     # `tmp_path` doubles as `repo_root` in every `run_doctor(...)` call in
     # this file, so `workers_root` must be a SIBLING of it (never a child) —
     # matching the pattern `test_full_healthy_run` already uses for the
@@ -98,16 +109,30 @@ def make_config(tmp_path, provider=None, **policy) -> AutoloopConfig:
         state_dir=tmp_path / ".al",
         workers_root=tmp_path.parent / f"{tmp_path.name}-workers_root",
         conversation=conversation,
+        codex=codex or CodexConfig(),
     )
 
 
-def probes(conversation=None) -> DoctorProbes:
-    """The one boundary left. `probe_cdp`/`playwright_present` were arguments
-    here until brw-19c and are gone with the fields they set: a helper that
-    still accepted them would let a test believe it had stubbed a check that
-    no longer exists."""
+def preflight_ok(detail="`codex exec` ran in a fake directory"):
+    """A stand-in for the codex preflight, defaulting to the healthy answer."""
+    return PreflightResult("ok", detail, preflight.OK)
+
+
+def probes(conversation=None, codex_preflight=None) -> DoctorProbes:
+    """`probe_cdp`/`playwright_present` were arguments here until brw-19c and
+    are gone with the fields they set: a helper that still accepted them would
+    let a test believe it had stubbed a check that no longer exists.
+
+    `codex_preflight` is stubbed by DEFAULT, and that default is not a
+    convenience: `make_config` configures a `codex_cli` seat, so an unstubbed
+    bundle would launch a real `codex exec` — spending the operator's ChatGPT
+    allowance — in every test in this file, on any machine that has the binary,
+    and would fail everywhere else. Tests about the preflight's own logic live
+    in `test_codex_preflight.py`, where the invocation boundary is faked one
+    level down."""
     return DoctorProbes(
         conversation_factory=(lambda: conversation) if conversation else None,
+        codex_preflight=codex_preflight or (lambda codex: preflight_ok()),
     )
 
 
@@ -254,7 +279,10 @@ def test_the_probe_bundle_no_longer_offers_a_browser_knob(tmp_path):
     — a stub with nothing behind it is the quietest kind of dead guard."""
     fields = {f.name for f in dataclasses.fields(DoctorProbes)}
 
-    assert fields == {"conversation_factory"}
+    # `codex_preflight` (prov-02) is the second boundary, and it is a REAL one:
+    # the default launches a codex process. The assertion stays exact so a
+    # knob nothing reads still cannot be added quietly.
+    assert fields == {"conversation_factory", "codex_preflight"}
     with pytest.raises(TypeError):
         DoctorProbes(probe_cdp=lambda url: "{}")
 
@@ -375,6 +403,308 @@ def test_stale_lock_reported_as_failure(tmp_path):
     named = by_name(results)
     assert named["lock"].status == "fail"
     assert "unlock" in named["lock"].detail
+
+
+# ---- the codex seat: command, confinement and the preflight (prov-02) --------
+
+
+def codex_rows(tmp_path, codex=None, codex_preflight=None, provider="codex_cli"):
+    results = run_doctor(
+        make_config(tmp_path, provider=provider, codex=codex),
+        tmp_path,
+        probes(FakeConversation(), codex_preflight=codex_preflight),
+    )
+    return by_name(results), results
+
+
+def codex_exit(named, *names):
+    """`exit_code` over the named rows ALONE.
+
+    `tmp_path` here is not a git repository and `codex` may not be installed,
+    so a whole-sweep `exit_code` would be 1 for reasons that have nothing to do
+    with the claim under test — and 1 for the right reason would then be
+    indistinguishable from 1 for the wrong one."""
+    return exit_code([named[name] for name in names])
+
+
+def test_doctor_distinguishes_a_resolvable_codex_command_from_an_unresolvable_one(
+    tmp_path, monkeypatch
+):
+    """`codex_command` is the cheapest of the four rows and the one every other
+    check depends on: an unresolvable command means the preflight below has
+    nothing to invoke.
+
+    PATH is stubbed both ways rather than read from the machine, so this says
+    something about `doctor` instead of about whether the developer happens to
+    have codex installed — which is what the row's only previous coverage (that
+    it EXISTS) left open."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda binary: f"/fake/bin/{binary}")
+    named, _ = codex_rows(tmp_path)
+    assert named["codex_command"].status == "ok"
+    assert "/fake/bin/codex" in named["codex_command"].detail
+    assert codex_exit(named, "codex_command") == 0
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda binary: None)
+    named, _ = codex_rows(tmp_path)
+    assert named["codex_command"].status == "fail"
+    assert "not on PATH" in named["codex_command"].detail
+    assert codex_exit(named, "codex_command") == 1
+
+
+def test_the_preflight_row_carries_the_probe_verdict_and_is_not_attempted_blindly(tmp_path):
+    """The row that answers "could this loop use codex_cli right now".
+
+    Both halves in one test because they are one claim: `doctor` reports what
+    the preflight said, and it only asks when asking is safe."""
+    named, _ = codex_rows(tmp_path)
+    assert named["codex_preflight"].status == "ok", named["codex_preflight"].detail
+    assert codex_exit(named, "codex_preflight") == 0
+
+    # A refused invocation is the row's `fail`, and the detail is the probe's.
+    def refused(codex):
+        return PreflightResult(
+            "fail",
+            "`codex exec` exited 1: Not inside a trusted directory",
+            preflight.INVOCATION_FAILED,
+        )
+
+    named, _ = codex_rows(tmp_path, codex_preflight=refused)
+    assert named["codex_preflight"].status == "fail"
+    assert "trusted directory" in named["codex_preflight"].detail
+    assert codex_exit(named, "codex_preflight") == 1
+
+
+def test_a_spent_allowance_is_a_warning_and_never_a_failed_check(tmp_path):
+    """An account state is not a misconfiguration. `doctor` exiting 1 because
+    the weekly window is used up would tell an operator to fix a machine that
+    is correctly configured — and, through `cli._precondition_*`, is the shape
+    that holds blockers shut on a condition no operator action can clear."""
+
+    def spent(codex):
+        return PreflightResult(
+            "warn",
+            "the codex allowance is SPENT: codex said 'usage limit reached'",
+            preflight.QUOTA_EXHAUSTED,
+        )
+
+    named, _ = codex_rows(tmp_path, codex_preflight=spent)
+
+    assert named["codex_preflight"].status == "warn"
+    assert "usage limit reached" in named["codex_preflight"].detail
+    assert codex_exit(named, "codex_preflight") == 0
+
+
+def test_a_working_dir_inside_the_repository_is_refused_before_anything_runs(tmp_path):
+    """The one case where NOT asking is the right answer: running the reviewer
+    inside the checkout to find out whether it runs is doing the thing being
+    diagnosed. `fail`, never `skip` — "not attempted" is not evidence that the
+    transport works, which is exactly what the removed `cdp` skip claimed."""
+    asked = []
+
+    def probe(codex):
+        asked.append(codex)
+        return preflight_ok()
+
+    named, _ = codex_rows(
+        tmp_path,
+        codex=CodexConfig(working_dir=str(tmp_path / "inside")),
+        codex_preflight=probe,
+    )
+
+    assert named["codex_workdir"].status == "fail"
+    assert "INSIDE the repository" in named["codex_workdir"].detail
+    assert named["codex_preflight"].status == "fail"
+    assert "not attempted" in named["codex_preflight"].detail
+    assert asked == [], "the probe must not run the reviewer inside the checkout"
+    assert codex_exit(named, "codex_workdir", "codex_preflight") == 1
+
+
+def test_a_configured_working_dir_that_does_not_exist_fails_and_is_never_created(tmp_path):
+    """A configured path is the operator's statement about where reviews
+    happen. Creating a mistyped one would run them somewhere nobody named."""
+    missing = tmp_path.parent / f"{tmp_path.name}-not-there"
+    named, _ = codex_rows(tmp_path, codex=CodexConfig(working_dir=str(missing)))
+
+    assert named["codex_workdir"].status == "fail"
+    assert str(missing) in named["codex_workdir"].detail
+    assert not missing.exists()
+    assert named["codex_preflight"].status == "fail"
+
+
+def test_the_default_path_spelled_out_is_graded_as_a_configured_directory(
+    tmp_path, monkeypatch
+):
+    """The row and the reviewer must agree about WHO owns the directory, and the
+    only way they can disagree is if one of them decides it by comparing paths.
+
+    `codex.working_dir = "~/.autoloop/codex-workdir"` resolves to the same place
+    as an unset one, and it is still the operator's statement — so `doctor`
+    fails it while absent rather than promising it is "created on first use",
+    which is what the reviewer's own ensure step would then refuse. `$HOME` is
+    moved to a sibling of the repository so the default lands outside the
+    checkout and this grades provenance rather than the INSIDE-the-repo rule."""
+    home = tmp_path.parent / f"{tmp_path.name}-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    default = default_working_dir()
+    assert not default.exists()
+    asked = []
+
+    def probe(codex):
+        asked.append(codex)
+        return preflight_ok()
+
+    named, _ = codex_rows(
+        tmp_path, codex=CodexConfig(working_dir=str(default)), codex_preflight=probe
+    )
+
+    assert named["codex_workdir"].status == "fail"
+    assert str(default) in named["codex_workdir"].detail
+    assert not default.exists(), "and doctor creates nothing on the way to saying so"
+    assert named["codex_preflight"].status == "fail"
+    assert "not attempted" in named["codex_preflight"].detail
+    assert asked == []
+    assert codex_exit(named, "codex_workdir", "codex_preflight") == 1
+
+    # The same absolute path, left UNSET: autoloop's own, and reported as about
+    # to be created rather than as a fault.
+    named, _ = codex_rows(tmp_path, codex=CodexConfig(), codex_preflight=probe)
+
+    assert named["codex_workdir"].status == "ok"
+    assert "created on first use" in named["codex_workdir"].detail
+    assert codex_exit(named, "codex_workdir", "codex_preflight") == 0
+    assert len(asked) == 1, "and only the usable directory is preflighted"
+
+
+def test_the_graded_working_dir_is_the_one_the_reviewer_actually_gets(tmp_path):
+    """The defect this whole check is downstream of was a doctor row that
+    passed about a directory nothing used. Both sides resolve through
+    `preflight.resolve_working_dir`, so this asserts the identity rather than
+    two copies of a rule."""
+    from autoloop.codex.conversation import SubprocessCodexRunner
+
+    named, _ = codex_rows(tmp_path)
+    assert str(default_working_dir()) in named["codex_workdir"].detail
+    assert SubprocessCodexRunner()._cwd == default_working_dir()
+
+    configured = tmp_path.parent / f"{tmp_path.name}-reviews"
+    configured.mkdir()
+    named, _ = codex_rows(tmp_path, codex=CodexConfig(working_dir=str(configured)))
+    assert named["codex_workdir"].status == "ok"
+    assert str(configured) in named["codex_workdir"].detail
+    assert SubprocessCodexRunner(cwd=configured)._cwd == configured
+
+
+def test_the_shipped_sandbox_policy_passes_and_is_named_in_the_row(tmp_path):
+    """`codex_sandbox` is the confinement row. The default seat is confined, so
+    it reads `ok` — and it says what the policy does and does not do, because a
+    row an operator reads as "the reviewer cannot see the checkout", or as "the
+    reviewer cannot run anything", is a guarantee codex does not give stated
+    where the seat is selected.
+
+    Both halves are asserted HERE and not only in `test_codex_preflight.py`:
+    this is the text an operator actually meets, and doctor composes it
+    (`policy.detail` plus its own sentence) rather than printing it through."""
+    named, _ = codex_rows(tmp_path)
+    row = named["codex_sandbox"]
+
+    assert row.status == "ok"
+    assert "--sandbox read-only" in row.detail
+    # What read-only really does: restricts writes, confines neither reads nor
+    # command execution.
+    assert "WRITES are restricted" in row.detail
+    assert "does NOT confine READS" in row.detail
+    assert "commands still run" in row.detail
+    assert "command execution are refused" not in row.detail
+    assert codex_exit(named, "codex_sandbox") == 0
+
+
+def test_an_unconfined_seat_fails_and_the_preflight_is_not_attempted(tmp_path):
+    """The claim: selecting `codex_cli` with no sandbox policy is not safe, and
+    `doctor` says so BEFORE a round rather than a review saying so during one.
+
+    The empty value is the one every config carried until this round, and it was
+    reported as a deliberate policy — `warn`, exit 0 — on the argument that
+    confinement rested on `codex.working_dir`. A working directory confines
+    nothing, so this is a `fail`; and the probe is not asked, because answering
+    "is this seat safe" by launching an unsandboxed reviewer answers a different
+    question."""
+    asked = []
+
+    def probe(codex):
+        asked.append(codex)
+        return preflight_ok()
+
+    named, _ = codex_rows(
+        tmp_path, codex=CodexConfig(sandbox_args=()), codex_preflight=probe
+    )
+
+    assert named["codex_sandbox"].status == "fail"
+    assert "UNCONFINED" in named["codex_sandbox"].detail
+    assert named["codex_preflight"].status == "fail"
+    assert "not attempted" in named["codex_preflight"].detail
+    assert asked == [], "an unsandboxed reviewer must not be launched to grade itself"
+    assert codex_exit(named, "codex_sandbox", "codex_preflight") == 1
+
+
+@pytest.mark.parametrize(
+    "args, status",
+    [
+        (("--sandbox", "workspace-write"), "warn"),
+        (("--dangerously-bypass-approvals-and-sandbox",), "fail"),
+        (("--sandbox", "banana"), "fail"),
+    ],
+)
+def test_the_row_grades_the_policy_rather_than_whether_anything_is_set(
+    tmp_path, args, status
+):
+    """Whether the list is SET is not the question. A bypass flag and a mode the
+    loop cannot name are both a seat with no sandbox, and both were `ok` under
+    the old row, which only tested that the list was non-empty."""
+    named, _ = codex_rows(tmp_path, codex=CodexConfig(sandbox_args=args))
+
+    assert named["codex_sandbox"].status == status
+
+
+def test_a_preflight_that_raises_or_answers_nonsense_is_a_failure_not_a_pass(tmp_path):
+    """Both fail-open shapes at the seam `doctor` cannot see inside.
+
+    A probe that raises would take the whole sweep with it if it were not
+    caught, and a status `exit_code` does not recognise would be counted as a
+    pass — `exit_code` only looks for the literal `"fail"`."""
+
+    def exploding(codex):
+        raise RuntimeError("no PATH at all")
+
+    named, _ = codex_rows(tmp_path, codex_preflight=exploding)
+    assert named["codex_preflight"].status == "fail"
+    assert "RuntimeError" in named["codex_preflight"].detail
+    assert codex_exit(named, "codex_preflight") == 1
+
+    def nonsense(codex):
+        return PreflightResult("green", "everything is fine, honestly", preflight.OK)
+
+    named, _ = codex_rows(tmp_path, codex_preflight=nonsense)
+    assert named["codex_preflight"].status == "fail"
+    assert "unrecognised status" in named["codex_preflight"].detail
+    assert codex_exit(named, "codex_preflight") == 1
+
+
+def test_no_codex_rows_at_all_when_no_codex_seat_is_configured(tmp_path):
+    """The rows are emitted for a `codex_cli` seat and for nothing else — a
+    check that grades a transport the config does not name is the `cdp`
+    mistake, and this one would launch a process to do it."""
+    asked = []
+    named, _ = codex_rows(
+        tmp_path,
+        provider=RETIRED_BROWSER_PROVIDER,
+        codex_preflight=lambda codex: asked.append(codex) or preflight_ok(),
+    )
+
+    assert not {"codex_command", "codex_workdir", "codex_sandbox", "codex_preflight"} & set(
+        named
+    ), sorted(named)
+    assert asked == []
 
 
 #: The URL-shape checks that lived here — five accepted forms, five rejected
