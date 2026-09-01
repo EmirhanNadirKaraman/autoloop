@@ -97,18 +97,43 @@ auto_merge_enabled = false
 
 [codex]
 # The Codex CLI reviewer. Only read when a codex provider is selected above.
-# Codex signs in with your ChatGPT plan (`codex login`) — no API key.
+# Codex signs in with your ChatGPT plan (`codex login`) — no API key. Run
+# `python -m autoloop doctor` after changing anything here: it resolves the
+# command, grades the working directory, and makes ONE trivial invocation from
+# that directory, which is the only thing that answers "would a review work".
 command = ["codex", "exec"]
-# Flags that confine the reviewer, e.g. a read-only sandbox. Left EMPTY on
-# purpose: the flag names could not be verified when this was written, and a
-# guessed value would look like a control without being one. `doctor` warns
-# while this is empty. Fill it in once you have checked `codex exec --help`.
+# Extra flags handed to every invocation, between `command` and the prompt.
+# EMPTY BY POLICY, and the policy is stated rather than implied: CONFINEMENT
+# RESTS ON `working_dir` ALONE — a dedicated directory outside the checkout,
+# with a self-contained prompt. No flag name can be verified from the autoloop
+# repository or in CI (no codex binary runs there), and a flag nobody can
+# execute is a setting that looks like a control without being one.
+#
+# Two worth knowing, neither of them defaulted:
+#   ["--sandbox", "read-only"]     the confinement this loop wants, if your
+#                                  build spells it that way — `codex exec --help`
+#   ["--skip-git-repo-check"]      accept an untrusted working directory. It
+#                                  works, and it switches codex's own guard off
+#                                  everywhere; trusting the directory once
+#                                  (below) is the better fix.
+# `doctor` warns while this is empty and names both. Whatever you put here is
+# passed to the preflight too, so a flag your build rejects fails that check
+# rather than the first review.
 sandbox_args = []
 timeout_seconds = 900.0
-# Where the CLI runs. Empty = your home directory. Never point this at the
-# repository: the prompt is self-contained, so the reviewer needs no filesystem
-# access, and running outside the checkout is a containment that holds no
-# matter what the sandbox flags are called. `doctor` fails if it is inside.
+# Where the CLI runs, and THE confinement — the one load-bearing setting here.
+# Empty = `~/.autoloop/codex-workdir`, a dedicated empty directory autoloop
+# creates on first use. TRUST IT ONCE — `cd ~/.autoloop/codex-workdir && codex`
+# — or codex refuses: it declines to run outside a trusted directory
+# ("Not inside a trusted directory and --skip-git-repo-check was not
+# specified"). That refusal is a guard worth keeping, which is why the default
+# is one empty directory rather than your home directory (untrusted, and
+# trusting it would trust every file you own) and rather than the flag above.
+#
+# Never point this at the repository: the prompt is self-contained, so the
+# reviewer needs no filesystem access at all. `doctor` fails if it is inside.
+# A CONFIGURED directory that does not exist is refused, never created, so a
+# typo here cannot become the place your reviews run.
 working_dir = ""
 # Substrings that mark a SPENT ALLOWANCE in a FAILED invocation — the window is
 # used up, waiting does not help, and the loop hands the reviewer role to
@@ -166,6 +191,14 @@ rate_limit_error_codes = []
 # still naming it here LOADS and prints a notice saying so; the run then refuses
 # at transport construction rather than reviewing on a transport you did not
 # choose. Change it to one of the two above.
+#
+# THE CEILING NEITHER OF THEM RAISES. Codex signed in with a ChatGPT account
+# (verified 2026-08-17: `stored API key: false`, `auth mode: chatgpt`) draws on
+# the SAME allowance the retired browser provider used. Switching transport
+# removed the DOM faults — 21 of this loop's first 103 blockers — and removed
+# nothing about the account rate limit that parked the loop for four hours on
+# 2026-08-17. Neither codex seat has a budget of its own; see
+# docs/AUTOLOOP.md's "Selecting the codex reviewer".
 provider = "codex_cli"
 # Where the reviewer role goes when `provider` reports its allowance exhausted.
 # Empty disables failover and the loop parks instead, which is the default and

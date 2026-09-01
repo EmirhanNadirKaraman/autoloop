@@ -52,12 +52,23 @@ structurally unreachable. Every rotation trigger — a disproven send, a wedged
 conversation, a chat that accepts a turn and never answers — describes a browser
 conversation. There is nothing here to rotate away from.
 
-**The reviewer gets no repository access.** It runs with `cwd` pointed outside
-the checkout: the prompt is self-contained (every turn re-sends its CONTEXT
-block and the full contract), so the reviewer needs no filesystem at all, and
-containment that does not depend on knowing a sandbox flag's name is
-containment that still holds when the flag is renamed. Configured sandbox
-arguments are passed through on top of that, not instead of it.
+**The reviewer gets no repository access, and that is the WHOLE confinement
+policy — stated, not implied.** It runs in a dedicated, empty directory outside
+the checkout (`preflight.resolve_working_dir`; `~/.autoloop/codex-workdir` when
+`codex.working_dir` is empty). The prompt is self-contained — every turn
+re-sends its CONTEXT block and the full contract — so the reviewer needs no
+filesystem at all, and a containment that does not depend on knowing a sandbox
+flag's name still holds when the flag is renamed. `codex.sandbox_args` ships
+EMPTY on purpose and passes through on top of this, never instead of it: the
+names cannot be verified from this repository or in CI, and a flag nobody here
+can run is a setting that looks like a control without being one. `doctor` says
+so in as many words rather than promising a sandbox this module does not
+enforce.
+
+The directory is dedicated rather than the home directory for a measured
+reason: codex declines to run outside a TRUSTED directory, `~` is not one, and
+trusting `~` to fix that would hand the reviewer every file the operator owns.
+One empty directory, trusted once, keeps codex's own check as a live guard.
 
 **Stdout is a transcript, and only one part of it is the reply.** `codex exec`
 prints role markers, hook lines and a token counter around the message, and
@@ -101,6 +112,7 @@ from typing import Protocol
 
 from ..conversation import SubmitResult
 from ..errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
+from .preflight import ensure_working_dir, resolve_working_dir
 from .quota import (
     DEFAULT_QUOTA_PATTERNS,
     DEFAULT_RATE_LIMIT_PATTERNS,
@@ -152,11 +164,13 @@ class SubprocessCodexRunner:
         self._command = tuple(command)
         self._sandbox_args = tuple(sandbox_args)
         self._timeout = timeout_seconds
-        # Default to the user's home rather than the repository. See the module
-        # docstring: the reviewer has no business reading this checkout, and a
-        # cwd outside it is a containment we can state without knowing the
-        # CLI's sandbox flag names.
-        self._cwd = Path(cwd) if cwd else Path.home()
+        # Resolved by `preflight.resolve_working_dir`, which is also what
+        # `doctor` grades — so the directory the preflight reports on is by
+        # construction the one a review turn gets. An unset `cwd` is a DEDICATED
+        # EMPTY DIRECTORY, never the home directory it used to mean: codex
+        # refuses to run in an untrusted directory, and `~` is both untrusted
+        # and full of the operator's files. See the module docstring.
+        self._cwd = resolve_working_dir(cwd)
         self._env = env
 
     @property
@@ -166,6 +180,13 @@ class SubprocessCodexRunner:
 
     def run(self, prompt: str) -> CodexResult:
         argv = (*self._command, *self._sandbox_args, prompt)
+        # BEFORE the process, because `subprocess.run` raises the SAME
+        # `FileNotFoundError` for a missing cwd as for a missing binary — so
+        # without this a working directory that is not there would be reported
+        # as "the codex CLI was not found", sending the investigation after a
+        # binary that is present. Creates the default directory and refuses a
+        # missing configured one; see `preflight.ensure_working_dir`.
+        cwd = ensure_working_dir(self._cwd)
         started = time.monotonic()
         try:
             proc = subprocess.run(
@@ -173,14 +194,16 @@ class SubprocessCodexRunner:
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
-                cwd=str(self._cwd),
+                cwd=str(cwd),
                 env=self._env,
             )
         except FileNotFoundError as exc:
             raise BrowserError(
                 f"the codex CLI was not found ({self._command[0]!r}). Install it "
-                "and sign in with `codex login`, or set conversation.provider "
-                "back to 'browser_chatgpt'."
+                "and sign in with `codex login`, then check the seat with "
+                "`python -m autoloop doctor`, which resolves this command and "
+                "makes one trivial invocation from the configured working "
+                "directory."
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise ResponseTimeoutError(
