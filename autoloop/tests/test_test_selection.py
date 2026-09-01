@@ -61,6 +61,7 @@ and the only reason a green advisory answer covers the verdict run.
 
 from __future__ import annotations
 
+import ast
 from inspect import signature
 from pathlib import Path
 
@@ -70,11 +71,14 @@ from autoloop.config import AuditConfig, AutoloopConfig, BrowserConfig
 from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import ImplementExecutor
 from autoloop.policy import PolicyConfig, PolicyEngine
-from autoloop.tasks import Task
+from autoloop.tasks import TRACKER_PATHS, Task
 from autoloop.validation import (
     TEST_SELECTION_FULL,
     TEST_SELECTION_REACHABLE,
+    _DYNAMIC_IMPORT_CALLS,
+    _INTERPRETER_LITERALS,
     _files_referencing,
+    _is_test_file,
     _reference_tokens,
     build_import_graph,
     select_validation_commands,
@@ -290,11 +294,14 @@ def test_a_bare_sibling_import_is_a_real_edge_in_the_real_repository():
     """The repository's own pattern, asserted as an EDGE rather than as a
     selection.
 
-    The selection assertion alone would be vacuous here: this file contains the
-    string `"python3"` (the `SUITE` constant above), which puts it in
-    `graph.opaque` and therefore on the frontier for every change — it would come
-    back "selected" even with the edge missing. The `importers` assertion is the
-    one that can tell the two apart, and it is false unless the bare name
+    The selection assertion alone used to be vacuous here: this file contains
+    the string `"python3"` (the `SUITE` constant above), which until select-04
+    (2026-09-01) put it in `graph.opaque` and therefore on the frontier for
+    every change — it came back "selected" even with the edge missing. That
+    literal is data now (this module spawns nothing), so the selection really
+    does rest on the edge. The `importers` assertion is kept anyway: it is the
+    one that can tell the two apart WITHOUT depending on the opacity rule
+    staying where select-04 put it, and it is false unless the bare name
     resolves in this file's own directory.
     """
     graph = real_repository_graph()
@@ -499,6 +506,562 @@ def test_a_changed_test_file_selects_itself(repo):
 
     assert not chosen.widened
     assert chosen.selected == ("suite/test_unrelated.py",)
+
+
+# ---- select-04: opacity is ATTRIBUTED, and the default is untouched ---------
+#
+# `ImportGraph.opaque` is still seeded on EVERY change and nothing below
+# weakens that: a file whose own imports cannot be read could reach anything.
+# What select-04 (2026-09-01) changed is which files that describes. Two
+# signals were being read off the source TEXT rather than off what the file
+# does:
+#
+#   * a dynamic import naming a module this repository does not own —
+#     `__import__("socket")`, `pytest.importorskip("asyncpg")` — which cannot
+#     reach repository code by any route;
+#   * an interpreter name that never reaches a `subprocess` entry point. In a
+#     repository whose SUBJECT is running validation commands that vocabulary
+#     is everywhere, and `SUITE` at the top of THIS file is an example: an argv
+#     fixture fed into the selector under test, which launches nothing.
+#
+# Everything uncertain keeps the old answer, and the fixtures at the end of the
+# block are what say so: a non-constant module name, a dynamic-import call
+# whose first argument is not a module name, an argv this cannot read, an
+# interpreter that really is executed, and a file that does not parse.
+
+#: The test files whose interpreter reference reaches a `subprocess` entry
+#: point, or whose dynamic import cannot be resolved — measured on this
+#: checkout, and asserted one name at a time below so a file leaving the set
+#: names itself rather than moving a count.
+#:
+#: `test_transport_vocabulary.py` is here for the other reason: its
+#: `importlib.import_module(name)` takes a VARIABLE, which is exactly the case
+#: the rule exists for. Every other name here spawns.
+STILL_OPAQUE = (
+    "test_audit_executor.py",
+    "test_crash_safety.py",
+    "test_dashboard.py",
+    "test_heartbeat.py",
+    "test_implement_executor.py",
+    "test_lock.py",
+    "test_operator_abort.py",
+    "test_per_test_selection.py",
+    "test_self_upgrade.py",
+    "test_stall_detector.py",
+    "test_tasks.py",
+    "test_transport_vocabulary.py",
+)
+
+#: The test files the rule used to call opaque and no longer does. Each one
+#: names an interpreter without ever executing one, or resolves its dynamic
+#: import to a module outside this repository.
+NO_LONGER_OPAQUE = (
+    "test_agent_self_validation.py",
+    "test_audit_intake.py",
+    "test_prose_doc_selection.py",
+    "test_test_selection.py",
+    "test_transport_fault_recovery.py",
+    "test_validation_env.py",
+    "test_validation_failfast.py",
+    "test_validation_parallelism.py",
+)
+
+#: The measured before/after, as numbers rather than as "fewer". `FLOOR` is
+#: what a change reaching NOTHING still selects — the opaque files plus
+#: everything that imports them — which is the floor under every round this
+#: repository runs.
+OPAQUE_TESTS_BEFORE = 20
+OPAQUE_TESTS_AFTER = 12
+FLOOR_BEFORE = 22
+FLOOR_AFTER = 16
+
+#: The round every task in this repository makes: the change note, and nothing
+#: else. Asserted as a count out of the whole suite, both before and after, so
+#: "it narrows" is a number rather than an adjective. The denominator is
+#: asserted too: the suite grows, and a ratio whose bottom half drifted would
+#: read as a narrowing that never happened.
+SUITE_SIZE = 102
+DOCS_ONLY_BEFORE = 24
+DOCS_ONLY_AFTER = 20
+
+_LEGACY_OPAQUE = None
+
+
+def legacy_file_is_opaque(rel: str, tree: ast.AST) -> bool:
+    """`_scan_module`'s opacity rule as it stood BEFORE select-04.
+
+    Written out here rather than kept behind a flag in the selector, for the
+    reason `test_prose_doc_selection.before_selection` gives about its own
+    before/after: the comparison this block has to make is against a rule that
+    no longer exists, and a switch that could restore it in production is a
+    bigger surface than the measurement is worth.
+
+    It reads `_DYNAMIC_IMPORT_CALLS` and `_INTERPRETER_LITERALS` from the module
+    under test rather than copying them, so the "before" tracks the vocabulary
+    those constants hold; what it deliberately does NOT track is the two
+    narrowings select-04 added, which is the whole point of it.
+    """
+    watch = _is_test_file(rel) or Path(rel).name == "conftest.py"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            called = ""
+            if isinstance(func, ast.Attribute):
+                called = func.attr
+            elif isinstance(func, ast.Name):
+                called = func.id
+            if called in _DYNAMIC_IMPORT_CALLS:
+                return True
+        elif watch and isinstance(node, ast.Attribute):
+            if (
+                node.attr == "executable"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+            ):
+                return True
+        elif watch and isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and node.value in _INTERPRETER_LITERALS:
+                return True
+    return False
+
+
+def legacy_opaque_paths() -> frozenset[str]:
+    """The whole checkout under the rule above. Cached, for the reason
+    `real_repository_graph` is."""
+    global _LEGACY_OPAQUE
+    if _LEGACY_OPAQUE is None:
+        found: set[str] = set()
+        for rel in sorted(real_repository_graph().files):
+            try:
+                tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, ValueError):
+                found.add(rel)
+                continue
+            if legacy_file_is_opaque(rel, tree):
+                found.add(rel)
+        _LEGACY_OPAQUE = frozenset(found)
+    return _LEGACY_OPAQUE
+
+
+def opaque_test_names(paths) -> list[str]:
+    return sorted(Path(rel).name for rel in paths if _is_test_file(rel))
+
+
+def floor_of(seeds) -> list[str]:
+    """Every test file a change reaching NOTHING still selects, given `seeds` as
+    the opaque set, as repo-relative paths.
+
+    `reachable_from` unions the graph's own opaque set in, and the "after" set
+    is a subset of the "before" one, so passing the legacy set reproduces the
+    legacy answer exactly rather than a mixture of the two."""
+    graph = real_repository_graph()
+    return sorted(rel for rel in graph.reachable_from(seeds) if _is_test_file(rel))
+
+
+@pytest.mark.parametrize("name", STILL_OPAQUE)
+def test_a_file_that_really_spawns_is_still_opaque(name):
+    """One case per file, so a regression names the file it broke.
+
+    Both halves are asserted: it was opaque before AND it is opaque now. The
+    first is what stops this passing for a file that was never on the list.
+    """
+    assert name in opaque_test_names(legacy_opaque_paths()), "was never opaque"
+    assert name in opaque_test_names(real_repository_graph().opaque)
+
+
+@pytest.mark.parametrize("name", NO_LONGER_OPAQUE)
+def test_a_file_that_only_names_an_interpreter_is_no_longer_opaque(name):
+    """The mirror, and the same two halves: without the first assertion this
+    would pass for any file that never carried the signal at all."""
+    assert name in opaque_test_names(legacy_opaque_paths()), (
+        "this file was not opaque before either, so it measures nothing"
+    )
+    assert name not in opaque_test_names(real_repository_graph().opaque)
+
+
+def test_the_opaque_set_is_exactly_the_files_that_spawn():
+    """The two lists above, as an EQUALITY over the whole checkout.
+
+    The per-file cases cannot see a file that JOINED the set, and a count
+    cannot see one file swapped for another.
+    """
+    graph = real_repository_graph()
+    measured = opaque_test_names(graph.opaque)
+
+    assert measured == sorted(STILL_OPAQUE), measured
+    assert opaque_test_names(legacy_opaque_paths()) == sorted(
+        STILL_OPAQUE + NO_LONGER_OPAQUE
+    ), opaque_test_names(legacy_opaque_paths())
+    assert len(measured) == OPAQUE_TESTS_AFTER
+    assert len(opaque_test_names(legacy_opaque_paths())) == OPAQUE_TESTS_BEFORE
+
+
+def test_nothing_became_opaque_that_was_not_opaque_before():
+    """The invariant that makes this a NARROWING and not a rewrite.
+
+    Both narrowings can only remove files: the dynamic-import arm declines to
+    mark a file that the old rule marked, and the interpreter arm is reached
+    only when the old rule's own literal test has already fired. So the new set
+    is a subset of the old one over the WHOLE checkout — production files
+    included, which is where a regression would be most expensive.
+    """
+    graph = real_repository_graph()
+
+    assert graph.opaque <= legacy_opaque_paths(), sorted(
+        graph.opaque - legacy_opaque_paths()
+    )
+    assert graph.opaque < legacy_opaque_paths(), "nothing was narrowed at all"
+
+
+def test_the_floor_under_every_selection_dropped_and_by_how_much():
+    """DONE-WHEN, measured. A change that reaches nothing still runs this many
+    test files, before and after, on this checkout."""
+    after = floor_of([])
+    before = floor_of(legacy_opaque_paths())
+
+    assert len(before) == FLOOR_BEFORE, before
+    assert len(after) == FLOOR_AFTER, after
+    assert set(after) <= set(before), sorted(set(after) - set(before))
+
+
+def test_the_floor_is_the_opaque_set_plus_only_what_imports_it():
+    """What the floor is MADE of, so the number above is not a snapshot.
+
+    Every file in it is either opaque itself or reaches an opaque file through
+    the import graph — there is no third way onto the frontier, and a file that
+    appeared for a third reason would mean `reachable_from` had changed under
+    this rather than the opaque set having shrunk.
+    """
+    graph = real_repository_graph()
+    forward: dict[str, set[str]] = {}
+    for target, importers in graph.importers.items():
+        for importer in importers:
+            forward.setdefault(importer, set()).add(target)
+
+    for rel in floor_of([]):
+        if rel in graph.opaque:
+            continue
+        seen: set[str] = set()
+        frontier = [rel]
+        while frontier:
+            for target in forward.get(frontier.pop(), ()):
+                if target not in seen:
+                    seen.add(target)
+                    frontier.append(target)
+        assert seen & graph.opaque, f"{rel} is on the floor importing nothing opaque"
+
+
+def test_a_docs_only_round_selects_this_many_of_the_suite():
+    """The measured before/after on the round this repository actually runs.
+
+    `before` is not a second selection: attribution does not depend on the
+    opaque set, so the legacy answer is exactly this answer unioned with the
+    legacy floor — which is why it can be stated as an equality rather than as
+    a re-run of a rule that no longer exists.
+    """
+    graph = real_repository_graph()
+    chosen = select_validation_commands(
+        (RUFF, ("python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto")),
+        sorted(TRACKER_PATHS),
+        REPO_ROOT,
+    )
+
+    assert not chosen.widened, chosen.reason
+    after = set(chosen.selected)
+    before = after | set(floor_of(legacy_opaque_paths()))
+
+    measured = (len(after), len(before), len(graph.test_files))
+    assert measured == (DOCS_ONLY_AFTER, DOCS_ONLY_BEFORE, SUITE_SIZE), (
+        f"(after, before, suite) = {measured}; selected {sorted(after)}"
+    )
+    assert "autoloop/tests/test_docs_merge.py" in after, (
+        "the one test a change note most needs; `test_prose_doc_selection.py` "
+        "owns that claim, and it must not be what this narrowing costs"
+    )
+
+
+# ---- and everything uncertain keeps the old answer --------------------------
+
+
+def test_a_dynamic_import_of_a_module_this_repo_does_not_own_is_not_opaque(repo):
+    """`__import__("socket")` and `pytest.importorskip("asyncpg")`, the two
+    shapes this checkout actually contains. Neither can reach repository code:
+    one is the standard library, the other a third-party optional-dependency
+    guard."""
+    write(
+        repo,
+        "suite/test_foreign.py",
+        "import pytest\n\n\ndef test_stdlib():\n"
+        "    assert __import__('socket')\n\n\ndef test_optional():\n"
+        "    pytest.importorskip('asyncpg')\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_foreign.py" not in graph.opaque
+    chosen = selection(repo, ["pkg/lonely.py"])
+    assert "suite/test_foreign.py" not in chosen.selected
+
+
+def test_a_dynamic_import_with_a_non_constant_argument_is_still_opaque(repo):
+    """THE case the rule exists for. A name this cannot read could be any
+    module in the checkout, so it is every module in the checkout."""
+    write(
+        repo,
+        "suite/test_computed.py",
+        "import importlib\n\n\ndef test_computed(name):\n"
+        "    assert importlib.import_module(name)\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_computed.py" in graph.opaque
+    assert "suite/test_computed.py" in selection(repo, ["pkg/lonely.py"]).selected
+
+
+def test_a_dynamic_import_call_that_takes_no_module_name_is_still_opaque(repo):
+    """`spec_from_file_location("os.path", path)` names a module and imports a
+    PATH, so its first argument says nothing about what gets loaded. The four
+    calls select-04 resolves are the ones whose first argument really is the
+    module being reached for; every other call in `_DYNAMIC_IMPORT_CALLS` is
+    unchanged, even with a constant sitting where a name would go."""
+    write(
+        repo,
+        "suite/test_by_path.py",
+        "import importlib.util\n\n\ndef test_by_path(path):\n"
+        "    assert importlib.util.spec_from_file_location('os.path', path)\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_by_path.py" in graph.opaque
+
+
+def test_an_interpreter_literal_that_is_only_data_is_not_opaque(repo):
+    """The measured false positive, constructed. A module-level tuple
+    describing an operator's configured validation commands launches
+    nothing."""
+    write(
+        repo,
+        "suite/test_config_shape.py",
+        "LEGACY_SERIAL = (\n"
+        "    ('ruff', 'check', '.'),\n"
+        "    ('python3', '-m', 'pytest', 'suite', '-q'),\n"
+        ")\n\n\ndef test_shape():\n"
+        "    assert LEGACY_SERIAL[1][0] == 'python3'\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_config_shape.py" not in graph.opaque
+    assert "suite/test_config_shape.py" not in selection(repo, ["pkg/lonely.py"]).selected
+
+
+def test_an_interpreter_literal_that_is_executed_is_still_opaque(repo):
+    """Constructed rather than borrowed from a file that happens to spawn
+    today: the claim is about the RULE, and a real file could stop spawning
+    without this noticing."""
+    write(
+        repo,
+        "suite/test_executes.py",
+        "import subprocess\n\n"
+        "LEGACY_SERIAL = (('python3', '-m', 'pytest', 'suite', '-q'),)\n\n\n"
+        "def test_executes():\n"
+        "    subprocess.run(['python3', '-m', 'pytest', 'suite'], check=False)\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_executes.py" in graph.opaque
+    assert "suite/test_executes.py" in selection(repo, ["pkg/lonely.py"]).selected
+
+
+def test_sys_executable_reaching_a_spawn_is_still_opaque(repo):
+    """The other spelling, through a local variable rather than inline — the
+    argv is a name this cannot read, which is the fail-closed arm."""
+    write(
+        repo,
+        "suite/test_relaunch.py",
+        "import subprocess\nimport sys\n\n\ndef test_relaunch():\n"
+        "    argv = [sys.executable, '-c', 'import pkg.publisher']\n"
+        "    subprocess.run(argv, check=False)\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_relaunch.py" in graph.opaque
+
+
+def test_an_argv_this_cannot_read_is_opaque_even_when_the_program_is_git(repo):
+    """FAIL CLOSED, and the reason `run_git(cwd, *args)` keeps four real files
+    opaque. `args` is a parameter, so a caller could pass anything; the file
+    names an interpreter elsewhere; nothing here establishes that the two never
+    meet."""
+    write(
+        repo,
+        "suite/test_helper_spawn.py",
+        "import subprocess\n\n"
+        "SUITE = ('python3', '-m', 'pytest')\n\n\n"
+        "def run_git(cwd, *args):\n"
+        "    return subprocess.run(['git', *args], cwd=str(cwd), check=True)\n\n\n"
+        "def test_helper(tmp_path):\n    run_git(tmp_path, 'status')\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_helper_spawn.py" in graph.opaque
+
+
+def test_a_spawn_whose_argv_is_spelled_out_and_is_not_an_interpreter_is_inert(repo):
+    """The bound on the test above: a fully constant argv naming something
+    other than an interpreter is read, and read means it does not count. Without
+    this, the fail-closed arm would swallow the narrowing whole."""
+    write(
+        repo,
+        "suite/test_plain_git.py",
+        "import subprocess\n\n"
+        "SUITE = ('python3', '-m', 'pytest')\n\n\n"
+        "def test_plain():\n"
+        "    subprocess.run(['git', 'status'], check=False)\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_plain_git.py" not in graph.opaque
+
+
+def test_an_aliased_subprocess_import_cannot_hide_a_spawn(repo):
+    """`import subprocess as sp` — matched through the alias the file actually
+    bound, so renaming the module does not switch the rule off. `from
+    subprocess import Popen` is the other half."""
+    write(
+        repo,
+        "suite/test_aliased.py",
+        "import subprocess as sp\nimport sys\n\n\ndef test_aliased():\n"
+        "    sp.run([sys.executable, '-c', 'pass'], check=False)\n",
+    )
+    write(
+        repo,
+        "suite/test_from_import.py",
+        "import sys\nfrom subprocess import Popen\n\n\ndef test_popen():\n"
+        "    Popen([sys.executable, '-c', 'pass']).wait()\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_aliased.py" in graph.opaque
+    assert "suite/test_from_import.py" in graph.opaque
+
+
+def test_a_spawn_entry_point_that_is_referenced_rather_than_called_is_opaque(repo):
+    """`runner = subprocess.run` hands the spawn somewhere this cannot follow,
+    so it is counted exactly like a spawn whose argv it cannot read."""
+    write(
+        repo,
+        "suite/test_escapes.py",
+        "import subprocess\n\n"
+        "SUITE = ('python3', '-m', 'pytest')\n\n\n"
+        "def test_escapes():\n"
+        "    runner = subprocess.run\n"
+        "    assert runner is not None\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_escapes.py" in graph.opaque
+
+
+def test_a_method_that_merely_shares_a_name_with_a_spawn_is_not_one(repo):
+    """`orch.run(max_steps=1)` is not `subprocess.run`, and the whole
+    narrowing would be undone if it were: those calls are everywhere in this
+    suite. The alias set is read off the imports for exactly this reason."""
+    write(
+        repo,
+        "suite/test_method_run.py",
+        "SUITE = ('python3', '-m', 'pytest')\n\n\n"
+        "class Orch:\n    def run(self, max_steps=1):\n        return max_steps\n\n\n"
+        "def test_method():\n    assert Orch().run(max_steps=1) == 1\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "suite/test_method_run.py" not in graph.opaque
+
+
+#: Ways to reach a fresh interpreter that are NOT `subprocess`. The rule counts
+#: `_SUBPROCESS_CALLS` and nothing else, which is what select-04 was authorized
+#: to narrow to; before it, the interpreter LITERAL alone was enough and these
+#: were covered by accident. No file in this checkout uses one — asserted
+#: below rather than assumed, because that is the one way the narrowing could
+#: fail silently: the alarm would simply never fire.
+_OTHER_SPAWN_CALLS = frozenset(
+    {
+        "system",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "posix_spawn",
+        "posix_spawnp",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnl",
+        "spawnlp",
+        "spawn",
+        "popen",
+        "startfile",
+    }
+)
+
+
+def test_no_file_left_off_the_frontier_reaches_an_interpreter_around_subprocess():
+    """The gap the flow rule opens, asserted ABSENT rather than argued away.
+
+    A test that ran `os.execv(sys.executable, argv)` or `os.system("python3
+    ...")` would launch an interpreter this rule does not watch for, and —
+    since its interpreter literal now needs a `subprocess` call to count — it
+    would drop off the frontier with nothing said. That cannot be closed
+    statically without watching every callable in the standard library; what
+    can be done is to fail the round that introduces one, here, with the file
+    and line named. The same move `test_prose_doc_selection.py` makes for a
+    document name built instead of spelled.
+
+    Scoped to the files that are NOT opaque: a file already on the frontier is
+    selected for every change whatever route it takes.
+    """
+    graph = real_repository_graph()
+    offenders = []
+    for rel in sorted(graph.files):
+        if rel in graph.opaque or not _is_test_file(rel):
+            continue
+        try:
+            tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):  # pragma: no cover - then opaque
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            base = node.func.value
+            if node.func.attr in _OTHER_SPAWN_CALLS and (
+                isinstance(base, ast.Name) and base.id in ("os", "pty")
+            ):
+                offenders.append(f"{rel}:{node.lineno}")
+
+    assert offenders == [], (
+        "these launch a process by a route the opacity rule does not watch, so "
+        "the interpreter they name no longer puts them on the frontier: "
+        + ", ".join(offenders)
+    )
+
+
+def test_a_production_module_that_really_spawns_is_still_not_opaque(repo):
+    """Unchanged by select-04, and restated because the flow rule could look
+    like a reason to drop the file-kind rule that precedes it.
+    `run_validation_commands` executes an interpreter for a living; treating it
+    as opaque would put it on every change's frontier."""
+    write(
+        repo,
+        "pkg/runner.py",
+        "import subprocess\n\n\ndef go(argv):\n"
+        "    return subprocess.run(['python3', *argv], check=False)\n",
+    )
+    graph = build_import_graph(repo)
+
+    assert "pkg/runner.py" not in graph.opaque
 
 
 # ---- everything ambiguous widens --------------------------------------------
