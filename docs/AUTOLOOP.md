@@ -311,6 +311,93 @@ handoff that still ends the loop. It is recorded in the `argv` field of
 
 ---
 
+## Refused work goes back as a revise (autonomous mode)
+
+**Off unless you turn it on.** Everything below happens only with
+`[autonomy] enabled = true`; with the section absent — which is every config file
+written before it existed — each of these faults parks for you exactly as it
+always has, and turning the flag back off restores that.
+
+Seven blocker codes are the loop REFUSING what a round produced, and saying why:
+
+| Code | The refusal |
+|---|---|
+| `post_commit_verification_failed` | the commit failed a post-commit check (ancestry, an empty range, a dirty worktree, validation) |
+| `commit_refused` | git refused the commit before it happened |
+| `review_feedback_unchanged` | the reviewer asked for the same change twice, so the executor changed nothing |
+| `review_packet_build_failed` | the candidate passed review and could not be PRESENTED |
+| `approved_paths_missing` | the task carries no `approved_paths`, so no write-capable round may start |
+| `push_not_descendant` | the approved candidate is not a descendant of the task base |
+| `push_tree_mismatch` | the approved candidate's tree is not the tree that was reviewed |
+
+None of them is a decision. The park text already names the fault, and the
+operator's whole step is relaying it to the agent that has to fix it — which is
+why `review_feedback_unchanged` sat at a median of 5.92h, the longest of any
+code, over 4 parks and 35.4h (measured 2026-08-24, 131 resolved records).
+
+**A refusal is feedback, so the loop returns it as feedback.** Instead of
+parking, the task is re-dispatched as a `revise` whose `feedback` is the refusal
+text, verbatim, under one line saying that no reviewer wrote it. Nothing is
+rolled back, discarded or pushed: a `revise` continues the same execution record,
+the same worker repository and the same task branch, so the refused commit stays
+exactly where it is.
+
+**And each refusal happens at most once.** The second occurrence of the SAME
+refusal sets that task aside (`task_fatal`) — the quarantine `run --continuous`
+already works past — rather than issuing another revise. The meter is keyed on
+the refusal, not on its code: a digest of (code, question, detail) is written to
+`Blocker.revised_refusals` at the moment a revise is issued, and the allowance is
+one per digest, counted across every blocker record on disk including closed
+ones. So answering or archiving a record cannot refund an allowance, and a
+refusal that migrates one phase along keeps spending the same one.
+
+**A different refusal under the same code gets its own revise**, deliberately.
+`post_commit_verification_failed` covers five different checks; refusing the
+second on the strength of the first would park work that had an answer. What that
+means is that a code whose text changes every round is not bounded by the digest
+— it is bounded by three limits you already have, which compose on top and are
+unchanged: a self-issued revise is refused if its feedback repeats the last
+round's, it is refused once `policy.max_review_rounds` is reached, and it costs an
+attempt from `MAX_TASK_ATTEMPTS` exactly as a reviewer's does. Both of those
+ceilings end in a set-aside, and a set-aside task is `blocked` — which policy
+refuses to revise. The chain terminates in a quarantine, never in a loop.
+
+### What you will see
+
+    autonomous_recovery        action=revise, with the attempt and the budget
+    autonomous_revise_dispatched   the round actually starting
+    autonomous_revise_refused      a revise the loop declined to issue, with why
+
+`same_refusal_repeated` is the guard firing. The other reasons are fall-throughs
+— no task on the record, a task the registry does not hold, a task with no
+approved plan, a refusal with no text, a revise already queued,
+`revise_disabled_by_config` for `max_recovery_attempts = 0`, and
+`meter_write_failed:*` for a state directory that cannot be written — and every
+one of them parks with the question it always had. None of THOSE spends the
+allowance: a revise the loop declined to issue is not an attempt, so the same
+refusal still gets its one round once the obstacle clears. The one exception is
+`autonomous_revise_dropped`, which is a revise that was queued — the allowance
+paid for — and then dropped at the step boundary because an urgent pin arrived
+in between. That one stays spent, so the same refusal does not queue a round the
+same pin would drop again.
+
+**The blocker stays OPEN while the revise runs**, and that is deliberate rather
+than a leak: a round completing proves the round ran, not that the refusal
+cleared, so closing the record there would tell you the loop recovered from a
+fault that is still standing. It costs the meter nothing either way — that counts
+closed records too. So `python -m autoloop blockers` lists it throughout; answer
+it as you would any other, or let the repeat set the task aside.
+
+**Two sites are deliberately untouched.** `push_not_descendant` and
+`push_tree_mismatch` are each raised twice — once for a task, once for an
+operator's queued changeset. A changeset has no roadmap task, so there is nothing
+to revise, and that arm parks exactly as it does today.
+
+`max_recovery_attempts = 0` keeps the set-aside and issues no revise at all, if
+you want the quarantine without the extra round.
+
+---
+
 ## Running several tasks at once — the split plan
 
 **Status: a PLAN, not a mechanism.** Nothing in this section is implemented.

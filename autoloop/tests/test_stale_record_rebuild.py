@@ -122,6 +122,7 @@ from autoloop.blockers import (
     HARD_HALT_CODES,
     NO_TASK,
     RECOVER_BY_REBUILDING_AT_HEAD,
+    REFUSED_WORK_RECOVERIES,
     STALE_AUDIT_POINTER,
     STALE_EXECUTION_RECORD,
     STALE_PUSH_BINDING,
@@ -861,13 +862,13 @@ def test_the_parts_of_the_table_are_disjoint_and_merge_into_the_one_lookup():
     refusal lives. A caller that consulted any part directly would bypass it, so
     the parts must not be reachable as a substitute for the merge.
 
-    THREE parts since halt-01 (2026-08-26) added `EXHAUSTED_BUDGET_RECOVERIES`;
+    FOUR parts since halt-04 (2026-09-01) added `REFUSED_WORK_RECOVERIES`;
     this test was written when there were two. The claim is unchanged — pairwise
     disjoint, and the merge is exactly their union — and it is deliberately
     stated over every part the module exposes rather than over a literal list of
     two, so the NEXT part to be added fails here if it is not merged in."""
     parts = (TRANSPORT_RECOVERIES, STALE_RECORD_RECOVERIES,
-             EXHAUSTED_BUDGET_RECOVERIES)
+             EXHAUSTED_BUDGET_RECOVERIES, REFUSED_WORK_RECOVERIES)
     merged: set[str] = set()
     for part in parts:
         assert merged.isdisjoint(set(part)), "two parts claim the same code"
