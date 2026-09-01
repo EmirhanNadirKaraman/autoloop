@@ -13,6 +13,7 @@ from pathlib import Path
 
 import tomllib
 
+from .codex.sandbox import DEFAULT_SANDBOX_ARGS
 from .errors import ConfigError
 from .notify import (
     NOTIFY_DEFAULT_STATUSES,
@@ -173,19 +174,60 @@ class CodexConfig:
     """
 
     #: Base invocation. Split from `sandbox_args` so the two can be reasoned
-    #: about separately — this is "how do I run it", that is "what may it do".
+    #: about separately — this is "how do I run it", that is "what may it do" —
+    #: but they are graded TOGETHER (`codex.sandbox.describe_invocation`),
+    #: because codex sees one argv and a bypass flag here would otherwise be a
+    #: way round the policy there.
     command: tuple[str, ...] = ("codex", "exec")
-    #: Flags that confine the reviewer. Deliberately NOT given a permissive
-    #: default: the flag names cannot be verified from this repository, and
-    #: guessing them would produce a setting that looks like a control and is
-    #: not one. `doctor` warns while this is empty. The reviewer is confined
-    #: regardless by running outside the checkout (see `working_dir`).
-    sandbox_args: tuple[str, ...] = ()
+    #: Extra flags handed to every invocation, between `command` and the
+    #: prompt — and, since prov-02, **THE confinement**. It ships
+    #: `["--sandbox", "read-only"]` and is no longer empty: an empty value means
+    #: no sandbox mode is asked for, which `codex.sandbox.describe_sandbox`
+    #: grades UNCONFINED and both the runner and the preflight then REFUSE.
+    #:
+    #: It used to ship empty "by policy", with confinement said to rest on
+    #: `working_dir` alone. That was wrong: a working directory chooses where a
+    #: process starts and refuses nothing — not an absolute path, not `..`, not
+    #: a subprocess — so the seat was unconfined while a `doctor` row said the
+    #: policy was deliberate.
+    #:
+    #: What is claimed for this value is narrow, and it is all that can be
+    #: claimed from here: the flags are PRESENT in every invocation (the review
+    #: turn and the preflight, from this one setting), and `doctor`'s preflight
+    #: proves the configured build ACCEPTS them, because no codex binary runs in
+    #: this repository or in CI. Enforcement is codex's; `read-only` restricts
+    #: WRITES, does NOT refuse command execution (commands still run under it,
+    #: sandboxed) and does NOT confine reads. Nothing depends on either — the
+    #: prompt is self-contained.
+    #:
+    #: `--skip-git-repo-check` may be added alongside (accept an untrusted
+    #: working directory, which switches codex's own guard off everywhere;
+    #: trusting the directory once is better). It names no sandbox mode, so it
+    #: neither provides nor weakens the policy.
+    sandbox_args: tuple[str, ...] = DEFAULT_SANDBOX_ARGS
     timeout_seconds: float = 900.0
-    #: Where the CLI runs. Empty means the user's home directory — anywhere but
-    #: the repository. The prompt is self-contained, so the reviewer needs no
-    #: filesystem access, and this containment holds without depending on a
-    #: sandbox flag's name.
+    #: Where the CLI runs. NOT a confinement — that is `sandbox_args` — but
+    #: still worth getting right: it decides which directory codex trusts, and
+    #: which one a reviewer's relative path would land in. Empty means the
+    #: dedicated, empty directory `~/.autoloop/codex-workdir`
+    #: (`codex.preflight.resolve_working_dir`, which `doctor` and both
+    #: transports share so the graded path is the used one).
+    #:
+    #: It used to mean the HOME DIRECTORY, and that default could not work:
+    #: codex declines to run outside a trusted directory, and `~` is not one
+    #: (measured 2026-08-17 — `Not inside a trusted directory and
+    #: --skip-git-repo-check was not specified`). Trusting `~` to fix it would
+    #: have handed the reviewer every file the operator owns; one empty
+    #: directory, trusted once, keeps codex's own check as a live guard.
+    #:
+    #: The prompt is self-contained, so the reviewer needs no filesystem at all.
+    #: Never point this inside the repository — `doctor` fails if it is, because
+    #: a reviewer started in the checkout is one relative path from the tree it
+    #: is grading. A CONFIGURED directory that does not exist is refused rather
+    #: than created, so a typo does not become a new directory nobody meant —
+    #: and CONFIGURED means this key is non-empty, not that the path differs
+    #: from the default. Spelling `~/.autoloop/codex-workdir` out here makes it
+    #: yours: it is refused while absent, exactly like any other named path.
     working_dir: str = ""
     #: Substrings that identify a SPENT ALLOWANCE in a FAILED invocation — the
     #: window is used up and waiting does not help, so the loop parks or hands

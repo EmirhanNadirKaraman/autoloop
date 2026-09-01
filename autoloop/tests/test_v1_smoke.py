@@ -724,12 +724,26 @@ def test_doctor_reports_the_complete_v1_configuration(tmp_path):
     worth stating: this test used to hand `DoctorProbes` a CDP probe that
     raised and a playwright that was absent, purely so the sweep could reach
     the checks below without the machine's real browser deciding the outcome.
-    Neither knob exists now — `doctor` grades no browser — so the DEFAULT
-    bundle reaches exactly the same v1 checks with nothing stubbed."""
+    Neither knob exists now — `doctor` grades no browser.
+
+    ONE knob is back, and it is not a browser: prov-02's codex preflight really
+    launches `codex exec` from the configured working directory, which is the
+    right thing for an operator running `doctor` and the wrong thing for a test
+    — it would spend the ChatGPT allowance on any machine that has the binary
+    and fail on every machine that does not. Stubbed here for that reason
+    alone; the v1 checks below neither read it nor depend on it."""
+    from autoloop.codex.preflight import OK, PreflightResult
+
     repo_root, _origin = real_repo_with_origin(tmp_path)
     config = make_config(tmp_path)
 
-    results = run_doctor(config, repo_root, probes=DoctorProbes())
+    results = run_doctor(
+        config,
+        repo_root,
+        probes=DoctorProbes(
+            codex_preflight=lambda codex: PreflightResult("ok", "stubbed", OK)
+        ),
+    )
     names = {r.name: r for r in results}
     for expected in (
         "branch_policy",

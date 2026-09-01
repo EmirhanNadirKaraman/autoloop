@@ -61,7 +61,7 @@ from autoloop.conversation import (
     available_providers,
     create_conversation,
 )
-from autoloop.errors import QuotaExhaustedError, ResponseTimeoutError
+from autoloop.errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
@@ -897,14 +897,127 @@ def test_the_adapter_declares_idempotent_submit_and_no_rotation_surface():
     assert not hasattr(codex, "current_url")
 
 
-def test_the_runner_never_uses_a_shell_and_confines_the_working_dir(tmp_path):
+def test_the_runner_never_uses_a_shell_and_carries_the_policy(tmp_path):
     runner = SubprocessCodexRunner(
-        command=("codex", "exec"), sandbox_args=("--read-only",), cwd=tmp_path
+        command=("codex", "exec"), sandbox_args=("--sandbox", "read-only"), cwd=tmp_path
     )
-    assert runner.argv_preview == ("codex", "exec", "--read-only")
+    assert runner.argv_preview == ("codex", "exec", "--sandbox", "read-only")
     # The preview is what reaches diagnostics — it must not carry the prompt,
     # which is the entire review packet.
     assert all("request" not in part for part in runner.argv_preview)
+
+
+# ---- the sandbox policy reaches the process, or nothing does (prov-02) -------
+#
+# `argv_preview` is a diagnostic string and `run` builds its own argv, so a test
+# on the preview proves nothing about what was launched. These assert the list
+# `subprocess.run` was actually handed, through the PRODUCTION factory, because
+# a policy is dropped between a config and a process, not inside one function.
+
+
+class Spawned:
+    """One captured `subprocess.run`, and a scripted result for it."""
+
+    def __init__(self, returncode=0, stdout="codex\nfine.\ntokens used: 12\n", stderr=""):
+        self.calls = []
+        self._result = type(
+            "Completed", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+        )()
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        return self._result
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [
+        # The shipped default, which is what a fresh deployment runs …
+        ({}, ["--sandbox", "read-only"]),
+        # … and a DIFFERENT enforceable policy, which is what says the SETTING
+        # is honoured rather than a constant reproduced: a factory that
+        # hardcoded `DEFAULT_SANDBOX_ARGS` and ignored `codex.sandbox_args`
+        # would pass the first case and fail this one.
+        (
+            {"sandbox_args": ("--sandbox", "workspace-write")},
+            ["--sandbox", "workspace-write"],
+        ),
+    ],
+)
+def test_the_configured_policy_is_in_the_argv_the_reviewer_process_receives(
+    tmp_path, monkeypatch, configured, expected
+):
+    """The claim the whole task turns on, pinned at the only level that can
+    carry it: the real provider, built by the real factory, from a real config.
+
+    It is deliberately NOT a claim that a sandbox was enforced — nothing in this
+    repository can run codex, and `read-only` permits reads in any case. It is
+    that the policy an operator configured is present, unaltered, between the
+    command and the prompt, in the invocation the reviewer actually gets."""
+    spawned = Spawned()
+    monkeypatch.setattr("autoloop.codex.conversation.subprocess.run", spawned)
+    workdir = tmp_path / "codex-workdir"
+    workdir.mkdir()
+    config = codex_config(tmp_path, working_dir=str(workdir), **configured)
+    conversation = create_conversation("codex_cli", config)
+
+    assert conversation.submit(RID, PROMPT) is SubmitResult.CONFIRMED
+
+    (argv, kwargs), = spawned.calls
+    assert argv == ["codex", "exec", *expected, PROMPT]
+    assert kwargs["cwd"] == str(workdir), "and from the configured directory"
+    # No shell anywhere near model-authored text.
+    assert "shell" not in kwargs
+
+
+def test_a_seat_with_no_sandbox_policy_refuses_to_launch_at_all(tmp_path, monkeypatch):
+    """`codex.sandbox_args = []` was the shipped value until this round, and it
+    asks for no sandbox at all. The reviewer is not started under it — the
+    refusal is in `run`, the last point before the process, so no construction
+    path and no caller can get past it."""
+    spawned = Spawned()
+    monkeypatch.setattr("autoloop.codex.conversation.subprocess.run", spawned)
+    conversation = create_conversation("codex_cli", codex_config(tmp_path, sandbox_args=()))
+
+    with pytest.raises(BrowserError) as excinfo:
+        conversation.submit(RID, PROMPT)
+
+    message = str(excinfo.value)
+    assert "unsandboxed" in message
+    assert "codex.sandbox_args" in message
+    assert spawned.calls == [], "no process may start under a refused policy"
+
+
+def test_a_bypass_in_the_command_is_refused_even_with_a_good_policy_beside_it(
+    tmp_path, monkeypatch
+):
+    """`codex.command` and `codex.sandbox_args` are two keys and ONE argv. A
+    runner that graded only the second would launch this one."""
+    spawned = Spawned()
+    monkeypatch.setattr("autoloop.codex.conversation.subprocess.run", spawned)
+    runner = SubprocessCodexRunner(command=("codex", "exec", "--yolo"), cwd=tmp_path)
+
+    with pytest.raises(BrowserError) as excinfo:
+        runner.run("hello")
+
+    assert "unsandboxed" in str(excinfo.value)
+    assert spawned.calls == []
+
+
+def test_a_bypass_flag_is_refused_like_an_absent_policy(tmp_path, monkeypatch):
+    """The other direction of the same gate: a policy that is PRESENT and turns
+    the sandbox off is not a policy. Read as "set or not set", this argv would
+    have passed."""
+    spawned = Spawned()
+    monkeypatch.setattr("autoloop.codex.conversation.subprocess.run", spawned)
+    conversation = create_conversation(
+        "codex_cli",
+        codex_config(tmp_path, sandbox_args=("--dangerously-bypass-approvals-and-sandbox",)),
+    )
+
+    with pytest.raises(BrowserError):
+        conversation.submit(RID, PROMPT)
+    assert spawned.calls == []
 
 
 def test_a_missing_binary_is_a_clear_actionable_error(tmp_path):

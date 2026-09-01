@@ -1312,3 +1312,189 @@ fired — the same reason `quota.py` records `suppressed_patterns`.
   park (`orchestrator._step_submission_rejected`), and it says in its own record
   that the CLI printed two messages — which is an operator's problem, not a
   reviewer's, and re-prompting the reviewer about it would fix nothing.
+
+---
+
+## Selecting the codex reviewer: what is confined, what is checked, and the ceiling
+
+Read this beside `conversation.provider` and the `[codex]` section in
+`autoloop/config.example.toml`.
+
+### The ceiling, first, because no transport change moves it
+
+Codex on this deployment signs in with a **ChatGPT account**, not an API key —
+verified 2026-08-17: `stored API key: false`, `auth mode: chatgpt`. It therefore
+draws on **the same allowance the retired browser provider drew on**. Switching
+the reviewer from a browser to `codex_cli` removed the DOM faults that produced
+21 of this loop's first 103 blockers; it removed nothing whatsoever about the
+account rate limit that parked the loop for four hours on 2026-08-17.
+
+Three consequences worth stating plainly:
+
+* **Neither codex seat has a budget of its own.** `codex_cli` and
+  `codex_app_server` are two transports on one account, which is why
+  `conversation.fallback_provider` defaults to empty and why naming one as the
+  other's fallback fails over to the same wall.
+* **An exhausted allowance is not a broken configuration**, and nothing in the
+  loop treats it as one: `codex/quota.py` classifies it from codex's own output
+  (never from an echo of our prompt), the loop parks or hands over, and
+  `doctor`'s preflight reports it as a `warn` naming the marker rather than as a
+  failed check.
+* **Waiting is the remedy**, and a park is the loop saying so. Adding rounds,
+  retries or a second seat spends the same window faster.
+
+### Confinement: the sandbox flags, and what a working directory is not
+
+**A working directory is not a confinement.** This document said it was, and
+that was wrong: `cwd` chooses where a process STARTS and refuses nothing — not
+an absolute path, not `..`, not a subprocess, not a read of `~/.ssh`. A reviewer
+launched with no sandbox flag is unconfined wherever it starts, and the seat was
+described as contained on that basis until prov-02's second round.
+
+The confinement is `codex.sandbox_args`, and it ships set:
+
+* **`codex.sandbox_args = ["--sandbox", "read-only"]`** is the shipped policy.
+  The reviewer answers from a self-contained packet — every turn re-sends its
+  CONTEXT block, the full contract and the diff — so it needs no writes, no
+  commands and no repository. That is what the seat NEEDS, not what the mode
+  refuses: read-only permits both commands and reads, as the last bullet below
+  states. `codex/sandbox.py` reads the value as a policy
+  rather than as "set or not set", and it is FAIL-CLOSED: an empty list, a mode
+  it cannot name, a dangling `--sandbox`, `--full-auto`'s wider
+  `workspace-write` (allowed, with a warning) and a bypass flag are each graded
+  on their own. When several modes are named, the WEAKEST one decides, whatever
+  clap's last-wins rule would do with the argv — nothing here can run the binary
+  to find out, and the safe direction of being wrong is a `fail` an operator
+  clears by deleting a flag.
+* **An unconfined policy is refused, not warned about.** `doctor`'s
+  `codex_sandbox` row fails, the preflight makes no invocation, and
+  `SubprocessCodexRunner.run` raises rather than launching — the last point
+  before the process, so no caller and no construction path gets past it.
+* **The whole invocation is graded, not just the key that should carry it.**
+  `codex.command` and `codex.sandbox_args` are two settings and one argv, so a
+  bypass flag in the command line fails exactly as one in `sandbox_args` does
+  (`sandbox.describe_invocation`). Grading only the second key would have made
+  the first a way round it.
+* **What is actually claimed is narrow, and it is all this repository can
+  claim.** (1) The policy is PRESENT in the invocation, between `command` and
+  the prompt, in the review turn and in the preflight, from that one setting —
+  pinned against the argv `subprocess.run` really receives. (2) `doctor`'s
+  preflight proves the configured build ACCEPTS it, because no codex binary runs
+  in this repository or in CI, so a spelling your build rejects fails a check
+  instead of your first review (`codex exec --help`).
+* **What is NOT claimed.** Enforcement is codex's; nothing here can prove a
+  sandbox held. And `read-only` is narrower than its name reads: it restricts
+  **WRITES**, it does **not** refuse COMMAND EXECUTION — commands still run
+  under it, sandboxed rather than refused — and it does not confine READS, so
+  the reviewer may read the checkout and the operator's home. Whether the mode
+  also closes the network is codex's own behaviour, is not verified from this
+  repository, and is claimed nowhere in it. Nothing in the loop depends on any
+  of that: the packet is self-contained. An earlier draft of this section said
+  read-only refused command execution; it does not, and selecting this seat on
+  that basis would be selecting it on a guarantee codex does not give.
+
+**Upgrading is one config line.** A `.autoloop/config.toml` written before this
+change carries `sandbox_args = []`, which is now an unconfined seat: `doctor`
+fails it and every review turn raises `refusing to run the codex reviewer
+unsandboxed` until it reads `["--sandbox", "read-only"]`. That break is
+deliberate — the alternative is a loop that keeps reviewing under a policy
+nobody set, which is the state this section used to describe as containment.
+
+`codex.working_dir` still earns its default, as the smaller thing it is:
+
+* Empty means **`~/.autoloop/codex-workdir`**, a dedicated empty directory
+  autoloop creates on first use (`codex/preflight.resolve_working_dir`, the
+  single definition both transports and `doctor` share, so the path `doctor`
+  grades is the path the reviewer gets). A configured directory that does not
+  exist is refused rather than created: a typo must not become the place reviews
+  run.
+* **"Configured" means the setting is non-empty, not that the path differs from
+  the default.** Writing `working_dir = "~/.autoloop/codex-workdir"` out is a
+  configured directory like any other, and an absent one is refused rather than
+  provisioned — by both transports and by `doctor`, which reports it as a `fail`
+  instead of "created on first use". The provenance travels from the setting
+  (`preflight.working_dir_is_default`) rather than being inferred from the
+  resolved path, because inference by path equality answers "unset" for the one
+  configured value that spells the default out, which is precisely the value an
+  operator writes when copying the documented default into their own config.
+* It decides which directory codex TRUSTS (below), and it keeps the reviewer
+  from being started inside the tree it is grading. Neither is confinement.
+
+`codex_app_server` is the other seat, and `codex.sandbox_args` does **not** reach
+it: that setting is `codex exec` argv. That transport selects no sandbox preset
+at all; what it has instead is a property of its own replies — every approval the
+server asks for is answered `abort` (`codex/app_server.py`). Selecting it is
+therefore selecting an unsandboxed reviewer that is refused every command and
+patch it asks to run, which is a different guarantee from `codex_cli`'s and is
+not preflighted.
+
+### Why the default is one empty directory and not `~`
+
+`codex.working_dir` used to mean the home directory — "anywhere but the
+repository" — and that default **could not work**. Measured 2026-08-17:
+
+    $ cd ~ && codex exec "reply with exactly: ready"
+    Not inside a trusted directory and --skip-git-repo-check was not specified.
+
+Two ways out, and the loop takes the first:
+
+1. **Trust one empty directory, once.** `cd ~/.autoloop/codex-workdir && codex`.
+   Codex's repository check stays a live guard everywhere else, and the trusted
+   directory contains nothing.
+2. **`--skip-git-repo-check` in `codex.sandbox_args`.** Verified to work, and it
+   switches that guard off for every invocation. Available, documented, not
+   defaulted.
+
+Trusting `~` itself is the option that is not taken: it would hand the reviewer
+every file the operator owns to fix a problem one empty directory fixes.
+
+**The shipped default therefore still needs one operator action on a fresh
+machine, and `doctor` now says so.** That is the intended shape rather than a
+residue of the defect: before, the default could not work and nothing reported
+it; now it is one named action from working, and the check that names it runs
+before a round instead of during one.
+
+### What `doctor` actually checks
+
+Four rows, only for a configured `codex_cli` seat:
+
+    codex_command     the first word of codex.command resolves on PATH
+    codex_workdir     the RESOLVED directory: outside the checkout, and either
+                      present or autoloop's own — which means the setting is
+                      EMPTY, the one case created on first use
+    codex_sandbox     the POLICY codex.sandbox_args names: read-only (ok),
+                      workspace-write (warn), and fail for none, a bypass or a
+                      mode this loop cannot name
+    codex_preflight   ONE trivial invocation, from that directory, under that
+                      policy — graded on its EXIT CODE, and not attempted at
+                      all when the policy failed
+
+The preflight is the row that answers "could this loop use `codex_cli` right
+now". It is bounded by its own short deadline rather than
+`codex.timeout_seconds`, it never sends a review packet, and it is graded on
+exit 0 and nothing else: `codex exec` echoes its prompt back, so looking for the
+preflight's own words in the output would be reading our input as evidence —
+the defect class `quota.py` and `reply.py` exist to close. A message coming back
+is corroborated with `reply.isolate_reply`, which refuses any text the prompt
+contains; exit 0 with nothing isolable is a `warn`, not a pass and not a
+failure.
+
+Statuses, and why they are not all `fail`:
+
+* `fail` — the command is unresolvable (no invocation attempted, and `fail`
+  rather than `skip`: "not asked" is not evidence that the transport works), the
+  sandbox policy is not enforceable (also no invocation: the answer to "is this
+  seat safe" must not be obtained by launching an unsandboxed reviewer), the
+  working directory is unusable or inside the repository, the invocation was
+  refused for an unclassified reason (the row quotes codex's own bounded,
+  echo-stripped output and names both directory remedies), or the probe itself
+  raised.
+* `warn` — the allowance is spent, or the account is being throttled. An account
+  state, not a misconfiguration.
+* `ok` — exit 0 and a reply that is not our own text coming back.
+
+Two limits it does not hide. The new rows are not in
+`cli._TRANSPORT_PRECONDITION_CHECKS` or its optional/fail-only companions, so a
+failing preflight does not hold a transport blocker shut. And because
+`cli._precondition_transport_live` runs the whole sweep, answering such a
+blocker makes one trivial invocation.
