@@ -184,19 +184,12 @@ _DOMAIN = re.compile(r"Your domain:\s*(.+?)\.")
 DEFAULT_AUDIT_REPORT_GLOB = "docs/AUDIT_*.md"
 
 
-def _is_safe_glob(pattern: str) -> bool:
-    """Is `pattern` a plain repository-relative glob?
-
-    `load_config` refuses an unsafe one at startup, but this module reads the
-    raw TOML (see `DEFAULT_AUDIT_REPORT_GLOB`), so it never gets that check —
-    and `Path.glob` raises outright on an absolute pattern, which would 500 the
-    page rather than degrade it. Traversal is refused for the obvious reason: a
-    read-only tracker has no business rendering files from outside the checkout
-    it was pointed at.
-    """
-    if pattern.startswith(("/", "~")) or "\\" in pattern:
-        return False
-    return not any(seg in ("", ".", "..") for seg in pattern.split("/"))
+#: The glob safety rule that used to live here as `_is_safe_glob` moved to
+#: `inbox._is_safe_report_glob` (intake-01, 2026-09-01), together with the
+#: report selection and the finding parser. One implementation, because the id
+#: an intake outcome is RECORDED under and the id this panel FILTERS on have to
+#: be the same string — two spellings is how a declined finding keeps appearing
+#: here with nothing saying why.
 
 #: This module's content hash, frozen at IMPORT. `PAGE` is a module-level
 #: string, so a process started before an edit serves the old HTML for as long
@@ -359,79 +352,106 @@ def live_agents() -> list[dict]:
     return agents
 
 
-#: A finding heading in the audit report: `#### <domain>:<id> — <title>`.
-#: The previous pattern expected a markdown TABLE row (`| rt-01 | P1 | … |`),
-#: a format the auditor stopped emitting — so this panel had been silently
-#: empty for both of the reports on disk, not merely the newest one. An
-#: em dash or a plain hyphen may separate id from title.
-_FINDING = re.compile(
-    r"^#{2,4}\s+([a-z_]+):([a-z]+-\d+)\s*[—-]\s*(.+?)\s*$", re.M
-)
-#: Severity line beneath a finding, used as the priority stand-in.
-_SEVERITY = re.compile(r"severity\s+\*{0,2}(critical|high|medium|low)\*{0,2}", re.I)
-#: The retired table form, still honoured so an older report keeps rendering.
+#: The retired table form (`| rt-01 | P1 | … |`), still honoured so an older
+#: report keeps rendering. Kept HERE rather than moved into the shared parser
+#: because it is not the same kind of row: it carries no domain, so it has no
+#: QUALIFIED id, so it can never be a key in the audit-intake ledger. Those rows
+#: are therefore never filtered — they are shown unconditionally, and an
+#: operator who wants one to stop appearing has to delete the legacy report. No
+#: report the current auditor writes contains one.
 _RT_ROW = re.compile(r"^\|\s*\*{0,2}(rt-\d+|hb-\d+)\*{0,2}\s*\|\s*\*{0,2}(P\d)\*{0,2}\s*\|\s*(.+?)\s*\|", re.M)
 
 
 def app_tasks(repo: Path, limit: int = 40,
-              report_glob: str = DEFAULT_AUDIT_REPORT_GLOB) -> list[dict]:
-    """The application backlog, read from the newest committed audit report.
+              report_glob: str = DEFAULT_AUDIT_REPORT_GLOB,
+              intake_dir: Path | None = None) -> list[dict]:
+    """The OUTSTANDING audit findings, read from the newest committed report.
 
-    The loop's own registry holds only what has been seeded; the audit report is
-    where the proposed work actually lives, so a tracker that showed the
-    registry alone would claim there is one task when there are fifteen.
+    **Outstanding, not all.** This panel used to render every finding in the
+    newest report as a task-shaped row — an id, a severity, a source — which
+    made it read as a backlog while being nothing of the kind. Since intake-01
+    a finding leaves it when somebody DECIDES about it: promoted into a real
+    task, recorded as already done against the tree, or declined with a reason
+    (`inbox.record_audit_outcome`). What is left is what nobody has actioned.
+
+    `intake_dir` is where that ledger lives. `None` means no ledger was
+    consulted and nothing is filtered, which is what a caller passing only a
+    repo has always got. An UNREADABLE ledger also filters nothing, and
+    `collect()`'s `audit_intake` summary says so — hiding rows on the strength
+    of a file we could not open would shrink this list for the one reason that
+    should make it least trustworthy.
 
     `report_glob` is `[repo].audit_report_glob` — where THIS target repository
     files those reports — defaulted to this one's `docs/AUDIT_*.md` so a caller
-    that does not pass it behaves exactly as before the setting existed. Newest
-    is newest BY NAME (`reverse=True` on the sorted paths), which works because
-    the reports are date-stamped; that is a property of the naming convention,
-    not of the glob, so a repository whose reports are not date-sortable gets
-    the last one alphabetically rather than a wrong-but-confident "newest".
+    that does not pass it behaves exactly as before the setting existed. The
+    report is selected and parsed by `inbox.newest_audit_report`, the same call
+    `python -m autoloop intake audit` makes, so the two cannot disagree about
+    which report or which findings are in play.
     """
-    report_glob = (report_glob or "").strip()
-    if not report_glob or not _is_safe_glob(report_glob):
-        return []
-    reports = sorted(repo.glob(report_glob), reverse=True)
-    if not reports:
-        return []
-    try:
-        text = reports[0].read_text()
-    except OSError:
-        return []
-    def _clean(value: str) -> str:
-        return re.sub(r"\s+", " ", re.sub(r"[*`]", "", value)).strip()
+    return audit_findings_panel(
+        repo, report_glob=report_glob, intake_dir=intake_dir, limit=limit
+    )["rows"]
 
-    out, seen = [], set()
 
-    # Current format: one heading per finding, severity on the line below.
-    for match in _FINDING.finditer(text):
-        domain, short, title = match.groups()
-        tid = f"{domain}:{short}"
-        if tid in seen:
-            continue
-        seen.add(tid)
-        tail = text[match.end(): match.end() + 400]
-        sev = _SEVERITY.search(tail)
-        out.append({
-            "id": tid,
-            "priority": (sev.group(1).lower() if sev else ""),
-            "title": _clean(title)[:180],
-            "source": reports[0].name,
-        })
-        if len(out) >= limit:
-            return out
+def audit_findings_panel(
+    repo: Path,
+    *,
+    report_glob: str = DEFAULT_AUDIT_REPORT_GLOB,
+    intake_dir: Path | None = None,
+    limit: int = 40,
+) -> dict:
+    """`{"rows": [...], "summary": {...}}` from ONE read of report and ledger.
 
-    # Retired table form, so an older report still renders.
-    for tid, prio, title in _RT_ROW.findall(text):
-        if tid in seen:
-            continue
-        seen.add(tid)
-        out.append({"id": tid, "priority": prio, "title": _clean(title)[:180],
-                    "source": reports[0].name})
-        if len(out) >= limit:
-            break
-    return out
+    Both halves come off the same read, deliberately: the page polls every two
+    seconds, and a summary computed from a second read could describe a report
+    the rows above it did not come from.
+
+    The SUMMARY is shipped rather than derived from the rows, because once the
+    rows are filtered EMPTY IS THE SUCCESS STATE — a note that read the report's
+    name off `rows[0].source` would lose it at exactly the moment every finding
+    had been actioned. It carries `ledger_read` / `report_read` too, so
+    "0 outstanding" and "the ledger could not be read" are never rendered as the
+    same sentence.
+    """
+    from .inbox import (
+        AuditLedger,
+        audit_intake_summary,
+        load_audit_intake,
+        newest_audit_report,
+        outstanding_findings,
+    )
+
+    report = newest_audit_report(repo, report_glob)
+    if intake_dir is None:
+        # No ledger was consulted at all, which is what a caller passing only a
+        # repo has always got. Recorded as NOT READ rather than as an empty
+        # ledger: "nothing has been decided" is a claim, and this is not it.
+        ledger = AuditLedger(
+            records={}, read=False, note="no intake directory was given, so no "
+            "outcome ledger was consulted"
+        )
+        findings = report.findings
+    else:
+        ledger = load_audit_intake(intake_dir)
+        findings = outstanding_findings(report.findings, ledger)
+
+    rows = [finding.as_row(report.source) for finding in findings][:limit]
+    if len(rows) < limit:
+        # Retired table form, so an older report still renders. See `_RT_ROW`.
+        seen = {row["id"] for row in rows}
+
+        def _clean(value: str) -> str:
+            return re.sub(r"\s+", " ", re.sub(r"[*`]", "", value)).strip()
+
+        for tid, prio, title in _RT_ROW.findall(report.text):
+            if tid in seen:
+                continue
+            seen.add(tid)
+            rows.append({"id": tid, "priority": prio, "title": _clean(title)[:180],
+                         "source": report.source})
+            if len(rows) >= limit:
+                break
+    return {"rows": rows, "summary": audit_intake_summary(report, ledger)}
 
 
 
@@ -4106,6 +4126,12 @@ def collect(repo: Path) -> dict:
     # mid-write.
     executions = _executions(sd)
 
+    # The audit-finding panel, rows and counts together off one read of the
+    # report and one read of the outcome ledger — see `audit_findings_panel`.
+    findings_panel = audit_findings_panel(
+        repo, report_glob=_audit_report_glob(repo), intake_dir=_intake_dir(repo)
+    )
+
     # The grouped read of the same rows, hoisted out of the payload literal
     # because the flat list below borrows one answer from it.
     groups = task_groups(tasks, executions)
@@ -4213,7 +4239,12 @@ def collect(repo: Path) -> dict:
         # Roadmap panel already shows for it.
         "depgraph": dependency_graph(tasks, groups),
         "inbox": _pending_inbox(repo),
-        "app_tasks": app_tasks(repo, report_glob=_audit_report_glob(repo)),
+        # The OUTSTANDING findings — those nobody has promoted, recorded as
+        # already done, or declined — plus the counts that say what happened to
+        # the rest. One read for both (`audit_findings_panel`), so the note
+        # under the rows cannot describe a different report from the rows.
+        "app_tasks": findings_panel["rows"],
+        "audit_intake": findings_panel["summary"],
         "pipeline": pipeline(state, live_agents_cache, blockers),
         # Completed is not integrated: which finished tasks are actually in the
         # branch, decided by git ancestry rather than by their status.
@@ -4996,7 +5027,7 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       confirmation — so Ask and Submit both write this box out first, and
       neither goes ahead if that write fails. What you queue is what you see.</p>
   </section>
-  <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
+  <section><h2>Audit findings — OUTSTANDING only</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>
   <section><h2>Recent events</h2><div id="events" class="scroll"></div></section>
   <section><h2>Git</h2><div id="git" class="scroll"></div></section>
@@ -6314,7 +6345,23 @@ function render(d, force){
       return `<tr class="${cls}"><td><code>${esc(a.id)}</code></td><td>${esc(a.priority)}</td>
         <td>${esc(mark)}</td><td class="tt" data-s="${esc(a.title)}">${esc(a.title.slice(0,96))}${a.title.length>96?"…":""}</td></tr>`;
     }).join(""))
-    + `<p class="muted" style="font-size:12px;margin:9px 0 0">${(d.app_tasks||[]).length} proposed in ${esc((d.app_tasks[0]||{}).source||"audit report")} · ${inRoadmap.size} in the loop's registry</p>`;
+    // The note comes from `d.audit_intake`, NOT from the rows: once findings
+    // are filtered, an empty list is the SUCCESS state, and a note derived from
+    // `app_tasks[0].source` would lose the report's name at exactly the moment
+    // every finding had been actioned. `ledger_read` is rendered too — "0
+    // outstanding" and "the outcome ledger could not be read" must never look
+    // like the same sentence.
+    + (() => {
+        const a = d.audit_intake || {};
+        const decided = (a.promoted||0) + (a.already_done||0) + (a.declined||0);
+        let note = `${a.outstanding ?? (d.app_tasks||[]).length} OUTSTANDING of `
+          + `${a.total||0} findings in ${esc(a.report||"audit report")} · `
+          + `${decided} actioned (${a.promoted||0} promoted, ${a.already_done||0} already done, `
+          + `${a.declined||0} declined) · ${inRoadmap.size} tasks in the loop's registry`;
+        if (a.report_read === false && a.report_note) note += ` · REPORT NOT READ: ${esc(a.report_note)}`;
+        if (a.ledger_read === false) note += ` · OUTCOME LEDGER NOT READ (${esc(a.ledger_note||"unknown")}) — nothing below is filtered`;
+        return `<p class="muted" style="font-size:12px;margin:9px 0 0">${note}</p>`;
+      })();
   document.querySelectorAll(".tt").forEach(td => {
     td.addEventListener("mousemove", e => showTip(e, esc(td.dataset.s)));
     td.addEventListener("mouseleave", hideTip);

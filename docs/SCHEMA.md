@@ -62,6 +62,31 @@ Readers are tolerant of missing keys (each has a default) and INTOLERANT of
 unreadable ones: a record that fails to decode raises rather than reading as
 absent, because "no blocker" and "a blocker we cannot read" must not look alike.
 
+## Audit intake ledger
+
+`<intake_dir>/audit_intake.json` — one object, keyed by the QUALIFIED finding id
+(`db_migrations:db-01`) exactly as `inbox.parse_audit_findings` reads it out of a
+rendered report. Beside the drafts and `declined.json`, outside the checkout: the
+escape detector snapshots the checkout, and `TaskInbox.drain` would eat a `*.json`
+written into the inbox directory itself.
+
+Each value: `outcome` (`promoted` | `already_done` | `declined`), `fingerprint`,
+`title`, `source`, `detail`, `task_id`, `evidence`, `recorded_at`.
+
+`fingerprint` is a digest of the finding's (qualified id, title) — the evidence
+the decision was made about. A record only applies while it matches, so a
+re-worded finding reopens rather than staying silently closed, and a finding
+nobody touched stays closed across every later run.
+
+`outcome` is a CLOSED vocabulary: a value outside those three is read as no
+record at all, so a hand-edited or future ledger leaves its finding OUTSTANDING
+rather than making it vanish from the dashboard under a word nothing understands.
+
+An ABSENT file means nothing has been recorded yet. An UNREADABLE one is a
+different fact and never collapses into that one: readers filter nothing and say
+so, and `record_audit_outcome` refuses to write — the file is every decision
+already made, and rewriting it from `{}` to record one more would destroy them.
+
 ## Transcript event
 
 `{"ts", "type", "iteration", "request_id", "data"}`. An operation that records
