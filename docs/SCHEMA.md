@@ -92,3 +92,25 @@ already made, and rewriting it from `{}` to record one more would destroy them.
 `{"ts", "type", "iteration", "request_id", "data"}`. An operation that records
 its own elapsed time puts it under `data.duration_seconds`; a record without one
 is not an error, it predates the measurement.
+
+## Execution record retirement
+
+`executions/<task>.json` is meant to be retired WITH the work it describes:
+MOVED, never deleted, into `executions/archive/<task>-<label>.json` by
+`worktask.retire_execution`, which `release` and `discard` both call. Readers of
+the live records glob `executions/*.json`, which does not recurse, so an
+archived record leaves the merge window's view while staying recoverable.
+
+A record can still outlive its task — a retirement that failed halfway, an
+operator edit, or (2026-08-27) a history rewrite leaving records for ids the
+registry no longer holds. `cli._merge_window_blockers` EXCLUDES such a record
+from the merge window when three facts all hold: the registry has no task by
+that id, no worker repo exists for it at either its recorded `worktree_path` or
+`workers_root/<task_id>`, and `published_sha` is unset. The exclusion is
+reported as a note naming the record, the reason and the remedy — never applied
+silently. If any of the three cannot be established the record still holds the
+window shut, exactly as a live, worker-backed or published one does.
+
+Nothing archives an orphaned record automatically. `release` and `discard` both
+require a task id the registry knows, so retiring one is still a move into
+`executions/archive/` by hand.
