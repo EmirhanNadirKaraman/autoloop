@@ -574,6 +574,107 @@ class AutonomyConfig:
     max_recovery_attempts: int = 2
 
 
+#: The hard ceiling on `[concurrency].lanes`, and a REFUSAL rather than a clamp:
+#: "a fleet size nobody can name is not a fleet size to guess at"
+#: (docs/AUTOLOOP.md, "Decision 4 — the fleet cap"), and a clamped value would
+#: read as configured while running a different fleet.
+#:
+#: THE NUMBER IS THIS CANDIDATE'S TO PICK, and the plan says so in as many
+#: words. docs/AUTOLOOP.md, "What this plan does not decide", lists "the hard
+#: ceiling on `lanes`" and then: "It should be measured against the executor's
+#: actual concurrency behaviour and the machine, not asserted; conc-02 picks a
+#: conservative number and says how it was chosen." So this comment is the
+#: required half of that sentence, and here is how:
+#:
+#: FOUR — the largest fleet the plan itself describes anywhere. Decision 1
+#: reasons about "four lanes sharing one clone", Decision 6 says "four lanes
+#: manufacture that continuously", and the measured prize/cost paragraph prices
+#: "a 4x multiplier" that "multiplies rework 4x as well". Four therefore refuses
+#: no value the plan has asked for — its own acceptance round (conc-10) is
+#: `lanes = 2` — while still refusing the digit-slip an operator actually makes
+#: (40, 100) before it becomes that many clones of the repository.
+#:
+#: IT IS NOT A MEASUREMENT and does not claim to be. Nothing in this repository
+#: can measure it: no lane exists yet, and the executor's concurrency behaviour
+#: on a given host is exactly what the plan says should decide this and exactly
+#: what cannot be observed from here. A measured number belongs to conc-10, the
+#: candidate that turns concurrency on and runs the end-to-end round; raising or
+#: lowering this is one edit and one review, which is the point of it being a
+#: named constant rather than a literal at the comparison.
+MAX_LANES = 4
+
+#: What a lane is CALLED, and the whole of the collision argument.
+#:
+#: A lane id is a path component: `lanes/<lane_id>/state.json` (Decision 2) and
+#: the per-lane observed checkout (Decision 1) both derive from it, and they sit
+#: beside directories addressed by TASK ID (`worker_env.WorkerRepoManager.
+#: path_for`, `worktree.WorktreeManager.path_for`). The two namespaces must not
+#: be able to meet — a task id spelling a lane id would name a lane's own tree.
+#: `default_observed_checkout` already records that exact shape of bug: a fixed
+#: name under `workers_root` is one `add-task --id observed-checkout` away from
+#: a collision.
+#:
+#: Kept apart BY CONSTRUCTION rather than by a second rule that has to stay in
+#: step: a lane id begins with `_`, and `worktree.validate_task_id` requires an
+#: ALPHANUMERIC first character, so no task id can equal a lane id and neither
+#: side has to know about the other. `_` rather than `.` because a lane's
+#: directory should be visible in a plain `ls`, and rather than `-` because a
+#: leading dash is read as a flag by argv parsers and by git.
+LANE_ID_PREFIX = "_lane-"
+
+
+def lane_id(index: int) -> str:
+    """The name of lane `index` — `_lane-0`, `_lane-1`, ... — derived, never
+    stored.
+
+    Positional and deterministic on purpose: every per-lane path the plan
+    describes hangs off this string, so lane 3's state file, clone and lease
+    have to land on the same name in the next process as in this one. See
+    `LANE_ID_PREFIX` for why the result can never be a task id.
+
+    A negative index, a float and a bool are refused rather than formatted:
+    `lane_id(True)` would otherwise be a second spelling of lane 1, and
+    `lane_id(-1)` a directory named after a lane that does not exist.
+    """
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError(f"lane index must be a non-negative integer, got {index!r}")
+    return f"{LANE_ID_PREFIX}{index}"
+
+
+@dataclass(frozen=True)
+class ConcurrencyConfig:
+    """`[concurrency]` — how many tasks the loop runs at once (conc-02,
+    2026-09-01).
+
+    ONE, and nothing reads it yet. Both halves of that sentence are deliberate.
+
+    This is candidate 1 of the nine in docs/AUTOLOOP.md, "Running several tasks
+    at once — the split plan". The setting lands first, alone, so that the eight
+    candidates after it have one validated name to be written against instead of
+    each inventing their own; the fleet supervisor that consumes it is candidate
+    5, and candidate 9 is the one that may raise the value. Until then `lanes`
+    is accepted, validated and unread — every deployment behaves exactly as it
+    does today, because at `1` there is nothing for a reader to do differently.
+    That is the acceptance criterion the whole split carries: nothing before the
+    last candidate may change default behaviour.
+
+    "A setting that loads and is then ignored is worse than a constant" is this
+    repository's own rule (`_migrate_retired_tracker_paths`), and it is about a
+    setting that is ignored FOREVER while reading as configured — a retired key
+    still in a live config. This one is ignored for the length of a planned
+    sequence, is refused rather than clamped when it names a fleet the loop
+    could not build, and has exactly one value that means anything today: `1`,
+    which is what it defaults to.
+    """
+
+    #: The fleet size: how many lanes the supervisor may run. `1` is the loop as
+    #: it runs today — the single lane, `state.json` at its current path, the
+    #: fleet lock held by what is still just the loop. Bounded by `MAX_LANES`
+    #: above; `0` and negatives are refused rather than read as "off", because
+    #: the "off" this section could mean IS `1`.
+    lanes: int = 1
+
+
 #: The longest `[notify].timeout_seconds` this loop will accept. The round pays
 #: this wait whenever the SMTP server stops answering, so it is bounded here
 #: rather than left to an operator's typo: a notification is an accessory and
@@ -985,6 +1086,13 @@ class AutoloopConfig:
     #: test suite, `doctor`) sends nothing without naming the field. Appended
     #: after `projects` for the reason that field's own comment gives.
     notify: NotifyConfig = NotifyConfig()
+    #: `[concurrency]` — the fleet size (conc-02, 2026-09-01). Default `1`, so
+    #: every `AutoloopConfig(...)` built directly is the single-lane loop that
+    #: exists today without naming the field, and a config with no such section
+    #: loads to a value equal to one that spells `lanes = 1`. Appended after
+    #: `notify` for the reason `observed_checkout`'s own comment gives: the
+    #: positional meaning of every field before it must not move.
+    concurrency: ConcurrencyConfig = ConcurrencyConfig()
 
     @property
     def state_file(self) -> Path:
@@ -1205,7 +1313,7 @@ class AutoloopConfig:
 
 _SECTIONS = {
     "browser", "policy", "paths", "conversation", "codex", "executor", "audit",
-    "repo", "autonomy", "projects", "notify",
+    "repo", "autonomy", "projects", "notify", "concurrency",
 }
 
 
@@ -1782,6 +1890,69 @@ def _load_notify_section(data: dict) -> NotifyConfig:
     return notify
 
 
+def _load_concurrency_section(data: dict) -> ConcurrencyConfig:
+    """`[concurrency]`, validated. Absent means `ConcurrencyConfig()` — one
+    lane, which is every config file written before this section existed and is
+    the loop exactly as it runs today.
+
+    Every refusal below names `concurrency.lanes`, because the message is
+    plausibly the only thing an operator sees (`cli.main` prints `error: <exc>`
+    and nothing else), and "which key did I get wrong" is the whole question at
+    that moment. Nothing here is clamped: a fleet size the loop would not run is
+    refused, in the style `[paths]` refuses a relative `workers_root`, so a
+    typo'd value can never read as configured while a different one runs.
+    """
+    raw = data.get("concurrency", {})
+    # Shape first, exactly as `_load_repo_section`, `_load_projects_section` and
+    # `_load_notify_section` do it: `concurrency = "two"` written as a bare key
+    # gets this loader's own error naming the section, rather than
+    # `_check_keys` reporting the letters of the string as unknown keys.
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[concurrency] must be a table, got {raw!r} — write it as a section "
+            "header (`[concurrency]` followed by `lanes = 1`), not as a bare key"
+        )
+    _check_keys(
+        "concurrency", raw, {f.name for f in dataclasses.fields(ConcurrencyConfig)}
+    )
+    if "lanes" not in raw:
+        return ConcurrencyConfig()
+    lanes = raw["lanes"]
+    # `bool` BEFORE `int`, exactly as `autonomy.max_recovery_attempts` orders
+    # it, and for the same reason: `True` IS an int in Python and is `>= 1`, so
+    # an unguarded check would accept `lanes = true` as a fleet of one — a value
+    # that reads as a switch someone flipped ON while behaving as a count.
+    if isinstance(lanes, bool) or not isinstance(lanes, int):
+        extra = (
+            " A boolean is refused rather than read as its integer value: this "
+            "is a COUNT of lanes, not a switch, and `true` would quietly mean 1."
+            if isinstance(lanes, bool)
+            else ""
+        )
+        raise ConfigError(
+            f"concurrency.lanes must be an integer number of lanes, got {lanes!r}."
+            + extra
+            + f" Valid values are 1 to {MAX_LANES}; delete the key entirely for "
+            "the default of 1, which is the single-lane loop."
+        )
+    if lanes < 1:
+        raise ConfigError(
+            f"concurrency.lanes must be at least 1, got {lanes!r} — there is no "
+            "'off' value here, because the off state IS 1: one lane is the loop "
+            "as it has always run. A fleet of zero lanes would dispatch nothing "
+            "while reading as configured."
+        )
+    if lanes > MAX_LANES:
+        raise ConfigError(
+            f"concurrency.lanes must be at most {MAX_LANES}, got {lanes!r} — "
+            "each lane costs its own observed clone of the repository and its "
+            "own worker repositories, and a fleet size nobody can name is not "
+            "one to guess at. Raise MAX_LANES in autoloop/config.py if you "
+            "really want more, so the decision is a reviewed commit."
+        )
+    return ConcurrencyConfig(lanes=lanes)
+
+
 def load_config(path: Path) -> AutoloopConfig:
     path = Path(path)
     if not path.exists():
@@ -2017,6 +2188,7 @@ def load_config(path: Path) -> AutoloopConfig:
     repo, repo_notices = _load_repo_section(data)
     projects = _load_projects_section(data)
     notify = _load_notify_section(data)
+    concurrency = _load_concurrency_section(data)
 
     return AutoloopConfig(
         browser=browser,
@@ -2035,4 +2207,5 @@ def load_config(path: Path) -> AutoloopConfig:
         observed_checkout=observed_checkout,
         projects=projects,
         notify=notify,
+        concurrency=concurrency,
     )
