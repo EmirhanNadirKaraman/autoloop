@@ -23,10 +23,15 @@ right answer to a reviewer that answered in prose), while stdout from which no
 message could be isolated at all is a FAILED invocation — never a defaulted
 decision, and never a verdict chosen from two by position.
 
-**The echo is the case that matters most.** The prompt comes back under the
-`user` marker and the prompt carries the response contract; in the shape that
-was reproduced it also carries an example directive. Text the loop SENT, read
-back as the reviewer's answer, would be an approval nobody gave.
+**The echo is the case that matters most, and "the segment after the `codex`
+marker" does not close it on its own.** The prompt comes back under the `user`
+marker, and the prompt is the review packet — including, when the loop is
+maintaining itself, a QUOTED codex transcript with markers and hook lines in it.
+This module's own task description carries one. Text the loop SENT, read back as
+the reviewer's answer, would be an approval nobody gave, so three bounds answer
+it and there is a test below for each: a marker starts at column 0, a marker
+opens a turn only after furniture, and the echoed prompt is skipped outright
+when it is found verbatim. Where they disagree the answer is a refusal.
 """
 
 import json
@@ -35,6 +40,10 @@ import pytest
 
 from autoloop.codex.conversation import CodexConversation, CodexResult
 from autoloop.codex.reply import (
+    ECHO_ANCHOR_INERT,
+    ECHO_ANCHOR_MATCHED,
+    ECHO_ANCHOR_SWALLOWED,
+    ECHO_ANCHOR_UNMATCHED,
     FROM_NOTHING,
     FROM_SEGMENT,
     FROM_WHOLE_STDOUT,
@@ -118,6 +127,59 @@ def decorate(verdict, *, echoed="{...}"):
 
 REPORTED_STDOUT = decorate(SMOKE_VERDICT)
 PUSH_STDOUT = decorate(json.dumps(PUSH_DIRECTIVE))
+
+#: A codex transcript QUOTED INSIDE A PROMPT — hook lines, a `codex` marker and
+#: a complete directive — indented by four spaces, which is exactly how this
+#: module's own task description carries the reproduction. Every review packet
+#: quoting a log looks like this, so it is the echo shape production will meet
+#: first.
+QUOTED_TRANSCRIPT = "\n".join(
+    [
+        "THE DEFECT, reproduced 2026-08-17:",
+        "",
+        "    hook: UserPromptSubmit Completed",
+        "    codex",
+        f"    {json.dumps(ECHOED_DIRECTIVE)}",
+        "    tokens used",
+        "    6,080",
+    ]
+)
+
+#: The same transcript pasted FLUSH LEFT — the quoting that bound 1 keys on,
+#: removed. Nothing in a line tells this apart from the run's own transcript,
+#: which is what the prompt anchor is for.
+FLUSH_TRANSCRIPT = "\n".join(
+    line[4:] if line.startswith("    ") else line
+    for line in QUOTED_TRANSCRIPT.splitlines()
+)
+
+#: A prompt that quotes a transcript flush left: the packet this adapter has to
+#: survive, since the loop maintains itself and its own tasks quote its output.
+QUOTING_PROMPT = f"{PROMPT}\n\n{FLUSH_TRANSCRIPT}\n"
+
+
+def echo_prompt(prompt, verdict):
+    """The captured shape with `prompt` echoed under the `user` marker VERBATIM,
+    which is what `codex exec` does — `quota.py` measured a 180,024-byte packet
+    coming back whole."""
+    return (
+        "\n".join(
+            [
+                "--------",
+                "user",
+                prompt,
+                "hook: SessionStart",
+                "hook: UserPromptSubmit Completed",
+                "codex",
+                verdict,
+                "hook: Stop",
+                "tokens used",
+                "6,080",
+                verdict,
+            ]
+        )
+        + "\n"
+    )
 
 
 class FakeRunner:
@@ -247,6 +309,165 @@ def test_the_echoed_prompt_is_never_read_as_the_verdict():
     assert directive.commit_message is None
 
 
+# ---- the echo, bound three ways ---------------------------------------------
+#
+# "the segment after the `codex` marker" is not on its own enough. The packet
+# is prose the loop sent, and prose about this CLI quotes this CLI's output —
+# markers, hook lines and all. Each test below is one bound, on the shape that
+# bound is the answer to.
+
+
+def test_a_quoted_transcript_in_the_prompt_does_not_open_a_message():
+    """BOUND 1, column zero. This module's own task description quotes the
+    captured transcript indented by four spaces, so the packet for that very
+    review carries `hook:` then `codex` then a complete directive. The CLI
+    prints its markers flush left; a quotation is indented."""
+    stdout = decorate(json.dumps(PUSH_DIRECTIVE), echoed=QUOTED_TRANSCRIPT)
+    assert "\n    codex\n" in stdout and "commit_and_push" in stdout
+
+    isolated = isolate_reply(stdout)  # no prompt: the line rules, alone
+    assert isolated.segments == 1
+    assert parse_response(isolated.text).decision is Decision.PUSH
+
+
+def test_a_bare_codex_line_in_the_prompts_prose_does_not_open_a_message():
+    """BOUND 2, the turn boundary. A marker opens a turn after furniture or at
+    the start — never mid-message, which is where a packet's own prose sits."""
+    echoed = "the task says: make the\ncodex\nadapter hand back a verdict"
+    stdout = decorate(json.dumps(PUSH_DIRECTIVE), echoed=echoed)
+    assert "\ncodex\nadapter" in stdout
+
+    isolated = isolate_reply(stdout)
+    assert isolated.segments == 1
+    assert parse_response(isolated.text).decision is Decision.PUSH
+
+
+def test_a_flush_left_transcript_in_the_prompt_is_excluded_by_the_anchor():
+    """BOUND 3, the anchor — and the two directions stated together. No line
+    tells a flush-left quotation apart from the run's own transcript, so the
+    line rules FAIL CLOSED on it: two messages, refused. The loop knows what it
+    sent, so with the prompt in hand the echo is not read at all."""
+    stdout = echo_prompt(QUOTING_PROMPT, json.dumps(PUSH_DIRECTIVE))
+
+    blind = isolate_reply(stdout)
+    assert blind.text == "" and blind.segments == 2
+    assert blind.echo_anchor == ECHO_ANCHOR_INERT
+
+    isolated = isolate_reply(stdout, QUOTING_PROMPT)
+    assert isolated.echo_anchor == ECHO_ANCHOR_MATCHED
+    assert isolated.segments == 1
+    assert parse_response(isolated.text).decision is Decision.PUSH
+
+
+def test_a_marker_that_exists_only_inside_the_echo_is_refused_never_read():
+    """The fail-open path the anchor could have had, closed WHENEVER THE ECHO IS
+    VERBATIM. When every marker falls inside the echo there is no reviewer
+    message — only ours coming back — and "no marker survived, so read the whole
+    thing" would hand the contract the loop's own example. It carries THIS
+    round's request id and head sha, so the downstream stamp gates would not
+    catch it either.
+
+    The second assertion is not only a counterfactual: it is what still happens
+    when the echo is REFLOWED and the reviewer's own message is empty. See
+    `reply.py`, "What is NOT closed", for why no rule is added for that — the
+    only discriminator left cannot tell an echo from a reviewer that copied the
+    prompt's example."""
+    stdout = "--------\nuser\n" + QUOTING_PROMPT + "\nhook: Stop\ntokens used\n6,080\n"
+
+    isolated = isolate_reply(stdout, QUOTING_PROMPT)
+    assert isolated.text == ""
+    assert isolated.echo_anchor == ECHO_ANCHOR_SWALLOWED
+    assert "falls inside the echoed prompt" in isolated.note
+
+    # What it would have been: the echoed directive, read as the verdict.
+    assert (
+        parse_response(isolate_reply(stdout).text).decision is Decision.COMMIT_AND_PUSH
+    )
+
+    # The boundary of the same case: stdout that is the echo and NOTHING else.
+    assert isolate_reply(QUOTING_PROMPT, QUOTING_PROMPT).text == ""
+
+
+def test_two_reviewer_messages_are_still_refused_when_the_echo_is_anchored():
+    """The anchor narrows where the rules apply; it never relaxes one. Two
+    genuine reviewer messages both sit after the echo, so both survive the cut
+    and the refusal is exactly as it was."""
+    stdout = (
+        "--------\nuser\n"
+        + QUOTING_PROMPT
+        + "\nhook: UserPromptSubmit Completed\n"
+        "codex\n" + json.dumps(PUSH_DIRECTIVE) + "\n"
+        "hook: Stop\n"
+        'codex\n{"version": 3, "decision": "stop", "reason": "second message"}\n'
+        "tokens used\n6,080\n"
+    )
+    isolated = isolate_reply(stdout, QUOTING_PROMPT)
+    assert isolated.echo_anchor == ECHO_ANCHOR_MATCHED
+    assert isolated.text == "" and isolated.segments == 2
+    assert "position" in isolated.note
+
+
+def test_a_second_message_after_a_quoted_role_line_is_still_counted():
+    """`user` here opens no turn — message text precedes it — but it still
+    leaves a boundary behind it, so the `codex` after it opens the SECOND
+    message. Without that, two messages silently collapse to one and the reply
+    is chosen by position after all."""
+    stdout = (
+        f"codex\n{SMOKE_VERDICT}\nuser\ncodex\n"
+        '{"version": 3, "decision": "stop", "reason": "second"}\n'
+    )
+    isolated = isolate_reply(stdout)
+    assert isolated.text == "" and isolated.segments == 2
+
+
+def test_a_prompt_that_was_not_echoed_verbatim_leaves_the_line_rules_alone():
+    """The anchor is a bound, not a guarantee: a reflowed or truncated echo is
+    not found, and the outcome is the line rules unchanged — the same answer
+    every caller got before the prompt was passed at all. Recorded as
+    `unmatched` rather than inferred from an absent field."""
+    reflowed = isolate_reply(PUSH_STDOUT, "a prompt this stdout never carried")
+    assert reflowed.echo_anchor == ECHO_ANCHOR_UNMATCHED
+    assert reflowed.text == isolate_reply(PUSH_STDOUT).text
+    assert parse_response(reflowed.text).decision is Decision.PUSH
+
+
+def test_an_absent_prompt_leaves_the_anchor_inert_and_says_so():
+    """The bound's own missing-input case. With nothing sent there is no echo to
+    find, the line rules answer alone, and the state is RECORDED rather than
+    inferred from an absent field — `quota.failure_digest`'s `prompt_guard`
+    rule, because a bound that quietly does not apply is the failure class this
+    provider's two guards both exist to remove."""
+    for absent in ("", "   \n", None):
+        isolated = isolate_reply(PUSH_STDOUT, absent)
+        assert isolated.echo_anchor == ECHO_ANCHOR_INERT
+        assert parse_response(isolated.text).decision is Decision.PUSH
+
+
+def test_an_undecorated_reply_is_cut_free_of_the_echo_too():
+    """The quiet one, and the reason the anchor is not limited to the decorated
+    path. With no role marker anywhere the whole text goes to the contract, and
+    `contract._extract_envelope` takes a lone fenced block WHEREVER it sits — so
+    an echoed example is the directive, with no marker involved at all. Cutting
+    is safe because the match is the whole prompt and never a fragment."""
+    prompt = (
+        "Answer with exactly one fenced block, like this:\n"
+        "```json\n" + json.dumps(ECHOED_DIRECTIVE) + "\n```\n"
+    )
+    stdout = prompt + "I decline to approve this candidate.\n"
+
+    # Blind, this parses — and the directive it yields is the one we SENT.
+    blind = parse_response(isolate_reply(stdout).text)
+    assert blind.decision is Decision.COMMIT_AND_PUSH
+
+    isolated = isolate_reply(stdout, prompt)
+    assert isolated.echo_anchor == ECHO_ANCHOR_MATCHED
+    assert isolated.text == "I decline to approve this candidate."
+    # Left for the contract to refuse, which is the right answer to a reviewer
+    # that answered in prose: a corrective re-prompt, not an approval.
+    with pytest.raises(ContractError):
+        parse_response(isolated.text)
+
+
 def test_the_trailing_duplicate_is_excluded_by_the_token_counter_not_by_counting():
     """Structural, not "de-duplicate identical objects". The closing copy sits
     after `tokens used`, which ends the message, so it is never inside one — and
@@ -360,11 +581,13 @@ def test_undecorated_stdout_is_passed_through_unchanged():
 # ---- what counts as furniture, and what does not ----------------------------
 
 
-def test_a_role_marker_is_a_whole_line_never_a_prefix():
-    """`codex exec is running` is prose. Opening a message inside a diagnostic
-    would put the diagnostic in front of the contract."""
+def test_a_role_marker_is_a_whole_line_at_column_zero():
+    """`codex exec is running` is prose, and `  codex  ` is a transcript
+    somebody QUOTED. Opening a message at either puts text this run did not
+    produce in front of the contract."""
     assert role_marker_count("codex exec is running\ncodex CLI 0.9.1\n") == 0
-    assert role_marker_count("codex\n  codex  \nuser\n") == 2
+    assert role_marker_count("hook: Stop\n  codex  \n") == 0
+    assert role_marker_count("codex\nhook: Stop\ncodex\n") == 2
 
 
 def test_a_hook_line_inside_a_json_value_cannot_truncate_the_message():
@@ -409,10 +632,32 @@ def test_the_token_counter_closes_a_message_on_either_of_its_two_shapes():
 
 def test_a_message_that_runs_to_the_end_of_stdout_is_still_isolated():
     """No trailing furniture at all — a build that prints no token counter must
-    not lose the reply for want of a terminator."""
-    assert isolate_reply(f"--------\nuser\nprompt\ncodex\n{SMOKE_VERDICT}\n").text == (
-        SMOKE_VERDICT
-    )
+    not lose the reply for want of a terminator. What precedes the marker is the
+    rule this CLI draws between turns; the test below says why a marker with
+    message text in front of it is not a turn at all."""
+    stdout = f"--------\nuser\nprompt\n--------\ncodex\n{SMOKE_VERDICT}\n"
+    assert isolate_reply(stdout).text == SMOKE_VERDICT
+
+
+def test_a_marker_in_the_middle_of_a_message_is_message_text():
+    """The turn boundary, and its cost, both stated. `user` / prompt text /
+    `codex` with no furniture between is the echoed prompt's own shape, so a
+    marker there is read as text — which loses the reply on a build that prints
+    neither hooks nor rules between turns. That is the direction to err in: it
+    is a refusal the contract makes, not a verdict assembled out of our own
+    prompt. The anchor resolves this shape when the echo is verbatim."""
+    stdout = f"--------\nuser\nprompt text\ncodex\n{SMOKE_VERDICT}\n"
+    assert codex_segments(stdout) == ()
+
+    isolated = isolate_reply(stdout)
+    assert isolated.source == FROM_WHOLE_STDOUT
+    with pytest.raises(ContractError):
+        parse_response(isolated.text)
+
+    # With the prompt, the echo is behind us and the marker opens the region.
+    anchored = isolate_reply(stdout, "prompt text")
+    assert anchored.text == SMOKE_VERDICT
+    assert anchored.echo_anchor == ECHO_ANCHOR_MATCHED
 
 
 # ---- the adapter seam -------------------------------------------------------
@@ -468,10 +713,30 @@ def test_the_isolation_leaves_a_visible_counts_only_record():
     assert record["stdout_chars"] == len(PUSH_STDOUT)
     assert record["reply_chars"] < record["stdout_chars"]
     assert record["request_id"] == RID
-    # Nothing but the request id is text, so no packet content can ride out on
-    # this record however large the prompt or the reply was.
-    assert set(record) == {"request_id", "segments", "stdout_chars", "reply_chars"}
-    assert not any(isinstance(v, str) for k, v in record.items() if k != "request_id")
+    # The anchor's state is recorded rather than inferred, for the reason
+    # `quota.failure_digest` records `prompt_guard`: a bound that can quietly
+    # not apply has to say when it did not.
+    assert record["echo_anchor"] == ECHO_ANCHOR_UNMATCHED
+    # Nothing but the request id is free text, so no packet content can ride out
+    # on this record however large the prompt or the reply was.
+    assert set(record) == {
+        "request_id",
+        "segments",
+        "stdout_chars",
+        "reply_chars",
+        "echo_anchor",
+    }
+    assert record["echo_anchor"] in {
+        ECHO_ANCHOR_MATCHED,
+        ECHO_ANCHOR_UNMATCHED,
+        ECHO_ANCHOR_INERT,
+        ECHO_ANCHOR_SWALLOWED,
+    }
+    assert not any(
+        isinstance(v, str)
+        for k, v in record.items()
+        if k not in {"request_id", "echo_anchor"}
+    )
 
 
 def test_undecorated_stdout_claims_no_isolation():
@@ -480,6 +745,46 @@ def test_undecorated_stdout_claims_no_isolation():
     codex, logged = adapter(raw)
     assert codex.submit(RID, PROMPT) is SubmitResult.CONFIRMED
     assert codex.await_response(RID) == raw
+    assert not rows(logged, "codex_reply_isolated")
+
+
+def test_an_undecorated_pass_through_that_cut_an_echo_still_leaves_a_record():
+    """The converse, and the same rule: with no marker anywhere the anchor is
+    the only thing that dropped any text, so silence about it would be a rule
+    nobody can tell from one that never fired."""
+    reply = '{"version": 3, "decision": "stop", "reason": "not this round"}'
+    codex, logged = adapter(f"{PROMPT}\n{reply}\n")
+    assert codex.submit(RID, PROMPT) is SubmitResult.CONFIRMED
+    assert codex.await_response(RID) == reply
+
+    record = rows(logged, "codex_reply_isolated")[0]
+    assert record["echo_anchor"] == ECHO_ANCHOR_MATCHED
+    assert record["segments"] == 0 and record["reply_chars"] < record["stdout_chars"]
+
+
+def test_the_adapter_anchors_on_the_prompt_it_actually_sent():
+    """The seam for the echo bound: `submit` passes the FINAL prompt, the one
+    that reached the process, so a packet quoting a codex transcript flush left
+    still yields the reviewer's own verdict."""
+    stdout = echo_prompt(QUOTING_PROMPT, json.dumps(PUSH_DIRECTIVE))
+    codex, logged = adapter(stdout)
+
+    assert codex.submit(RID, QUOTING_PROMPT) is SubmitResult.CONFIRMED
+    assert parse_response(codex.await_response(RID)).decision is Decision.PUSH
+    assert rows(logged, "codex_reply_isolated")[0]["echo_anchor"] == ECHO_ANCHOR_MATCHED
+
+
+def test_a_transcript_whose_only_marker_is_echoed_fails_rather_than_approving():
+    """The one that would have been an approval nobody gave. Every marker sits
+    inside the packet's own quoted transcript, so there is no reviewer message —
+    REJECTED with a record naming why, not CONFIRMED with our own directive."""
+    stdout = "--------\nuser\n" + QUOTING_PROMPT + "\nhook: Stop\ntokens used\n6,080\n"
+    codex, logged = adapter(stdout)
+
+    assert codex.submit(RID, QUOTING_PROMPT) is SubmitResult.REJECTED
+    assert codex.has_request(RID) is False
+    note = rows(logged, "codex_invocation_failed")[0]["note"]
+    assert "falls inside the echoed prompt" in note
     assert not rows(logged, "codex_reply_isolated")
 
 

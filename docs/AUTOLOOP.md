@@ -1202,16 +1202,57 @@ dashes) — and the adapter hands the contract that and nothing else.
   used`, which closes the message. This is not "take the last object" and not
   "de-duplicate identical objects" — the first is the position rule the contract
   refuses, and the second reads two copies that happen to agree as agreement.
-* The echoed prompt is excluded structurally too, and that is the half that
-  matters most. The prompt comes back under the `user` marker, and the prompt
-  carries the response contract and, in the captured shape, an example
-  directive. Text the loop *sent*, read back as the reviewer's answer, would be
-  an approval nobody gave.
+* The echoed prompt is excluded too, and that is the half that matters most —
+  but "the segment after the `codex` marker" does not do it on its own. The
+  prompt comes back under the `user` marker, and the prompt is the review
+  packet: the response contract, an example directive, the task text, the diff,
+  the agent's report. This loop maintains itself, so its packets quote its own
+  CLI output — the task that produced this module quotes the captured
+  transcript, hook lines and `codex` marker and all, inside its own description.
+  Text the loop *sent*, read back as the reviewer's answer, would be an approval
+  nobody gave. **Three bounds** answer it, and each is the answer to a different
+  shape:
+  1. **A role marker starts at column 0.** The CLI prints its markers flush
+     left; a quotation is indented, bulleted or diff-prefixed. This is what
+     excludes the shape above. The cost: a build that indents or timestamps its
+     markers yields no verdict at all here — fail-closed, with a record.
+  2. **A role marker opens a turn only at a turn boundary** — at the start, or
+     after furniture. Mid-message, `codex` on a line is message text, which is
+     what a packet's prose is. The cost: a build that prints no hook line and no
+     rule between the prompt and the answer loses the marker, which the third
+     bound then resolves.
+  3. **The echoed prompt is skipped outright when it is found verbatim.** The
+     loop knows what it sent, so `submit` passes the final prompt down and
+     reading starts after the echo. It matches *exactly*, like
+     `quota.strip_echoed_prompt`, so a reflowed echo defeats it and nothing
+     depends on it not doing so; the region it hands on is always a suffix of
+     stdout. It applies to the undecorated pass-through as well, which is where
+     it is least obviously needed and most quietly needed: with no marker
+     anywhere the whole text reaches the contract, and the contract takes a lone
+     fenced block wherever it sits — so an echoed *example* would be the
+     directive. `echo_anchor` on the isolation record says which of `matched` /
+     `unmatched` / `inert` / `swallowed` happened, rather than leaving it to be
+     inferred.
+
+  Where the prompt is found and **every** `codex` marker falls inside it, that
+  is a refusal (`swallowed`), never a fallback to reading the whole thing: the
+  echoed example carries *this* round's own `request_id` and `head_sha`, so the
+  downstream stamp gates would accept it. The gates catch a stale stamp, not our
+  own text coming back in the same round.
+
+  **What is not closed.** That refusal needs the prompt to be *found*. A
+  reflowed echo, in a packet quoting a flush-left transcript, in a round whose
+  reviewer message is empty, still leaves one segment and it is ours — three
+  conditions at once, `echo_anchor: unmatched` on every round it could apply to,
+  and a strictly smaller surface than passing the whole transcript to the parser
+  as before. It is left open on purpose: the only discriminator left is whether
+  the reply is contained in the prompt, and that cannot tell an echo from a
+  reviewer who copied the example the prompt showed it.
 * Stdout from which no message can be isolated is a **failed invocation**, never
   a defaulted decision: `submit` returns REJECTED and writes
   `codex_invocation_failed` with a note saying which way it happened — nothing
-  on stdout, a marker with no message under it, furniture and nothing else, or
-  two messages.
+  on stdout, a marker with no message under it, furniture and nothing else, two
+  messages, or every marker inside the echo.
 
 **Isolation does not mean validation, and this boundary never judges a reply.**
 A reviewer that answers in prose gets its message isolated and then refused by
@@ -1220,10 +1261,13 @@ message at all" is this layer's failure.
 
 ### What you will see
 
-    codex_reply_isolated       counts only — segments, stdout_chars, reply_chars
+    codex_reply_isolated       counts only — segments, stdout_chars, reply_chars,
+                               echo_anchor (matched/unmatched/inert/swallowed)
     codex_invocation_failed    note: "no reply on stdout" / "no message under any
                                of them" / "only transcript furniture" /
-                               "refusing to choose a verdict by position"
+                               "refusing to choose a verdict by position" /
+                               "every codex role marker ... falls inside the
+                               echoed prompt"
 
 The isolation record is counts-only on purpose: stdout carries the echoed
 prompt, which is the whole review packet, and the isolated reply already reaches
