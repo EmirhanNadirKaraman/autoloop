@@ -398,6 +398,50 @@ you want the quarantine without the extra round.
 
 ---
 
+## Which verb the reviewer wanted
+
+**`<state_dir>/wanted_decisions.json` is the evidence you read before adding a
+decision to the protocol.** It is a cumulative count of the answers reviewers
+gave to one question — *which verb would you have used?* — and it is how the next
+missing verb gets found by counting instead of by someone happening to read a
+`reason` field. `recut` exists because that is how it was found.
+
+**Every reply answers it, including "nothing was missing".** The question used to
+be asked only when nothing in the decision list fitted, which is a condition that
+effectively never holds: the reviewer always finds something to issue. Measured
+2026-08-25 the field had been used zero times and this file did not exist,
+because nothing had ever written to it — and a zero tally reads as "the
+vocabulary is complete" when nobody has actually been asked. The schema now asks
+on every reply and offers `none` for "the verb I used is the verb I wanted", so
+`none x412, split x9, defer x3` is evidence where a tally of nothing was not.
+
+**A reply that does not answer is refused and re-prompted, not parked.** The
+parser still accepts a directive without the field — the wire protocol is
+unchanged, and a missing answer must never become a `parse_error`, which would
+spend the two-round parse budget and park the loop `parse_budget_exhausted` over
+a bookkeeping field. `policy.authorize_directive` denies it instead
+(`wanted_decision_missing`), which explains itself, costs no attempt, and is
+bounded by `policy.max_policy_denials` like every other denial.
+
+**The answer is never acted on.** The loop executes `decision` and nothing else;
+a `wanted_decision` naming a real, powerful verb is counted and then ignored. It
+is not a second way to choose a decision, and it never becomes one.
+
+### What you will see
+
+    wanted_decision            one per directive, with `wanted: none x412, split x9`
+    policy_denied              code `wanted_decision_missing`, when a reply skipped it
+
+`tally_reset` on the event is true only when a file existed and could not be
+read: the counter enforces nothing, so an unreadable file is rebuilt rather than
+taking a round down — but a rebuilt count says so, because a lost history that
+looked like a first sighting would be worse than no count at all.
+
+**What to do with a number.** Nothing automatic — deliberately. A named verb
+becomes real only the slow way: a person reads the tally and files a task.
+
+---
+
 ## Audit finding intake — three outcomes, never a panel
 
 An audit report is prose. Until intake-01 (2026-09-01) the dashboard rendered

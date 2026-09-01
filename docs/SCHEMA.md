@@ -18,6 +18,7 @@ rewrites.
 | `executions/<task>.json` | object | Per-task execution record: branch, base sha, candidate sha, review round, attempt ledger. |
 | `blockers/` | one file per blocker | Open and resolved blockers, with the code that raised them. |
 | `pending_upgrade.json` | object | A merge that changed loop code, and whether the handoff happened. |
+| `wanted_decisions.json` | object | `{verb: count}` — the verbs reviewers said they WOULD have used, `none` included. Evidence for a human; enforces nothing, so an unreadable file is read as empty and rewritten. |
 | `LOCK` | text | One holder per state dir. Never stolen. |
 
 ## Task

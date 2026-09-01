@@ -580,7 +580,10 @@ FLOOR_AFTER = 16
 #: "it narrows" is a number rather than an adjective. The denominator is
 #: asserted too: the suite grows, and a ratio whose bottom half drifted would
 #: read as a narrowing that never happened.
-SUITE_SIZE = 102
+#: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). The
+#: DENOMINATOR only: the new file reads no tracker and spawns no interpreter, so
+#: neither the docs-only selection nor the floor moved with it.
+SUITE_SIZE = 103
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

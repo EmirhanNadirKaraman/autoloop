@@ -50,7 +50,7 @@ from pathlib import Path
 from gitrepo import make_repo_from_template
 
 from autoloop.config import AutoloopConfig, BrowserConfig
-from autoloop.contract import Decision, Directive, ReviewRef
+from autoloop.contract import NO_WANTED_DECISION, Decision, Directive, ReviewRef
 from autoloop.errors import GitError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
@@ -181,6 +181,10 @@ def implement(task_id="t1"):
 
 
 def block(obj) -> str:
+    # See `test_orchestrator.block`: wanted-01 made the field a policy
+    # requirement on every directive, so fixtures answer it by default.
+    obj = dict(obj)
+    obj.setdefault("wanted_decision", NO_WANTED_DECISION)
     return f"Reasoning...\n```json\n{json.dumps(obj)}\n```"
 
 

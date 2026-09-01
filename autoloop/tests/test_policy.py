@@ -6,6 +6,7 @@ import pytest
 
 from autoloop.contract import (
     ACTIVE_DECISIONS,
+    NO_WANTED_DECISION,
     RETIRED_DECISIONS,
     Decision,
     Decomposition,
@@ -20,13 +21,23 @@ from autoloop.policy import (
 from autoloop.tasks import Task, TaskRegistry
 
 
-def directive(decision: Decision, task_id=None, decomposition=None) -> Directive:
+def directive(
+    decision: Decision,
+    task_id=None,
+    decomposition=None,
+    wanted_decision=NO_WANTED_DECISION,
+) -> Directive:
+    """`wanted_decision` defaults to the "the verb I used is the verb I wanted"
+    answer, so every test below is refused (or allowed) for the reason it is
+    about rather than for the reply-shape gate every directive passes since
+    wanted-01. Pass `wanted_decision=None` to exercise that gate itself."""
     return Directive(
         decision=decision,
         reason="r",
         task_id=task_id,
         commit_message="m",
         decomposition=decomposition,
+        wanted_decision=wanted_decision,
     )
 
 
