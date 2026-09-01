@@ -365,6 +365,7 @@ from .contract import (
     AUDIT_UNIT_PREFIX,
     is_audit_unit,
     COMMIT_DECISIONS,
+    NO_WANTED_DECISION,
     PUSH_DECISIONS,
     RETIRED_DECISIONS,
     REVIEWED_DECISIONS,
@@ -4576,9 +4577,9 @@ class Orchestrator:
                 "planned_tasks": len(directive.tasks) if directive.tasks else 0,
                 "commit_message": directive.commit_message,
                 "question": directive.question,
-                # The verb the reviewer would have used, when it named one.
-                # `None` on every ordinary directive, which is every directive
-                # written before this field existed.
+                # The verb the reviewer would have used — `NO_WANTED_DECISION`
+                # when that is the one it used. `None` only for a reply that
+                # did not answer, which the policy gate below then denies.
                 "wanted_decision": directive.wanted_decision,
             },
         )
@@ -4738,10 +4739,30 @@ class Orchestrator:
     def _record_wanted_decision(self, directive: Directive, resp: LastResponse) -> None:
         """Count and record a `wanted_decision`, and do nothing else with it.
 
-        A NO-OP when the directive carries none, which is every directive today
-        — no event, no file, nothing on disk. That is what makes the field free
-        for the existing protocol: a reply that omits it behaves exactly as it
-        did before this existed.
+        **Every directive reaches here with one, since wanted-01 (2026-09-01).**
+        The schema asks on every reply and `policy._check_wanted_decision`
+        denies a reply that does not answer, so the tally file the operator is
+        supposed to read now actually gets written — it never had been, because
+        the question was only posed "when none above fits" and that condition
+        held zero times. `NO_WANTED_DECISION` is recorded like any other value
+        and special-cased nowhere: `none x412, split x9` is the evidence a
+        person reads before filing the task that makes a verb real.
+
+        Still a NO-OP when the directive carries none — no event, no file,
+        nothing on disk. That path is what the parser's continued acceptance of
+        an omitted key leaves behind, and it is deliberately kept: a directive
+        with no answer is denied by policy AFTER this runs (`_step_executing`
+        logs and counts, then authorizes), and counting an empty answer as an
+        occurrence of nothing would put a phantom key in the operator's
+        evidence.
+
+        **What it counts is ROUNDS, not authorized rounds.** This runs before
+        `authorize_directive`, so a reply that is then denied for some other
+        reason still contributes its answer. That is the wanted direction: the
+        answer is about the vocabulary the reviewer reached for, which it
+        reached for whether or not the directive turned out to be authorized,
+        and moving the call after the gate would silently stop counting exactly
+        the rounds where the reviewer was struggling most.
 
         **It cannot influence what happens next, structurally.** This method
         neither returns a value nor mutates anything the dispatch reads: it
@@ -12731,6 +12752,16 @@ class Orchestrator:
             reason=self._autonomous_revise_reason(code),
             task_id=task_id,
             feedback=feedback,
+            # The loop answering its OWN question, honestly: it authored this
+            # directive and wanted exactly the verb it wrote. Carried rather
+            # than exempted, because `policy._check_wanted_decision` refusing a
+            # directive with no answer is only worth having if there is no
+            # directive that can skip it — and there is no reviewer behind this
+            # one to ask. It is never tallied: `_record_wanted_decision` runs
+            # in `_step_executing`, which a self-issued revise does not pass
+            # through, so the operator's evidence file stays a record of what
+            # REVIEWERS answered.
+            wanted_decision=NO_WANTED_DECISION,
         )
         # THE SAME GATE a reviewer's `revise` passes, asked here rather than
         # trusted: it is what refuses a blocked, retired or completed task, a
@@ -12844,6 +12875,11 @@ class Orchestrator:
                 reason=self._autonomous_revise_reason(code),
                 task_id=task_id,
                 feedback=feedback,
+                # The same answer the queue-time directive carried, and it must
+                # stay the same: this is the directive that is DISPATCHED, and
+                # two spellings of the loop's own reply would make the gate at
+                # queue time a check of something other than what runs.
+                wanted_decision=NO_WANTED_DECISION,
             )
         )
         return True

@@ -27,7 +27,7 @@ from autoloop.changeset_review import (
     build_changeset_packet,
 )
 from autoloop.config import AutoloopConfig, BrowserConfig
-from autoloop.contract import Decision, Directive
+from autoloop.contract import NO_WANTED_DECISION, Decision, Directive
 from autoloop.errors import GitCommandError
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -77,6 +77,10 @@ def stamped_push_reply(req) -> str:
                 "head_sha": req.head_sha,
                 "report_sha256": req.report_sha256,
             },
+            # Every directive answers which verb the reviewer wanted since
+            # wanted-01; policy denies one that does not, so a reply that is
+            # meant to be "well-behaved" has to carry it.
+            "wanted_decision": NO_WANTED_DECISION,
         }
     )
 
@@ -378,7 +382,13 @@ def _stamped_push(prompt: str) -> str:
     return (
         "```json\n"
         + json.dumps(
-            {"version": 3, "decision": "push", "reason": "approved", "reviewed": stamp}
+            {
+                "version": 3,
+                "decision": "push",
+                "reason": "approved",
+                "reviewed": stamp,
+                "wanted_decision": NO_WANTED_DECISION,
+            }
         )
         + "\n```"
     )

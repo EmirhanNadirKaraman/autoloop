@@ -135,7 +135,7 @@ from autoloop.blockers import (
     autonomous_recovery,
 )
 from autoloop.config import AutoloopConfig, AutonomyConfig, BrowserConfig
-from autoloop.contract import Decision, Directive
+from autoloop.contract import NO_WANTED_DECISION, Decision, Directive
 from autoloop.errors import StateCorruptError, TaskGraphError
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -614,6 +614,10 @@ class ChangesetWiring:
                 "head_sha": req.head_sha,
                 "report_sha256": req.report_sha256,
             },
+            # Since wanted-01 a directive that does not answer which verb the
+            # reviewer wanted is denied by policy — a "well-behaved" reply
+            # answers it.
+            "wanted_decision": NO_WANTED_DECISION,
         })
 
 
@@ -820,6 +824,7 @@ class PostcommitWiring:
                 "head_sha": req.head_sha,
                 "report_sha256": req.report_sha256,
             },
+            "wanted_decision": NO_WANTED_DECISION,
         })
 
 

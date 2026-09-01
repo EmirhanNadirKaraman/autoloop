@@ -34,6 +34,7 @@ from gitrepo import make_repo_from_template
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import (
     ACTIVE_DECISIONS,
+    NO_WANTED_DECISION,
     RETIRED_DECISIONS,
     CONTRACT_INSTRUCTIONS,
     Decision,
@@ -85,7 +86,21 @@ def ok_validation(argv, **kwargs):
 
 
 def block(obj) -> str:
+    """Deliberately WITHOUT the `wanted_decision` default the other suites'
+    `block` helpers carry: half the tests in this file are parser tests whose
+    claim is that an omitted field still parses. The three reply builders below
+    supply the answer instead, because those drive the loop through the policy
+    gate that requires it."""
     return "Reasoning...\n```json\n" + json.dumps(obj) + "\n```"
+
+
+def answered(data: dict) -> dict:
+    """One reviewer reply, answering the wanted-verb question if it has not
+    already. Since wanted-01 a directive that leaves it unanswered is denied by
+    `policy._check_wanted_decision`, so a fixture that omitted it would test the
+    denial rather than whatever it was written for."""
+    data.setdefault("wanted_decision", NO_WANTED_DECISION)
+    return data
 
 
 def decomp(files=("docs/A.md",)):
@@ -98,13 +113,15 @@ def decomp(files=("docs/A.md",)):
 
 def implement_block(task_id="t1", files=("docs/A.md",)):
     return block(
-        {
-            "version": 3,
-            "decision": "implement",
-            "reason": "next",
-            "task_id": task_id,
-            "decomposition": decomp(files),
-        }
+        answered(
+            {
+                "version": 3,
+                "decision": "implement",
+                "reason": "next",
+                "task_id": task_id,
+                "decomposition": decomp(files),
+            }
+        )
     )
 
 
@@ -117,14 +134,14 @@ def recut_block(task_id="t1", reason="the branch is contaminated", wanted=None):
     }
     if wanted is not None:
         data["wanted_decision"] = wanted
-    return block(data)
+    return block(answered(data))
 
 
 def stop_block(reason="all done", wanted=None):
     data = {"version": 3, "decision": "stop", "reason": reason}
     if wanted is not None:
         data["wanted_decision"] = wanted
-    return block(data)
+    return block(answered(data))
 
 
 class FakeClient:
@@ -475,14 +492,18 @@ def test_a_wanted_decision_naming_a_real_decision_is_kept_verbatim(value):
     assert not isinstance(directive.wanted_decision, Decision)
 
 
-def test_a_blank_wanted_decision_is_rejected():
-    """Optional, never blank: an empty answer to "what would you have used" is
-    worse than no answer, because it counts as an occurrence of nothing."""
-    with pytest.raises(ContractError) as exc:
-        parse_response(block(
-            {"version": 3, "decision": "stop", "reason": "r", "wanted_decision": "  "}
-        ))
-    assert exc.value.code == "missing_field:wanted_decision"
+def test_a_blank_wanted_decision_reads_as_no_answer_rather_than_as_malformed():
+    """It used to raise `missing_field:wanted_decision`, and that stopped being
+    safe the moment wanted-01 asked the question on EVERY reply: a blank is the
+    non-answer a model asked something new is most likely to produce, and a
+    `parse_error` for it spends the parse-retry budget (2, `loop_fatal` on
+    exhaustion) instead of the denial budget. It still counts as an occurrence
+    of nothing — that is exactly why it becomes `None` here and is refused one
+    layer up by `policy._check_wanted_decision`, which explains itself."""
+    directive = parse_response(block(
+        {"version": 3, "decision": "stop", "reason": "r", "wanted_decision": "  "}
+    ))
+    assert directive.wanted_decision is None
 
 
 def test_a_non_string_wanted_decision_is_rejected():
@@ -521,8 +542,9 @@ def test_a_wanted_verb_never_becomes_the_verb_that_is_acted_on(tmp_path, wanted)
     stop: no executor round, no git push, no recut of the live task.
 
     A directive is built by hand rather than parsed, so even a value the parser
-    would refuse (the empty string) is put through `_dispatch` — the claim is
-    about what the dispatcher can do with the field, not about what reaches it.
+    would never produce (the empty string, which it reads as no answer at all)
+    is put through `_dispatch` — the claim is about what the dispatcher can do
+    with the field, not about what reaches it.
     """
     wiring = build(tmp_path, tasks=[ready_task("t1")])
     orch = wiring.orch

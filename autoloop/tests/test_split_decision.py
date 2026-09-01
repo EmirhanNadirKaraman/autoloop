@@ -58,6 +58,7 @@ from autoloop.contract import (
     ACTIVE_DECISIONS,
     CARRIES_TASK_SPECS,
     CONTRACT_INSTRUCTIONS,
+    NO_WANTED_DECISION,
     RETIRED_DECISIONS,
     Decision,
     parse_response,
@@ -119,6 +120,10 @@ def ok_validation(argv, **kwargs):
 
 
 def block(obj) -> str:
+    # See `test_orchestrator.block`: wanted-01 made the field a policy
+    # requirement on every directive, so fixtures answer it by default.
+    obj = dict(obj)
+    obj.setdefault("wanted_decision", NO_WANTED_DECISION)
     return "Reasoning...\n```json\n" + json.dumps(obj) + "\n```"
 
 
