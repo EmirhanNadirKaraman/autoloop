@@ -50,7 +50,7 @@ contains
         {"version": 3, "decision": "push", ...}
 
 A rule that only asked "is the previous line a hook line" would open a message
-there. Three bounds answer it instead, and each is independently sufficient for
+there. Four bounds answer it instead, and each is independently sufficient for
 a different shape:
 
 1. **A role marker starts at column 0** (`_role_marker`). The CLI prints its own
@@ -61,10 +61,14 @@ a different shape:
    is message text, which is what a packet's prose or a pasted log is.
 3. **The echoed prompt is skipped outright when it is found verbatim**
    (`_anchor`). The loop knows what it sent, so it can start reading after it.
+4. **No candidate the prompt CONTAINS is ever returned** (`_is_echoed_text`,
+   applied at `_accept`). Literally, or with both sides squeezed. This is the
+   one that does not depend on the echo being recognisable as an echo, so it is
+   what holds on the round where bound 3 cannot fire at all.
 
 **The anchor is a bound, not a guarantee, and nothing depends on it.** Like
 `quota.strip_echoed_prompt`, it matches the prompt EXACTLY: a codex build that
-re-wraps or truncates its echo defeats it, and when it does, bounds 1 and 2
+re-wraps or truncates its echo defeats it, and when it does, bounds 1, 2 and 4
 still stand and the outcome is a refusal rather than a wrong verdict. It also
 never widens what is read — the region it hands on is a SUFFIX of stdout — and
 it never fires unless a role marker survives it, so it cannot delete the reply.
@@ -79,23 +83,39 @@ reading it would be the echo failure in full: the packet states this round's own
 the head-SHA check) would pass an echoed example of THIS round. That shape
 returns no verdict.
 
-**What is NOT closed, stated rather than implied.** The refusal above needs the
-prompt to be found. A REFLOWED echo (`quota.py` records that these happen) whose
-packet quotes a flush-left transcript, in a round where the reviewer's own
-message is empty, leaves exactly one segment and it is ours. Three conditions at
-once, and the surface is strictly smaller than before this module (which passed
-the whole transcript, echo included, to the parser), but it is not zero. It is
-left open deliberately: the only discriminator available is whether the
-segment's text is contained in the prompt, and that cannot tell an echo from a
-reviewer who copied the example directive the prompt showed it — refusing there
-would break a legitimate reply. `echo_anchor` says `unmatched` on exactly the
-rounds where this applies, so the bound announces when it did not apply.
+**The residual it leaves is closed by a fourth bound, which fails CLOSED.**
+The refusal above needs the prompt to be found. A REFLOWED echo (`quota.py`
+records that these happen) whose packet quotes a flush-left transcript, in a
+round where the reviewer's own message is empty, leaves exactly one segment and
+it is ours — three conditions at once, and `echo_anchor` says `unmatched` on
+every round where they can hold. So no text leaves this module that the prompt
+already contains: `_is_echoed_text` is asked about every candidate at the one
+place a reply is returned (`_accept`), and it compares on `quota._squeeze`'s
+basis as well as literally — the same normalization the classifier uses, for the
+same measured reason, that a literal substring test is exactly what a re-wrapped
+echo defeats.
 
-**Undecorated stdout is passed through unchanged.** When no role marker is
-present at all, this is a build (or a fake) whose stdout is simply the reply,
-which is what every caller got before this module existed. That is a
+The ambiguity is real and is resolved deliberately. A candidate contained in the
+prompt is either an echo or a reviewer that copied the example directive the
+prompt showed it, and nothing available here tells those apart. Both are
+refused, because they are not symmetric: the echo half carries THIS round's own
+`request_id` and `head_sha`, so every downstream stamp gate would accept it and
+an approval nobody made would authorize a push — while refusing a reviewer that
+answered by copying an example costs one resend of a reply that chose nothing.
+The refusal is not silent: the invocation fails with a note saying the reply was
+text this round sent, alongside whatever the anchor did — `unmatched` on the
+reflowed echo it is here for, `matched` on a reviewer that copied the example
+after a verbatim echo, since the check is applied at `_accept` rather than
+conditioned on one anchor state.
+
+**Undecorated stdout is passed through unchanged, unless it is ours.** When no
+role marker is present at all, this is a build (or a fake) whose stdout is simply
+the reply, which is what every caller got before this module existed. That is a
 pass-through, not a guess: the whole text still goes to the contract, and the
-contract still refuses it if it is not exactly one directive.
+contract still refuses it if it is not exactly one directive. It goes through
+`_accept` like any other candidate, so the one text it will not pass through is
+text the prompt already contains — which on this path is the shape that needs it
+most, since the contract reads a lone fenced block wherever it sits.
 
 The one thing the pass-through will not do is carry FURNITURE ONLY. Hook and
 token lines with no role marker anywhere are decoration a build did not label,
@@ -125,6 +145,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+# The prompt-containment comparison, IMPORTED rather than re-implemented. Both
+# guards on this provider must fold the two sides the same way or neither's
+# statement survives the first time one of them moves — and the reason for this
+# particular basis is measured, not stylistic: `quota.py` records a REFLOWED
+# echo defeating a literal substring test against the prompt.
+from .quota import _squeeze
 
 #: The role marker `codex exec` prints on its own line before the assistant's
 #: message. A whole line at COLUMN 0, never a prefix and never indented:
@@ -170,8 +197,8 @@ FROM_NOTHING = "none"
 #:
 #: * `matched`   — the prompt was found verbatim and reading starts after it.
 #: * `unmatched` — the prompt was not echoed verbatim (a build that re-wraps or
-#:   truncates its echo), so reading covers the whole stdout and only the line
-#:   rules exclude the echo.
+#:   truncates its echo), so reading covers the whole stdout and the echo is
+#:   excluded by the line rules and by `_is_echoed_text`, never by position.
 #: * `inert`     — no prompt was supplied, so there was never an echo to find.
 #: * `swallowed` — the prompt was found and EVERY `codex` marker in stdout falls
 #:   inside it. Not a fallback: no verdict, and the invocation fails.
@@ -408,6 +435,85 @@ def _anchor(stdout: str, prompt) -> tuple[str, str]:
     return stdout, ECHO_ANCHOR_UNMATCHED
 
 
+def _is_echoed_text(text: str, prompt) -> bool:
+    """Is this candidate reply the loop's OWN text coming back?
+
+    True when the whole candidate occurs in the prompt — literally, or with both
+    sides reduced by `quota._squeeze` (lower-cased, punctuation and whitespace
+    removed). Two arms because neither covers the other:
+
+    * the SQUEEZED arm carries essentially all of it, and it is why the anchor's
+      failure is no longer a hole: a directive the echo re-wrapped across two
+      lines is contained in the prompt on this basis and on no other. `quota.py`
+      measured that shape — prompt text `quota\\nexceeded` echoed back as
+      `quota exceeded` — as the reason its own comparison is not literal;
+    * the LITERAL arm covers EXACTLY ONE case, stated precisely because an
+      overclaim here would be believed in the wrong place. Squeezing is monotone
+      over containment (`quota.py` states and pins it), so a candidate that is
+      literally inside the prompt and squeezes to something non-empty is caught
+      by the arm above anyway. What is left is a candidate that squeezes to
+      NOTHING — punctuation and whitespace alone — which the `bool(squeezed)`
+      guard below has to exclude, since `"" in anything` is true and would
+      refuse every reply. The literal arm is the compensation for that guard.
+
+    Deliberately ASYMMETRIC with `_anchor`, which matches the prompt exactly.
+    That answers "where does the echo END", and cutting at a place the prompt
+    only approximately occupies would delete a reviewer's words. This answers
+    "is this ours AT ALL", where the generous comparison is the safe direction:
+    a false yes costs one resend, a false no hands the contract a directive the
+    loop wrote itself, stamped for this very round.
+    """
+    if not isinstance(prompt, str) or not prompt.strip() or not text:
+        return False
+    if text in prompt:
+        return True
+    squeezed = _squeeze(text)
+    return bool(squeezed) and squeezed in _squeeze(prompt)
+
+
+def _accept(
+    text: str,
+    source: str,
+    segments: int,
+    chars: int,
+    anchor: str,
+    prompt,
+) -> CodexReply:
+    """The ONE place a reply leaves this module, and the last check on it.
+
+    Every text-carrying return goes through here rather than each testing for
+    itself, because the invariant is worth being able to state in one sentence:
+    `isolate_reply` never returns text whose content occurs in the prompt this
+    invocation sent. A check written three times is three chances to add a
+    fourth return that forgets it.
+
+    A refusal keeps the segment count it was given — `segments: 1` says a
+    message was there and it was ours, which is a different fact from "codex
+    printed nothing" and reads differently in the record.
+    """
+    if _is_echoed_text(text, prompt):
+        return CodexReply(
+            "",
+            FROM_NOTHING,
+            segments,
+            chars,
+            note=(
+                "the only message isolated from stdout is text this round SENT "
+                "— its content occurs in the submitted prompt, so it is an echo "
+                f"of our own packet and not a verdict (prompt echo: {anchor})"
+            ),
+            echo_anchor=anchor,
+        )
+    return CodexReply(
+        text,
+        source,
+        segments,
+        chars,
+        reply_chars=len(text),
+        echo_anchor=anchor,
+    )
+
+
 def isolate_reply(stdout: str, prompt: str = "") -> CodexReply:
     """The reviewer's message in `stdout`, or nothing with a reason why.
 
@@ -417,7 +523,7 @@ def isolate_reply(stdout: str, prompt: str = "") -> CodexReply:
     the prompt back, so passing it is how a caller says which half of the
     transcript is its own; `CodexConversation.submit` does.
 
-    Five outcomes, and only the first two carry text:
+    Six outcomes, and only the first two carry text:
 
     * exactly one `codex` segment — that segment, decoration removed;
     * no `codex` marker at all — the stripped text, unchanged, which is what
@@ -429,7 +535,11 @@ def isolate_reply(stdout: str, prompt: str = "") -> CodexReply:
     * a marker whose segment is empty, nothing on stdout at all, or stdout that
       is furniture and nothing else — no verdict;
     * two or more segments — no verdict, because choosing by position is the
-      rule the contract refuses and this is not the layer to break it in.
+      rule the contract refuses and this is not the layer to break it in;
+    * a candidate from either of the first two whose content occurs in the
+      prompt — no verdict. Both text-carrying outcomes are returned through
+      `_accept`, so this applies whatever the anchor did, and it is what closes
+      the reflowed echo that `_anchor` cannot find.
     """
     raw = stdout if isinstance(stdout, str) else ""
     chars = len(raw)
@@ -484,14 +594,7 @@ def isolate_reply(stdout: str, prompt: str = "") -> CodexReply:
                 ),
                 echo_anchor=anchor,
             )
-        return CodexReply(
-            whole,
-            FROM_WHOLE_STDOUT,
-            0,
-            chars,
-            reply_chars=len(whole),
-            echo_anchor=anchor,
-        )
+        return _accept(whole, FROM_WHOLE_STDOUT, 0, chars, anchor, prompt)
 
     if not segments:
         return CodexReply(
@@ -521,14 +624,7 @@ def isolate_reply(stdout: str, prompt: str = "") -> CodexReply:
             echo_anchor=anchor,
         )
 
-    return CodexReply(
-        segments[0],
-        FROM_SEGMENT,
-        1,
-        chars,
-        reply_chars=len(segments[0]),
-        echo_anchor=anchor,
-    )
+    return _accept(segments[0], FROM_SEGMENT, 1, chars, anchor, prompt)
 
 
 __all__ = [

@@ -1210,7 +1210,7 @@ dashes) — and the adapter hands the contract that and nothing else.
   CLI output — the task that produced this module quotes the captured
   transcript, hook lines and `codex` marker and all, inside its own description.
   Text the loop *sent*, read back as the reviewer's answer, would be an approval
-  nobody gave. **Three bounds** answer it, and each is the answer to a different
+  nobody gave. **Four bounds** answer it, and each is the answer to a different
   shape:
   1. **A role marker starts at column 0.** The CLI prints its markers flush
      left; a quotation is indented, bulleted or diff-prefixed. This is what
@@ -1233,6 +1233,14 @@ dashes) — and the adapter hands the contract that and nothing else.
      directive. `echo_anchor` on the isolation record says which of `matched` /
      `unmatched` / `inert` / `swallowed` happened, rather than leaving it to be
      inferred.
+  4. **No text whose content occurs in the prompt is ever returned.** Every
+     candidate leaves `reply.py` through one function (`_accept`), which refuses
+     it when the prompt contains it — literally, or with both sides reduced by
+     `quota._squeeze` (lower-cased, punctuation and whitespace removed). The
+     squeezed comparison is the load-bearing one and the basis is not a
+     preference: `quota.py` measured a reflowed echo defeating a literal
+     substring test against the prompt. This is the bound that holds when bound
+     3 cannot fire at all.
 
   Where the prompt is found and **every** `codex` marker falls inside it, that
   is a refusal (`swallowed`), never a fallback to reading the whole thing: the
@@ -1240,24 +1248,29 @@ dashes) — and the adapter hands the contract that and nothing else.
   downstream stamp gates would accept it. The gates catch a stale stamp, not our
   own text coming back in the same round.
 
-  **What is not closed.** That refusal needs the prompt to be *found*. A
-  reflowed echo, in a packet quoting a flush-left transcript, in a round whose
-  reviewer message is empty, still leaves one segment and it is ours — three
-  conditions at once, `echo_anchor: unmatched` on every round it could apply to,
-  and a strictly smaller surface than passing the whole transcript to the parser
-  as before. It is left open on purpose: the only discriminator left is whether
-  the reply is contained in the prompt, and that cannot tell an echo from a
-  reviewer who copied the example the prompt showed it.
+  **The round that used to slip through, and what it costs to stop it.** That
+  refusal needs the prompt to be *found*. A reflowed echo, in a packet quoting a
+  flush-left transcript, in a round whose reviewer message is empty, leaves one
+  segment and it is ours — and bound 4 refuses it, `echo_anchor: unmatched`,
+  with `segments: 1` and a note saying the reply was text this round sent. The
+  ambiguity that used to leave this open is real: a candidate contained in the
+  prompt is either an echo or a reviewer that copied the example the packet
+  showed it, and nothing at this seam tells them apart. It is resolved *closed*
+  because the two are not symmetric — refusing a copied example costs one resend
+  of a reply that chose nothing, while accepting an echo authorizes a push
+  nobody approved, stamped for the round that is running.
 * Stdout from which no message can be isolated is a **failed invocation**, never
   a defaulted decision: `submit` returns REJECTED and writes
   `codex_invocation_failed` with a note saying which way it happened — nothing
   on stdout, a marker with no message under it, furniture and nothing else, two
-  messages, or every marker inside the echo.
+  messages, every marker inside the echo, or a message the prompt itself
+  contains.
 
 **Isolation does not mean validation, and this boundary never judges a reply.**
 A reviewer that answers in prose gets its message isolated and then refused by
-the contract, which is right: that draws the corrective re-prompt. Only "no
-message at all" is this layer's failure.
+the contract, which is right: that draws the corrective re-prompt. This layer's
+own failures are only "no message at all" and "the message is one we sent" —
+neither is a judgement about whether a reply is a valid directive.
 
 ### What you will see
 
@@ -1267,7 +1280,8 @@ message at all" is this layer's failure.
                                of them" / "only transcript furniture" /
                                "refusing to choose a verdict by position" /
                                "every codex role marker ... falls inside the
-                               echoed prompt"
+                               echoed prompt" / "the only message isolated from
+                               stdout is text this round SENT"
 
 The isolation record is counts-only on purpose: stdout carries the echoed
 prompt, which is the whole review packet, and the isolated reply already reaches
