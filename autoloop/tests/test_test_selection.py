@@ -591,7 +591,11 @@ FLOOR_AFTER = 16
 #: 105 -> 106 when conc-02 added `test_config_concurrency.py` (2026-09-01),
 #: the DENOMINATOR again: it validates `[concurrency]` from `tmp_path` config
 #: strings and reads no tracker, so 20 and 24 are unchanged once more.
-SUITE_SIZE = 106
+#: 106 -> 107 when conc-05 added `test_lane_state.py` (2026-09-01), the
+#: DENOMINATOR again: it resolves lane paths and lease records under
+#: `tmp_path`, reads no tracker and spawns nothing, so 20 and 24 are unchanged
+#: once more.
+SUITE_SIZE = 107
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
