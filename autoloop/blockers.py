@@ -71,15 +71,24 @@ is feedback, so every one of them is instead returned to the agent as feedback:
 `RECOVER_BY_REVISING` re-dispatches the task with the refusal's own text as the
 `revise` feedback.
 
-THE REPEAT GUARD IS THE HARD PART, not the resend, and it is deliberately TWO
-mechanisms rather than one. The bound is `max_attempts = 1` metered on
-`open_recurrences`, so a second occurrence of the same (task, code) sets the
-task aside whatever it says; `Blocker.refusal_fingerprint` plus
-`BlockerStore.last_refusal_fingerprint` is the second, narrowing lock that
-recognises the SAME refusal even across a closed record. The order matters: the
-fingerprint can only ever set a task aside EARLIER, never license a further
-revise, because refusal text carries commit shas and round numbers and a guard
-that depended on it matching would switch itself off the moment one changed.
+THE REPEAT GUARD IS THE HARD PART, not the resend, and it is metered on the
+REFUSAL rather than on its code. `refusal_identity` digests one refusal's
+(code, question, detail); `BlockerStore.note_refusal_revise` spends that
+identity's single allowance at the moment a revise is issued, and
+`BlockerStore.refusal_revises` counts it back across every record on disk,
+closed ones included. So the SAME complaint arriving again sets the task aside,
+while a genuinely different complaint under the same code is feedback the agent
+has never been given and gets its own revise. That is why the meter is not
+keyed on (task, code): two occurrences of `post_commit_verification_failed` are
+routinely two different faults, and parking the second because the first spent
+the code's allowance would park work that had an answer.
+
+WHAT STOPS A CODE THAT CHURNS ITS TEXT, since the identity meter by itself does
+not: every self-issued revise is dispatched through the ordinary path, so it
+costs one of `MAX_TASK_ATTEMPTS` and one of `policy.max_review_rounds` exactly
+as a reviewer's does — and both ceilings are themselves set-aside codes in
+`EXHAUSTED_BUDGET_RECOVERIES`. A task whose refusals never repeat therefore
+ends at `attempt_count_ceiling`, quarantined, rather than looping.
 """
 
 from __future__ import annotations
@@ -87,7 +96,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -769,12 +778,22 @@ EXHAUSTED_BUDGET_RECOVERIES: dict[str, AutonomousRecovery] = {
 # does not know what to do with it quickly.
 #
 # EVERY ENTRY IS `max_attempts = 1`, and that number is the claim. One revise per
-# (task, code) per open-blocker episode, metered on `BlockerStore.
-# open_recurrences` — which sums across phases, so a refusal that migrates one
-# phase along keeps spending the same allowance rather than buying a second.
-# `review_feedback_unchanged` exists as a code precisely because a reviewer
-# repeating itself is a recognised failure; resending without that bound would
-# convert a park into an infinite loop, which is strictly worse than the park.
+# REFUSAL — per `refusal_identity`, not per (task, code) — metered on
+# `BlockerStore.refusal_revises`, which counts every record on disk and is blind
+# to phase, so the same complaint raised one phase along keeps spending the same
+# allowance rather than buying a second. `review_feedback_unchanged` exists as a
+# code precisely because a reviewer repeating itself is a recognised failure;
+# resending without that bound would convert a park into an infinite loop, which
+# is strictly worse than the park.
+#
+# KEYED ON THE REFUSAL BECAUSE A CODE IS NOT A COMPLAINT.
+# `post_commit_verification_failed` names five different checks and
+# `commit_refused` covers every reason git declined a commit; a second occurrence
+# saying something genuinely different is feedback the agent has never been
+# given, and refusing to hand it over because a sibling fault already spent the
+# code's allowance would park work that had an answer. What that costs is that a
+# code whose text changes every round is not bounded HERE, which is why the three
+# bounds below are load-bearing rather than decorative.
 #
 # THREE FURTHER BOUNDS ALREADY EXIST and are not re-implemented here, because a
 # fourth copy of a limit is a fourth place for it to disagree with itself:
@@ -840,10 +859,11 @@ REFUSED_WORK_RECOVERIES: dict[str, AutonomousRecovery] = {
                 "feedback IS on record and IS quoted in the park text. Returning "
                 "it once, labelled as a refusal rather than as a fresh reviewer "
                 "request, is the one move that can change the outcome. THE "
-                "SHARPEST CASE FOR THE BOUND, and the reason it is metered rather "
-                "than trusted to text: a second unchanged round is the definition "
-                "of this code, and `_revise_feedback_is_unchanged` would catch "
-                "the resend even if the meter did not."
+                "SHARPEST CASE FOR THE BOUND: a second unchanged round is the "
+                "definition of this code, so what arrives the second time is the "
+                "identical refusal — which is exactly what the identity meter "
+                "recognises, and what `_revise_feedback_is_unchanged` would catch "
+                "even if the meter did not."
             ),
         ),
         AutonomousRecovery(
@@ -938,18 +958,24 @@ def refusal_identity(code: str, question: str, detail: str) -> str:
     refusal, and two genuinely different complaints must always be allowed to
     be different.
 
-    **What this is NOT is the bound**, and reading it as one is the fail-open
-    this whole design is written around. Refusal text carries commit shas and
-    round numbers — `post_commit_verification_failed` names both — so two
-    occurrences of the identical fault routinely produce different digests. A
-    guard that only fired on a match would therefore switch itself off exactly
-    where it is needed. The bound is `max_attempts = 1` on the recurrence meter;
-    this digest can only ever set a task aside EARLIER than that, which is why it
-    is safe for it to be exact.
+    **This IS the repeat guard's key**, and its exactness is the point: the
+    guard has to distinguish "the loop is saying the same thing again", which is
+    a loop and must stop, from "the loop is saying something new", which is
+    feedback the agent has never been given. A fuzzy digest would silently
+    collapse the second case into the first and park work that had an answer.
 
-    Returns `""` for a refusal with no text at all, which
-    `last_refusal_fingerprint` and its one caller both read as "no identity to
-    compare", never as "these two match".
+    What it deliberately does NOT bound is a code whose text changes every
+    round — `post_commit_verification_failed` names a commit sha, so two
+    occurrences of the same underlying fault can digest differently. That case
+    is bounded elsewhere and on purpose: every self-issued revise costs an
+    attempt from `MAX_TASK_ATTEMPTS` and a round from `policy.max_review_rounds`,
+    both of which end in a set-aside code. Widening this digest to cover it would
+    trade a bounded churn for a guard that cannot tell two faults apart.
+
+    Returns `""` for a refusal with no text at all, which `refusal_revises` and
+    `orchestrator._refusal_revise_budget` both read as "no identity to meter" —
+    the textless refusal is refused outright rather than revised, so `""` can
+    never be stored and two absences can never read as a match.
     """
     normalised = " ".join(f"{code}\n{question}\n{detail}".split()).strip().lower()
     if not normalised or normalised == code.strip().lower():
@@ -1002,19 +1028,20 @@ class Blocker:
     #: to clear a dead blocker would forge exactly the operator confirmation
     #: `_RESOLUTION_PRECONDITIONS` exists to require.
     archived_reason: str = ""
-    #: `refusal_identity` of the refusal this record was written for, or `""`
-    #: (halt-04). Written only for the codes in `REFUSED_WORK_RECOVERIES`, and
-    #: read only by `last_refusal_fingerprint` — the repeat guard's memory of
-    #: WHICH refusal this was, so the same one arriving again is recognisable
-    #: after the record it was first written on has been closed.
+    #: Every `refusal_identity` this record has already been answered with a
+    #: self-issued `revise` (halt-04) — the repeat guard's memory, and the only
+    #: thing `refusal_revises` counts. Appended by `note_refusal_revise` at the
+    #: moment the loop commits to a revise, never on a park that merely happened,
+    #: so it records ACTIONS THE LOOP TOOK rather than occurrences it saw.
     #:
     #: Persisted on the blocker rather than on the execution record because a
     #: refusal is not always about a task that HAS one (`approved_paths_missing`
     #: is raised before any record exists) and because the blocker is the record
     #: that already survives a set-aside deleting the session file. Empty on
-    #: every record written before this field existed, which `load` supplies by
-    #: default and every reader treats as "no identity to compare".
-    refusal_fingerprint: str = ""
+    #: every record written before this field existed and on every code
+    #: autonomous mode does not answer with a revise, which `load` supplies by
+    #: default and `refusal_revises` reads as "nothing spent here".
+    revised_refusals: list[str] = field(default_factory=list)
 
 
 #: Severity rank for primary selection — LOWER is more urgent. `loop_fatal`
@@ -1118,9 +1145,24 @@ class BlockerStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return Blocker(**data)
+            blocker = Blocker(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(f"blocker record {path} is unreadable: {exc}") from exc
+        # halt-04: the meter's own field is type-checked once, here, rather than
+        # at every read. `refusal_revises` calls `.count` on it, and a
+        # hand-edited `revised_refusals` that is a string would count SUBSTRINGS
+        # while one that is `null` would raise an AttributeError out of a park
+        # handler. Either way the honest answer is the one this module gives
+        # everywhere else: a record we cannot read is not a record that says
+        # nothing was spent.
+        if not isinstance(blocker.revised_refusals, list) or not all(
+            isinstance(entry, str) for entry in blocker.revised_refusals
+        ):
+            raise StateCorruptError(
+                f"blocker record {path} is unreadable: `revised_refusals` is not "
+                "a list of refusal identities"
+            )
+        return blocker
 
     def next_id(self, task_id: str) -> str:
         """`f"blk-{task_id}-{n:03d}"` for the next free `n` — scans existing
@@ -1148,16 +1190,22 @@ class BlockerStore:
         return None
 
     def record(self, *, task_id, kind, code, question, detail, phase, now,
-               session_id: str = "", refusal_fingerprint: str = "") -> "Blocker":
+               session_id: str = "") -> "Blocker":
         """Idempotent upsert. Returns the existing open blocker for this
         condition with its recurrence count bumped, or a new one.
 
-        `refusal_fingerprint` is halt-04's, and an EMPTY one never erases a
-        stored one: every caller but the refused-work path passes nothing, and a
-        bump that blanked the field would delete the repeat guard's memory of an
-        episode while claiming to update it. A non-empty one always wins, because
-        the newest refusal is the one the NEXT occurrence has to be compared
-        against.
+        Deliberately does NOT touch `revised_refusals`: this method records that
+        a fault was SEEN, and the repeat guard meters what the loop DID about it
+        (`note_refusal_revise`). `replace` carries the field over unnamed, which
+        is what keeps a bump from blanking the guard's memory of an episode while
+        claiming to update it.
+
+        WHAT `replace` CARRIES OVER IS THE LIST OBJECT, not a copy — `bumped` and
+        `existing` share one. That is why `note_refusal_revise` REBINDS the field
+        to a new list rather than appending to it, and why anything else writing
+        this field must do the same: an in-place `.append` here would write
+        through both records at once, and through whichever other record a caller
+        still holds.
         """
         existing = self.find_open(task_id, code, phase)
         if existing is not None:
@@ -1168,7 +1216,6 @@ class BlockerStore:
                 last_seen_at=now,
                 question=question,
                 detail=detail,
-                refusal_fingerprint=refusal_fingerprint or existing.refusal_fingerprint,
             )
             self.save(bumped)
             return bumped
@@ -1176,44 +1223,71 @@ class BlockerStore:
             id=self.next_id(task_id), task_id=task_id, kind=kind, code=code,
             question=question, detail=detail, phase=phase, created_at=now,
             last_seen_at=now, session_id=session_id,
-            refusal_fingerprint=refusal_fingerprint,
         )
         self.save(fresh)
         return fresh
 
-    def last_refusal_fingerprint(self, task_id: str, code: str) -> str:
-        """The most recent `refusal_identity` recorded for this (task, code),
-        or `""` when none was ever recorded (halt-04).
+    def note_refusal_revise(self, blocker_id: str, fingerprint: str) -> "Blocker":
+        """Spend this refusal identity's one revise allowance, on this record
+        (halt-04). THE ONLY WRITER of `Blocker.revised_refusals`.
 
-        **Deliberately blind to whether the record is open**, which is the whole
-        reason this is not read off `find_open`. An autonomous revise leaves its
-        blocker OPEN on purpose, but a record can be closed by an operator
-        answering it, by `archive_stale` when its session is retired, or by
-        `close_recovered` after some other retry — and a guard that forgot the
-        refusal at that moment would hand the identical refusal a fresh
-        allowance. Every record on disk is therefore in scope.
+        Called at the moment the loop COMMITS to a self-issued revise — before
+        the round is queued, never after it returns. A process that dies between
+        the two leaves the attempt spent and the round unrun, which is the safe
+        direction: the next occurrence of that refusal is set aside rather than
+        revised a second time. The reverse order would let a crash refund an
+        attempt the loop had already decided to make.
 
-        Blind to PHASE too, exactly like `open_recurrences` and for the same
-        reason: the same fault raised one phase along is the same fault, and
-        keying the memory on phase would buy it a second life.
+        An EMPTY fingerprint RAISES rather than being appended. `refusal_identity`
+        returns `""` for a refusal with no text, and a stored `""` would be a
+        meter entry that every other textless refusal matched — a task set aside
+        on two absences rather than on a repeat. Its one caller refuses a
+        textless refusal a step earlier, so reaching here with one is a bug and
+        is reported as one.
+        """
+        if not fingerprint:
+            raise StateError("a refusal with no identity cannot be metered")
+        blocker = self.load(blocker_id)
+        if blocker is None:
+            raise StateError(f"no blocker with id '{blocker_id}'")
+        blocker.revised_refusals = [*blocker.revised_refusals, fingerprint]
+        self.save(blocker)
+        return blocker
 
-        Scans backwards for the most recent NON-EMPTY fingerprint rather than
-        taking the last record's field verbatim. Records written before this
-        field existed carry `""`, and letting one of those hide an older,
-        genuine identity would be the fail-open direction — this way an
-        unfingerprinted record is transparent rather than amnesic, and the guard
-        can only ever fire more often.
+    def refusal_revises(self, task_id: str, fingerprint: str) -> int:
+        """How many self-issued revises this task has already been given for THIS
+        refusal identity — halt-04's meter, read by
+        `orchestrator._refusal_revise_budget`.
+
+        Keyed on the refusal rather than on its code, which is the whole of the
+        repeat guard: the same complaint twice is a loop and must stop, while a
+        different complaint under the same code is feedback the agent has never
+        been given. `refusal_identity` folds the code into the digest already, so
+        this is blind to code and to phase without needing to be told either —
+        the same phase-blindness `open_recurrences` has, and for the same reason.
+
+        **Counts CLOSED records as well as open ones.** An operator answering the
+        blocker, `archive_stale` retiring its session and `close_recovered` all
+        end the episode, and a meter that forgot the attempt at that moment would
+        hand the identical refusal a fresh allowance every time a record went
+        away. Nothing in this package deletes a blocker record, so the memory is
+        permanent by construction rather than by a record being left open.
+
+        An empty `fingerprint` counts NOTHING and returns 0 — `""` may never
+        match `""`. Its caller refuses a textless refusal outright rather than
+        metering it, so that 0 can never license one.
 
         Reads through `all_blockers`, so a corrupt record RAISES rather than
-        reading as "nothing recorded", which would license a revise on evidence
-        that could not be read.
+        reading as "nothing spent", which would be the fail-open answer: a
+        further revise licensed by evidence that could not be read.
         """
-        for blocker in reversed(self.all_blockers()):
-            if (blocker.task_id, blocker.code) != (task_id, code):
-                continue
-            if blocker.refusal_fingerprint:
-                return blocker.refusal_fingerprint
-        return ""
+        if not fingerprint:
+            return 0
+        return sum(
+            blocker.revised_refusals.count(fingerprint)
+            for blocker in self.all_blockers()
+            if blocker.task_id == task_id
+        )
 
     def archive_stale(self, blocker_id: str, reason: str) -> "Blocker":
         """Close a blocker that belongs to a RETIRED session, recording a
