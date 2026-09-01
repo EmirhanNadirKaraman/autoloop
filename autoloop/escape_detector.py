@@ -21,6 +21,21 @@ the scope did not. This is the same argument port-01 (2026-08-23) made when it
 moved the loop's writable STATE out of the observed tree, applied one level up
 to the tree itself.
 
+ONE OBSERVED TREE PER LANE (conc-04, 2026-09-01), and still nothing in this
+module names one. The split plan's Decision 1 (docs/AUTOLOOP.md) makes the
+clone per LANE rather than per loop, because `ObservedCheckout.synchronize`
+rewrites a whole working tree: with lanes sharing one clone, lane B moving to
+its own commit inside lane A's window would show up here as every path in the
+repository having changed — a true report, attributed to the wrong agent, and
+loop-fatal on the first round two lanes overlapped. So each lane brackets its
+own tree (`config.lane_observed_checkout`, checked against every sibling by
+`worker_env.validate_lane_observed_checkouts`), lane 0 keeps the configured
+path exactly, and a single-lane deployment is bracketing the same tree it
+always did. The residual this buys, recorded rather than papered over: a write
+by lane A into lane B's clone is still DETECTED — B's window brackets it — and
+is attributed to B. The bound on it is the FETCH_HEAD argument below, one lane
+over instead of one operator over.
+
 READ THIS BEFORE TRUSTING IT. This module is an ESCAPE DETECTOR, not an OS
 security sandbox. It does not stop a write-capable agent from touching
 anything on disk — nothing here has that power, because the agent runs as an

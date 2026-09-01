@@ -588,7 +588,10 @@ FLOOR_AFTER = 16
 #: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01). The
 #: DENOMINATOR again: it fakes the invocation boundary rather than spawning
 #: one, and reads no tracker, so 20 and 24 are unchanged once more.
-SUITE_SIZE = 105
+#: 105 -> 106 when conc-04 added `test_lane_observed_checkouts.py`
+#: (2026-09-01), for the same reason once more: it builds real repositories
+#: but spawns no interpreter and reads no tracker, so 20 and 24 hold.
+SUITE_SIZE = 106
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
