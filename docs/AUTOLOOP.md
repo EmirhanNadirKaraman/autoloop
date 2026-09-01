@@ -1169,3 +1169,146 @@ candidate rather than the test.
   from.
 * **A provider with a shared conversation.** Every codex turn is its own
   subprocess, so nothing here designs around one.
+
+---
+
+## What the codex CLI actually prints, and where the verdict comes from
+
+**`codex exec` stdout is a rendered transcript, not a reply.** Captured on this
+machine on 2026-08-17, one review turn came back as a separator rule, a `user`
+role marker with the prompt echoed under it, four `hook:` lines, a `codex` role
+marker with the answer under it, two more `hook:` lines, `tokens used`, a count
+— and then the answer A SECOND TIME as the run's closing summary. The adapter
+did `reply = result.stdout.strip()` and handed the whole of that to the
+contract, which answered
+
+    ContractError: invalid_json: the reply is not exactly one JSON value
+
+so the `codex_cli` provider could not return a verdict at all.
+
+**The contract was not the thing that was wrong.** It refuses prose plus a bare
+object, and it refuses a second object, deliberately: with a directive that can
+authorize a commit or a push, "guess which one they meant" is not an acceptable
+rule, and two identical objects today are two *different* objects the first day
+a hook prints something unexpected. Nothing about it was relaxed. What changed
+is the input it is given: `autoloop/codex/reply.py` isolates the reviewer's own
+message — the lines after a `codex` marker, up to the first line of transcript
+furniture (another role marker, a `hook:` line, `tokens used`, or a rule of
+dashes) — and the adapter hands the contract that and nothing else.
+
+**Three things follow, and they are the operational shape of it.**
+
+* The trailing duplicate is excluded *structurally*: it sits after `tokens
+  used`, which closes the message. This is not "take the last object" and not
+  "de-duplicate identical objects" — the first is the position rule the contract
+  refuses, and the second reads two copies that happen to agree as agreement.
+* The echoed prompt is excluded too, and that is the half that matters most —
+  but "the segment after the `codex` marker" does not do it on its own. The
+  prompt comes back under the `user` marker, and the prompt is the review
+  packet: the response contract, an example directive, the task text, the diff,
+  the agent's report. This loop maintains itself, so its packets quote its own
+  CLI output — the task that produced this module quotes the captured
+  transcript, hook lines and `codex` marker and all, inside its own description.
+  Text the loop *sent*, read back as the reviewer's answer, would be an approval
+  nobody gave. **Four bounds** answer it, and each is the answer to a different
+  shape:
+  1. **A role marker starts at column 0.** The CLI prints its markers flush
+     left; a quotation is indented, bulleted or diff-prefixed. This is what
+     excludes the shape above. The cost: a build that indents or timestamps its
+     markers yields no verdict at all here — fail-closed, with a record.
+  2. **A role marker opens a turn only at a turn boundary** — at the start, or
+     after furniture. Mid-message, `codex` on a line is message text, which is
+     what a packet's prose is. The cost: a build that prints no hook line and no
+     rule between the prompt and the answer loses the marker, which the third
+     bound then resolves.
+  3. **The echoed prompt is skipped outright when it is found verbatim.** The
+     loop knows what it sent, so `submit` passes the final prompt down and
+     reading starts after the echo. It matches *exactly*, like
+     `quota.strip_echoed_prompt`, so a reflowed echo defeats it and nothing
+     depends on it not doing so; the region it hands on is always a suffix of
+     stdout. It applies to the undecorated pass-through as well, which is where
+     it is least obviously needed and most quietly needed: with no marker
+     anywhere the whole text reaches the contract, and the contract takes a lone
+     fenced block wherever it sits — so an echoed *example* would be the
+     directive. `echo_anchor` on the isolation record says which of `matched` /
+     `unmatched` / `inert` / `swallowed` happened, rather than leaving it to be
+     inferred.
+  4. **No text whose content occurs in the prompt is ever returned.** Every
+     candidate leaves `reply.py` through one function (`_accept`), which refuses
+     it when the prompt contains it — literally, or with both sides reduced by
+     `quota._squeeze` (lower-cased, punctuation and whitespace removed). The
+     squeezed comparison is the load-bearing one and the basis is not a
+     preference: `quota.py` measured a reflowed echo defeating a literal
+     substring test against the prompt. This is the bound that holds when bound
+     3 cannot fire at all.
+
+  Where the prompt is found and **every** `codex` marker falls inside it, that
+  is a refusal (`swallowed`), never a fallback to reading the whole thing: the
+  echoed example carries *this* round's own `request_id` and `head_sha`, so the
+  downstream stamp gates would accept it. The gates catch a stale stamp, not our
+  own text coming back in the same round.
+
+  **The round that used to slip through, and what it costs to stop it.** That
+  refusal needs the prompt to be *found*. A reflowed echo, in a packet quoting a
+  flush-left transcript, in a round whose reviewer message is empty, leaves one
+  segment and it is ours — and bound 4 refuses it, `echo_anchor: unmatched`,
+  with `segments: 1` and a note saying the reply was text this round sent. The
+  ambiguity that used to leave this open is real: a candidate contained in the
+  prompt is either an echo or a reviewer that copied the example the packet
+  showed it, and nothing at this seam tells them apart. It is resolved *closed*
+  because the two are not symmetric — refusing a copied example costs one resend
+  of a reply that chose nothing, while accepting an echo authorizes a push
+  nobody approved, stamped for the round that is running.
+* Stdout from which no message can be isolated is a **failed invocation**, never
+  a defaulted decision: `submit` returns REJECTED and writes
+  `codex_invocation_failed` with a note saying which way it happened — nothing
+  on stdout, a marker with no message under it, furniture and nothing else, two
+  messages, every marker inside the echo, or a message the prompt itself
+  contains.
+
+**Isolation does not mean validation, and this boundary never judges a reply.**
+A reviewer that answers in prose gets its message isolated and then refused by
+the contract, which is right: that draws the corrective re-prompt. This layer's
+own failures are only "no message at all" and "the message is one we sent" —
+neither is a judgement about whether a reply is a valid directive.
+
+### What you will see
+
+    codex_reply_isolated       counts only — segments, stdout_chars, reply_chars,
+                               echo_anchor (matched/unmatched/inert/swallowed)
+    codex_invocation_failed    note: "no reply on stdout" / "no message under any
+                               of them" / "only transcript furniture" /
+                               "refusing to choose a verdict by position" /
+                               "every codex role marker ... falls inside the
+                               echoed prompt" / "the only message isolated from
+                               stdout is text this round SENT"
+
+The isolation record is counts-only on purpose: stdout carries the echoed
+prompt, which is the whole review packet, and the isolated reply already reaches
+the transcript in full under `response_received.raw`. It exists at all because a
+rule that silently discards output cannot be told apart from a rule that never
+fired — the same reason `quota.py` records `suppressed_patterns`.
+
+### Three alternatives, and why none of them was taken
+
+* **Ask codex for a fenced ```json block and extract the fence.** The contract's
+  canonical form, and it would work — when the model complies. It is a rule
+  enforced by prose in a prompt, so the round it is not followed is the round
+  there is no verdict, and the prompt already says "your ENTIRE reply is exactly
+  one fenced JSON block" and still produced the output above. A transport
+  guarantee that depends on model compliance is not a transport guarantee.
+* **Run codex with hooks disabled, or in a machine-readable output mode.** This
+  would remove the decoration at the source, which is better than parsing it —
+  if the flags exist. They are not verifiable from this repository, they are a
+  property of a CLI version rather than of the loop, and the hook lines here
+  come from the operator's own codex configuration. Configured `sandbox_args`
+  already pass through, so an operator who has such a flag can add it, and this
+  boundary keeps working either way: undecorated stdout is passed through
+  unchanged.
+* **Hand the parser everything and let it refuse the ambiguous cases.** Refusal
+  is the contract's job, but the *budget* is wrong. A parse failure spends
+  `policy.max_parse_retries` (2) and parks the loop `parse_budget_exhausted`,
+  which is loop_fatal. A rejected invocation is bounded at one resend and then a
+  park (`orchestrator._step_submission_rejected`), and it says in its own record
+  that the CLI printed two messages — which is an operator's problem, not a
+  reviewer's, and re-prompting the reviewer about it would fix nothing.
