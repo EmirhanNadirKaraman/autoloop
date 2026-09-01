@@ -22,6 +22,15 @@ literally `state.json` at today's path; two processes cannot enter one lane.**
    `os.getpid()`, which is unquestionably alive, or the boot ordering is
    never exercised — and anything unreadable refuses rather than reading as a
    free lane.
+4. **And the run that really runs a lane is the one holding it.** Section 6
+   drives `cli._cmd_run` itself — the real fleet lock, the real startup sweep,
+   the real `_run_locked`, only the phase machine doubled — and section 7
+   drives `cli._run_continuous`, the loop `_cmd_run` hands the lane to, because
+   a mechanism nothing acquires excludes nobody. The second entrant there is
+   `cli._LaneEntry`, the same object the run entered with, and NOT a second
+   `_cmd_run`: two of those can never reach a lease, since the fleet lock
+   refuses the second first. Under the plan the two entrants of one lane are
+   two lanes behind ONE supervisor holding ONE fleet lock, which is this shape.
 
 No git repository, no subprocess and no agent: every claim here is about a path,
 a small JSON file and a predicate. The one place a real process is needed is
@@ -41,11 +50,29 @@ import pytest
 
 from autoloop import cli
 from autoloop import lock as lock_module
-from autoloop.config import AutoloopConfig, BrowserConfig, lane_id
+from autoloop.auto_merge import (
+    UPGRADE_EXEC_FAILED,
+    UPGRADE_PENDING,
+    PendingUpgrade,
+    UpgradeStore,
+)
+from autoloop.config import (
+    AutoloopConfig,
+    BrowserConfig,
+    ConcurrencyConfig,
+    lane_id,
+)
 from autoloop.errors import LockHeldError, StaleLockError, StateCorruptError
-from autoloop.lock import LOCK_FILENAME, LaneLease, LaneLeaseInfo, LockInfo, LoopLock
+from autoloop.lock import (
+    EXEC_HANDOFF_TOKEN_ENV,
+    LOCK_FILENAME,
+    LaneLease,
+    LaneLeaseInfo,
+    LockInfo,
+    LoopLock,
+)
 from autoloop.manifest import ManifestStore
-from autoloop.orchestrator import Orchestrator
+from autoloop.orchestrator import SELF_UPGRADE, Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import (
     LANE_LEASE_SUFFIX,
@@ -63,14 +90,23 @@ from autoloop.transcript import TranscriptLogger
 
 URL = "https://chatgpt.com/c/lane-state-test"
 
+#: The tree this process imports `autoloop` from, which is what a self-upgrade
+#: record has to name to be APPLICABLE (`cli._package_root`). Spelled the same
+#: way `test_self_upgrade.REPO_ROOT` spells it.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-def make_config(tmp_path: Path) -> AutoloopConfig:
+
+def make_config(tmp_path: Path, lanes: int = 1) -> AutoloopConfig:
     """The cheapest real config: `state_dir` is all these claims read, and
-    `workers_root` is optional. Same shape as `test_stop_livelock.make_config`."""
+    `workers_root` is optional. Same shape as `test_stop_livelock.make_config`.
+
+    `lanes` defaults to 1 — the deployment every existing caller here means, and
+    the one where no lease is ever asked for."""
     return AutoloopConfig(
         browser=BrowserConfig(conversation_url=URL),
         policy=PolicyConfig(),
         state_dir=tmp_path / ".al",
+        concurrency=ConcurrencyConfig(lanes=lanes),
     )
 
 
@@ -395,6 +431,36 @@ def test_an_absent_lease_is_a_free_lane_and_a_removed_one_is_too(tmp_path):
     assert lease.path.exists()
 
 
+@pytest.mark.parametrize("call", ["write", "fsync"])
+def test_a_write_that_fails_takes_its_own_lease_back_off_disk(tmp_path, monkeypatch, call):
+    """An ENOSPC between the `O_EXCL` and the record must not strand the lane.
+
+    The file exists at that point but says nothing, so every later reader —
+    `read`, `acquire`, `break_stale` — refuses it forever, which is a lane
+    closed by an ordinary I/O error with no process in it. Removing it is the
+    ONE unlink in this class that does not read the record first, and it is safe
+    for the reason no other one is: `O_CREAT|O_EXCL` has just proved this call
+    created the file, so there is no incumbent to steal from.
+
+    The raise still propagates — a caller that could not write its lease is not
+    in the lane — and the lane is enterable again immediately, which is the half
+    that says nothing was left behind.
+    """
+    lease = LaneLease(tmp_path, 1)
+
+    def boom(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lock_module.os, call, boom)
+
+    with pytest.raises(OSError):
+        lease.acquire()
+
+    assert not lease.path.exists(), "an unreadable lease was left in the lane"
+    monkeypatch.undo()
+    assert LaneLease(tmp_path, 1).acquire().read().pid == os.getpid()
+
+
 def test_release_removes_only_a_lease_this_process_still_owns(tmp_path):
     """`LoopLock.release`'s rule, for its reason: a lease somebody else has
     since recovered must not be deleted by the process that used to hold it."""
@@ -502,3 +568,327 @@ def test_an_orchestrator_is_lane_zero_unless_told_otherwise(tmp_path):
 def test_an_orchestrator_refuses_an_index_that_is_not_a_lane(tmp_path, index):
     with pytest.raises(ValueError):
         build_orchestrator(tmp_path, lane_index=index)
+
+
+# ---- 6. the run that runs a lane is the one holding it -----------------------
+
+
+def run_args() -> argparse.Namespace:
+    """What `_cmd_run` -> `_run_locked` reads: one ordinary round, no operator
+    flags. `--continuous` is off, because the single-round path is the shorter
+    of the two through the same `_LaneEntry` in `_cmd_run`."""
+    return argparse.Namespace(
+        config=None,
+        continuous=False,
+        max_steps=None,
+        kickoff=None,
+        kickoff_audit=False,
+        answer=None,
+        retry=False,
+        resubmit=False,
+    )
+
+
+class LaneWork:
+    """Stands in for the phase machine, and for nothing else.
+
+    `cli._cmd_run` and `cli._run_locked` are the REAL ones in every test below:
+    the config is loaded, the fleet lock taken and released, the startup sweep
+    run, the state and registry loaded, the summary printed, the heartbeat
+    published. Only the orchestrator is doubled — and its `run()` is the one
+    instant "while this lane is working" exists in, which is where a second
+    entrant has to be refused.
+    """
+
+    def __init__(self, state: LoopState, during):
+        self.state = state
+        self.steps_taken = 0
+        self._during = during
+
+    def run(self, max_steps=None) -> str:
+        self._during()
+        return Phase.STOPPED.value
+
+    def decline_self_upgrade(self, sha) -> bool:  # pragma: no cover - no boundary
+        return False
+
+
+def drive_a_run(root: Path, monkeypatch, lanes: int, during) -> AutoloopConfig:
+    """One real `run` over a real state dir, calling `during(config)` while the
+    lane's work is in flight. Returns the config it ran against."""
+    config = make_config(root, lanes=lanes)
+    StateStore(config.state_file).save(a_state("lane-wiring"))
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        cli,
+        "_build_orchestrator",
+        lambda cfg, args, store, state, task_store, registry: LaneWork(
+            state, lambda: during(cfg)
+        ),
+    )
+
+    assert cli._cmd_run(run_args()) == 0
+
+    return config
+
+
+def test_a_run_at_two_lanes_refuses_a_second_entrant_to_its_lane(tmp_path, monkeypatch):
+    """THE third part of the claim, through the code that really runs a lane.
+
+    The second entrant is `cli._LaneEntry` — the same object `_cmd_run` entered
+    the lane with — and deliberately not a second `_cmd_run`: two of those can
+    never reach a lease at all, because the fleet lock refuses the second one
+    first. Under docs/AUTOLOOP.md's "Decision 2" the two entrants of one lane
+    are two lanes behind ONE supervisor holding ONE fleet lock, and this is that
+    shape with the supervisor's second entry made by hand.
+
+    The refusal is checked to name the LEASE. A test that accepted any
+    `LockHeldError` here would pass just as happily on the fleet lock's, and
+    would be proving an exclusion that has existed since before lanes did.
+    """
+    seen: dict = {}
+
+    def second_attempt(config):
+        lease_path = lane_paths(config.state_dir, 0).lease_file
+        seen["held"] = json.loads(lease_path.read_text(encoding="utf-8"))
+        with pytest.raises(LockHeldError) as excinfo:
+            with cli._LaneEntry(config):
+                seen["entered"] = True
+        seen["refusal"] = str(excinfo.value)
+        seen["survivor"] = json.loads(lease_path.read_text(encoding="utf-8"))
+
+    config = drive_a_run(tmp_path, monkeypatch, 2, second_attempt)
+    lease_path = lane_paths(config.state_dir, 0).lease_file
+
+    assert "entered" not in seen, "a second process got into an occupied lane"
+    assert seen["held"]["pid"] == os.getpid()
+    assert seen["held"]["lane_id"] == lane_id(0)
+    assert lane_id(0) in seen["refusal"]
+    assert str(lease_path) in seen["refusal"], "the refusal must name the lease"
+    assert str(config.state_dir / LOCK_FILENAME) not in seen["refusal"], (
+        "a refusal naming the fleet lock would mean this passed on the wrong "
+        "exclusion — the fleet lock refuses a second PROCESS, never a second "
+        "entry to one lane behind one holder of it"
+    )
+    assert seen["survivor"]["run_id"] == seen["held"]["run_id"], (
+        "and the incumbent's own lease is untouched by the refusal"
+    )
+    assert not lease_path.exists(), "the lane is released when the run ends"
+
+
+def test_one_lane_adds_nothing_to_the_state_dir_that_two_lanes_do_not(
+    tmp_path, monkeypatch
+):
+    """THE acceptance criterion, through the production path, as a DIFFERENCE.
+
+    Two identical runs over two identical state dirs, one at `lanes = 1` and one
+    at `lanes = 2`, listed at the same instant — while the lane's work is in
+    flight, which is the only moment a lease exists at all. Everything a run
+    writes cancels out, so what is left is exactly what having lanes adds: one
+    lease file, and at one lane not even that.
+    """
+    listings: dict[int, list[str]] = {}
+
+    def listing_at(lanes):
+        def during(config):
+            listings[lanes] = sorted(p.name for p in config.state_dir.iterdir())
+        return during
+
+    one = drive_a_run(tmp_path / "one", monkeypatch, 1, listing_at(1))
+    two = drive_a_run(tmp_path / "two", monkeypatch, 2, listing_at(2))
+
+    assert set(listings[2]) - set(listings[1]) == {f"{lane_id(0)}{LANE_LEASE_SUFFIX}"}
+    assert set(listings[1]) - set(listings[2]) == set()
+    assert not any(name.endswith(LANE_LEASE_SUFFIX) for name in listings[1])
+    assert STATE_FILENAME in listings[1] and LOCK_FILENAME in listings[1], (
+        "the single-lane run really did take the fleet lock and write literally "
+        "state.json — otherwise the difference above is a difference between "
+        "two runs that did nothing"
+    )
+    for config in (one, two):
+        assert not any(
+            p.name.endswith(LANE_LEASE_SUFFIX) for p in config.state_dir.iterdir()
+        ), "nothing is left behind after either run"
+        assert not (config.state_dir / LANES_DIRNAME).exists()
+
+
+def test_at_one_lane_the_entry_holds_nothing_and_still_answers_every_verb(tmp_path):
+    """The gate itself. At one lane there is no lease to release for a handoff
+    and none to take back, so both verbs are no-ops that answer as if the lane
+    were held — a caller must not have to know which deployment it is in."""
+    entry = cli._LaneEntry(make_config(tmp_path, lanes=1))
+
+    with entry as entered:
+        assert entered is entry
+        assert entry.enabled is False
+        assert entry.lease is None
+        assert entry.release_for_handoff() is True
+        entry.reenter_after_handoff()
+        assert entry.lease is None
+
+    assert not (tmp_path / ".al").exists(), "not so much as a directory was made"
+
+
+# ---- 7. the lane and the self-upgrade handoff --------------------------------
+
+
+def upgrade_config(root: Path, lanes: int = 2) -> AutoloopConfig:
+    """A config with a pending upgrade naming the tree this process really
+    imports from — which is what makes the boundary APPLICABLE rather than
+    answered `unapplicable` before it reaches the handoff."""
+    config = make_config(root, lanes=lanes)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    UpgradeStore(config.pending_upgrade_file).save(
+        PendingUpgrade(
+            base_sha="b" * 40,
+            previous_base_sha="a" * 40,
+            candidate_sha="c" * 40,
+            task_id="conc-05",
+            repo_root=str(REPO_ROOT),
+            paths=["autoloop/lock.py"],
+            status=UPGRADE_PENDING,
+            recorded_at=utcnow_iso(),
+        )
+    )
+    return config
+
+
+def upgrade_details(config) -> list[str]:
+    """The `detail` of every `self_upgrade_exec_failed` entry in the
+    transcript — a boundary that ends in silence is the one shape this path
+    exists to prevent, so the outcome is read from the log rather than only from
+    the return value."""
+    path = config.transcript_file
+    if not path.exists():
+        return []
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [
+        r["data"].get("detail", "")
+        for r in rows
+        if r["type"] == f"self_upgrade_{UPGRADE_EXEC_FAILED}"
+    ]
+
+
+class StopTheLoop(Exception):
+    """Ends `_run_continuous` from inside iteration two — reaching it at all is
+    half the assertion, since a boundary that killed the loop would not."""
+
+
+class BoundaryThenStop:
+    """Offers the self-upgrade boundary once, then ends the run.
+
+    The round counter is SHARED rather than an attribute: `_run_continuous`
+    rebuilds the orchestrator every iteration, so a per-object counter would
+    reset and offer the boundary forever.
+    """
+
+    def __init__(self, state: LoopState, rounds: list):
+        self.state = state
+        self.steps_taken = 0
+        self._rounds = rounds
+
+    def run(self, *_args, **_kwargs) -> str:
+        self._rounds.append(len(self._rounds))
+        if len(self._rounds) >= 2:
+            raise StopTheLoop()
+        return SELF_UPGRADE
+
+    def decline_self_upgrade(self, sha) -> bool:
+        return True
+
+
+def test_the_lane_is_free_at_the_instant_of_the_exec(tmp_path, monkeypatch):
+    """`os.execv` does not unwind, so a lease held across it survives into the
+    successor as a LIVE lease naming the successor's own pid — and the successor
+    fails closed on its own lane, which ends the run. The lease therefore goes
+    before the exec, and this observes the file from inside the replacement
+    itself.
+
+    Driven through `cli._run_continuous`, the loop that really reaches the
+    boundary, so what is pinned is the WIRING and not only the callee: a lane
+    that never travelled from `_cmd_run` to the decision would leave the lease
+    on disk at the moment `os.execv` was called, which is the assertion below.
+
+    The second half is the exec that does NOT happen: the process carries on
+    doing lane work with the code it started with, so it has to be back in its
+    lane — under a new run id, because it is a new acquisition and not a
+    resurrection of the old record.
+    """
+    config = upgrade_config(tmp_path)
+    StateStore(config.state_file).save(a_state("upgrade-lane"))
+    lock = LoopLock(config.state_dir).acquire()
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    rounds: list = []
+    monkeypatch.setattr(
+        cli,
+        "_build_orchestrator",
+        lambda cfg, args, store, state, task_store, registry: BoundaryThenStop(
+            state, rounds
+        ),
+    )
+    lease_path = lane_paths(config.state_dir, 0).lease_file
+    observed: dict = {}
+
+    def refuse_to_exec(path, argv):
+        observed["lease_at_exec"] = lease_path.exists()
+        raise OSError("no successor today")
+
+    monkeypatch.setattr(os, "execv", refuse_to_exec)
+    args = argparse.Namespace(config=None, continuous=True, null_executor=False)
+    try:
+        with cli._LaneEntry(config) as lane:
+            held = json.loads(lease_path.read_text(encoding="utf-8"))
+
+            with pytest.raises(StopTheLoop):
+                cli._run_continuous(args, config, lock, lane)
+
+            assert observed["lease_at_exec"] is False, (
+                "the successor would have found a live lease naming its own pid"
+            )
+            assert lease_path.exists(), "an exec that did not happen re-enters the lane"
+            back = json.loads(lease_path.read_text(encoding="utf-8"))
+            assert back["pid"] == os.getpid()
+            assert back["run_id"] != held["run_id"]
+            assert lane.lease is not None and lane.lease.run_id == back["run_id"]
+    finally:
+        lock.release()
+
+    assert not lease_path.exists(), "and the lane is released with the run"
+    assert EXEC_HANDOFF_TOKEN_ENV not in os.environ
+    assert rounds == [0, 1], "the loop carried on past the boundary"
+    assert upgrade_details(config), "the boundary is never left unlogged"
+
+
+def test_a_lane_that_cannot_be_released_refuses_the_handoff(tmp_path, monkeypatch):
+    """Fail-closed, and the exact symmetry of the lock that cannot be armed: a
+    lease still on disk would be one the successor must refuse, so there is no
+    point replacing the process — and every reason not to. The lock is disarmed
+    again with it, or the token would outlive the handoff it authorised.
+
+    The lease is made unreleasable the way it really becomes unreleasable: it
+    stops being ours, so `LaneLease.release` leaves it exactly as it is."""
+    config = upgrade_config(tmp_path)
+    lock = LoopLock(config.state_dir).acquire()
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+
+    def must_not_exec(*_args, **_kwargs):
+        raise AssertionError("the replacement must not be attempted")
+
+    monkeypatch.setattr(os, "execv", must_not_exec)
+    try:
+        with cli._LaneEntry(config) as lane:
+            write_lease(
+                lane.lease, lease_record(lane=lane_id(0), run_id="somebody-else")
+            )
+
+            outcome = cli._self_upgrade_at_boundary(config, lock, None, lane)
+
+            assert outcome == UPGRADE_EXEC_FAILED
+            assert any("lane lease" in detail for detail in upgrade_details(config))
+            assert lane.lease is not None, "the lane was not given up"
+            assert EXEC_HANDOFF_TOKEN_ENV not in os.environ
+            assert lock.read().exec_handoff is None, "the lock is disarmed again"
+            record = UpgradeStore(config.pending_upgrade_file).load()
+            assert record.status == UPGRADE_PENDING, "still retryable by the next process"
+    finally:
+        lock.release()
