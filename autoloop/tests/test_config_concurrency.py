@@ -25,6 +25,7 @@ where the setting is held to its whole contract, in three parts:
 from __future__ import annotations
 
 import dataclasses
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -284,3 +285,31 @@ def test_the_template_ships_one_lane_and_documents_the_key():
     # could supply on its own. Spelled from the constant so a raised limit
     # cannot leave the template quoting the old one.
     assert f"1..{MAX_LANES}" in section
+
+
+def test_the_shipped_section_is_a_real_table_the_loader_accepts(tmp_path):
+    """The test above matches TEXT, and text is exactly what a config file is
+    not: `split` and `in` would also pass on a `lanes = 1` sitting inside a
+    comment, on a key spelled `lane`, and on a section that is not valid TOML at
+    all. Each of those ships an operator a template whose fleet size is not the
+    one it reads as — the same "reads as configured while something else runs"
+    failure the loader refuses to clamp its way into.
+
+    So the shipped section is PARSED, and then loaded through `load_config`
+    itself, spliced onto the same minimal document every other case here uses.
+    Both halves are needed: parsing proves `lanes` is the integer 1 rather than
+    a string, a float or a `true`, and loading proves the loader accepts what is
+    shipped — an unknown key or a bare value in there would raise instead. The
+    equality is the compatibility claim applied to the template: a deployment
+    that copies this file gets a config equal to one with no section at all.
+    """
+    example = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    lanes = tomllib.loads(example)["concurrency"]["lanes"]
+    assert lanes == 1 and isinstance(lanes, int) and not isinstance(lanes, bool)
+
+    body = "[concurrency]" + example.split("[concurrency]", 1)[1].split("\n[", 1)[0]
+    shipped = load_config(write_config(tmp_path, body + "\n"))
+    absent = load_config(write_config(tmp_path))
+
+    assert shipped.concurrency.lanes == 1
+    assert shipped == absent
