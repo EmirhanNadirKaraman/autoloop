@@ -147,6 +147,7 @@ from .auto_merge import (
     MergeDeferralStore,
     PendingUpgrade,
     UpgradeStore,
+    concurrency_lanes,
     upgrade_bound_sha,
 )
 from .lock import LoopLock
@@ -6505,6 +6506,33 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
     only changes what closes the window, never how the sweep behaves once it is
     open.
 
+    **A SIXTH exemption exists only above one lane** (conc-03, the split plan's
+    Decision 6 in docs/AUTOLOOP.md). With N lanes, N−1 of them hold exactly the
+    bound-to-the-head candidate this predicate is built to block on, so the
+    fleet-wide mutual exclusion above would mean the window essentially never
+    opens. Above one lane a candidate whose base IS the head is therefore a NOTE
+    stating an OBLIGATION — that candidate must be carried forward and
+    RE-REVIEWED before anything of it can be pushed — rather than a blocker. The
+    obligation is not enforced here and could not be: this is a predicate three
+    read-only callers poll (`merge-window --wait`, `context._merge_window`, the
+    dashboard), and one that wrote to an execution record would fire from all
+    three. It is enforced where the work is, in `orchestrator.
+    _carry_reviewed_candidate_past` (which above one lane re-points
+    `candidate_sha` at the merge commit, so the old `PostcommitBinding` no
+    longer matches) and in `_dispatch_task_push` (which above one lane refuses
+    an approval whose recorded base is no longer the head). The note is the
+    RECORD of the obligation, and both mergers already log every note they are
+    given — `auto_merge_window_note`, `merge_sweep_window_note` — so a merge
+    that opened the window over a bound candidate leaves the reason in the
+    transcript.
+
+    ONLY `BASE_AT_HEAD` is exempted this way. `BASE_UNVERIFIED` keeps the window
+    shut at every lane count, unchanged: a base git cannot place is not a base
+    anything can be carried forward FROM, so the obligation could not be
+    discharged and "could not tell" must never read as "carry on". At `lanes ==
+    1` the branch is not evaluated at all and every reason below is the exact
+    string it has always been.
+
     The residual, reported as a note rather than hidden: a published record is
     still re-dispatchable, and a `revise` naming it after the base moves would
     park on `task_base_behind_head`. That park is recoverable exactly as its
@@ -6528,6 +6556,10 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
         ], notes
 
     _, registry = _load_tasks(config)
+    # Read ONCE, before the walk: every record in one invocation must be judged
+    # against the same fleet size, and `concurrency_lanes` answers 1 for a
+    # config that names none (which is every deployment until conc-02 lands).
+    lanes = concurrency_lanes(config)
     executions = sorted(config.state_dir.glob("executions/*.json"))
     for path in executions:
         try:
@@ -6631,6 +6663,22 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
                 "window; it will need a merge-forward or a recut before it can "
                 "be reviewed again (its next dispatch attempts the merge-forward "
                 "and parks on task_base_behind_head if that refuses)"
+            )
+            continue
+        if verdict == BASE_AT_HEAD and lanes > 1:
+            # The fleet exemption, and the ONLY one gated on the lane count.
+            # Placed after every exemption above so each keeps its existing
+            # meaning and its existing wording, and before the blocker below so
+            # that string is left exactly as it is. See the docstring.
+            notes.append(
+                f"task {task_id}: candidate {candidate} is bound to base "
+                f"{base}, {detail} — with {lanes} lanes configured this does "
+                "NOT hold the window, and the candidate OWES A RE-REVIEW: "
+                "moving the head puts work it has never been reviewed against "
+                "underneath it, so its next dispatch carries it forward onto "
+                "the new head and re-reviews it, and no approval taken against "
+                "the old base may push it (orchestrator._dispatch_task_push "
+                "refuses one)"
             )
             continue
         reasons.append(

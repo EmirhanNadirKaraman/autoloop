@@ -288,6 +288,23 @@ condition, which is the "part of it" this exists to avoid. `attempt` still
 re-checks the gate per branch, and that check stays: it is the race guard for
 a window that shuts mid-sweep.
 
+Above one lane that per-branch re-check acquires a second job, and it is the
+reason nothing here needed a loop of its own for it (conc-03, Decision 6 of the
+split plan). Each merge inside a sweep MOVES THE BASE for every candidate that
+is not it, so the set of candidates owing a re-review is different after every
+merge — and because the gate is re-derived per branch, from the records and from
+git, the obligation is re-evaluated between merges rather than once at the
+start. A candidate bound to the head is reported as owing a re-review before the
+first merge and as ALREADY BEHIND after it, and `attempt` logs every note it is
+given (`auto_merge_window_note`), so the transcript carries one obligation
+verdict per branch attempted.
+
+None of that changes what this module MERGES. A genuine blocker — an executing
+phase, a base git cannot place — still shuts the gate at every lane count, still
+defers the whole sweep with nothing attempted, and the stop-at-the-first-failure
+rule below is untouched. The all-or-nothing property is the same property it
+always was; only which records hold the gate shut moved.
+
 ## No state of its own
 
 There is no sweep queue on disk. The work-list is re-derived from git ancestry

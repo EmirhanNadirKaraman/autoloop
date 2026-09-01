@@ -332,6 +332,7 @@ from .auto_merge import (
     MergeDeferral,
     MergeDeferralStore,
     UpgradeStore,
+    concurrency_lanes,
     upgrade_bound_sha,
 )
 from .blockers import (
@@ -10800,6 +10801,46 @@ class Orchestrator:
         tip = worktree_git.head_sha()
         return worktree_git.is_descendant(tip, candidate) and worktree_git.is_descendant(tip, base)
 
+    def _approval_base_moved(self, execution: TaskExecution) -> str:
+        """Above one lane: has the base moved since this record's packet was
+        built? A clause naming what git said, or `""` when the push may proceed.
+
+        THE OTHER HALF OF conc-03's claim, and the half no ordering hides. The
+        candidate-sha check above catches an approval whose record has already
+        been carried forward — but a sibling lane's merge lands whenever it
+        lands, and the likeliest ordering is that it lands while this task is
+        AWAITING: no dispatch has run, so nothing has carried anything forward,
+        the record still names the reviewed sha, its tree still matches, and
+        `_candidate_is_on_task_line` still passes. Everything the push checks
+        agrees, and the loop publishes a candidate approved against a base that
+        no longer exists — Decision 3's step 3 in docs/AUTOLOOP.md, which is the
+        one way overlapping scopes become incorrect rather than merely costly.
+
+        Asked of GIT, through `cli._candidate_base_ancestry` — the predicate the
+        merge window itself uses, called rather than copied for the reason that
+        function's own docstring gives about being the second implementation of
+        this question. Its verdicts map straight onto the answer:
+
+        * `BASE_AT_HEAD` — nothing has landed since; push.
+        * `BASE_BEHIND` — a merge landed after this record was bound. Refuse.
+        * `BASE_UNVERIFIED` — no base recorded, a checkout that will not name
+          its head, a `merge-base` that failed, a base outside the head's
+          history. Refuse: "could not tell" is never "safe to publish", the same
+          fail-closed direction every other reader of that function takes.
+
+        `""` at one lane, computed BEFORE anything is read from git or the
+        config, so a single-lane loop evaluates none of this and pushes exactly
+        what it pushes today.
+        """
+        if self._lanes() < 2:
+            return ""
+        from . import cli
+
+        verdict, detail = cli._candidate_base_ancestry(
+            getattr(self, "_config", None), asdict(execution), self._git
+        )
+        return "" if verdict == cli.BASE_AT_HEAD else detail
+
     def _dispatch_task_push(
         self,
         directive: Directive,
@@ -10818,6 +10859,14 @@ class Orchestrator:
         `TaskExecutionStore` now disagrees with the binding, or the recorded
         candidate no longer resolves, or its tree no longer matches what was
         reviewed, nothing is pushed.
+
+        **Above one lane there is a fifth refusal** (conc-03): an approval whose
+        recorded base is no longer the branch head is refused, because with a
+        fleet the head moves when a SIBLING lane's candidate lands and the
+        reviewer never saw that work. `_approval_base_moved` is the whole of it
+        and explains why the four checks below cannot catch that ordering on
+        their own. At one lane it returns `""` without reading git or the
+        config, so nothing about this method changes for a single-lane loop.
 
         `binding` defaults to `resp.postcommit`, which is where it comes from
         for every ordinary round. `_dispatch` passes it explicitly so an
@@ -10903,6 +10952,33 @@ class Orchestrator:
                 code="push_candidate_stale",
                 task_id=binding.task_id,
                 detail=f"approved={binding.candidate_sha}",
+            )
+            return
+        moved = self._approval_base_moved(execution)
+        if moved:
+            self._to_needs_user(
+                f"task {binding.task_id}: push refused — the base this approval "
+                f"was taken against has moved. {moved}. With more than one lane "
+                "that means another lane's candidate landed after this packet "
+                "was built, so the reviewer never saw the work now underneath "
+                f"candidate {binding.candidate_sha[:12]}. Nothing was pushed; "
+                "the next dispatch carries this candidate onto the current head "
+                "and it is re-reviewed there before anything is published.",
+                kind="loop_fatal",
+                # ITS OWN CODE, not `push_candidate_stale`. That one means the
+                # RECORD moved on (a later round advanced the candidate), and it
+                # has exactly one park site, which `test_stale_record_rebuild.py`
+                # pins structurally. This means the BASE moved under an approval
+                # the record still agrees with — a different fact, a different
+                # remedy, and one no autonomous rebuild is claimed for: an
+                # unrecognised code is `autonomous_recovery`'s fail-closed
+                # direction, so it parks for a human exactly as written.
+                code="push_base_moved",
+                task_id=binding.task_id,
+                detail=(
+                    f"approved={binding.candidate_sha} "
+                    f"base={execution.task_base_sha} reason={moved}"
+                ),
             )
             return
         worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
@@ -14544,6 +14620,18 @@ class Orchestrator:
 
         return resolve
 
+    def _lanes(self) -> int:
+        """This deployment's lane count, or 1 for anything that cannot say.
+
+        `getattr` on `_config` for the same reason `concurrency_lanes` uses one
+        on the config itself: the orchestrators this suite builds with
+        `Orchestrator.__new__` wire only the collaborators the method under test
+        touches, and several of them (`test_rebase_stale_base.py::_orch`) carry
+        no config at all. Those get 1 — today's behaviour — rather than an
+        AttributeError raised from inside a merge.
+        """
+        return concurrency_lanes(getattr(self, "_config", None))
+
     def _carry_reviewed_candidate_past(
         self, execution: TaskExecution, task: Task, head: str
     ) -> str:
@@ -14574,6 +14662,39 @@ class Orchestrator:
         branch. `candidate_sha`, `candidate_commit_count`, `review_round`,
         `attempt_count`, `fault_attempt_count` and the ledger are all left
         alone — a moving base must refill no budget and forget no round.
+
+        ABOVE ONE LANE, TWO OF THOSE MOVE (conc-03, Decision 6 of the split
+        plan in docs/AUTOLOOP.md), and the difference is the whole of that
+        candidate's claim. At `lanes == 1` the head can only move under a
+        reviewed candidate when an operator merges past a shut window, and the
+        approval that candidate carries still describes work the reviewer saw
+        against a base nothing else was landing on. With a fleet, the head moves
+        because a SIBLING LANE's candidate landed — so the reviewed diff is now
+        a diff against work no reviewer of this task ever saw, and publishing on
+        that approval is exactly what Decision 3 forbids. So above one lane:
+
+          * `candidate_sha` is re-pointed at the MERGE COMMIT this method just
+            made. That commit is the reviewed work plus the new head, which is
+            what the next review has to be about — and it is what makes the old
+            approval refuse itself, because `_dispatch_task_push` compares the
+            binding's sha against the record's and parks `push_candidate_stale`
+            when they differ. Nothing is rewritten and nothing is lost: the
+            reviewed object is the merge's first parent, still reachable, still
+            exactly the sha the reviewer approved.
+          * `review_round` is RESET, so the loop asks for that review instead of
+            meeting `max_review_rounds` and parking `review_round_cap` on a
+            candidate whose whole problem is that it needs one more round. The
+            round that was displaced is written to the transcript rather than
+            forgotten. `attempt_count`, `fault_attempt_count` and the ledger are
+            untouched at every lane count — the retry budget is what stops a
+            task churning forever, and a moving base must never refill it.
+
+        The reset is coupled to the branch selection in
+        `_rebase_execution_if_stale` and cannot be read on its own: with
+        `review_round` back at 0, a predicate keyed on that counter would send
+        the NEXT carry-forward down the re-base arm and quarantine the worker
+        holding this merge. That method's fleet arm is therefore keyed on
+        "there is a candidate to preserve" instead. Change neither alone.
 
         FIVE PRECONDITIONS, each of which falls back to the park unchanged.
         This is deliberately conservative: the park it replaces was correct,
@@ -14740,6 +14861,26 @@ class Orchestrator:
             return detail
 
         execution.task_base_sha = head
+        # Above one lane the candidate becomes the merge commit and owes a
+        # review; at one lane neither line runs and the record is exactly what
+        # it has always been. See the docstring for why both, and why the reset
+        # is coupled to `_rebase_execution_if_stale`'s branch selection.
+        rereview_owed = self._lanes() > 1 and bool(attempt.head_sha)
+        round_before = execution.review_round
+        if rereview_owed:
+            execution.candidate_sha = attempt.head_sha
+            execution.review_round = 0
+            try:
+                execution.candidate_commit_count = len(
+                    worker.commit_list(head, attempt.head_sha)
+                )
+            except (GitError, OSError):
+                # Best effort, and deliberately not fatal: the merge has already
+                # happened and cannot be unwound here, `_dispatch_task_postcommit`
+                # recomputes this field before every packet, and nothing decides
+                # anything on it. Leaving the old count is a stale number in one
+                # log line; raising would turn a completed merge into a park.
+                pass
         self._execution_store.save(execution)
         self._log(
             "execution_base_carried_forward",
@@ -14748,11 +14889,22 @@ class Orchestrator:
                 "old_base": old_base,
                 "new_base": head,
                 "merge_sha": attempt.head_sha,
-                # Every one of these is asserted to be UNCHANGED by this path:
-                # the reviewed object still exists, the round count still says
-                # how many reviews happened, and neither budget was refilled.
+                # `candidate_sha` is the REVIEWED object — unchanged at one lane
+                # and still reachable at any lane count, because a merge rewrites
+                # nothing. `new_candidate_sha` is what the record now names, which
+                # differs only above one lane. Both are logged so a reader can see
+                # which protocol ran without inferring it from the lane count.
                 "candidate_sha": candidate,
+                "new_candidate_sha": execution.candidate_sha,
+                "rereview_owed": rereview_owed,
+                # The count the reset replaced, so no round is forgotten
+                # silently; equal to `review_round` at one lane, where nothing
+                # is reset. Named apart from the `displaced_*` keys a PREEMPTION
+                # record carries (`_quarantine_execution`), which describe a
+                # different event entirely.
+                "review_round_before": round_before,
                 "review_round": execution.review_round,
+                # Neither budget is refilled at any lane count.
                 "attempt_count": execution.attempt_count,
                 "fault_attempt_count": execution.fault_attempt_count,
                 "worktree_path": worktree_path,
@@ -14810,6 +14962,28 @@ class Orchestrator:
           completion auto-merges), so answering one park caused the next.
           23 of 108 parks before 2026-08-20 were this one code; roadmap-01 was
           unstuck and re-parked four minutes later.
+
+        ABOVE ONE LANE THE SECOND AND THIRD CASES ARE KEYED ON THE CANDIDATE
+        rather than on `review_round` (conc-03). Two reasons, and the first is a
+        correctness coupling rather than a preference:
+
+        * `_carry_reviewed_candidate_past` RESETS `review_round` above one lane,
+          because the carried candidate owes a review it has not had. A branch
+          selection keyed on that counter would then send the very next
+          carry-forward — the ordinary case with four lanes, where the head
+          moves again while this task is still in flight — down the re-base arm,
+          which quarantines the worker and clears `candidate_sha`. That is the
+          quiet discard of reviewed work this whole path exists to prevent,
+          arrived at by the fix for it. The two must move together.
+        * With a fleet the head moves because a SIBLING landed, so any candidate
+          is work that a merge would put someone else's changes underneath.
+          "There is a candidate to preserve" is the honest question at that
+          point, and it is strictly stronger than the counter: every record the
+          counter selected is still selected.
+
+        At one lane the predicate is `review_round > 0` exactly as it has always
+        been, so a record with a committed-but-never-reviewed candidate still
+        re-bases and still rebuilds its worker.
         """
         head = self._git.head_sha()
         base = execution.task_base_sha
@@ -14821,9 +14995,15 @@ class Orchestrator:
         if not self._git.is_descendant(head, base):
             return execution
 
-        if execution.review_round > 0 and self._reconcile_published_execution(execution, task):
+        # See the docstring: identical to `review_round > 0` at one lane, and
+        # widened to "holds a candidate" above one, where the reset makes the
+        # counter an unsafe thing to select on.
+        carry_forward = execution.review_round > 0 or (
+            self._lanes() > 1 and bool(execution.candidate_sha)
+        )
+        if carry_forward and self._reconcile_published_execution(execution, task):
             return None
-        if execution.review_round > 0:
+        if carry_forward:
             # Same re-synchronisation the re-base branch below does, and for the
             # same reason: `head` was read at the top of this method, AFTER the
             # caller's own boundary sync, so an operator committing in between
@@ -14839,10 +15019,23 @@ class Orchestrator:
             refusal = self._carry_reviewed_candidate_past(execution, task, head)
             if not refusal:
                 return execution
+            # One clause, two readings, and the reviewed one is byte-identical
+            # to what this park has always said. The other is only reachable
+            # above one lane (see the widened predicate above), where the record
+            # may hold a candidate that has NOT been reviewed — or one whose
+            # round was reset by an earlier carry-forward — and claiming a
+            # review had run would be a false statement to the operator.
+            held = (
+                "but a review round has already run against candidate "
+                f"{(execution.candidate_sha or '(none)')[:12]}"
+                if execution.review_round > 0
+                else "but it holds candidate "
+                f"{(execution.candidate_sha or '(none)')[:12]}, which owes a "
+                "re-review and must be carried forward rather than rebuilt"
+            )
             self._to_needs_user(
                 f"task {task.id}: its recorded base {base[:12]} is behind the "
-                f"branch head {head[:12]}, but a review round has already run "
-                f"against candidate {(execution.candidate_sha or '(none)')[:12]}. "
+                f"branch head {head[:12]}, {held}. "
                 f"The head could not be merged into the task branch either — "
                 f"{refusal}. Re-basing would discard work a reviewer has "
                 "already seen, so nothing was changed. Either publish or "
