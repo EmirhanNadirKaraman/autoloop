@@ -69,6 +69,12 @@ the fix belongs on this side of it, and `docs/AUTOLOOP.md`'s "What the codex CLI
 actually prints" for the three alternatives — asking for a fenced block,
 disabling hooks, letting the parser refuse the ambiguity — that were rejected.
 
+The transcript also carries the ECHOED PROMPT, which is the whole review packet,
+so `submit` passes the prompt to the isolation for the same reason it passes it
+to `quota.classify`: text the loop SENT is not evidence about what came back. A
+packet that QUOTES a codex transcript — this repository's own task descriptions
+do — otherwise puts a `codex` marker and a directive inside the haystack.
+
 **Every non-zero exit leaves a record, and the prompt cannot classify it.**
 `submit` logs `codex_invocation_failed` on every failure — including the ones
 it does not recognise — and it classifies with `quota.classify`, which is
@@ -98,7 +104,7 @@ from .quota import (
     classify,
     failure_digest,
 )
-from .reply import FROM_SEGMENT, isolate_reply
+from .reply import ECHO_ANCHOR_MATCHED, FROM_SEGMENT, isolate_reply
 
 #: Ceiling on the argv-borne prompt, well under this host's 1 MiB ARG_MAX so
 #: the environment block and the rest of the command line still fit.
@@ -370,7 +376,13 @@ class CodexConversation:
         # is not exactly one JSON value`). `reply.isolate_reply` hands the
         # contract the reviewer's own message and nothing else; the contract is
         # unchanged and still decides whether that message is a directive.
-        isolated = isolate_reply(result.stdout)
+        #
+        # `prompt` — the FINAL one, for the same reason `classify` above is
+        # given it: `codex exec` echoes the whole prompt back, so the surest way
+        # to keep the loop's own text out of the answer is not to read it. The
+        # line rules do not depend on this argument; it narrows where they are
+        # applied. See `reply._anchor`.
+        isolated = isolate_reply(result.stdout, prompt)
         if not isolated.text:
             # No verdict could be isolated: nothing on stdout, a role marker
             # with no message under it, or two messages between which choosing
@@ -391,10 +403,13 @@ class CodexConversation:
             )
             return SubmitResult.REJECTED
 
-        if isolated.source == FROM_SEGMENT:
+        if isolated.source == FROM_SEGMENT or isolated.echo_anchor == ECHO_ANCHOR_MATCHED:
             # The boundary is VISIBLE, for the reason `quota.py`'s
             # `suppressed_patterns` is: a rule that silently discards output is
-            # indistinguishable from a rule that never fired. COUNTS ONLY —
+            # indistinguishable from a rule that never fired. That covers the
+            # anchor as well as the segment — on undecorated stdout the anchor
+            # is the ONLY thing that dropped anything, so a pass-through that
+            # cut an echo still owes a record. COUNTS ONLY —
             # stdout carries the echoed prompt, which is the whole review
             # packet, and the isolated reply already reaches the transcript in
             # full under `response_received.raw`.
@@ -405,6 +420,13 @@ class CodexConversation:
                     "segments": isolated.segments,
                     "stdout_chars": isolated.stdout_chars,
                     "reply_chars": isolated.reply_chars,
+                    # Whether the echoed prompt was excluded by POSITION or only
+                    # by the line rules. A bound that can quietly not apply — a
+                    # reflowed echo defeats the anchor — has to say when it did
+                    # not, the reason `quota.failure_digest` records
+                    # `prompt_guard`. One of four fixed words, never text from
+                    # the run.
+                    "echo_anchor": isolated.echo_anchor,
                 },
             )
 
