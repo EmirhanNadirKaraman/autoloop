@@ -461,6 +461,88 @@ def test_a_write_that_fails_takes_its_own_lease_back_off_disk(tmp_path, monkeypa
     assert LaneLease(tmp_path, 1).acquire().read().pid == os.getpid()
 
 
+def test_a_short_write_still_lands_a_whole_lease(tmp_path, monkeypatch):
+    """The failure that is not an exception. `os.write` is one `write(2)`: it
+    may write FEWER bytes than it was given and RETURN that count, raising
+    nothing. A single call treated as the whole record is therefore not an error
+    path but the quiet one — a lease its owner believes it holds, truncated on
+    disk, which every later `read` must refuse forever. That closes a lane with
+    no process in it, and nothing says so.
+
+    The fake writes seven bytes a call THROUGH THE REAL `os.write`, so what is
+    asserted is the file that really lands rather than a description of it, and
+    `len(chunks) > 1` is what keeps this honest: a test whose fake was never
+    reached, or whose payload fitted in one chunk, would pass on any
+    implementation at all — including the one-call version this exists to
+    exclude.
+    """
+    real_write = os.write
+    chunks: list[int] = []
+
+    def short_write(fd, data):
+        count = real_write(fd, data[:7])
+        chunks.append(count)
+        return count
+
+    monkeypatch.setattr(lock_module.os, "write", short_write)
+    lease = LaneLease(tmp_path, 1)
+
+    acquired = lease.acquire()
+
+    monkeypatch.undo()
+    assert len(chunks) > 1, "the payload was written in one call — fake unused"
+    assert sum(chunks) == lease.path.stat().st_size, "bytes went missing"
+    record = lease.read()
+    assert record is not None, "the record must be complete, not merely present"
+    assert record.pid == os.getpid()
+    assert record.run_id == acquired.run_id
+    assert record.lane_id == lane_id(1)
+    # ...and a record that is complete is a record that still excludes.
+    with pytest.raises(LockHeldError):
+        LaneLease(tmp_path, 1).acquire()
+
+
+def test_a_write_that_makes_no_progress_refuses_rather_than_looping(
+    tmp_path, monkeypatch
+):
+    """The other end of the same contract. A `write(2)` returning 0 has moved
+    nothing, and it is neither an exception to propagate nor progress to build
+    on: retrying it is a lane that hangs, and accepting it is a zero-byte lease
+    that reads as acquired. So it is raised — as an `OSError`, which is the type
+    the cleanup path catches. A raise of any other type would skip the unlink
+    and strand exactly the empty record this is about, which is why the lease is
+    asserted GONE rather than only the raise asserted.
+
+    The fake gives up after a handful of calls so a looping implementation FAILS
+    here instead of hanging a worker until something times out with no
+    diagnosis.
+    """
+    lease = LaneLease(tmp_path, 1)
+    calls: list[int] = []
+
+    def no_progress(fd, data):
+        calls.append(len(data))
+        if len(calls) > 8:
+            raise AssertionError(
+                "acquire retried a zero-byte write instead of refusing"
+            )
+        return 0
+
+    monkeypatch.setattr(lock_module.os, "write", no_progress)
+
+    with pytest.raises(OSError) as excinfo:
+        lease.acquire()
+
+    monkeypatch.undo()
+    assert calls, "the write was never attempted"
+    assert str(lease.path) in str(excinfo.value)
+    assert not lease.path.exists(), "an empty lease was left in the lane"
+    # The lane is enterable again — nothing was left behind and nobody is in it.
+    entrant = LaneLease(tmp_path, 1).acquire()
+    assert entrant.read().pid == os.getpid()
+    assert entrant.read().run_id == entrant.run_id
+
+
 def test_release_removes_only_a_lease_this_process_still_owns(tmp_path):
     """`LoopLock.release`'s rule, for its reason: a lease somebody else has
     since recovered must not be deleted by the process that used to hold it."""
