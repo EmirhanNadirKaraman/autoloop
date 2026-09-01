@@ -186,6 +186,7 @@ from .state import (
     StopRepetitionStore,
     abort_flag_file,
     abort_requested,
+    lane_state_file,
     packet_outstanding_reason,
     stop_repetition_file,
     utcnow_iso,
@@ -251,8 +252,20 @@ def load_config(path: Path) -> AutoloopConfig:
     return config
 
 
-def _load_state(config: AutoloopConfig) -> tuple[StateStore, LoopState | None]:
-    store = StateStore(config.state_file)
+def _load_state(
+    config: AutoloopConfig, lane_index: int = 0
+) -> tuple[StateStore, LoopState | None]:
+    """The store and state for ONE lane — lane 0 unless told otherwise.
+
+    Resolved through `state.lane_state_file` rather than `config.state_file`
+    (conc-05). For lane 0 the two are the SAME path — `state_dir/state.json`,
+    byte for byte what every reader of this loop has always seen — so nothing
+    about a single-lane deployment moves; what changes is that the CLI now asks
+    a lane-aware resolver for it, so the fleet supervisor (candidate 5 of
+    docs/AUTOLOOP.md's split plan) has a lane to name here rather than a call
+    site to rewrite.
+    """
+    store = StateStore(lane_state_file(config.state_dir, lane_index))
     state = store.load()
     # An UNSET `browser.conversation_url` is not drift, it is the absence of a
     # configured conversation — the normal shape of a config since brw-16

@@ -944,6 +944,95 @@ class StateStore:
         return backup
 
 
+#: The state file's name. Literally `state.json`, and lane 0 writes exactly
+#: this at exactly the path it writes today — see `lane_paths`.
+#:
+#: `AutoloopConfig.state_file` spells the same name independently, and that is
+#: deliberate rather than an oversight: this module imports nothing from
+#: `config.py` (see `abort_flag_file`, which duck-types the config for the same
+#: reason). The two are pinned AGAINST EACH OTHER by a test rather than either
+#: against a literal, so an edit to one that the other did not follow fails.
+STATE_FILENAME = "state.json"
+
+#: Where lanes ABOVE ZERO keep their own state: `state_dir/lanes/<lane_id>/`.
+#: Lane 0 does not appear under it at all — that asymmetry is the whole of the
+#: `lanes = 1` criterion made structural (docs/AUTOLOOP.md, "Decision 2 — one
+#: fleet lock, N lane leases, N state files"): at one lane no new file exists
+#: and no existing reader moves.
+LANES_DIRNAME = "lanes"
+
+#: What a lane's lease file is called: `<lane_id>.lease.json`, beside that
+#: lane's state file. The lane id is in the NAME as well as in the record,
+#: because lane 0's lease shares a directory with everything else under
+#: `state_dir` and a file called `lease.json` there would not say what it is a
+#: lease for. `lock.LaneLease` is what reads and writes it.
+LANE_LEASE_SUFFIX = ".lease.json"
+
+
+@dataclass(frozen=True)
+class LanePaths:
+    """Everything one lane owns on disk, resolved together.
+
+    One resolver rather than three functions each deriving the lane id again:
+    the id, the directory, the state file and the lease have to agree in every
+    process that ever looks at this lane, and three derivations are three
+    chances to disagree.
+    """
+
+    lane_id: str
+    #: The directory this lane's files live in — `state_dir` itself for lane 0.
+    state_dir: Path
+    state_file: Path
+    lease_file: Path
+
+
+def lane_paths(state_dir: Path, lane_index: int) -> LanePaths:
+    """Where lane `lane_index` keeps its state and its lease.
+
+    Lane 0 is `state_dir/state.json` — LITERALLY today's path, with no new
+    directory and no new file — and lane *k>0* is
+    `state_dir/lanes/<lane_id>/state.json`. The asymmetry is the plan's, and
+    the reason is the acceptance criterion every candidate in the split carries:
+    at `lanes = 1` nothing on disk moves, so every existing reader of
+    `AutoloopConfig.state_file` keeps reading the same bytes.
+
+    THE INDEX IS VALIDATED FIRST, unconditionally, and only then is lane 0
+    branched on. The obvious spelling — `if lane_index == 0: return ...` at the
+    top — accepts `False`, because `False == 0` in Python, and would hand a
+    bool the single most important path in this package while `config.lane_id`
+    exists precisely to refuse it (`lane_id(True)` would otherwise be a second
+    spelling of lane 1). Same argument for a float: `1.0 == 1` is true, and a
+    directory named after `1.0` is not lane 1's.
+
+    `config.lane_id` is imported HERE rather than at module level because the
+    module-level version is a real cycle, not a stylistic worry:
+    `state` -> `config` -> `policy` -> `tasks` -> `state`, every edge a
+    module-level import that exists today. The local import is the same device
+    `_load_changeset` above uses, for the same reason.
+    """
+    from .config import lane_id
+
+    name = lane_id(lane_index)
+    root = Path(state_dir)
+    lane_dir = root if lane_index == 0 else root / LANES_DIRNAME / name
+    return LanePaths(
+        lane_id=name,
+        state_dir=lane_dir,
+        state_file=lane_dir / STATE_FILENAME,
+        lease_file=lane_dir / f"{name}{LANE_LEASE_SUFFIX}",
+    )
+
+
+def lane_state_file(state_dir: Path, lane_index: int) -> Path:
+    """`lane_paths(...).state_file` — the half most callers want.
+
+    Named separately because it is what a `StateStore` is built on, and
+    `StateStore(lane_state_file(config.state_dir, 0))` reads better at a call
+    site than reaching through the record for one field.
+    """
+    return lane_paths(state_dir, lane_index).state_file
+
+
 #: Filename of the operator ABORT flag, beside `PAUSE` (see `abort_flag_file`).
 ABORT_FILENAME = "ABORT"
 
