@@ -9,12 +9,16 @@ submits a review, reads one back, or reconciles one.
 
 THE ONE PROCESS IT STARTS, since prov-02 (2026-09-01), is the codex preflight
 — `codex.preflight.preflight_codex`, a fixed one-line prompt run from the
-configured working directory, bounded by its own short deadline. That is not
-the reviewer conversation and carries no review packet, and it is here because
-the question "could this loop use codex_cli right now" was previously answered
-by two checks that could both pass on a machine where every review would fail:
-the shipped `working_dir` default was the home directory, and codex refuses to
-run there.
+configured working directory UNDER THE CONFIGURED SANDBOX POLICY, bounded by
+its own short deadline. That is not the reviewer conversation and carries no
+review packet, and it is here because the question "could this loop use
+codex_cli right now" was previously answered by two checks that could both pass
+on a machine where every review would fail: the shipped `working_dir` default
+was the home directory, and codex refuses to run there.
+
+It is not started at all when `codex.sandbox_args` names no enforceable sandbox
+(`codex_sandbox` fails first): the question "is this seat safe to select" must
+never be answered by launching an unsandboxed reviewer.
 
 NO BROWSER CHECKS since brw-19c (2026-08-31). Until then this command probed
 the CDP endpoint, imported playwright, and — for the literal provider name
@@ -50,6 +54,7 @@ from .codex.preflight import (
     preflight_codex,
     resolve_working_dir,
 )
+from .codex.sandbox import describe_invocation
 from .config import AutoloopConfig
 from .conversation import available_providers, create_conversation
 from .errors import AutoloopError, BrowserError, LoginExpiredError
@@ -423,12 +428,15 @@ def run_doctor(
     # and `browser.project_url` are still ACCEPTED by the loader — see
     # `config.BrowserConfig` — they are simply no longer graded.
 
-    # 13d. Codex reviewer, when either seat uses it. Four rows, and the fourth
-    # is the one that answers the question the other three only circle: the
-    # live probe below constructs the ADAPTER, `codex_command` resolves the
-    # BINARY, `codex_workdir` grades a PATH — and all three passed on a machine
-    # where every review would have failed, because the shipped `working_dir`
-    # default was the home directory and codex declines to run there.
+    # 13d. Codex reviewer, when either seat uses it. Four rows, and two of them
+    # are the ones that answer the questions the others only circle. The live
+    # probe below constructs the ADAPTER, `codex_command` resolves the BINARY,
+    # `codex_workdir` grades a PATH — and all three passed on a machine where
+    # every review would have failed, because the shipped `working_dir` default
+    # was the home directory and codex declines to run there. `codex_sandbox`
+    # answers "is this seat CONFINED" and `codex_preflight` answers "would a
+    # review actually run"; either one failing means selecting codex_cli is not
+    # safe, and the runner itself refuses the first of those at launch.
     codex_seats = {provider, config.conversation.fallback_provider} & {"codex_cli"}
     if codex_seats:
         binary = config.codex.command[0] if config.codex.command else ""
@@ -453,9 +461,11 @@ def run_doctor(
             add(
                 "codex_workdir",
                 "fail",
-                f"{workdir} — INSIDE the repository. The reviewer's prompt is "
-                "self-contained and it must not be able to read the checkout; "
-                "set codex.working_dir outside it.",
+                f"{workdir} — INSIDE the repository. The prompt is "
+                "self-contained, so the reviewer has no business being STARTED "
+                "in the tree it is grading; set codex.working_dir outside it. "
+                "(This is not the confinement — that is codex.sandbox_args "
+                "below. A working directory refuses nothing.)",
             )
         elif exists:
             add(
@@ -487,41 +497,53 @@ def run_doctor(
                 "never created for you, so a typo cannot become the place your "
                 "reviews run.",
             )
-        if not config.codex.sandbox_args:
-            add(
-                "codex_sandbox",
-                "warn",
-                "codex.sandbox_args is empty, which is the shipped policy and "
-                "not an oversight: confinement rests on codex.working_dir "
-                "ALONE — a dedicated directory outside the checkout, with a "
-                "self-contained prompt — because no flag name can be verified "
-                "from this repository. To add one, `--sandbox read-only` is the "
-                "confinement this loop wants if your build spells it that way "
-                "(`codex exec --help`); the preflight below runs whatever is "
-                "set here, so a flag this build rejects fails that check "
-                "instead of the first review.",
-            )
-        else:
-            add(
-                "codex_sandbox",
-                "ok",
-                " ".join(config.codex.sandbox_args)
-                + " — passed to every invocation, including the preflight below",
-            )
+        # THE confinement row. `codex.sandbox_args` is read as a POLICY
+        # (`codex.sandbox.describe_invocation`), never as "set or not set": an
+        # empty value, an unknown mode and a bypass flag are all a seat with no
+        # sandbox, and all `fail`. This row used to `warn` that empty was the
+        # shipped policy and that confinement rested on `codex.working_dir`
+        # alone — which was not true of any working directory: `cwd` chooses
+        # where a process starts and refuses nothing.
+        # `command` too, not only `sandbox_args`: codex sees one argv, so a
+        # bypass flag in the command line is a bypass, and a row that graded the
+        # key MEANT to hold the policy would report `ok` about an invocation
+        # that turns it off.
+        policy = describe_invocation(config.codex.command, config.codex.sandbox_args)
+        add(
+            "codex_sandbox",
+            policy.status,
+            policy.detail
+            + (
+                " Passed to every invocation, including the preflight below."
+                if policy.is_enforceable
+                else ""
+            ),
+        )
 
         # 13e. THE preflight: one trivial invocation, from that directory, with
         # those flags. Not attempted when the directory is already refused
         # above — running the reviewer inside the checkout to find out whether
-        # it runs would be doing the thing being diagnosed — and `fail`, never
-        # `skip`, when it is not attempted: "not asked" is not evidence that
-        # the transport works, which is the fail-open the removed `cdp` skip
-        # was.
+        # it runs would be doing the thing being diagnosed — nor when the
+        # sandbox policy is not enforceable, for the same reason one level up:
+        # the answer to "is this seat safe to select" must not be obtained by
+        # launching an unsandboxed reviewer. `fail`, never `skip`, when it is
+        # not attempted: "not asked" is not evidence that the transport works,
+        # which is the fail-open the removed `cdp` skip was. `preflight_codex`
+        # refuses both cases itself; this gate holds even when the probe is
+        # replaced (`DoctorProbes.codex_preflight`).
         if not workdir_usable:
             add(
                 "codex_preflight",
                 "fail",
                 "not attempted — the working directory is unusable; see the "
                 "'codex_workdir' check above",
+            )
+        elif not policy.is_enforceable:
+            add(
+                "codex_preflight",
+                "fail",
+                "not attempted — the reviewer would run unsandboxed; see the "
+                "'codex_sandbox' check above",
             )
         else:
             probe = probes.codex_preflight or preflight_codex

@@ -940,7 +940,10 @@ def test_a_silent_server_times_out_and_says_so():
     assert any(m.get("method") == "turn/interrupt" for m in fake.sent)
 
 
-def test_the_real_transport_never_uses_a_shell_and_confines_the_working_dir(tmp_path):
+def test_the_real_transport_never_uses_a_shell_and_starts_in_the_working_dir(tmp_path):
+    """Named for what it checks. A working directory is where a process STARTS,
+    not a confinement — this seat selects no sandbox at all, and what it has
+    instead is that every approval the server asks for is answered `abort`."""
     server = SubprocessAppServer(command=("codex", "app-server"), cwd=tmp_path)
     assert server.argv_preview == ("codex", "app-server")
     # Nothing model-authored can reach argv here at all: prompts travel as JSON

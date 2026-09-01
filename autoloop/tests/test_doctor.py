@@ -550,20 +550,65 @@ def test_the_graded_working_dir_is_the_one_the_reviewer_actually_gets(tmp_path):
     assert SubprocessCodexRunner(cwd=configured)._cwd == configured
 
 
-def test_an_empty_sandbox_setting_warns_and_names_the_policy(tmp_path):
-    """`sandbox_args` is empty BY POLICY now, and the row has to say which
-    policy — an operator reading "empty" needs to know whether anything is
-    confining the reviewer at all."""
+def test_the_shipped_sandbox_policy_passes_and_is_named_in_the_row(tmp_path):
+    """`codex_sandbox` is the confinement row. The default seat is confined, so
+    it reads `ok` — and it says what the policy does and does not do, because a
+    row an operator reads as "the reviewer cannot see the checkout" would be the
+    false claim this round exists to remove."""
     named, _ = codex_rows(tmp_path)
     row = named["codex_sandbox"]
 
-    assert row.status == "warn"
-    assert "working_dir" in row.detail
-    assert codex_exit(named, "codex_sandbox") == 0, "a stated policy is not a failed check"
+    assert row.status == "ok"
+    assert "--sandbox read-only" in row.detail
+    assert "does NOT confine READS" in row.detail
+    assert codex_exit(named, "codex_sandbox") == 0
 
-    named, _ = codex_rows(tmp_path, codex=CodexConfig(sandbox_args=("--sandbox", "read-only")))
-    assert named["codex_sandbox"].status == "ok"
-    assert "--sandbox read-only" in named["codex_sandbox"].detail
+
+def test_an_unconfined_seat_fails_and_the_preflight_is_not_attempted(tmp_path):
+    """The claim: selecting `codex_cli` with no sandbox policy is not safe, and
+    `doctor` says so BEFORE a round rather than a review saying so during one.
+
+    The empty value is the one every config carried until this round, and it was
+    reported as a deliberate policy — `warn`, exit 0 — on the argument that
+    confinement rested on `codex.working_dir`. A working directory confines
+    nothing, so this is a `fail`; and the probe is not asked, because answering
+    "is this seat safe" by launching an unsandboxed reviewer answers a different
+    question."""
+    asked = []
+
+    def probe(codex):
+        asked.append(codex)
+        return preflight_ok()
+
+    named, _ = codex_rows(
+        tmp_path, codex=CodexConfig(sandbox_args=()), codex_preflight=probe
+    )
+
+    assert named["codex_sandbox"].status == "fail"
+    assert "UNCONFINED" in named["codex_sandbox"].detail
+    assert named["codex_preflight"].status == "fail"
+    assert "not attempted" in named["codex_preflight"].detail
+    assert asked == [], "an unsandboxed reviewer must not be launched to grade itself"
+    assert codex_exit(named, "codex_sandbox", "codex_preflight") == 1
+
+
+@pytest.mark.parametrize(
+    "args, status",
+    [
+        (("--sandbox", "workspace-write"), "warn"),
+        (("--dangerously-bypass-approvals-and-sandbox",), "fail"),
+        (("--sandbox", "banana"), "fail"),
+    ],
+)
+def test_the_row_grades_the_policy_rather_than_whether_anything_is_set(
+    tmp_path, args, status
+):
+    """Whether the list is SET is not the question. A bypass flag and a mode the
+    loop cannot name are both a seat with no sandbox, and both were `ok` under
+    the old row, which only tested that the list was non-empty."""
+    named, _ = codex_rows(tmp_path, codex=CodexConfig(sandbox_args=args))
+
+    assert named["codex_sandbox"].status == status
 
 
 def test_a_preflight_that_raises_or_answers_nonsense_is_a_failure_not_a_pass(tmp_path):

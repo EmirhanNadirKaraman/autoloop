@@ -9,6 +9,14 @@ Two verified defects, measured 2026-08-17, are the subject:
 * nothing anywhere ran the configured command from the configured directory, so
   the first thing that could disagree with those checks was a failed review.
 
+And a third, found in review of the round that fixed those two: the loop called
+the working directory its confinement. It is not one — `cwd` chooses where a
+process STARTS and refuses nothing — so the seat was unconfined while a row
+said the emptiness of `codex.sandbox_args` was a deliberate policy. The policy
+is now the flags (`codex/sandbox.py`), it ships `--sandbox read-only`, and an
+unconfined one is refused before any process starts. What that can and cannot
+prove is stated where those tests begin.
+
 No codex binary is involved in this file. The invocation boundary
 (`preflight.PreflightRunner`) is faked one level below the logic under test,
 which is the only level at which "an exhausted allowance is classified as an
@@ -27,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from autoloop.codex import preflight
+from autoloop.codex import preflight, sandbox
 from autoloop.codex.conversation import SubprocessCodexRunner
 from autoloop.codex.preflight import (
     PREFLIGHT_PROMPT,
@@ -39,6 +47,7 @@ from autoloop.codex.preflight import (
     preflight_codex,
     resolve_working_dir,
 )
+from autoloop.codex.sandbox import DEFAULT_SANDBOX_ARGS, describe_sandbox
 from autoloop.codex.quota import (
     DEFAULT_QUOTA_PATTERNS,
     DEFAULT_RATE_LIMIT_PATTERNS,
@@ -107,6 +116,10 @@ def test_a_resolvable_command_is_invoked_from_the_configured_directory(tmp_path,
     assert argv[:2] == ("codex", "exec")
     assert argv[-1] == PREFLIGHT_PROMPT
     assert cwd == tmp_path
+    # …and under the shipped policy, because the preflight validates the seat
+    # an operator would actually get. A check that ran the reviewer WITHOUT the
+    # flags a review turn carries would be grading a different invocation.
+    assert argv[2:-1] == DEFAULT_SANDBOX_ARGS
 
 
 def test_an_empty_command_is_a_failure_rather_than_an_empty_invocation(tmp_path, on_path):
@@ -119,20 +132,137 @@ def test_an_empty_command_is_a_failure_rather_than_an_empty_invocation(tmp_path,
 
 
 def test_the_configured_sandbox_flags_are_what_the_preflight_runs(tmp_path, on_path):
-    """The whole justification for shipping `sandbox_args` empty rather than
-    guessing: whatever an operator puts there is validated by a real
-    invocation, so a flag their build rejects fails this check instead of the
-    first review."""
+    """Why the flags are worth setting at all: whatever an operator puts there
+    is validated by a real invocation, so a spelling their build rejects fails
+    this check instead of the first review. No codex binary runs in this
+    repository or in CI, so that — plus "the flags are present" — is the whole
+    of what can be verified from here."""
     run = FakeRun()
-    codex = config(tmp_path, sandbox_args=("--sandbox", "read-only"))
+    codex = config(tmp_path, sandbox_args=("--sandbox", "workspace-write"))
 
     preflight_codex(codex, run=run)
 
     (argv, _cwd), = run.calls
-    assert argv == ("codex", "exec", "--sandbox", "read-only", PREFLIGHT_PROMPT)
+    assert argv == ("codex", "exec", "--sandbox", "workspace-write", PREFLIGHT_PROMPT)
     # And the preview used in diagnostics carries the flags but never the
     # prompt, matching the runner's own `argv_preview` rule.
-    assert preflight_argv(codex) == ("codex", "exec", "--sandbox", "read-only")
+    assert preflight_argv(codex) == ("codex", "exec", "--sandbox", "workspace-write")
+
+
+# ---- the sandbox policy: what "safe to select" means -------------------------
+#
+# The claim these pin is narrow on purpose. Nothing here proves a sandbox is
+# ENFORCED — no codex binary runs in this repository — and `read-only` does not
+# confine reads in any case. What is proven is that an unconfined policy is
+# REFUSED before a process starts, and that the policy an operator configured is
+# the policy the invocation carries.
+
+
+@pytest.mark.parametrize(
+    "args, mode, status",
+    [
+        # Every spelling clap accepts for the same policy.
+        (("--sandbox", "read-only"), sandbox.READ_ONLY, "ok"),
+        (("--sandbox=read-only",), sandbox.READ_ONLY, "ok"),
+        (("-s", "read-only"), sandbox.READ_ONLY, "ok"),
+        (("-sread-only",), sandbox.READ_ONLY, "ok"),
+        (("--sandbox", "Read-Only"), sandbox.READ_ONLY, "ok"),
+        # A flag that names no mode neither provides nor weakens one.
+        (("--skip-git-repo-check", "--sandbox", "read-only"), sandbox.READ_ONLY, "ok"),
+        # A real sandbox, wider than this seat needs.
+        (("--sandbox", "workspace-write"), sandbox.WORKSPACE_WRITE, "warn"),
+        (("--full-auto",), sandbox.WORKSPACE_WRITE, "warn"),
+        # No mode asked for — the shape that used to be "empty by policy".
+        ((), sandbox.UNSET, "fail"),
+        (("--skip-git-repo-check",), sandbox.UNSET, "fail"),
+        # The sandbox switched off, in each spelling.
+        (("--sandbox", "danger-full-access"), sandbox.FULL_ACCESS, "fail"),
+        (("--dangerously-bypass-approvals-and-sandbox",), sandbox.FULL_ACCESS, "fail"),
+        (("--yolo",), sandbox.FULL_ACCESS, "fail"),
+        # Unreadable: a near-miss spelling, a dangling option, a non-string.
+        (("--sandbox", "readonly"), sandbox.UNRECOGNISED, "fail"),
+        (("--sandbox",), sandbox.UNRECOGNISED, "fail"),
+        (("--sandbox", None), sandbox.UNRECOGNISED, "fail"),
+        (("-s",), sandbox.UNRECOGNISED, "fail"),
+        # The WEAKEST named mode decides, whatever clap's last-wins rule would
+        # do with it: this module cannot run the binary to find out, and the
+        # safe direction of being wrong is a `fail` an operator clears by
+        # deleting a flag.
+        (
+            ("--sandbox", "danger-full-access", "--sandbox", "read-only"),
+            sandbox.FULL_ACCESS,
+            "fail",
+        ),
+    ],
+)
+def test_the_policy_is_read_fail_closed_from_the_flags(args, mode, status):
+    policy = describe_sandbox(args)
+
+    assert (policy.mode, policy.status) == (mode, status)
+    assert policy.is_enforceable is (status != "fail")
+    assert policy.detail.strip(), "a row an operator cannot act on is not a check"
+
+
+def test_the_shipped_default_is_the_one_policy_that_passes():
+    """`CodexConfig` ships this value, so the default seat is confined without
+    an operator action. The assertion is on the CONFIG, not on a constant in
+    isolation — a default that agreed with `sandbox.py` and not with the
+    dataclass would be exactly the divergence this file exists to catch."""
+    assert CodexConfig().sandbox_args == DEFAULT_SANDBOX_ARGS
+    assert describe_sandbox(CodexConfig().sandbox_args).status == "ok"
+    # The overclaim a previous round was rejected for, refused in the row
+    # itself: a read-only sandbox refuses writes and permits reads, so a row
+    # that let an operator read it as "the reviewer cannot see the checkout"
+    # would be the same false claim with a flag attached.
+    assert "does NOT confine READS" in describe_sandbox(DEFAULT_SANDBOX_ARGS).detail
+
+
+@pytest.mark.parametrize(
+    "args",
+    [(), ("--skip-git-repo-check",), ("--sandbox", "danger-full-access"), ("--yolo",)],
+)
+def test_an_unconfined_policy_fails_the_preflight_without_invoking_anything(
+    tmp_path, on_path, args
+):
+    """The fail-open this closes: a preflight that ran an UNSANDBOXED reviewer
+    to prove the seat works would answer "it runs" to the question "is it safe",
+    and the `ok` would be evidence for the wrong claim."""
+    run = FakeRun()
+
+    result = preflight_codex(config(tmp_path, sandbox_args=args), run=run)
+
+    assert (result.status, result.kind) == ("fail", preflight.SANDBOX_UNCONFINED)
+    assert run.calls == [], "nothing may be launched under a policy that failed"
+    assert "sandbox" in result.detail.lower()
+
+
+def test_a_bypass_in_the_command_is_graded_too_not_only_the_sandbox_key(
+    tmp_path, on_path
+):
+    """The two keys are one argv. `codex.command` is documented as "how do I run
+    it" and `codex.sandbox_args` as "what may it do", but codex reads a single
+    command line — so a bypass flag in the first key beside a perfectly good
+    policy in the second is an unsandboxed reviewer, and grading only the key
+    that is MEANT to carry the policy is how the other one becomes a way round
+    it."""
+    run = FakeRun()
+    codex = config(tmp_path, command=("codex", "exec", "--yolo"))
+    assert describe_sandbox(codex.sandbox_args).status == "ok", "the setting alone passes"
+
+    result = preflight_codex(codex, run=run)
+
+    assert (result.status, result.kind) == ("fail", preflight.SANDBOX_UNCONFINED)
+    assert run.calls == []
+
+
+def test_the_refusal_names_the_setting_the_value_and_where_to_check(tmp_path, on_path):
+    """An operator reading `fail` needs the next action. The empty case is the
+    one a config carried until this round, so its message names what to set."""
+    result = preflight_codex(config(tmp_path, sandbox_args=()), run=FakeRun())
+
+    assert "codex.sandbox_args" in result.detail
+    assert '["--sandbox", "read-only"]' in result.detail
+    assert "codex exec --help" in result.detail
 
 
 # ---- the working directory ---------------------------------------------------
