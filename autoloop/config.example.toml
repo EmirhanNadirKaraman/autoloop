@@ -807,3 +807,29 @@ workers_root = "~/.autoloop/workers"
 #   "~/code/project-a/.autoloop/config.toml",
 #   "~/code/project-b/.autoloop/config.toml",
 # ]
+
+[concurrency]
+# How many tasks the loop runs at once. ONE today, and one is the only value
+# that means anything today: nothing reads this setting yet.
+#
+# It exists first, alone and unread, because it is candidate 1 of the nine in
+# docs/AUTOLOOP.md, "Running several tasks at once — the split plan". Each
+# candidate lands independently and leaves the loop working; the fleet
+# supervisor that would act on this is candidate 5, and candidate 9 is the one
+# that turns concurrency on. Setting it above 1 before then changes nothing —
+# it is validated and ignored — so leave it at 1.
+#
+# Whatever it is set to, values outside 1..8 are REFUSED at load rather than
+# clamped: 0 and negatives (a fleet of no lanes dispatches nothing while reading
+# as configured), fractions and strings, `true` (a count, not a switch), and
+# anything above the ceiling in autoloop/config.py's MAX_LANES — each lane costs
+# its own clone of the repository and its own worker repositories.
+#
+# When it does start meaning something, read the plan's Decision 3 first: the
+# admission rule co-schedules two tasks that share only a directory entry such
+# as `autoloop/tests/` and the always-granted documentation trackers, and the
+# trackers only stay mergeable while every task keeps CLAUDE.md's change-note
+# discipline — ONE new line, appended at the end, nothing else touched.
+# autoloop/note_merge.py switches itself off silently when that is broken, so
+# concurrency raises the price of breaking it.
+lanes = 1
