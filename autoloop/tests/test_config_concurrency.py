@@ -153,7 +153,9 @@ def test_the_ceiling_is_inclusive(tmp_path):
 
     with pytest.raises(ConfigError) as exc:
         load_config(write_config(tmp_path, f"[concurrency]\nlanes = {MAX_LANES + 1}\n"))
-    assert str(MAX_LANES) in str(exc.value), "the message should say what the limit is"
+    # `at most <n>`, not a bare `<n>`: the rejected value is in the message too,
+    # so a digit alone would also match a sentence that never states the limit.
+    assert f"at most {MAX_LANES}" in str(exc.value), "the message must say the limit"
 
 
 def test_every_value_in_range_loads(tmp_path):
@@ -277,6 +279,8 @@ def test_the_template_ships_one_lane_and_documents_the_key():
     assert "lanes = 1" in section
     for field in dataclasses.fields(ConcurrencyConfig):
         assert f"{field.name} =" in section, f"the template does not document {field.name}"
-    # The ceiling, in the file an operator actually reads. Spelled from the
-    # constant so a raised limit cannot leave the template quoting the old one.
-    assert str(MAX_LANES) in section
+    # The ceiling, in the file an operator actually reads — asserted as the
+    # RANGE rather than as a bare digit, which prose elsewhere in the section
+    # could supply on its own. Spelled from the constant so a raised limit
+    # cannot leave the template quoting the old one.
+    assert f"1..{MAX_LANES}" in section
