@@ -315,9 +315,11 @@ def _repair_orphaned_record(
     **The `resumable` gate is what makes that trade honest, and it is not
     optional.** A live record holds the merge window shut
     (`cli._merge_window_blockers` exempts a record only for a terminal task, a
-    PUBLISHED candidate, a base already behind the head, or a worker that is
-    GONE — none of which this residue satisfies), and the window is the
-    repository-wide merge sweep, not this one task. Paying that to save a
+    PUBLISHED candidate, a base already behind the head, a worker that is GONE,
+    or a record ORPHANED of its task entirely — none of which this residue
+    satisfies, the last one least of all: the task this restores a record for is
+    in the registry and has just been moved back to pending), and the window is
+    the repository-wide merge sweep, not this one task. Paying that to save a
     resumable round is worth it; paying it for a worker the next dispatch would
     refuse anyway buys nothing and hides the refusal behind a stalled sweep.
     So a non-resumable residue is left SPLIT and reported as the directory an

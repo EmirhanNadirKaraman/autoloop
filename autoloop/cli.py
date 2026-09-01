@@ -197,6 +197,7 @@ from .worker_env import (
     ObservedCheckout,
     WorkerRepoManager,
     validate_observed_checkout,
+    validate_task_id,
     validate_workers_root,
     verify_worker_isolation,
 )
@@ -6233,6 +6234,106 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
     )
 
 
+def _candidate_is_orphaned(config, registry, task_id, record) -> str:
+    """Is this record an ORPHAN — an execution record with no task, no worker
+    and no publication left behind it? A one-line reason if so, `""` if it must
+    still be respected.
+
+    MEASURED 2026-08-27. One record did this to the whole repository.
+    `audit-0002` is not a task: it is absent from the registry, its worker
+    directory does not exist, its `published_sha` is None, and its record is
+    dated 2026-08-05. `git filter-repo --path autoloop/` had just rewritten
+    every sha, so the base it names resolves nowhere and
+    `_candidate_base_ancestry` returns `BASE_UNVERIFIED` — which fails closed,
+    correctly, and closed the merge window for EVERY task. `select-02` published
+    to its side branch and sat unmerged behind it with `auto_merge_enabled` on.
+
+    A candidate holds the window shut because moving the base under it strands
+    real, reviewed, unpublished work. For this record there is no such work to
+    strand: no task to return to the queue, no worker whose round could be
+    invalidated, no branch to orphan. Three facts say so, and ALL THREE are
+    required:
+
+    1. **The registry has no task by that id at all.** Not pending, not
+       in-progress, not terminal — absent. `_candidate_is_retired` handles the
+       record whose task IS known and is back in the queue; this one is the case
+       that falls through every escape today.
+    2. **No worker repo exists for it.** Asked of BOTH places one could be: the
+       `worktree_path` the record names (when it names one), and the
+       conventional `workers_root/<task_id>` a dispatch would have created.
+       Either one present means a round's work may still be sitting there.
+    3. **It was never published.** `published_sha` is the loop's own confirmed
+       record of a publication; a record carrying one is describing work that
+       reached a remote branch, and is not this shape whatever else is true of
+       it. (The caller has already asked the REMOTE and been told no — that
+       question is fail-closed and can be unanswerable, so this one is asked of
+       the record, where the answer is definite.)
+
+    **Absence of evidence is not one of the three.** Two guards make "the
+    registry has no such task" an ANSWER rather than a failure to look, and they
+    are the fail-open this predicate would otherwise be:
+
+    * `tasks.json` must EXIST and the registry must be non-empty. A registry
+      that was never written says nothing about any task id, so a wiped or
+      unreachable one would otherwise make every record on disk look orphaned at
+      once — the same "read the wrong directory and print OPEN" failure the
+      `state_dir` check at the top of `_merge_window_blockers` refuses.
+    * `workers_root` must be CONFIGURED and must BE a directory. Otherwise
+      `workers_root/<id>` reads absent because nothing was read, and condition 2
+      would be established from an unmounted path, a mistyped config, or (the
+      dataclass default) no configured worker location at all.
+
+    An EMPTY `worktree_path` is accepted here, where `_candidate_is_retired`
+    deliberately refuses it, and the difference is not a loosening. There, the
+    task is live in the registry and the recorded path is the only evidence
+    about where its candidate lives, so "we never recorded where it was" is
+    genuinely not "we know it is gone". Here the id is not in the registry at
+    all, and the conventional location is checked DIRECTLY — the answer does not
+    come from the record, so a record that names nothing does not withhold it.
+    `_candidate_is_retired` itself is untouched, and the two predicates are
+    disjoint by construction: it returns `""` for exactly the records this one
+    can accept (`not registry.has(task_id)`), so their order at the call site is
+    about which note reads better, never about which verdict wins.
+
+    Nothing about the general rule is relaxed. An unresolvable sha belonging to
+    a LIVE task still fails closed and still closes the window; so does one
+    whose worker directory is still there, one that was published, and one where
+    any of the three facts cannot be established. Ordered cheapest-first —
+    registry, then the record's own fields, then the filesystem.
+    """
+    if not config.tasks_file.exists() or not registry.all_tasks():
+        return ""       # a registry nobody wrote cannot say a task is absent
+    if registry.has(task_id):
+        return ""
+    if record.get("published_sha"):
+        return ""
+    worktree_path = str(record.get("worktree_path") or "")
+    if worktree_path and Path(worktree_path).exists():
+        return ""
+    try:
+        validate_task_id(task_id)
+    except (ValueError, TypeError):
+        # An id no worker path could be built from (a non-string from a
+        # hand-edited record, a traversal attempt). Nothing to check condition
+        # 2 against, so nothing is established.
+        return ""
+    workers_root = config.workers_root
+    if workers_root is None or not workers_root.is_dir():
+        return ""
+    default_worker = workers_root / task_id
+    if default_worker.exists():
+        return ""
+    where = (
+        f"neither its recorded {worktree_path} nor {default_worker}"
+        if worktree_path
+        else f"{default_worker}, and its record names none"
+    )
+    return (
+        f"the registry has no task {task_id}, no worker repo exists for it "
+        f"({where}), and it was never published"
+    )
+
+
 #: Where a record's `task_base_sha` sits relative to the branch head RIGHT NOW,
 #: as `_candidate_base_ancestry` reports it. Only `BASE_BEHIND` stops a record
 #: from holding the merge window shut, and only ever by turning it into a note.
@@ -6361,7 +6462,7 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
     existed only inside quarantined worker repos — and a tool that cries wolf
     gets ignored, which is the failure it exists to prevent.
 
-    Four exemptions, and the difference between them matters:
+    Five exemptions, and the difference between them matters:
 
     * The task reached a terminal registry state (completed / quarantined).
     * The candidate is already PUBLISHED on its own side branch, confirmed
@@ -6380,6 +6481,19 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
       behind, and it is provably not in-flight work — there is no reachable
       commit for a moved base to strand. Reported as a NOTE, never hidden: a
       record that should have been retired is worth seeing.
+    * The record is an ORPHAN: the registry has no task by that id at all, no
+      worker repo exists for it, and it was never published
+      (`_candidate_is_orphaned`, which explains each condition, the two guards
+      that keep "absent" an answer rather than a failure to look, and why an
+      empty `worktree_path` is read differently there than in
+      `_candidate_is_retired`). Measured 2026-08-27: `audit-0002`, a record
+      dated 2026-08-05 for a task that does not exist, closed the window for the
+      WHOLE repository after `git filter-repo` made its base unplaceable — and
+      `select-02` sat published and unmerged behind it. There is no task to
+      return to the queue and no worker to invalidate, so a merge can strand
+      nothing. Also a NOTE, and the note names the remedy: neither `release` nor
+      `discard` reaches a record whose task the registry has never heard of,
+      so retiring it is a move into `executions/archive/` by hand.
     * The record's base is ALREADY a proper ancestor of the head. Also a NOTE,
       for the same reason and by the same rule: the task will need a
       merge-forward or a recut before it can be reviewed again, and dropping it
@@ -6479,6 +6593,24 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
                 f"is NOT in flight — {retired}, and the task is back in the queue. "
                 "The record should have been retired with its worker "
                 "(`release` does this now); ignoring it for the window"
+            )
+            continue
+        # AFTER the retirement exemption, and disjoint from it: that one only
+        # ever fires for a record whose task the registry HAS, this one only for
+        # a record whose task it has never heard of. Ordered this way so the
+        # two notes stay independently readable rather than because either
+        # verdict could preempt the other.
+        orphaned = _candidate_is_orphaned(config, registry, task_id, record)
+        if orphaned:
+            notes.append(
+                f"execution record {path.name}: candidate "
+                f"{str(record.get('candidate_sha'))[:12]} is NOT in flight — "
+                f"{orphaned}. There is no task to return to the queue, no worker "
+                "to invalidate and no branch to orphan, so nothing a merge could "
+                "strand; excluding it from the window. Retire it by moving "
+                f"{path} into {path.parent / 'archive'}/ — `release` and "
+                "`discard` both need a task id the registry knows, so neither "
+                "reaches this record"
             )
             continue
         candidate = str(record.get("candidate_sha"))[:12]

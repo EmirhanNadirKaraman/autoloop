@@ -215,7 +215,14 @@ def test_a_record_for_a_LIVE_task_still_closes_it(wired, remote, capsys):
 
 
 def test_a_record_whose_task_is_unknown_still_closes_it(wired, remote):
-    """An id the registry has never heard of is not evidence of safety."""
+    """An id the registry has never heard of is not evidence of safety.
+
+    This fixture writes no `tasks.json` at all, which is the whole reason it
+    still closes: an unwritten registry cannot say a task is absent. The
+    orphan exemption further down this file requires that registry to EXIST
+    and be non-empty before it will read `has()` as an answer, plus a worker
+    location it can actually look in — see `_candidate_is_orphaned`. The two
+    cases are not in tension; this one is the failure-to-look half of it."""
     _state(wired, phase=Phase.AWAITING.value)
     _execution(wired, task_id="ghost-1")
 
@@ -837,6 +844,305 @@ def test_the_command_OPENS_and_prints_the_already_behind_candidate(
     out = capsys.readouterr().out
     assert "OPEN" in out
     assert "note:" in out and "blk-01" in out and "ALREADY behind" in out
+
+
+# --- a record ORPHANED of its task entirely -----------------------------------
+#
+# MEASURED 2026-08-27. `git filter-repo --path autoloop/` rewrote every sha in
+# this repository, so 132 of ~141 execution records name a base and a candidate
+# that resolve nowhere. Almost all are harmless (their tasks are `completed`).
+# ONE was not: `audit-0002`, dated 2026-08-05, is not a task at all — absent
+# from the registry, no worker directory, `published_sha` None. Nothing could
+# strand it, and it closed the merge window for the WHOLE repository:
+#
+#   - task audit-0002 has a candidate (8d96c52aeca4) bound to base 278b93107ac6
+#     — git could not place it against head e50ad3d26a83 ... so it is treated as
+#     bound to the head and merging would strand it
+#
+# `select-02` completed and published to origin/autoloop/select-02 and sat
+# unmerged behind it with `auto_merge_enabled` on. The record fell through every
+# escape — `_candidate_is_retired` needs a task the registry HAS — and landed in
+# the most dangerous arm while being the most inert record on disk.
+#
+# The exemption is three facts, all required, each established affirmatively;
+# everything else here pins the ways it must NOT fire.
+
+ORPHAN = "audit-0002"
+ORPHAN_CANDIDATE = "8d96c52aeca4"
+ORPHAN_BASE = "278b93107ac6"
+
+
+def _orphan(config, task_id=ORPHAN, *, others=("live-1",), filename=None, **fields):
+    """The 2026-08-05 record `audit-0002` left behind, and the surroundings
+    that make its three facts ANSWERS rather than a failure to look: a
+    `tasks.json` that exists and is non-empty and has never heard of `task_id`,
+    and a `workers_root` that is a real directory with no repo in it.
+
+    `filename` names the file independently of the id inside it, for the ids
+    that could not be a filename at all.
+
+    Returns the record's path, which the note has to name."""
+    d = config.state_dir / "executions"
+    d.mkdir(parents=True, exist_ok=True)
+    record = {
+        "task_id": task_id,
+        "candidate_sha": ORPHAN_CANDIDATE,
+        "task_base_sha": ORPHAN_BASE,
+        "intended_remote": "",
+        "intended_remote_ref": "",
+        "worktree_path": "",
+    }
+    record.update(fields)
+    path = d / (filename or f"{task_id}.json")
+    path.write_text(json.dumps(record), encoding="utf-8")
+    TaskStore(config.tasks_file).save(
+        TaskRegistry([Task(id=t, title="t", description="d") for t in others])
+    )
+    config.workers_root.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_an_orphaned_record_does_not_close_the_window(wired):
+    """THE case. No task, no worker, no publication — and a base no checkout
+    can place, which is what made this the most dangerous-looking record in the
+    directory rather than the most inert one."""
+    _state(wired, phase=Phase.AWAITING.value)
+    path = _orphan(wired)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons == [], f"nothing exists for a merge to strand: {reasons}"
+    assert len(notes) == 1
+    note = notes[0]
+    assert path.name in note and ORPHAN_CANDIDATE in note, (
+        f"the note must name the record and its candidate: {note}"
+    )
+    assert "NOT in flight" in note
+    assert f"the registry has no task {ORPHAN}" in note
+    assert "no worker repo exists for it" in note
+    assert "it was never published" in note
+    assert "archive" in note, (
+        "an excluded record must come with the remedy: neither `release` nor "
+        f"`discard` can reach it, so the note has to say so — {note}"
+    )
+
+
+def test_the_exclusion_is_REPORTED_through_the_operators_own_command(
+    wired, monkeypatch, capsys
+):
+    """Excluded is not dropped. End to end: exit 0, and the record an operator
+    now has to retire by hand is on screen with its reason."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    monkeypatch.setattr(cli, "_window_git", lambda _config: _FakeCheckout())
+
+    assert cli._cmd_merge_window(_args()) == 0
+
+    out = capsys.readouterr().out
+    assert "OPEN" in out
+    assert "note:" in out and ORPHAN in out
+    assert "NOT in flight" in out and "archive" in out
+
+
+def test_a_record_whose_task_is_IN_PROGRESS_still_closes_the_window(wired):
+    """The general rule is untouched. A dispatched round is exactly the work
+    this command protects, and an unresolvable sha belonging to it must still
+    fail closed however much the rest of the record looks orphaned."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    store = TaskStore(wired.tasks_file)
+    registry = TaskRegistry([
+        Task(id="live-1", title="t", description="d"),
+        Task(id=ORPHAN, title="t", description="d"),
+    ])
+    registry.mark_in_progress(ORPHAN)
+    store.save(registry)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and ORPHAN in reasons[0] and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_a_record_whose_task_is_merely_IN_THE_QUEUE_still_closes_the_window(wired):
+    """The other half of "live". A pending task will be dispatched again, so
+    the registry knowing the id at all is what stops this exemption — the first
+    of the three facts is absence from the registry, not a state within it."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired, others=("live-1", ORPHAN))
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and ORPHAN in reasons[0] and "would strand it" in reasons[0]
+    assert notes == [], "the retirement note needs a recorded worker path too"
+
+
+def test_an_orphan_whose_DEFAULT_worker_directory_exists_still_closes_it(wired):
+    """A worker repo where the next dispatch would have created one may hold a
+    round's work, and this record names no other place to look."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    (wired.workers_root / ORPHAN).mkdir(parents=True)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_an_orphan_whose_RECORDED_worker_directory_exists_still_closes_it(
+    wired, tmp_path
+):
+    """Both places are asked, not one. A worker that survived somewhere other
+    than the conventional location is still a worker."""
+    survivor = tmp_path / "elsewhere" / ORPHAN
+    survivor.mkdir(parents=True)
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired, worktree_path=str(survivor))
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_an_orphan_that_WAS_published_still_closes_the_window(wired):
+    """`published_sha` is the loop's own confirmed record that this candidate
+    reached a remote branch. The remote no longer carries it — a deleted or
+    force-moved ref — so the publication exemption cannot fire either, and a
+    record describing work that was really published is not this shape whatever
+    else is true of it."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(
+        wired,
+        intended_remote="origin",
+        intended_remote_ref=PUSHED,
+        published_sha=ORPHAN_CANDIDATE,
+    )
+    git = _FakeCheckout()
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), git)
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+    assert git.lookups == [("origin", PUSHED)], "the remote is still asked first"
+
+
+def test_a_registry_that_was_never_WRITTEN_excludes_nothing(wired):
+    """The fail-open this exemption would otherwise be. A `tasks.json` that
+    does not exist says nothing about any task id — and `_seed_registry` would
+    hand back the git-tracked seed file instead, so 'absent' would mean 'not in
+    the seed'. Every record on disk would be written off at once."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    wired.tasks_file.unlink()
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_an_EMPTY_registry_excludes_nothing(wired):
+    """The same failure one step along: a registry that loaded but holds no
+    task cannot be the authority on which ids exist."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    TaskStore(wired.tasks_file).save(TaskRegistry([]))
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_a_workers_root_that_is_not_THERE_excludes_nothing(wired):
+    """A missing worker repo has to be read from a place that could have held
+    one. An unmounted or mistyped `workers_root` answers 'absent' having read
+    nothing — the same mistake as reading the wrong state directory and
+    printing OPEN."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    wired.workers_root.rmdir()
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_an_UNCONFIGURED_workers_root_excludes_nothing(wired):
+    """`AutoloopConfig.workers_root` defaults to `None`, and a deployment with
+    no configured worker location cannot say a worker is gone."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    unconfigured = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=PolicyConfig(),
+        state_dir=wired.state_dir,
+        workers_root=None,
+    )
+
+    reasons, notes = cli._merge_window_blockers(unconfigured, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_a_task_id_no_worker_path_could_be_built_from_excludes_nothing(wired):
+    """`workers_root/<id>` is only askable for an id that is a legal path
+    component. A hand-edited record naming something else leaves condition 2
+    with nothing to check, which is not the same as checking it and finding
+    nothing — and it must not be answered by walking out of `workers_root`."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired, task_id="../escape", filename="escape.json")
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_a_task_id_that_is_not_even_a_STRING_excludes_nothing(wired):
+    """A hand-edited record can hold anything JSON can. The id reaches a regex
+    match, which raises `TypeError` rather than `ValueError` on a non-string —
+    a raise that would otherwise escape the whole command."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired, task_id=7, filename="numeric.json")
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_an_executing_phase_closure_reports_THAT_and_nothing_else(wired):
+    """The two blockers stay independent, and an excluded orphan adds nothing
+    to the reasons — the window is closed by the phase, says so, and says only
+    that. The record is still on the operator's screen, as a note."""
+    _state(wired, phase=Phase.EXECUTING.value)
+    _orphan(wired)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons == ["a phase is executing — an agent may be mid-write"]
+    assert len(notes) == 1 and ORPHAN in notes[0]
+
+
+def test_one_orphan_does_not_excuse_a_live_sibling_bound_to_the_head(wired):
+    """Per-record, like every other exemption here. A window with one of each
+    stays shut, and stays shut for the right record."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _orphan(wired)
+    _execution(wired, task_id="live-1", base=HEAD)
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(), _FakeCheckout(head=HEAD, commits={HEAD})
+    )
+
+    assert len(reasons) == 1 and "live-1" in reasons[0]
+    assert "IS the current head" in reasons[0]
+    assert len(notes) == 1 and ORPHAN in notes[0]
 
 
 # --- a stale park whose task has since completed ------------------------------
