@@ -484,13 +484,20 @@ uncertainty rather than resolving it**:
 * *Could the registry be read at all?* If not, promotion is REFUSED. "No task
   covers this" is not something an unread registry says.
 
-Two more refusals guard the same property from the other side, because a
+Three more refusals guard the same property from the other side, because a
 finding leaves the outstanding list once it is promoted but its id can still be
 typed: promoting a finding **already recorded as promoted** is refused naming
-the task it went to, and a spec whose id **the registry already holds** is
-refused with `--task-id` as the remedy. The second one matters because
-`TaskRegistry.add_many` would refuse that request on merge — after the ledger
-had recorded that a task exists.
+the task it went to, a spec whose id **the registry already holds** is refused
+with `--task-id` as the remedy, and so is one whose id **a request still queued
+in the inbox already claims**. The last two matter for the same reason —
+`TaskRegistry.add_many` would refuse that request on merge, after the ledger had
+recorded that a task exists — and the queue needs its own check because
+`tasks.json` cannot see an undrained request. Two findings can reach one task id
+without either being typed twice: `finding_task_id` reduces every run of
+non-alphanumerics to `-`, so `db-01` and `db_01` collide, as do two long ids
+sharing their first 64 characters. The refusal happens before either the request
+or the ledger is written, so the earlier request is untouched and the refused
+finding stays OUTSTANDING.
 
 ALREADY DONE is the outcome for a fix that shipped under a task which never
 named the finding — the case the check above cannot see. It is never inferred:

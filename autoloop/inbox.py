@@ -559,6 +559,47 @@ class TaskInbox:
             return []
         return sorted(p for p in self.directory.glob("*.json") if p.is_file())
 
+    def pending_creation_ids(self) -> dict[str, Path]:
+        """Task ids QUEUED CREATION REQUESTS already claim -> the file claiming
+        each, oldest first (so the first claimant wins a tie).
+
+        The registry cannot answer this question. A queued request has not
+        reached `tasks.json` yet, so `registry_task_ids` says nothing about it —
+        and two requests carrying the SAME id both land in this directory under
+        distinct names (`submit` stamps `time_ns()`), drain in order, and the
+        second is refused by `TaskRegistry.add_many` as a duplicate. Whoever
+        queued it has by then already recorded that a task exists. Reading the
+        queue before writing to it is the only place that pair can be caught;
+        `promote_finding` is the caller that does.
+
+        **A file this cannot read is skipped, and that is not fail-open.**
+        `drain` parses with exactly the `(OSError, ValueError)` set used here and
+        MOVES anything that fails into `rejected/` — so a request unreadable here
+        is a request that becomes no task there, and cannot collide with
+        anything. The same goes for a spec that is not a JSON object, which
+        `drain` rejects outright.
+
+        Only CREATION requests count, and the kind is resolved the way
+        `check_request_shape` resolves it (absent means `task`, since files
+        written before kinds existed still drain). A MUTATION names an existing
+        task and creates none; a request whose kind is unknown — including an
+        unhashable `[]` — is refused by `check_request_shape` on merge and
+        likewise creates none. Compared with `!=` rather than looked up in
+        `MUTATION_PAYLOAD` for that last reason: a dict lookup on a list raises.
+        """
+        claimed: dict[str, Path] = {}
+        for path in self.pending():
+            try:
+                spec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(spec, dict) or spec.get("kind", KIND_TASK) != KIND_TASK:
+                continue
+            task_id = str(spec.get("id") or "").strip()
+            if task_id and task_id not in claimed:
+                claimed[task_id] = path
+        return claimed
+
     def drain(self) -> tuple[list[dict], list[str]]:
         """Every pending request, oldest first, removed from the inbox.
 
@@ -3269,6 +3310,14 @@ def promote_finding(
       * A task already NAMES this finding — record it as promoted UNDER THAT
         TASK and queue nothing. The finding is actioned, so it leaves the
         outstanding list; no second task is created.
+      * A request ALREADY QUEUED in the inbox claims the same task id — refuse,
+        naming that file and `--task-id`. `tasks.json` cannot see an undrained
+        request, so two findings whose ids collide (two spellings reducing to
+        one `finding_task_id`, two long ids sharing their first 64 characters,
+        or the same `--task-id` typed twice) both pass the registry check above
+        and queue two requests for ONE id. The drain then applies the first and
+        `add_many` refuses the second — after the ledger has recorded that a
+        runnable task exists for it.
       * Otherwise — queue one creation request through `TaskInbox.submit`, the
         same gate every other route uses, and record it.
     """
@@ -3332,6 +3381,24 @@ def promote_finding(
             "recorded as promoted. Pass --task-id to file it under another id, "
             "or record the finding against the existing task by naming "
             f"{finding.qualified_id} in that task's description."
+        )
+    # The QUEUE, which the registry check above cannot see. Read here rather
+    # than carried on the assessment because promotion itself writes to this
+    # directory: an id read once at `read_audit_intake` time would be stale by
+    # the second promotion of the same pass. Both writes below are still ahead
+    # of us, so a refusal here leaves the earlier request byte-for-byte intact
+    # and this finding OUTSTANDING — which is the honest state, since no task
+    # for it exists or is queued.
+    queued_claim = inbox.pending_creation_ids().get(str(spec["id"]))
+    if queued_claim is not None:
+        raise IntakeError(
+            "a request queued in the inbox already asks for a task called "
+            f"{str(spec['id'])!r} ({queued_claim.name}), and it has not been "
+            "drained into the registry yet — queueing a second one would file "
+            "two requests for one id, of which the merge accepts only the "
+            "first, while this finding was recorded as promoted. Pass --task-id "
+            "to file it under another id, or drain the inbox first "
+            "(`python -m autoloop drain-inbox`) and promote it again."
         )
     # Shape-checked before anything is written, by the same function
     # `TaskInbox.submit` calls — so a spec that would be refused on the way in
