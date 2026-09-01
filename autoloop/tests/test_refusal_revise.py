@@ -15,18 +15,22 @@ The one claim under test, stated as the loop has to satisfy it:
 about the bound rather than about the send. Sections 4 and 5 own it, and section
 5 exists for one specific fail-open that an earlier design would have shipped: an
 autonomous retry marks its blocker for closure by the next COMPLETED step, and a
-revise round completing IS such a step — so closing the record there would reset
-the recurrence meter and hand the identical refusal a fresh allowance, every
-round, forever. `test_a_completed_revise_round_does_not_refund_the_allowance` is
-the regression for exactly that.
+revise round completing IS such a step — so closing the record there would tell
+an operator the loop recovered from a refusal that is still standing.
+`test_a_completed_revise_round_does_not_refund_the_allowance` is the regression,
+and it also pins the property that makes the meter survive it: the allowance is
+counted across CLOSED records too, so no closure can refund one.
 
-Two orthogonal locks are asserted separately on purpose. The METER
-(`max_attempts = 1` on `open_recurrences`) bounds the resend whatever the refusal
-says, which matters because refusal text carries commit shas and round numbers
-and therefore routinely differs between two occurrences of the identical fault.
-The FINGERPRINT (`blockers.refusal_identity` on the blocker record) can only ever
-set the task aside SOONER. A test that only exercised the fingerprint would pass
-while the loop span on a refusal whose sha changed.
+The meter is keyed on the REFUSAL, not on its code
+(`BlockerStore.refusal_revises` over `blockers.refusal_identity`), and both
+directions are asserted because each is half the claim. The same complaint twice
+sets the task aside — that is the loop this task exists to prevent. A DIFFERENT
+complaint under the same code gets its own revise — `post_commit_verification_
+failed` names five different checks, and refusing the second on the strength of
+the first would park work that had an answer. What the identity key deliberately
+does NOT bound is a code whose text churns every round; that is bounded by
+`MAX_TASK_ATTEMPTS` and `policy.max_review_rounds`, and section 4 pins the way
+that chain terminates.
 
 Self-contained per this codebase's convention (see `test_blockers.py`'s
 docstring) — the small config/orchestrator helpers are duplicated here rather
@@ -45,11 +49,13 @@ from autoloop.blockers import (
     HARD_HALT_CODES,
     NO_TASK,
     RECOVER_BY_REVISING,
+    RECOVER_UNAVAILABLE,
     REFUSED_WORK_RECOVERIES,
     BlockerStore,
     autonomous_recovery,
     refusal_identity,
 )
+from autoloop.errors import StateCorruptError
 from autoloop.config import AutoloopConfig, AutonomyConfig, BrowserConfig
 from autoloop.contract import Decision
 from autoloop.manifest import ManifestStore
@@ -297,8 +303,8 @@ def test_with_the_flag_off_every_named_code_parks_exactly_as_before(tmp_path, co
     assert orch._pending_autonomous_revise is None
     blocker = blocker_store.load(orch.state.park_blocker_id)
     assert (blocker.kind, blocker.code, blocker.task_id) == (SITE_KIND[code], code, "t1")
-    assert blocker.refusal_fingerprint == "", (
-        "the off position wrote a repeat-guard identity it will never read"
+    assert blocker.revised_refusals == [], (
+        "the off position spent a revise allowance without issuing a revise"
     )
     assert "autonomous_recovery" not in transcript_types(config)
 
@@ -348,7 +354,10 @@ def test_each_code_is_returned_as_a_revise_carrying_the_refusal_text(tmp_path, c
     # And the fault is on the record, OPEN, with the repeat guard's identity.
     open_records = blocker_store.open_blockers()
     assert [(b.code, b.task_id, b.recurrences) for b in open_records] == [(code, "t1", 1)]
-    assert open_records[0].refusal_fingerprint == refusal_identity(code, REFUSAL, DETAIL)
+    assert open_records[0].revised_refusals == [refusal_identity(code, REFUSAL, DETAIL)], (
+        "the allowance was not spent against this refusal's own identity"
+    )
+    assert blocker_store.refusal_revises("t1", refusal_identity(code, REFUSAL, DETAIL)) == 1
     recovery = transcript_entries(config, "autonomous_recovery")
     assert recovery and recovery[0]["action"] == RECOVER_BY_REVISING
     assert (recovery[0]["attempt"], recovery[0]["budget"]) == (1, 1)
@@ -470,16 +479,15 @@ def test_the_same_refusal_repeating_sets_the_task_aside(tmp_path, code):
     )
 
 
-def test_a_DIFFERENT_refusal_for_the_same_code_is_still_bounded_by_the_meter(tmp_path):
-    """THE test the fingerprint alone would fail, and the reason the meter is the
-    bound rather than the digest.
+def test_a_DIFFERENT_refusal_for_the_same_code_gets_its_own_revise(tmp_path):
+    """THE reason the meter is keyed on the refusal rather than on its code.
 
-    `post_commit_verification_failed`'s own text names the candidate sha and the
-    round number, so two occurrences of the identical fault produce different
-    text — every round. A guard that only fired on a text match would therefore
-    switch itself off exactly where it is needed, and the loop would revise
-    forever. Here the second refusal says something genuinely different, the
-    fingerprint does NOT match, and the task is set aside anyway."""
+    `post_commit_verification_failed` is raised for five different checks and
+    `commit_refused` for every reason git declined one. A second occurrence
+    saying something genuinely different is feedback the agent has never been
+    given, and a (task, code) meter would refuse it on the strength of a fault it
+    has nothing to do with — parking work that had an answer. Here the second
+    refusal is a different complaint, and it is owed its own revise."""
     orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
     dispatched = capture_dispatch(orch)
 
@@ -491,41 +499,65 @@ def test_a_DIFFERENT_refusal_for_the_same_code_is_still_bounded_by_the_meter(tmp
     refuse(orch, "post_commit_verification_failed",
            question="task t1: commit bbbbbbbbbbbb (round 2) was REFUSED",
            detail="post-commit validation failed: 3 tests failed")
+    orch._step(Phase(orch.state.phase))
 
-    assert len(dispatched) == 1, "a changed sha bought a second revise"
+    assert len(dispatched) == 2, "a genuinely new refusal was never returned"
+    assert "post-commit validation failed: 3 tests failed" in dispatched[1].feedback
+    assert orch.state.phase == Phase.READY.value, "the second complaint parked"
+    assert not transcript_entries(config, "autonomous_revise_refused")
+    # Two identities, one allowance each, both spent — and neither refunds the
+    # other.
+    spent = [b.revised_refusals for b in blocker_store.all_blockers()]
+    assert sum(len(entries) for entries in spent) == 2
+    assert len({fp for entries in spent for fp in entries}) == 2
+
+
+def test_the_third_occurrence_of_the_FIRST_refusal_is_still_set_aside(tmp_path):
+    """The other half of the test above, and the one that stops it being a hole.
+
+    Letting a different complaint through must not refund the first one's
+    allowance: the meter is per identity, so refusal A, refusal B, refusal A
+    again is one revise for A, one for B, and a set-aside for A's return — never
+    a rotation that revises forever."""
+    orch, config, _, _, _ = build(tmp_path, enabled=True)
+    dispatched = capture_dispatch(orch)
+    first = dict(question="task t1: commit aaaaaaaaaaaa was REFUSED", detail="dirty")
+    second = dict(question="task t1: commit bbbbbbbbbbbb was REFUSED", detail="ancestry")
+
+    for refusal in (first, second, first):
+        refuse(orch, "post_commit_verification_failed", **refusal)
+        if orch._pending_autonomous_revise is not None:
+            orch._step(Phase(orch.state.phase))
+
+    assert len(dispatched) == 2, "the first refusal came back and bought a revise"
     assert (orch.state.park_kind, orch.state.park_task_id) == ("task_fatal", "t1")
-    refusals = transcript_entries(config, "autonomous_revise_refused")
-    assert not refusals, (
-        "the fingerprint guard fired; this case must be stopped by the meter, "
-        "which is what proves the meter is the bound"
+    assert transcript_entries(config, "autonomous_revise_refused")[-1]["reason"] == (
+        "same_refusal_repeated"
     )
-    assert blocker_store.open_recurrences("t1", "post_commit_verification_failed") == 2
 
 
 def test_the_allowance_cannot_be_refreshed_by_the_refusal_moving_one_phase_along(
     tmp_path,
 ):
     """`BlockerStore.record` keys on phase — correctly, for an operator question
-    — so the budget is metered on `open_recurrences`, which does not. A refusal
-    raised in `executing` and again in `ready` (which is exactly where a
-    self-issued revise leaves the loop) is one allowance, not two."""
+    — while `refusal_identity` does not, so the SAME refusal raised in `executing`
+    and again in `ready` (which is exactly where a self-issued revise leaves the
+    loop) is one allowance across two records, not two allowances."""
     orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
     dispatched = capture_dispatch(orch)
 
     refuse(orch, "commit_refused", phase=Phase.EXECUTING.value)
     orch._step(Phase(orch.state.phase))  # the revise round; nothing is queued now
 
-    refuse(orch, "commit_refused", phase=Phase.READY.value,
-           question="task t1: the commit was refused — index.lock exists")
+    refuse(orch, "commit_refused", phase=Phase.READY.value)
 
     assert len(dispatched) == 1, "a phase change bought a second revise"
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert orch.state.park_kind == "task_fatal"
     assert len(blocker_store.open_blockers()) == 2, "two records, one budget"
-    assert not transcript_entries(config, "autonomous_revise_refused"), (
-        "this must be stopped by the phase-blind meter, not by a text match or "
-        "by the already-queued check"
-    )
+    assert transcript_entries(config, "autonomous_revise_refused")[-1]["reason"] == (
+        "same_refusal_repeated"
+    ), "the phase-blind identity meter did not recognise the refusal"
 
 
 def test_the_set_aside_park_makes_continuous_mode_continue(tmp_path, capsys):
@@ -590,19 +622,23 @@ def test_refusal_identity_is_stable_normalised_and_empty_for_nothing():
 def test_a_stored_empty_identity_never_matches_a_textless_refusal(tmp_path):
     """The direction the empty digest must fail in.
 
-    The store already holds a CLOSED record for this (task, code) carrying NO
-    fingerprint — a record written before the field existed, or by a park raised
+    The store already holds a CLOSED record for this (task, code) that spent no
+    allowance — a record written before the field existed, or by a park raised
     while the flag was off. A textless refusal arrives on top of it, and the two
     absences must not read as a match: that would set a task aside on a
     coincidence rather than on a repeat. It is refused as `empty_refusal_text`
-    instead, which is the honest reason."""
+    instead, which is the honest reason — ONCE, because the guard returns before
+    `_queue_autonomous_revise` can log the same fact a second time."""
     orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
     seeded = blocker_store.record(
         task_id="t1", kind="task_fatal", code="commit_refused", question="",
         detail="", phase="ready", now="2026-09-01T00:00:00+00:00",
     )
     blocker_store.resolve(seeded.id, "answered by hand")
-    assert blocker_store.last_refusal_fingerprint("t1", "commit_refused") == ""
+    assert seeded.revised_refusals == []
+    assert blocker_store.refusal_revises("t1", "") == 0, (
+        "an empty identity counted a spent allowance"
+    )
 
     refuse(orch, "commit_refused", question="", detail="")
 
@@ -613,6 +649,24 @@ def test_a_stored_empty_identity_never_matches_a_textless_refusal(tmp_path):
     assert orch.state.phase == Phase.NEEDS_USER.value
 
 
+def test_an_empty_identity_can_never_be_written_into_the_meter(tmp_path):
+    """The store's own half of the rule above. `""` stored once would match every
+    later textless refusal, so the meter refuses to hold it at all rather than
+    trusting its caller to have checked."""
+    from autoloop.errors import StateError
+
+    _, _, blocker_store, _, _ = build(tmp_path, enabled=True)
+    blocker = blocker_store.record(
+        task_id="t1", kind="task_fatal", code="commit_refused", question="q",
+        detail="d", phase="ready", now="2026-09-01T00:00:00+00:00",
+    )
+
+    with pytest.raises(StateError):
+        blocker_store.note_refusal_revise(blocker.id, "")
+
+    assert blocker_store.load(blocker.id).revised_refusals == []
+
+
 # =============================================================================
 # 5. THE FAIL-OPEN: a completed round must not refund the allowance
 # =============================================================================
@@ -621,19 +675,24 @@ def test_a_stored_empty_identity_never_matches_a_textless_refusal(tmp_path):
 # because for a transport fault a step completing IS evidence the fault passed.
 # For a revise it is evidence of nothing of the kind — the round ran, that is
 # all, and the refusal is usually raised BY that round. Closing the record there
-# resets `open_recurrences` to zero, and the next identical refusal finds a full
-# allowance. Every round. Forever.
+# would file a machine `archived_reason` claiming the loop recovered from a
+# refusal still standing. The meter itself is counted across CLOSED records too,
+# so no closure — by this marker, by an operator's answer, or by `archive_stale`
+# — can refund an allowance. Both properties are asserted, because the marker
+# being wrong and the meter being refundable are two different defects.
 
 
 def test_a_completed_revise_round_does_not_refund_the_allowance(tmp_path):
     """THE regression, driven the way `run` drives it: a step, then `run`'s own
     `else` branch (`_close_recovered_blocker`), then the same refusal again.
 
-    Asserted in three places rather than one, because each catches a different
+    Asserted in four places rather than one, because each catches a different
     way of getting this wrong: the marker is never set, the record is still open
-    after a completed step, and the second refusal parks."""
+    after a completed step, the spent allowance is still on the record, and the
+    second refusal parks."""
     orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
     dispatched = capture_dispatch(orch)
+    identity = refusal_identity("post_commit_verification_failed", REFUSAL, DETAIL)
 
     refuse(orch, "post_commit_verification_failed")
     assert orch._autonomous_recovered_blocker == "", (
@@ -644,11 +703,35 @@ def test_a_completed_revise_round_does_not_refund_the_allowance(tmp_path):
     orch._close_recovered_blocker()           # `run`'s else branch, verbatim
 
     assert len(blocker_store.open_blockers()) == 1, "the completed round closed the record"
-    assert blocker_store.open_recurrences("t1", "post_commit_verification_failed") == 1
+    assert blocker_store.refusal_revises("t1", identity) == 1
 
     refuse(orch, "post_commit_verification_failed")
 
     assert len(dispatched) == 1, "the refund handed the same refusal a second revise"
+    assert (orch.state.park_kind, orch.state.park_task_id) == ("task_fatal", "t1")
+
+
+def test_answering_the_blocker_does_not_refund_the_allowance_either(tmp_path):
+    """The same property against the OTHER two ways a record closes. An operator
+    answering it and `archive_stale` retiring its session both end the episode,
+    and a meter read off open records alone would hand the identical refusal a
+    fresh allowance at that moment."""
+    orch, _, blocker_store, _, _ = build(tmp_path, enabled=True)
+    dispatched = capture_dispatch(orch)
+    identity = refusal_identity("commit_refused", REFUSAL, DETAIL)
+
+    refuse(orch, "commit_refused")
+    orch._step(Phase(orch.state.phase))
+    blocker_store.archive_stale(blocker_store.open_blockers()[0].id, "session retired")
+
+    assert blocker_store.open_blockers() == []
+    assert blocker_store.refusal_revises("t1", identity) == 1, (
+        "closing the record refunded the allowance"
+    )
+
+    refuse(orch, "commit_refused")
+
+    assert len(dispatched) == 1
     assert (orch.state.park_kind, orch.state.park_task_id) == ("task_fatal", "t1")
 
 
@@ -667,10 +750,10 @@ def test_a_transport_retry_still_closes_its_record(tmp_path):
     assert blocker_store.open_blockers() == []
 
 
-def test_ten_consecutive_refusals_produce_exactly_one_revise(tmp_path):
-    """The bound stated as a number rather than as a shape. Whatever the refusal
-    says and whichever phase it is raised in, one (task, code) buys ONE
-    self-issued revise per open blocker — the rest park."""
+def test_ten_consecutive_identical_refusals_produce_exactly_one_revise(tmp_path):
+    """The bound stated as a number rather than as a shape. Whichever phase it is
+    raised in and however many records it spreads across, ONE refusal buys ONE
+    self-issued revise — the other nine park."""
     orch, _, _, _, _ = build(tmp_path, enabled=True)
     dispatched = capture_dispatch(orch)
 
@@ -678,7 +761,7 @@ def test_ten_consecutive_refusals_produce_exactly_one_revise(tmp_path):
         refuse(
             orch,
             "review_packet_build_failed",
-            question=f"task t1: round {round_number} could not be presented",
+            question="task t1: the round could not be presented",
             phase=(Phase.EXECUTING.value if round_number % 2 else Phase.READY.value),
         )
         if orch._pending_autonomous_revise is not None:
@@ -688,6 +771,51 @@ def test_ten_consecutive_refusals_produce_exactly_one_revise(tmp_path):
     assert len(dispatched) == 1
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert orch.state.park_kind == "task_fatal"
+
+
+# =============================================================================
+# 5b. what bounds a code whose TEXT churns, which the identity meter does not
+# =============================================================================
+#
+# The identity key is deliberately exact, so a refusal that says something new
+# every round is not stopped HERE. It is stopped by the ceilings a self-issued
+# revise spends exactly as a reviewer's does, and then by the quarantine those
+# ceilings produce. Both ends of that chain are pinned below rather than
+# asserted in prose, and neither costs a real round: `test_a_self_issued_revise_
+# reaches_the_executor_branch` above already proves the revise arrives at
+# `_dispatch_executor`, which is the site that charges `MAX_TASK_ATTEMPTS`.
+
+
+def test_the_ceilings_that_bound_a_churning_refusal_are_themselves_set_asides():
+    """`attempt_count_ceiling` and `review_round_cap` terminate the chain, and
+    they terminate it in a QUARANTINE rather than in another revise: both are
+    `RECOVER_UNAVAILABLE` with a budget of 0, so the set-aside fires on their
+    first occurrence. Neither is in halt-04's table, so neither can be answered
+    with the revise that spent them."""
+    for code in ("attempt_count_ceiling", "review_round_cap"):
+        entry = autonomous_recovery(code)
+        assert entry is not None, f"{code} is not automated at all"
+        assert entry.action == RECOVER_UNAVAILABLE, f"{code} retries instead of stopping"
+        assert entry.max_attempts == 0
+        assert code not in REFUSED_WORK_RECOVERIES
+
+
+def test_a_task_already_set_aside_cannot_be_revised_back_out_of_quarantine(tmp_path):
+    """The far end of the chain. A set-aside leaves the task
+    `blocked_by_operator`, and `policy.authorize_directive` refuses a `revise` of
+    one — so once the ceilings quarantine a task, no later refusal can start
+    another round on it, whatever its text says."""
+    orch, config, _, task_store, registry = build(tmp_path, enabled=True)
+    registry.block("t1", "quarantined by an earlier ceiling")
+    task_store.save(registry)
+
+    refuse(orch, "post_commit_verification_failed")
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch._pending_autonomous_revise is None
+    assert transcript_entries(config, "autonomous_revise_refused")[0]["reason"] == (
+        "policy_denied:task_blocked_by_operator"
+    )
 
 
 # =============================================================================
@@ -822,6 +950,78 @@ def test_a_live_urgent_pin_naming_another_task_refuses_the_revise(tmp_path):
     )
 
 
+def test_a_revise_the_loop_DECLINED_to_issue_does_not_spend_the_allowance(tmp_path):
+    """The meter counts what the loop DID, not what it saw.
+
+    Every refusal in this section parks with the question it always had, and none
+    of them is a loop — no round ran, so there is nothing to bound. Spending the
+    allowance on one would mean a refusal that was never returned to the agent
+    could never be returned at all, which is the automation quietly not
+    happening. Here the gate clears and the same refusal gets its one revise."""
+    orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
+    dispatched = capture_dispatch(orch)
+    orch._stat_only_split_review_task = lambda: "t1"  # type: ignore[method-assign]
+
+    refuse(orch, "post_commit_verification_failed")
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert blocker_store.open_blockers()[0].revised_refusals == []
+
+    orch._stat_only_split_review_task = lambda: ""  # type: ignore[method-assign]
+    refuse(orch, "post_commit_verification_failed")
+
+    assert orch.state.phase == Phase.READY.value
+    assert orch._pending_autonomous_revise is not None
+    orch._step(Phase(orch.state.phase))
+    assert len(dispatched) == 1
+    reasons = [e["reason"] for e in transcript_entries(config, "autonomous_revise_refused")]
+    assert reasons == ["stat_only_split_ask_outstanding"]
+
+
+def test_a_meter_the_loop_cannot_WRITE_parks_rather_than_revising(tmp_path):
+    """The fail-open this guard must not have. If the allowance cannot be
+    recorded, issuing the round anyway would leave a revise nothing counted —
+    and the next identical refusal would find a full allowance, forever. A state
+    directory that refuses the write parks with the question it always had."""
+    orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
+    dispatched = capture_dispatch(orch)
+
+    def unwritable(blocker_id, fingerprint):
+        raise OSError("read-only file system")
+
+    blocker_store.note_refusal_revise = unwritable  # type: ignore[method-assign]
+
+    refuse(orch, "post_commit_verification_failed")
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert (orch.state.park_kind, orch.state.park_task_id) == ("task_fatal", "t1")
+    assert orch._pending_autonomous_revise is None
+    assert dispatched == []
+    assert transcript_entries(config, "autonomous_revise_refused")[0]["reason"] == (
+        "meter_write_failed:OSError"
+    )
+
+
+def test_a_meter_the_loop_cannot_READ_raises_rather_than_revising(tmp_path):
+    """The other direction of the same fail-open. A record whose
+    `revised_refusals` is not a list of identities would answer `.count` with a
+    substring match or with an AttributeError — so it is refused at `load`, and
+    "we cannot read the meter" never reads as "nothing was spent"."""
+    orch, config, blocker_store, _, _ = build(tmp_path, enabled=True)
+    seeded = blocker_store.record(
+        task_id="t1", kind="task_fatal", code="commit_refused", question="q",
+        detail="d", phase="ready", now="2026-09-01T00:00:00+00:00",
+    )
+    path = config.blockers_dir / f"{seeded.id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["revised_refusals"] = "not-a-list"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(StateCorruptError):
+        refuse(orch, "commit_refused")
+
+    assert orch._pending_autonomous_revise is None
+
+
 def test_a_pin_granted_after_the_queue_drops_the_revise_rather_than_re_prompting(
     tmp_path,
 ):
@@ -884,8 +1084,14 @@ def test_a_second_revise_is_never_queued_behind_a_first(tmp_path):
 def test_a_zero_ceiling_keeps_the_set_aside_and_issues_no_revise(tmp_path):
     """`max_recovery_attempts = 0` is the operator's off switch for the ACTION
     without switching autonomy off: the set-aside stays, the revise does not
-    happen, and no round is run."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, max_recovery_attempts=0)
+    happen, and no round is run.
+
+    The REASON matters as much as the refusal. A config of zero is not a repeat,
+    and logging it as `same_refusal_repeated` would put a claim in the transcript
+    that no evidence supports — an operator reading it would go looking for a
+    first occurrence that never happened."""
+    orch, config, blocker_store, _, _ = build(tmp_path, enabled=True,
+                                              max_recovery_attempts=0)
 
     refuse(orch, "post_commit_verification_failed")
 
@@ -893,6 +1099,12 @@ def test_a_zero_ceiling_keeps_the_set_aside_and_issues_no_revise(tmp_path):
     assert (orch.state.park_kind, orch.state.park_task_id) == ("task_fatal", "t1")
     assert orch._pending_autonomous_revise is None
     assert "autonomous_recovery" not in transcript_types(config)
+    assert transcript_entries(config, "autonomous_revise_refused")[0]["reason"] == (
+        "revise_disabled_by_config"
+    )
+    assert blocker_store.open_blockers()[0].revised_refusals == [], (
+        "a refusal the loop declined to answer still spent its one allowance"
+    )
 
 
 def test_without_a_blocker_store_nothing_is_revised(tmp_path):
@@ -963,7 +1175,7 @@ def test_a_hard_halt_is_never_revised_and_keeps_its_own_classification(
     assert orch.state.park_kind == site_kind, f"{code} was re-classified"
     assert orch.state.resume_phase == Phase.EXECUTING.value
     assert orch._pending_autonomous_revise is None
-    assert blocker_store.load(orch.state.park_blocker_id).refusal_fingerprint == ""
+    assert blocker_store.load(orch.state.park_blocker_id).revised_refusals == []
     assert "autonomous_recovery" not in transcript_types(config)
 
 

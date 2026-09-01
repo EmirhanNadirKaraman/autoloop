@@ -342,23 +342,25 @@ rolled back, discarded or pushed: a `revise` continues the same execution record
 the same worker repository and the same task branch, so the refused commit stays
 exactly where it is.
 
-**And it happens at most once.** The second occurrence of the same code for the
-same task sets that task aside (`task_fatal`) — the quarantine
-`run --continuous` already works past — rather than issuing another revise. Two
-independent locks carry that:
+**And each refusal happens at most once.** The second occurrence of the SAME
+refusal sets that task aside (`task_fatal`) — the quarantine `run --continuous`
+already works past — rather than issuing another revise. The meter is keyed on
+the refusal, not on its code: a digest of (code, question, detail) is written to
+`Blocker.revised_refusals` at the moment a revise is issued, and the allowance is
+one per digest, counted across every blocker record on disk including closed
+ones. So answering or archiving a record cannot refund an allowance, and a
+refusal that migrates one phase along keeps spending the same one.
 
-* the **recurrence meter**, `Blocker.recurrences` summed across every open record
-  for a (task, code). This is the bound, and it does not care what the refusal
-  says — which matters, because refusal text carries commit shas and round
-  numbers and therefore differs between two occurrences of the identical fault;
-* the **refusal digest** on the blocker record, which recognises the SAME refusal
-  even after the record it was first written on has been closed. It can only ever
-  set a task aside sooner.
-
-Three limits you already have compose on top and are unchanged: a self-issued
-revise is refused if its feedback repeats the last round's, it is refused once
-`policy.max_review_rounds` is reached, and it costs an attempt from
-`MAX_TASK_ATTEMPTS` exactly as a reviewer's does.
+**A different refusal under the same code gets its own revise**, deliberately.
+`post_commit_verification_failed` covers five different checks; refusing the
+second on the strength of the first would park work that had an answer. What that
+means is that a code whose text changes every round is not bounded by the digest
+— it is bounded by three limits you already have, which compose on top and are
+unchanged: a self-issued revise is refused if its feedback repeats the last
+round's, it is refused once `policy.max_review_rounds` is reached, and it costs an
+attempt from `MAX_TASK_ATTEMPTS` exactly as a reviewer's does. Both of those
+ceilings end in a set-aside, and a set-aside task is `blocked` — which policy
+refuses to revise. The chain terminates in a quarantine, never in a loop.
 
 ### What you will see
 
@@ -368,14 +370,23 @@ revise is refused if its feedback repeats the last round's, it is refused once
 
 `same_refusal_repeated` is the guard firing. The other reasons are fall-throughs
 — no task on the record, a task the registry does not hold, a task with no
-approved plan, a refusal with no text, a revise already queued — and every one of
-them parks with the question it always had.
+approved plan, a refusal with no text, a revise already queued,
+`revise_disabled_by_config` for `max_recovery_attempts = 0`, and
+`meter_write_failed:*` for a state directory that cannot be written — and every
+one of them parks with the question it always had. None of THOSE spends the
+allowance: a revise the loop declined to issue is not an attempt, so the same
+refusal still gets its one round once the obstacle clears. The one exception is
+`autonomous_revise_dropped`, which is a revise that was queued — the allowance
+paid for — and then dropped at the step boundary because an urgent pin arrived
+in between. That one stays spent, so the same refusal does not queue a round the
+same pin would drop again.
 
 **The blocker stays OPEN while the revise runs**, and that is deliberate rather
 than a leak: a round completing proves the round ran, not that the refusal
-cleared, so closing the record there would refund the meter and let the same
-refusal be resent forever. So `python -m autoloop blockers` lists it throughout;
-answer it as you would any other, or let the repeat set the task aside.
+cleared, so closing the record there would tell you the loop recovered from a
+fault that is still standing. It costs the meter nothing either way — that counts
+closed records too. So `python -m autoloop blockers` lists it throughout; answer
+it as you would any other, or let the repeat set the task aside.
 
 **Two sites are deliberately untouched.** `push_not_descendant` and
 `push_tree_mismatch` are each raised twice — once for a task, once for an

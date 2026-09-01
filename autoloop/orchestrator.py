@@ -12006,14 +12006,15 @@ class Orchestrator:
         for a human to relay: `RECOVER_BY_REVISING` queues a self-issued
         `revise` carrying the refusal's own text
         (`_queue_autonomous_revise`), dispatched at the next step boundary by
-        `_step`. Its repeat guard is TWO locks — the ordinary `max_attempts = 1`
-        on the recurrence meter, which bounds it whatever the refusal says, and
-        `blockers.refusal_identity` recorded on the blocker, which recognises the
-        SAME refusal even after the record it was first written on is closed and
-        can therefore only ever set the task aside sooner. Its budget is
-        deliberately NOT released by a completed step (see `_autonomous_retry`):
-        a revise round completing proves the round ran, never that the refusal
-        cleared.
+        `_step`. Its repeat guard is metered on the REFUSAL rather than on its
+        code — `blockers.refusal_identity` digests the (code, question, detail)
+        this method was handed, `BlockerStore.refusal_revises` counts how many
+        revises that identity has already bought across every record on disk, and
+        the allowance is one. So the same complaint again sets the task aside,
+        while a different complaint under the same code gets its own revise. A
+        code whose text churns is bounded instead by `MAX_TASK_ATTEMPTS` and
+        `policy.max_review_rounds`, which every self-issued revise spends exactly
+        as a reviewer's does.
 
         The set-aside stage is applied only to plans `_autonomy_requires_a_task`
         answers True for. A rebuild of a session-scoped record needs no victim
@@ -12077,23 +12078,14 @@ class Orchestrator:
         blocker = None
         if self._blocker_store is not None:
             blocker_task_id = task_id or NO_TASK
-            # halt-04's repeat guard, resolved BEFORE the upsert below, because
-            # the upsert is what overwrites the stored identity — reading it
-            # afterwards would compare this refusal against itself and never
-            # match. Computed only for a plan that actually revises; every other
-            # code records an empty fingerprint and `record` leaves any stored
-            # one alone.
+            # halt-04's repeat-guard key: the identity of THIS refusal, digested
+            # from exactly the three strings this method was handed and the agent
+            # is about to be shown. Computed only for a plan that actually
+            # revises, because it is the meter's key and nothing else reads it —
+            # a park that is not going to be revised has no attempt to meter.
             fingerprint = ""
-            repeated_refusal = False
             if plan is not None and plan.action == RECOVER_BY_REVISING:
                 fingerprint = refusal_identity(code, question, detail)
-                previous = self._blocker_store.last_refusal_fingerprint(
-                    blocker_task_id, code
-                )
-                # A refusal with no text has no identity, and `""` must never
-                # read as "these two match" — that would set a task aside on the
-                # strength of two absences.
-                repeated_refusal = bool(fingerprint) and fingerprint == previous
             # Idempotent: re-parking on the same (task, code, phase) updates
             # the existing open record instead of minting a duplicate, so a
             # restart/retry against the same wall does not fill the queue.
@@ -12108,11 +12100,10 @@ class Orchestrator:
                 # Attribution, so a later run can tell a live blocker from one
                 # abandoned by a session that has since been reset.
                 session_id=state.session_id or "",
-                refusal_fingerprint=fingerprint,
             )
             if plan is not None and self._autonomous_retry(
                 plan, blocker, code=code, resume_phase=resume_phase,
-                repeated_refusal=repeated_refusal,
+                refusal_fingerprint=fingerprint,
             ):
                 return
         # From here down the loop parks, exactly as it did before autonomous
@@ -12398,7 +12389,7 @@ class Orchestrator:
         *,
         code: str,
         resume_phase: str | None,
-        repeated_refusal: bool = False,
+        refusal_fingerprint: str = "",
     ) -> bool:
         """Re-enter `plan`'s recovery path. True when the loop moved and the
         caller must return without parking; False when it could not, and the
@@ -12423,53 +12414,44 @@ class Orchestrator:
         the fault was raised in, because the round the fault belonged to is the
         thing being discarded.
 
-        `RECOVER_BY_REVISING` (halt-04) is metered by the SAME budget on the same
-        meter, at an allowance of one, and adds `repeated_refusal` — the caller's
-        answer to "is this the SAME refusal as the last one recorded for this
-        (task, code)?", resolved before the upsert that would overwrite it. It is
-        consulted BEFORE the budget, so the guard can only ever set the task
-        aside sooner than the meter would, and the transcript reports the sharper
-        of the two reasons when both would have refused.
+        `RECOVER_BY_REVISING` (halt-04) is the ONE action that does not read the
+        recurrence meter at all. Its budget is `_refusal_revise_budget`, keyed on
+        `refusal_fingerprint` — the identity of this refusal — so the same
+        complaint twice sets the task aside while a different complaint under the
+        same code gets its own revise. Reading `open_recurrences` here as well
+        would put the (task, code) bound back in front of it and refuse the
+        second complaint on the strength of the first, which is the thing that
+        key is chosen not to do.
 
-        **The revise deliberately does NOT set `_autonomous_recovered_blocker`,
-        and that carve-out is the whole bound.** That marker exists so a
-        COMPLETED step closes the record the retry was riding on — honest for a
-        transport fault, where a step completing is evidence the fault passed.
-        A revise round completing is evidence of nothing of the kind: it means
-        the round ran, not that the refusal cleared, and the refusal is usually
-        raised by that very round. Closing the record there would reset
-        `open_recurrences` to zero and hand the next, identical refusal a fresh
-        allowance — the unbounded resend this task exists to prevent. So the
-        record stays OPEN until an operator answers it or the task is set aside,
-        and `python -m autoloop blockers` lists it throughout, which is the price
-        of the bound and is stated in `docs/AUTOLOOP.md`.
+        **The revise deliberately does NOT set `_autonomous_recovered_blocker`.**
+        That marker exists so a COMPLETED step closes the record the retry was
+        riding on — honest for a transport fault, where a step completing is
+        evidence the fault passed. A revise round completing is evidence of
+        nothing of the kind: it means the round ran, not that the refusal
+        cleared, and the refusal is usually raised by that very round. Closing
+        the record there would tell an operator reading `archived_reason` that
+        the loop recovered from a fault it has not recovered from. The meter no
+        longer depends on the record staying open — `refusal_revises` counts
+        resolved records too — so this is about the record being HONEST rather
+        than about the bound, and `python -m autoloop blockers` lists the record
+        until an operator answers it or the task is set aside.
         """
         state = self.state
-        # THE REPEAT GUARD, ahead of the budget rather than inside the action
-        # branch below. It can only ever refuse where the budget would also have
-        # refused eventually, so the order costs nothing — and it buys the
-        # transcript the more informative of the two reasons. With the refusal
-        # raised in the same phase twice the meter alone would already have
-        # answered, and "the allowance is spent" is a weaker account of the same
-        # event than "this is the same refusal as last time".
-        if plan.action == RECOVER_BY_REVISING and repeated_refusal:
-            self._log(
-                "autonomous_revise_refused",
-                data={
-                    "code": code,
-                    "task_id": blocker.task_id,
-                    "blocker_id": blocker.id,
-                    "reason": "same_refusal_repeated",
-                },
+        if plan.action == RECOVER_BY_REVISING:
+            metered = self._refusal_revise_budget(
+                plan, blocker, code=code, fingerprint=refusal_fingerprint
             )
-            return False
-        budget = min(plan.max_attempts, self._config.autonomy.max_recovery_attempts)
-        # `record` has already counted THIS occurrence, so the retries already
-        # spent are one fewer than the total. `max(0, ...)` guards a record
-        # written with a nonsense count rather than trusting arithmetic on it.
-        spent = max(0, self._blocker_store.open_recurrences(blocker.task_id, code) - 1)
-        if spent >= budget:
-            return False
+            if metered is None:
+                return False
+            spent, budget = metered
+        else:
+            budget = min(plan.max_attempts, self._config.autonomy.max_recovery_attempts)
+            # `record` has already counted THIS occurrence, so the retries already
+            # spent are one fewer than the total. `max(0, ...)` guards a record
+            # written with a nonsense count rather than trusting arithmetic on it.
+            spent = max(0, self._blocker_store.open_recurrences(blocker.task_id, code) - 1)
+            if spent >= budget:
+                return False
         if plan.action == RECOVER_BY_RESUMING:
             target = self._resumable_phase(resume_phase)
             if target is None:
@@ -12487,7 +12469,9 @@ class Orchestrator:
             if not self._autonomous_rebuild(plan, blocker, code=code):
                 return False
         elif plan.action == RECOVER_BY_REVISING:
-            if not self._queue_autonomous_revise(blocker, code=code):
+            if not self._queue_autonomous_revise(
+                blocker, code=code, fingerprint=refusal_fingerprint
+            ):
                 return False
             # A revise runs a NEW round rather than re-entering the phase this
             # fault was raised in, so the loop is left at the round boundary and
@@ -12511,7 +12495,8 @@ class Orchestrator:
         # NOT SET FOR A REVISE, and that is deliberate rather than an oversight
         # — see this method's docstring. A revise round completing says the
         # round ran, never that the refusal cleared, so closing the record on it
-        # would refund the very allowance that bounds the resend.
+        # would file a machine `archived_reason` saying the loop recovered from a
+        # fault that is still standing.
         if plan.action != RECOVER_BY_REVISING:
             self._autonomous_recovered_blocker = blocker.id
         self._log(
@@ -12557,23 +12542,29 @@ class Orchestrator:
     #
     # WHAT BOUNDS IT, in the order the bounds fire:
     #
-    #   1. the repeat guard — `blockers.refusal_identity` on the blocker record,
-    #      which recognises the SAME refusal even after the record it was written
-    #      on has been closed;
-    #   2. `max_attempts = 1` metered on `open_recurrences`, which bounds the
-    #      resend whatever the refusal text says — and, because the revise
-    #      deliberately never closes its own record, is not refunded by the round
-    #      it dispatches;
-    #   3. `_revise_feedback_is_unchanged`, `policy.max_review_rounds` and
-    #      `MAX_TASK_ATTEMPTS`, all of which gate a self-issued revise exactly as
-    #      they gate a reviewer's — which is the point of dispatching it through
-    #      `_dispatch` rather than building a second path to the executor.
+    #   1. THE REPEAT GUARD — one revise per `blockers.refusal_identity`, metered
+    #      by `_refusal_revise_budget` on `BlockerStore.refusal_revises`, which
+    #      counts every record on disk and so recognises a refusal even after the
+    #      record it was first written on has been closed. The SAME refusal a
+    #      second time is set aside; a DIFFERENT refusal under the same code is
+    #      feedback the agent has never been given, and gets its own revise;
+    #   2. the ceilings that bound a code whose text churns, which the identity
+    #      key deliberately does not: `_revise_feedback_is_unchanged`,
+    #      `policy.max_review_rounds` and `MAX_TASK_ATTEMPTS` gate a self-issued
+    #      revise exactly as they gate a reviewer's — which is the point of
+    #      dispatching it through `_dispatch` rather than building a second path
+    #      to the executor — and the last two end at `review_round_cap` and
+    #      `attempt_count_ceiling`, both set-aside codes;
+    #   3. the set-aside itself, which leaves the task `blocked` — and
+    #      `policy.authorize_directive` refuses a revise of a blocked task, so a
+    #      quarantined task cannot be revised back out of quarantine.
     #
     # EVERY REFUSAL BELOW RETURNS False AND MEANS "park exactly as this loop
     # parks today, with the question it always had": no task on the blocker, a
     # revise already queued, a task the registry does not hold, an outstanding
     # stat-only split ask, a live urgent pin naming somebody else, a refusal with
-    # no text to return, and any policy denial (a blocked or retired task, a task
+    # no text to return, a state directory the meter cannot be written to, and
+    # any policy denial (a blocked or retired task, a task
     # with no approved decomposition, a task owing a ceiling classification,
     # `implement_enabled` off). The task itself
     # can only ever be the ONE the round in flight belongs to — `_to_needs_user`
@@ -12619,9 +12610,55 @@ class Orchestrator:
             return ""
         return cls.AUTONOMOUS_REVISE_HEADER.format(code=code) + "\n\n" + body
 
-    def _queue_autonomous_revise(self, blocker, *, code: str) -> bool:
-        """Validate the self-issued `revise` this refusal is owed and remember
-        it for `_step`. True when it is queued; False to park as today.
+    def _refusal_revise_budget(self, plan, blocker, *, code: str, fingerprint: str):
+        """`(revises already spent on THIS refusal, the allowance)`, or `None`
+        when the revise is refused before anything is queued — THE REPEAT GUARD.
+
+        Keyed on `fingerprint`, the identity of this one refusal, and NOT on
+        (task, code). That is the whole design: the same complaint arriving again
+        is a loop and is set aside, while a different complaint under the same
+        code is feedback nobody has given the agent and is owed its own revise. A
+        code-keyed meter refuses the second on the strength of the first, and
+        `post_commit_verification_failed` alone covers five different checks.
+
+        `refusal_revises` counts CLOSED records too, so answering the blocker,
+        retiring its session or closing it after some other retry cannot refund
+        the attempt.
+
+        THREE REFUSALS, each of which parks exactly as this loop parks today:
+
+          * a refusal with NO TEXT has no identity, so there is nothing to meter
+            and nothing to say — it is refused here rather than metered as `""`,
+            which is what stops two absences from reading as a repeat. Refused
+            BEFORE the budget so `_queue_autonomous_revise` is never reached and
+            the transcript carries exactly one reason;
+          * `max_recovery_attempts = 0` — the operator's off switch for the
+            action, which is not a repeat and must not be logged as one;
+          * the allowance already spent, which IS the repeat.
+        """
+        if not fingerprint:
+            self._refuse_autonomous_revise(
+                code, blocker.task_id, blocker, "empty_refusal_text"
+            )
+            return None
+        budget = min(plan.max_attempts, self._config.autonomy.max_recovery_attempts)
+        if budget <= 0:
+            self._refuse_autonomous_revise(
+                code, blocker.task_id, blocker, "revise_disabled_by_config"
+            )
+            return None
+        spent = self._blocker_store.refusal_revises(blocker.task_id, fingerprint)
+        if spent >= budget:
+            self._refuse_autonomous_revise(
+                code, blocker.task_id, blocker, "same_refusal_repeated"
+            )
+            return None
+        return spent, budget
+
+    def _queue_autonomous_revise(self, blocker, *, code: str, fingerprint: str) -> bool:
+        """Validate the self-issued `revise` this refusal is owed, SPEND the
+        allowance and remember the round for `_step`. True when it is queued;
+        False to park as today.
 
         Nothing is dispatched here — see the section comment above.
         """
@@ -12679,6 +12716,13 @@ class Orchestrator:
             )
         feedback = self._autonomous_revise_feedback(code, blocker.question, blocker.detail)
         if not feedback:
+            # UNREACHABLE through the one caller today, and kept as the floor
+            # under a future one: `_refusal_revise_budget` has already refused a
+            # refusal with no text, on `refusal_identity` answering `""` for
+            # exactly the (question, detail) that make this answer `""`. Same
+            # reason string on purpose — it is the same fact — and only one of
+            # the two can ever be logged for one occurrence, because the earlier
+            # refusal returns before this method is called.
             return self._refuse_autonomous_revise(
                 code, task_id, blocker, "empty_refusal_text"
             )
@@ -12699,6 +12743,21 @@ class Orchestrator:
         if not verdict.allowed:
             return self._refuse_autonomous_revise(
                 code, task_id, blocker, f"policy_denied:{verdict.code}"
+            )
+        # THE ALLOWANCE IS SPENT HERE — durably, and BEFORE the round is queued.
+        # After every refusal above, because a revise the loop declined to issue
+        # is not an attempt and must leave this refusal its one chance; and
+        # before the queue, because a process that dies between the two must
+        # leave the attempt spent rather than refunded. `OSError` alone is
+        # caught: a state directory that cannot be written parks with the
+        # question it always had, while a CORRUPT record raises exactly as it
+        # does out of `refusal_revises` — reading it as "nothing spent" is the
+        # fail-open this guard exists to refuse.
+        try:
+            self._blocker_store.note_refusal_revise(blocker.id, fingerprint)
+        except OSError as exc:
+            return self._refuse_autonomous_revise(
+                code, task_id, blocker, f"meter_write_failed:{type(exc).__name__}"
             )
         self._pending_autonomous_revise = (task_id, feedback, code)
         return True
@@ -12752,11 +12811,12 @@ class Orchestrator:
         # because the alternative is `_dispatch_executor` answering the loop's
         # own directive through `_handle_policy_denial` — a re-prompt putting
         # words in front of the reviewer as if it had sent them, charged against
-        # `max_policy_denials`. Dropped rather than parked: the blocker is
-        # already open with the recurrence counted, so the allowance stays spent
-        # and the next occurrence of this refusal sets the task aside. The drop
-        # is LOGGED, because a queued round that silently evaporates is
-        # indistinguishable from autonomy being switched off.
+        # `max_policy_denials`. Dropped rather than parked: the allowance was
+        # already spent on the record at queue time, so the next occurrence of
+        # this refusal sets the task aside rather than queueing a second round
+        # the same pin would drop again. The drop is LOGGED, because a queued
+        # round that silently evaporates is indistinguishable from autonomy being
+        # switched off.
         urgent = self._registry.live_urgent_target() if self._registry else None
         if urgent is not None and urgent.id != task_id:
             self._log(
