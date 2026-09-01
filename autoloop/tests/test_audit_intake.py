@@ -10,6 +10,9 @@ So they are organised around the ways that claim could be TRUE-ish and wrong:
 * a promoted task that is not runnable (one approved path, no validation) —
   the exact shape that jams on the attempt ceiling or is refused by the reviewer,
 * work filed a second time because nobody checked what already covers it,
+* two findings minting ONE task id while the first request is still QUEUED —
+  `tasks.json` cannot see an undrained request, so the drain applies the first,
+  `add_many` refuses the second, and both ledger entries claim a runnable task,
 * ALREADY DONE asserted from the operator's sentence rather than from the tree
   (an echo), or satisfied by a file having been DELETED (fail-open),
 * an unreadable ledger reading as "nothing recorded", which silently un-filters
@@ -41,6 +44,7 @@ from autoloop.inbox import (
     audit_intake_file,
     audit_intake_summary,
     decline_finding,
+    finding_task_id,
     load_audit_intake,
     newest_audit_report,
     outstanding_findings,
@@ -81,6 +85,25 @@ REPORT = """\
 - files: `docs/SUMMARY.md`
 - evidence: docs/SUMMARY.md:1 says "Summary".
 - impact: A reader looks in the wrong file.
+"""
+
+#: Two findings whose QUALIFIED IDS differ — so the parser keeps both, and the
+#: ledger keys them apart — while the task ids derived from them are the SAME
+#: string: `finding_task_id` reduces every run of non-alphanumerics to `-`, so
+#: `db-01` and `db_01` land on `audit-db-migrations-db-01` together. The
+#: registry cannot see that collision while the first request is still queued,
+#: which is what `test_two_findings_whose_task_ids_collide_*` is about.
+COLLIDING_REPORT = """\
+# Repository audit — 2026-09-01
+
+## Confirmed defects (2)
+#### db_migrations:db-01 — Author a new baseline migration
+- severity **critical**, confidence **confirmed**, domain `db_migrations`
+- files: `backend/migrations/006_video.py`, `backend/models.py`
+
+#### db_migrations:db_01 — Move the Docker build context to the repo root
+- severity **critical**, confidence **confirmed**, domain `db_migrations`
+- files: `Dockerfile`, `docker-compose.yml`
 """
 
 APP_VALIDATION = (("python3", "-m", "pytest", "tests/", "-q"),)
@@ -356,6 +379,135 @@ def test_promotion_refuses_an_id_the_registry_already_holds(tmp_path):
     assert "already holds a task called" in str(exc.value)
     assert inbox.pending() == []
     assert not audit_intake_file(tmp_path / "intake").exists()
+
+
+def _collision_kwargs(tmp_path, inbox):
+    return dict(
+        inbox=inbox,
+        intake_dir=tmp_path / "intake",
+        app_test_root="tests",
+        app_validation=APP_VALIDATION,
+        loop_validation=LOOP_VALIDATION,
+    )
+
+
+def test_two_findings_whose_task_ids_collide_do_not_share_one_queued_request(tmp_path):
+    """`tasks.json` cannot see an UNDRAINED request, so the registry check is
+    blind to a second finding minting the same task id. Both requests would
+    queue, the drain would apply the first and `add_many` would refuse the
+    second — while both ledger entries claimed a runnable task existed."""
+    repo, state = state_for(tmp_path, text=COLLIDING_REPORT)
+    inbox = TaskInbox(tmp_path / "inbox")
+    kwargs = _collision_kwargs(tmp_path, inbox)
+    first = state.finding("db_migrations:db-01")
+    second = state.finding("db_migrations:db_01")
+    assert finding_task_id(first) == finding_task_id(second), (
+        "the fixture has stopped colliding, so this test would pass vacuously"
+    )
+
+    outcome = promote_finding(first, state.assess(first), **kwargs)
+    queued = Path(outcome.queued)
+    before = queued.read_bytes()
+
+    # A second, independent read — nothing has drained, so the registry still
+    # holds no task at all and the collision is invisible to it.
+    _, reread = state_for(tmp_path, text=COLLIDING_REPORT)
+    assert reread.assess(second).existing_task_ids == ()
+    with pytest.raises(IntakeError) as exc:
+        promote_finding(second, reread.assess(second), **kwargs)
+
+    assert "--task-id" in str(exc.value), "a refusal with no remedy is a dead end"
+    assert queued.name in str(exc.value), "name the file that already claims the id"
+    # The first request is still there, byte for byte, and still the FIRST
+    # finding's — not overwritten by, or shared with, the second.
+    assert inbox.pending() == [queued]
+    assert queued.read_bytes() == before
+    assert "db_migrations:db-01" in json.loads(before.decode("utf-8"))["description"]
+    # And nothing was recorded for the second finding, so it stays outstanding
+    # rather than claiming a task that will never exist.
+    _, after = state_for(tmp_path, text=COLLIDING_REPORT)
+    assert {f.qualified_id for f in after.outstanding()} == {"db_migrations:db_01"}
+    assert list(load_audit_intake(tmp_path / "intake").records) == ["db_migrations:db-01"]
+
+
+def test_the_remedy_the_collision_refusal_names_actually_works(tmp_path):
+    """`--task-id` is what the refusal above tells the operator to reach for, so
+    it has to file the second finding rather than refuse it again."""
+    repo, state = state_for(tmp_path, text=COLLIDING_REPORT)
+    inbox = TaskInbox(tmp_path / "inbox")
+    kwargs = _collision_kwargs(tmp_path, inbox)
+    first = promote_finding(
+        state.finding("db_migrations:db-01"),
+        state.assess(state.finding("db_migrations:db-01")),
+        **kwargs,
+    )
+
+    _, reread = state_for(tmp_path, text=COLLIDING_REPORT)
+    second_finding = reread.finding("db_migrations:db_01")
+    second = promote_finding(
+        second_finding,
+        reread.assess(second_finding),
+        task_id="audit-db-migrations-docker-01",
+        **kwargs,
+    )
+
+    assert second.task_id == "audit-db-migrations-docker-01"
+    assert sorted(p.name for p in inbox.pending()) == sorted(
+        [Path(first.queued).name, Path(second.queued).name]
+    )
+    _, after = state_for(tmp_path, text=COLLIDING_REPORT)
+    assert after.outstanding() == ()
+    assert after.summary()["promoted"] == 2
+
+
+def test_an_operator_supplied_task_id_collides_with_a_queued_one_too(tmp_path):
+    """The check runs on the RESOLVED spec id, so `--task-id` typed twice is
+    caught by the same guard as two ids that derive to one string."""
+    repo, state = state_for(tmp_path, text=COLLIDING_REPORT)
+    inbox = TaskInbox(tmp_path / "inbox")
+    kwargs = _collision_kwargs(tmp_path, inbox)
+    first = state.finding("db_migrations:db-01")
+    promote_finding(first, state.assess(first), task_id="audit-shared", **kwargs)
+
+    _, reread = state_for(tmp_path, text=COLLIDING_REPORT)
+    second = reread.finding("db_migrations:db_01")
+    with pytest.raises(IntakeError) as exc:
+        promote_finding(
+            second, reread.assess(second), task_id="audit-shared", **kwargs
+        )
+
+    assert "audit-shared" in str(exc.value)
+    assert len(inbox.pending()) == 1
+
+
+def test_a_queued_request_that_can_never_become_a_task_claims_no_id(tmp_path):
+    """Only CREATION requests claim an id, and the kind is resolved the way
+    `check_request_shape` resolves it. A `priority` mutation creates no task; an
+    unparseable file is moved to `rejected/` by `drain` and creates none either;
+    an unknown kind is refused on merge. Treating any of them as a claim would
+    refuse a promotion for no reason — and reading an unhashable `[]` kind out
+    of `MUTATION_PAYLOAD` would raise `TypeError` instead."""
+    repo, state = state_for(tmp_path, text=COLLIDING_REPORT)
+    inbox = TaskInbox(tmp_path / "inbox")
+    inbox.submit_priority("audit-db-migrations-db-01", 1)
+    queue = tmp_path / "inbox"
+    (queue / "20260101T000000Z-0000000000000000000-1.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    (queue / "20260101T000000Z-0000000000000000000-2.json").write_text(
+        json.dumps({"kind": [], "id": "audit-db-migrations-db-01"}), encoding="utf-8"
+    )
+    (queue / "20260101T000000Z-0000000000000000000-3.json").write_text(
+        json.dumps(["not", "an", "object"]), encoding="utf-8"
+    )
+    finding = state.finding("db_migrations:db-01")
+
+    outcome = promote_finding(
+        finding, state.assess(finding), **_collision_kwargs(tmp_path, inbox)
+    )
+
+    assert outcome.task_id == "audit-db-migrations-db-01"
+    assert outcome.queued is not None
 
 
 def test_promotion_is_refused_outright_when_the_registry_could_not_be_read(tmp_path):
