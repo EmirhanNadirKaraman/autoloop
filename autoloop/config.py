@@ -757,6 +757,76 @@ def resolve_observed_checkout(configured, workers_root) -> Path:
     return observed
 
 
+#: How a lane OTHER THAN LANE 0 spells its own observed checkout: a SIBLING of
+#: the configured one, named after it with the lane appended (conc-04). See
+#: `lane_observed_checkout` for why a sibling and not a child.
+LANE_OBSERVED_CHECKOUT_SUFFIX = "-lane-{index}"
+
+
+def lane_observed_checkout(observed_checkout, lane_index: int) -> Path | None:
+    """Which observed checkout LANE `lane_index` watches (conc-04, the split
+    plan's Decision 1 — one observed checkout per lane).
+
+    **Lane 0 is the configured path itself, unchanged.** That asymmetry is the
+    `lanes = 1` acceptance criterion made structural, and it is the same shape
+    Decision 2 gives the state file: at one lane no new directory exists, the
+    clone is exactly `[paths].observed_checkout` as `resolve_observed_checkout`
+    produced it, and `cli._build_orchestrator` needs no edit at all to keep
+    behaving as it does today.
+
+    **A SIBLING, not a child.** The plan's prose offers
+    `observed-checkout/<lane_id>` as one spelling, and the rule stated three
+    paragraphs later in the same section rules it out: a lane's observed
+    checkout must not be nested beneath, and must not contain, any other
+    lane's. Lane 0's tree IS `observed-checkout`, so putting lane 1 inside it
+    would put every one of lane 1's files into lane 0's snapshot — the
+    cross-attribution this whole candidate exists to remove, rebuilt one
+    directory down. `<base>-lane-<k>` beside it satisfies both sentences.
+    Sibling paths are still CHECKED rather than trusted:
+    `worker_env.validate_lane_observed_checkouts` runs the full boundary test
+    over every derived path.
+
+    Every refusal here is fail-CLOSED, because the failure mode of a lane path
+    this function cannot compute is two lanes sharing one tree:
+
+      * a non-integer, a `bool` (which `isinstance(x, int)` accepts, and
+        `True == 1` would silently make lane 1), or a negative index — refused
+        rather than falling through to the lane-0 branch, which would hand a
+        second lane lane 0's own clone;
+      * `observed_checkout is None` for any lane above 0. `None` means "watch
+        the primary checkout", which is the pre-esc-02 behaviour and is
+        harmless for a single lane and unusable for several: every lane would
+        watch one shared tree nobody can attribute a write in. `load_config`
+        always resolves a real path, so this is reachable only from a
+        hand-built config.
+    """
+    if isinstance(lane_index, bool) or not isinstance(lane_index, int):
+        raise ConfigError(
+            f"lane index must be a non-negative integer, got {lane_index!r} — "
+            "a lane whose index cannot be read is a lane whose observed "
+            "checkout cannot be told apart from another lane's"
+        )
+    if lane_index < 0:
+        raise ConfigError(
+            f"lane index must be a non-negative integer, got {lane_index!r} — "
+            "refusing rather than deriving lane 0's own clone for it"
+        )
+    if lane_index == 0:
+        return Path(observed_checkout) if observed_checkout is not None else None
+    if observed_checkout is None:
+        raise ConfigError(
+            f"lane {lane_index} has no observed checkout to derive one from: "
+            "paths.observed_checkout resolves to nothing, so every lane would "
+            "watch the primary checkout and no write could be attributed to "
+            "the lane that made it. Set [paths].observed_checkout (load_config "
+            "always resolves one) before running more than one lane."
+        )
+    base = Path(observed_checkout)
+    return base.parent / (
+        base.name + LANE_OBSERVED_CHECKOUT_SUFFIX.format(index=lane_index)
+    )
+
+
 def workers_root_from(raw) -> Path:
     """`[paths].workers_root` as a validated absolute `Path`.
 
@@ -985,6 +1055,17 @@ class AutoloopConfig:
     #: test suite, `doctor`) sends nothing without naming the field. Appended
     #: after `projects` for the reason that field's own comment gives.
     notify: NotifyConfig = NotifyConfig()
+
+    def observed_checkout_for_lane(self, lane_index: int) -> Path | None:
+        """This deployment's observed checkout for one LANE (conc-04).
+
+        A method rather than a property because it takes the lane, and the one
+        rule it applies lives in `lane_observed_checkout` — a second reader
+        deriving "the lane's clone" its own way is exactly how two lanes end up
+        pointed at one tree. Lane 0 gets `observed_checkout` itself, so a
+        single-lane deployment reads the same path it does today.
+        """
+        return lane_observed_checkout(self.observed_checkout, lane_index)
 
     @property
     def state_file(self) -> Path:

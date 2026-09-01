@@ -1311,6 +1311,7 @@ class Orchestrator:
         sleep=time.sleep,
         self_upgrade_enabled: bool = False,
         observed_checkout: ObservedCheckout | None = None,
+        lane_id: str = "",
     ):
         self._config = config
         self._store = store
@@ -1476,6 +1477,15 @@ class Orchestrator:
         #: derived from the mandatory `workers_root`), so production is always
         #: on the dedicated tree.
         self._observed = observed_checkout
+        #: WHICH LANE this Orchestrator is (conc-04), or "" for the loop that
+        #: is not part of a fleet — which is every deployment until the
+        #: concurrency setting leaves 1, and every Orchestrator in the suite.
+        #: Used for ATTRIBUTION only: when it is set, a park about the observed
+        #: tree names the lane it happened in, so "a write by one lane is not
+        #: attributed to another" is legible in the record and not just true in
+        #: the arrangement. Empty leaves every message byte-identical to
+        #: today's, which is the `lanes = 1` criterion applied to wording.
+        self._lane_id = str(lane_id or "")
         #: Built once, lazily, by `_observation_git` — a `GitGateway` rooted at
         #: the clone. Cached because `enumerate_checkout_paths` runs twice per
         #: round through it and re-deriving the scrubbed environment each time
@@ -7992,7 +8002,8 @@ class Orchestrator:
             dirt = observed.dirty_files()
         if dirt:
             self._to_needs_user(
-                f"task {task.id}: the observed checkout ({observed.repo_root}) "
+                f"task {task.id}: the observed checkout "
+                f"({observed.repo_root}){self._lane_label()} "
                 "is not clean — refusing to start a write-capable agent. A "
                 "dirty observed checkout cannot be used as a trustworthy "
                 "baseline for detecting whether the agent wrote outside its "
@@ -8001,7 +8012,9 @@ class Orchestrator:
                 kind="loop_fatal",
                 code="primary_checkout_dirty",
                 task_id=task.id,
-                detail=f"observed={observed.repo_root} dirty={sorted(dirt)[:20]}",
+                detail=self._lane_detail(
+                    f"observed={observed.repo_root} dirty={sorted(dirt)[:20]}"
+                ),
             )
             return None
 
@@ -8082,6 +8095,31 @@ class Orchestrator:
     # `worker_env.ObservedCheckout`, which holds the whole synchronisation
     # contract and every fail-safe branch of it.
 
+    def _lane_label(self) -> str:
+        """`" [lane <id>]"` when this Orchestrator was told which lane it is
+        (conc-04), and `""` otherwise.
+
+        Otherwise is every deployment at `lanes = 1` and every hand-built
+        Orchestrator in the suite, so the parks below keep today's wording to
+        the byte until a fleet actually exists to disambiguate.
+
+        Read through `getattr`, deliberately: several test doubles build an
+        Orchestrator with `__new__` and set only the handful of attributes the
+        path under test touches — `test_observed_checkout._carry_forward_orch`
+        is one, and it reaches the synchronisation park. A new field that
+        raised `AttributeError` there would turn a park into a crash inside
+        the one handler whose failures have nowhere left to go.
+        """
+        lane_id = getattr(self, "_lane_id", "")
+        return f" [lane {lane_id}]" if lane_id else ""
+
+    def _lane_detail(self, detail: str) -> str:
+        """`detail` with the lane named in front of it, when there is one —
+        the machine-readable half of `_lane_label`, `getattr`-read for the
+        same reason, and unchanged at `""`."""
+        lane_id = getattr(self, "_lane_id", "")
+        return f"[lane {lane_id}] {detail}" if lane_id else detail
+
     def _observation_git(self) -> GitGateway:
         """The gateway rooted at the tree this loop OBSERVES.
 
@@ -8090,10 +8128,21 @@ class Orchestrator:
         a method rather than a field. There is no third answer, and in
         particular no "the clone is broken, watch the primary instead": that
         decision belongs to `_synchronise_observed_checkout`, which parks.
+
+        The cache is keyed on the clone's PATH, not merely on "was one built"
+        (conc-04). Nothing in this class re-points `self._observed` today, but
+        a fleet that recovers one lane by handing it a rebuilt clone
+        (Decision 8) would otherwise keep snapshotting through a gateway rooted
+        at the tree the lane no longer owns — and both snapshots would agree,
+        so the diff would be empty and the alarm would never fire. A guard that
+        silently passes is the one failure this detector must not have.
         """
         if self._observed is None:
             return self._git
-        if self._observed_git is None:
+        if (
+            self._observed_git is None
+            or Path(self._observed_git.repo_root) != Path(self._observed.path)
+        ):
             self._observed_git = self._observed.gateway(self._policy)
         return self._observed_git
 
@@ -8170,7 +8219,7 @@ class Orchestrator:
             return True
         self._to_needs_user(
             f"task {task.id}: the loop-owned observed checkout at "
-            f"{self._observed.path} could not be established — "
+            f"{self._observed.path}{self._lane_label()} could not be established — "
             + "; ".join(violations)
             + ". This is LOOP-FATAL: that clone is the ONLY tree the escape "
             "detector watches, so continuing would mean running a "
@@ -8179,7 +8228,7 @@ class Orchestrator:
             kind="loop_fatal",
             code="observed_checkout_unusable",
             task_id=task.id,
-            detail="; ".join(violations),
+            detail=self._lane_detail("; ".join(violations)),
         )
         return False
 
@@ -8263,8 +8312,8 @@ class Orchestrator:
         if violations:
             self._to_needs_user(
                 f"task {task.id}: the write-capable agent changed the "
-                f"OBSERVED checkout ({observed.repo_root}) outside its worker "
-                "repository — "
+                f"OBSERVED checkout ({observed.repo_root}){self._lane_label()} "
+                "outside its worker repository — "
                 + "; ".join(violations)
                 + ". This is LOOP-FATAL: the isolation mechanism itself may "
                 "be compromised. Nothing was committed. This is DETECTION, "
@@ -8273,7 +8322,7 @@ class Orchestrator:
                 kind="loop_fatal",
                 code="checkout_escape_detected",
                 task_id=task.id,
-                detail="; ".join(violations),
+                detail=self._lane_detail("; ".join(violations)),
             )
             return None
         return outcome
