@@ -57,7 +57,7 @@ from typing import Any, Callable, Protocol
 
 from ..errors import BrowserError, ResponseTimeoutError, SessionLostError
 from . import wire
-from .preflight import ensure_working_dir, resolve_working_dir
+from .preflight import ensure_working_dir, resolve_working_dir, working_dir_is_default
 from .protocol_errors import (
     DEFAULT_QUOTA_ERROR_CODES,
     DEFAULT_RATE_LIMIT_ERROR_CODES,
@@ -134,6 +134,11 @@ class SubprocessAppServer:
         # to run in unless it is trusted, and trusting it would trust
         # everything the operator owns.
         self._cwd = resolve_working_dir(cwd)
+        # And the same PROVENANCE the `codex exec` seat carries: only an UNSET
+        # `codex.working_dir` is autoloop's to create, so the answer travels
+        # from the setting rather than being read back off the resolved path,
+        # where a spelled-out default is indistinguishable from an unset one.
+        self._cwd_is_default = working_dir_is_default(cwd)
         self._env = env
         self._proc: subprocess.Popen | None = None
         self._lines: queue.Queue = queue.Queue()
@@ -152,7 +157,7 @@ class SubprocessAppServer:
         # it: `Popen` raises `FileNotFoundError` for a missing cwd exactly as it
         # does for a missing binary, and the message below would then name the
         # wrong one.
-        cwd = ensure_working_dir(self._cwd)
+        cwd = ensure_working_dir(self._cwd, is_default=self._cwd_is_default)
         try:
             # An argv list, never a shell.
             self._proc = subprocess.Popen(

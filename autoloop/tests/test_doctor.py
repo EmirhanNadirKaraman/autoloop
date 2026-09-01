@@ -531,6 +531,51 @@ def test_a_configured_working_dir_that_does_not_exist_fails_and_is_never_created
     assert named["codex_preflight"].status == "fail"
 
 
+def test_the_default_path_spelled_out_is_graded_as_a_configured_directory(
+    tmp_path, monkeypatch
+):
+    """The row and the reviewer must agree about WHO owns the directory, and the
+    only way they can disagree is if one of them decides it by comparing paths.
+
+    `codex.working_dir = "~/.autoloop/codex-workdir"` resolves to the same place
+    as an unset one, and it is still the operator's statement — so `doctor`
+    fails it while absent rather than promising it is "created on first use",
+    which is what the reviewer's own ensure step would then refuse. `$HOME` is
+    moved to a sibling of the repository so the default lands outside the
+    checkout and this grades provenance rather than the INSIDE-the-repo rule."""
+    home = tmp_path.parent / f"{tmp_path.name}-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    default = default_working_dir()
+    assert not default.exists()
+    asked = []
+
+    def probe(codex):
+        asked.append(codex)
+        return preflight_ok()
+
+    named, _ = codex_rows(
+        tmp_path, codex=CodexConfig(working_dir=str(default)), codex_preflight=probe
+    )
+
+    assert named["codex_workdir"].status == "fail"
+    assert str(default) in named["codex_workdir"].detail
+    assert not default.exists(), "and doctor creates nothing on the way to saying so"
+    assert named["codex_preflight"].status == "fail"
+    assert "not attempted" in named["codex_preflight"].detail
+    assert asked == []
+    assert codex_exit(named, "codex_workdir", "codex_preflight") == 1
+
+    # The same absolute path, left UNSET: autoloop's own, and reported as about
+    # to be created rather than as a fault.
+    named, _ = codex_rows(tmp_path, codex=CodexConfig(), codex_preflight=probe)
+
+    assert named["codex_workdir"].status == "ok"
+    assert "created on first use" in named["codex_workdir"].detail
+    assert codex_exit(named, "codex_workdir", "codex_preflight") == 0
+    assert len(asked) == 1, "and only the usable directory is preflighted"
+
+
 def test_the_graded_working_dir_is_the_one_the_reviewer_actually_gets(tmp_path):
     """The defect this whole check is downstream of was a doctor row that
     passed about a directory nothing used. Both sides resolve through

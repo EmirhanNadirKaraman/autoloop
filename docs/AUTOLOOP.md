@@ -1408,6 +1408,15 @@ nobody set, which is the state this section used to describe as containment.
   grades is the path the reviewer gets). A configured directory that does not
   exist is refused rather than created: a typo must not become the place reviews
   run.
+* **"Configured" means the setting is non-empty, not that the path differs from
+  the default.** Writing `working_dir = "~/.autoloop/codex-workdir"` out is a
+  configured directory like any other, and an absent one is refused rather than
+  provisioned — by both transports and by `doctor`, which reports it as a `fail`
+  instead of "created on first use". The provenance travels from the setting
+  (`preflight.working_dir_is_default`) rather than being inferred from the
+  resolved path, because inference by path equality answers "unset" for the one
+  configured value that spells the default out, which is precisely the value an
+  operator writes when copying the documented default into their own config.
 * It decides which directory codex TRUSTS (below), and it keeps the reviewer
   from being started inside the tree it is grading. Neither is confinement.
 
@@ -1451,7 +1460,8 @@ Four rows, only for a configured `codex_cli` seat:
 
     codex_command     the first word of codex.command resolves on PATH
     codex_workdir     the RESOLVED directory: outside the checkout, and either
-                      present or autoloop's own (created on first use)
+                      present or autoloop's own — which means the setting is
+                      EMPTY, the one case created on first use
     codex_sandbox     the POLICY codex.sandbox_args names: read-only (ok),
                       workspace-write (warn), and fail for none, a bypass or a
                       mode this loop cannot name

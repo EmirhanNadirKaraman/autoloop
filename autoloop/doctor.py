@@ -50,9 +50,9 @@ from typing import Callable
 
 from .codex.preflight import (
     PREFLIGHT_STATUSES,
-    default_working_dir,
     preflight_codex,
     resolve_working_dir,
+    working_dir_is_default,
 )
 from .codex.sandbox import describe_invocation
 from .config import AutoloopConfig
@@ -453,7 +453,14 @@ def run_doctor(
         # The SAME resolution the runners use, so this row can never grade a
         # directory the reviewer does not get (`codex.preflight`).
         workdir = resolve_working_dir(config.codex.working_dir)
-        is_default = workdir == default_working_dir()
+        # Whether this directory is AUTOLOOP'S is a question about the SETTING,
+        # not about the path: `codex.working_dir` spelled out as
+        # `~/.autoloop/codex-workdir` resolves to the same place and is still
+        # the operator's, so an absent one is refused rather than provisioned.
+        # Asked through the predicate `preflight.ensure_working_dir` acts on, so
+        # this row cannot say "created on first use" about a path the reviewer's
+        # own ensure step would refuse.
+        is_default = working_dir_is_default(config.codex.working_dir)
         inside_repo = _is_within(workdir, repo_root)
         exists = workdir.is_dir()
         if inside_repo:
@@ -477,8 +484,9 @@ def run_doctor(
             )
             workdir_usable = True
         elif is_default:
-            # Absent and ours: the preflight below creates it, so this is a
-            # statement about what is about to happen, not a fault.
+            # Absent and ours — ours meaning the setting is EMPTY, not that the
+            # path looks like the default. The preflight below creates it, so
+            # this is a statement about what is about to happen, not a fault.
             add(
                 "codex_workdir",
                 "ok",
@@ -495,7 +503,8 @@ def run_doctor(
                 f"codex.working_dir points at {workdir}, which does not exist. "
                 "Create it, or correct the setting — a configured directory is "
                 "never created for you, so a typo cannot become the place your "
-                "reviews run.",
+                "reviews run. That holds for the default path SPELLED OUT too: "
+                "what provisions itself is an empty setting, not a spelling.",
             )
         # THE confinement row. `codex.sandbox_args` is read as a POLICY
         # (`codex.sandbox.describe_invocation`), never as "set or not set": an

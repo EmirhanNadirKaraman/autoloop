@@ -51,6 +51,7 @@ from autoloop.codex.app_server_conversation import (
     CodexAppServerConversation,
 )
 from autoloop.codex.conversation import CodexConversation
+from autoloop.codex.preflight import default_working_dir
 from autoloop.codex.protocol_errors import (
     DEFAULT_QUOTA_ERROR_CODES,
     DEFAULT_RATE_LIMIT_ERROR_CODES,
@@ -959,6 +960,37 @@ def test_a_missing_binary_is_a_clear_actionable_error(tmp_path):
     with pytest.raises(BrowserError) as exc:
         server.start()
     assert "codex login" in str(exc.value)
+
+
+def test_this_transport_creates_the_default_dir_only_when_the_setting_was_unset(
+    tmp_path, monkeypatch
+):
+    """Both seats read one `codex.working_dir`, so both must answer the same way
+    about who owns the directory. One absolute path, two settings: spelled out
+    (`cwd=`) it is the operator's and an absent one is refused before `Popen`;
+    unset it is autoloop's and is created before the spawn.
+
+    The command cannot exist in either arm, so nothing is launched — the second
+    arm still reaches the exec, which is what proves the ensure ran ahead of
+    it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    default = default_working_dir()
+    assert not default.exists()
+
+    server = SubprocessAppServer(
+        command=("definitely-not-a-real-binary-xyz",), cwd=default
+    )
+    with pytest.raises(BrowserError) as exc:
+        server.start()
+    assert str(default) in str(exc.value)
+    assert "was not found" not in str(exc.value), "that is the missing-binary message"
+    assert not default.exists()
+
+    server = SubprocessAppServer(command=("definitely-not-a-real-binary-xyz",))
+    with pytest.raises(BrowserError) as exc:
+        server.start()
+    assert "was not found" in str(exc.value)
+    assert default.is_dir()
 
 
 # ---- the protocol pin ------------------------------------------------------
