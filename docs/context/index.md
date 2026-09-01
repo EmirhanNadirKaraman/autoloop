@@ -1,8 +1,12 @@
 # Context records
 
-Machine-validated project context. Every file in this directory loads through
+Machine-validated project context. Every Markdown file in this directory — a
+dotted name such as `.hidden.md` included — loads through
 `autoloop/context_records.py`, which refuses a malformed record by name and
-never skips one. From the repository root:
+never skips one. The only files stepped over are non-Markdown droppings like
+`.DS_Store`, and `check` prints each of those by name too; a symlink is refused
+outright, because a broken one is a file a regular-file sweep drops in silence.
+From the repository root:
 
 ```
 python3 -m autoloop.context_records check

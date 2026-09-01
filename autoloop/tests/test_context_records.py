@@ -9,7 +9,17 @@ ONE CLAIM, in four parts, and each part is here because its failure is SILENT:
    repository has already recorded twice (`docs/SECURITY.md`, brw-19c/brw-19d,
    and the seeded lesson that collects them). So the refusals are asserted one
    by one, by `code` and by the record being NAMED in the message, and the
-   loader is shown returning NOTHING when one file in a tree is bad.
+   loader is shown returning NOTHING when one file in a tree is bad. What
+   counts as a record is decided by SUFFIX, case-folded, and never by the first
+   character of the name: `.hidden.md` and `.hidden.MD` are records like any
+   other. A filename-first exemption let a malformed or unindexed record leave
+   the contract by being renamed, so that bypass has its own block below —
+   including the operator surface, where it made `check` exit 0 over a tree
+   holding a record nothing had validated. The same silence has a second route,
+   pinned beside it: a DANGLING symlink is False to `is_file` and to `is_dir`,
+   so a sweep of regular files drops it without a word, and every symlink is
+   therefore refused. Only a NON-Markdown dropping is stepped over, and it is
+   reported.
 2. **Path fields are validated by the task registry's own
    `_validate_approved_path`.** Asserted as a CALL (a spy the loader must
    reach), not as two implementations agreeing on a sample: agreement today is
@@ -497,12 +507,132 @@ def test_a_file_that_is_neither_a_record_nor_navigation_is_refused(tmp_path):
     assert "notes.txt" in str(excinfo.value)
 
 
-def test_a_dotfile_is_ignored_and_said_so_rather_than_passed_over_silently(tmp_path):
+def test_a_non_markdown_dotfile_is_ignored_and_said_so_rather_than_passed_over_silently(tmp_path):
+    """The whole of the exemption: a dropping no record contract can describe.
+    It is REPORTED, never dropped in silence."""
     base = build_tree(tmp_path, {"features/good.md": record_text()})
     (base / ".DS_Store").write_bytes(b"\x00\x01")
     repository = load_context_records(tmp_path)
     assert repository.ignored == ("docs/context/.DS_Store",)
     assert len(repository.records) == 1
+
+
+def test_a_dangling_symlink_is_refused_rather_than_stepped_over_in_silence(tmp_path):
+    """The same bypass by a different route, and the one a regular-file sweep
+    loses: a broken link answers False to `is_file` AND to `is_dir`, so keeping
+    only regular files drops it without a word. `features/ghost.md` is a record
+    git can hold and nothing could read."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / "ghost.md").symlink_to(tmp_path / "no" / "such" / "file.md")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "symlinked_entry"
+    assert "features/ghost.md" in str(excinfo.value)
+
+
+def test_a_symlink_that_resolves_is_refused_too(tmp_path):
+    """Refusing only the BROKEN ones would leave a record validated as whatever
+    it points at today and something else tomorrow. Every symlink is refused,
+    so what a record is does not depend on the day it was read."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / "alias.md").symlink_to(base / "features" / "good.md")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "symlinked_entry"
+    assert "features/alias.md" in str(excinfo.value)
+
+
+# ---- a leading dot is not an exit from the contract ----------------------------
+#
+# Classification is by SUFFIX, not by the first character of the name. A
+# filename-first exemption would let a malformed or unindexed record leave the
+# one-validator contract by being renamed — the guard switching itself off for
+# exactly the file trying to evade it — so each of these asserts that a Markdown
+# dotfile is held to the same contract as any other record.
+
+
+def test_a_malformed_hidden_markdown_record_is_refused_by_name_not_stepped_over(tmp_path):
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / ".hidden.md").write_text(
+        record_text(id="ctx-fixture-two", kind="rumour"), encoding="utf-8"
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "bad_kind"
+    assert "ctx-fixture-two" in str(excinfo.value)
+    assert "docs/context/.hidden.md" in str(excinfo.value)
+
+
+def test_a_hidden_markdown_record_the_index_does_not_list_is_refused(tmp_path):
+    """The second half of the bypass, and the quieter one: a record that parses
+    but that the index never names is a record nobody finds."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / ".hidden.md").write_text(record_text(id="ctx-fixture-two"), encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "unindexed_record"
+    assert "ctx-fixture-two" in str(excinfo.value)
+    assert ".hidden.md" in str(excinfo.value)
+
+
+def test_a_hidden_markdown_record_that_is_valid_and_indexed_is_a_record_not_an_ignored_file(
+    tmp_path,
+):
+    """The positive direction, so "refused" is not achieved by refusing every
+    dotted name: a well-formed, indexed `.hidden.md` loads AS A RECORD and is
+    absent from `ignored`."""
+    build_tree(tmp_path, {".hidden.md": record_text()})
+    repository = load_context_records(tmp_path)
+    assert [record.path for record in repository.records] == ["docs/context/.hidden.md"]
+    assert repository.ignored == ()
+
+
+def test_a_file_named_only_md_is_parsed_rather_than_read_as_a_dotfile(tmp_path):
+    """`Path(".md").suffix` is `''`, so a suffix test through `Path` would sort
+    this one into the ignorable droppings. The match is on the whole name."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / ".md").write_text("# not a record\n", encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "no_front_matter"
+    assert "docs/context/.md" in str(excinfo.value)
+
+
+def test_an_uppercase_suffix_does_not_buy_the_exemption_back(tmp_path):
+    """The same bypass one keystroke along. On a case-preserving filesystem
+    `.hidden.MD` is as easy to write as `.hidden.md`, and an exact-case suffix
+    test would hand the second spelling the exemption the first was just
+    denied. The match is case-folded, so this is a record and is refused."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / ".hidden.MD").write_text("not a record\n", encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "no_front_matter"
+    assert "docs/context/.hidden.MD" in str(excinfo.value)
+
+
+def test_an_uppercase_suffix_is_a_record_even_without_the_dot(tmp_path):
+    """The other side of the same fold, stated so the rule is one rule: a
+    Markdown file is Markdown whatever the case of its suffix. `NOTES.MD` is a
+    record — not one of the structural names, which are spelled exactly — so it
+    is parsed and refused rather than reported as a foreign file."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / "NOTES.MD").write_text("# prose\n", encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "no_front_matter"
+    assert "features/NOTES.MD" in str(excinfo.value)
+
+
+def test_a_hidden_readme_is_a_record_and_not_navigation(tmp_path):
+    """`.README.md` is not one of the structural NAMES, so it is a record and is
+    parsed as one — a dot cannot borrow the navigation exemption either."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / ".README.md").write_text("# prose\n", encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "no_front_matter"
+    assert "features/.README.md" in str(excinfo.value)
 
 
 def test_two_records_may_not_share_an_id(tmp_path):
@@ -1176,16 +1306,33 @@ def test_check_passes_on_a_valid_tree_and_names_what_is_unstamped(tmp_path, caps
 def test_check_names_the_dotfiles_it_stepped_over_rather_than_passing_over_them(
     tmp_path, capsys
 ):
-    """The one category no record contract reaches — a record is a `.md` file the
-    index lists — so `check` says the file is there. Reported, not refused: a
-    `.DS_Store` is not a broken record, and a run that exited 1 on one would make
-    the operator surface useless. What must not happen is silence, which would
-    leave a file sitting under the context tree that nothing validated and
-    nothing mentioned."""
+    """The one category no record contract reaches — a NON-Markdown dropping —
+    so `check` says the file is there. Reported, not refused: a `.DS_Store` is
+    not a broken record, and a run that exited 1 on one would make the operator
+    surface useless. What must not happen is silence, which would leave a file
+    sitting under the context tree that nothing validated and nothing
+    mentioned."""
     stampable(tmp_path)
-    (tmp_path / CONTEXT_DIR / ".hidden.md").write_text(record_text(), encoding="utf-8")
+    (tmp_path / CONTEXT_DIR / ".DS_Store").write_bytes(b"\x00\x01")
     assert main(["check", str(tmp_path)]) == 0
-    assert "ignored (not a record): docs/context/.hidden.md" in capsys.readouterr().err
+    assert "ignored (not a record): docs/context/.DS_Store" in capsys.readouterr().err
+
+
+def test_check_refuses_a_hidden_markdown_record_rather_than_reporting_it_as_ignored(
+    tmp_path, capsys
+):
+    """The operator surface of the same rule, and the one that would be a green
+    run over a tree holding an unvalidated record: `check` must EXIT 1 and name
+    the file, not print it as ignored and pass."""
+    stampable(tmp_path)
+    (tmp_path / CONTEXT_DIR / ".hidden.md").write_text(
+        record_text(id="ctx-fixture-two", kind="rumour"), encoding="utf-8"
+    )
+    assert main(["check", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "bad_kind" in err
+    assert "docs/context/.hidden.md" in err
+    assert "ignored" not in err
 
 
 def test_check_fails_on_a_pointer_that_moved(tmp_path, capsys):

@@ -21,19 +21,39 @@ This module copies the fourth one's discipline and invents no second one. A
 record POINTS at the document that holds the detail; it never restates it.
 
 THE ONE VALIDATOR. `load_context_records` is the only way to read the tree, and
-it refuses rather than skips. Every `.md` file under `docs/context/` is either a
-record it parsed or one of the two STRUCTURAL names (`index.md`, `README.md`) it
-reports as structural — and a structural document that opens with the record
-fence is refused too, so a malformed record cannot be renamed into the quiet
-category. A file that is neither is named and refused. The ONE exemption is a
-leading dot: an editor's or the operating system's droppings cannot be records,
-because a record is a file the index lists. They are not dropped in silence
+it refuses rather than skips. Every Markdown file under `docs/context/` is
+either a record it parsed or one of the two STRUCTURAL names (`index.md`,
+`README.md`) it reports as structural — and a structural document that opens
+with the record fence is refused too, so a malformed record cannot be renamed
+into the quiet category. A file that is neither is named and refused.
+
+WHAT "EVERY MARKDOWN FILE" INCLUDES: one whose name begins with a dot. The
+classification is SUFFIX-FIRST, not filename-first, and that order is the whole
+guard. `.hidden.md` is parsed, id-checked, successor-checked and index-checked
+exactly like `features/anything.md`, because an exemption keyed on the first
+character would let a malformed or unindexed record leave the one-validator
+contract by being renamed — a guard that switches itself off for precisely the
+file that was trying to evade it. The suffix match is case-folded for the same
+reason: `.hidden.MD` is one keystroke from `.hidden.md` on a case-preserving
+filesystem, and it must not be the keystroke that buys the exemption back. The
+only thing stepped over is a NON-Markdown dotfile: `.DS_Store`, `.gitkeep` and
+the rest of an editor's or the operating system's droppings, which no contract
+written for a `.md` record can describe. Those are not dropped in silence
 either — the loader returns them as `ContextRepository.ignored` and `check`
 prints every one, so a file sitting in this tree that nothing validated is still
-said out loud. "Loaded zero records" is never an answer either: a missing
-`docs/context/` directory and a missing index are both refusals, because a
-validator that passes when its input is absent is the fail-open shape
-`docs/SECURITY.md` records twice for name-filtered rechecks.
+said out loud.
+
+A SYMLINK is refused outright, before the name is even looked at, and that is
+the same bypass by a different route: a dangling symlink answers False to
+`is_file` AND to `is_dir`, so the obvious sweep — every entry that is a regular
+file — steps over it without a word. `features/x.md` as a broken link is a
+record git can hold and no reader can check. Refusing every symlink rather than
+only the broken ones is deliberate: a working one is validated as whatever it
+happens to point at TODAY, which is a different file tomorrow. "Loaded zero records"
+is never an answer either: a missing `docs/context/` directory and a missing
+index are both refusals, because a validator that passes when its input is
+absent is the fail-open shape `docs/SECURITY.md` records twice for name-filtered
+rechecks.
 
 PATHS ARE VALIDATED BY `tasks._validate_approved_path` ITSELF, called through
 the module object rather than copied or re-implemented. A record naming a path
@@ -119,8 +139,20 @@ INDEX_NAME = "index.md"
 #: Files under `CONTEXT_DIR` that are navigation rather than records. Both are
 #: checked for the record fence anyway (see `_load_structural`), so this is a
 #: list of names that may be prose, not a list of files nobody validates.
+#: Matched EXACTLY, unlike the suffix: `README.MD` and `.README.md` are not
+#: these names, so each is a record and is parsed. That direction is the safe
+#: one — a near-miss spelling falls INTO the contract rather than out of it.
 STRUCTURAL_NAMES = frozenset({INDEX_NAME, "README.md"})
 
+#: What makes a file under `CONTEXT_DIR` this contract's business. Matched
+#: against the whole NAME rather than through `Path.suffix`, because `Path`
+#: reads a leading dot as the start of a stem: `Path(".md").suffix` is `''` and
+#: `Path(".hidden.md").suffix` is `'.md'`, so a suffix test alone would let a
+#: file literally named `.md` through as an ignorable dotfile. Case-FOLDED
+#: before the comparison, because the filesystems this runs on are not: on a
+#: case-preserving one `.hidden.MD` is as easy to write as `.hidden.md`, and an
+#: exact-case test would hand the second spelling the exemption the first was
+#: just denied.
 RECORD_SUFFIX = ".md"
 
 #: Opens and closes the metadata block. Three hyphens, alone on the line: the
@@ -261,9 +293,11 @@ class ContextRepository:
     `structural` and `ignored` are RETURNED rather than dropped: a loader that
     silently passed over a file would be indistinguishable from one that never
     saw it, which is the failure this format exists to refuse. `structural` is
-    the navigation documents it recognised by name; `ignored` is dotfiles (an
-    editor's or the operating system's droppings), which cannot be records
-    because a record is a `.md` file the index names.
+    the navigation documents it recognised by name; `ignored` is NON-Markdown
+    dotfiles (an editor's or the operating system's droppings), which no
+    contract written for a `.md` record can describe. A dotfile that IS Markdown
+    is a record and appears in `records` or stops the load — the dot buys no
+    exemption.
     """
 
     root: Path
@@ -745,9 +779,15 @@ def _verify_commits(root: Path, records: tuple[ContextRecord, ...], git=None) ->
 def load_context_records(root, git=None) -> ContextRepository:
     """THE loader for `docs/context/` — every file under it, one validation pass.
 
-    Refuses, never skips. Absent input is a refusal too: no `docs/context/`
-    directory and no `index.md` each raise, because "validated zero records
-    successfully" is a pass nobody asked for.
+    Refuses, never skips. Classification is by SUFFIX first: every Markdown
+    file is a record or a structural document, `.hidden.md` included, so no
+    rename moves a file out of the contract. Only a non-Markdown dotfile is
+    stepped over, and it is reported rather than dropped. A symlink is refused
+    before any of that, because a dangling one is neither a file nor a
+    directory and a sweep filtered to regular files would drop it in silence.
+    Absent input is a
+    refusal too: no `docs/context/` directory and no `index.md` each raise,
+    because "validated zero records successfully" is a pass nobody asked for.
 
     Checks run cheapest-first — parse, ids, successors, index, and git last —
     so a tree that fails on shape never reaches a subprocess. The last of them
@@ -772,12 +812,32 @@ def load_context_records(root, git=None) -> ContextRepository:
     records: list[ContextRecord] = []
     structural: list[str] = []
     ignored: list[str] = []
-    for file in sorted(p for p in base.rglob("*") if p.is_file()):
+    for file in sorted(base.rglob("*")):
         rel = file.relative_to(root).as_posix()
-        if file.name.startswith("."):
-            ignored.append(rel)
+        if file.is_symlink():
+            raise ContextRecordError(
+                "symlinked_entry",
+                f"{rel} under {CONTEXT_DIR} is a symlink; this tree holds regular files and "
+                "real directories. A DANGLING one is the reason this is a refusal rather "
+                "than a preference: it is neither a file nor a directory to `Path`, so a "
+                "sweep that kept only regular files would step over it in silence — a "
+                "record that evades the contract by being a broken link",
+            )
+        if file.is_dir():
             continue
-        if file.suffix != RECORD_SUFFIX:
+        if not file.is_file():
+            raise ContextRecordError(
+                "irregular_entry",
+                f"{rel} under {CONTEXT_DIR} is neither a regular file nor a directory; "
+                "nothing here can say what it holds, and an entry nothing can read is not "
+                "stepped over",
+            )
+        if not file.name.lower().endswith(RECORD_SUFFIX):
+            # A NON-Markdown dotfile is the only thing stepped over, and it is
+            # reported. Every other non-record file is refused by name.
+            if file.name.startswith("."):
+                ignored.append(rel)
+                continue
             raise ContextRecordError(
                 "foreign_file",
                 f"{rel} is under {CONTEXT_DIR} and is not a {RECORD_SUFFIX} file; this tree "
@@ -994,12 +1054,13 @@ def main(argv: list[str] | None = None) -> int:
     every UNSTAMPED record. Exit 0 is a pass, 1 a refusal with the reason on
     stderr, 2 a usage error.
 
-    `check` also NAMES every dotfile the load stepped over. Those are the one
-    thing under `CONTEXT_DIR` no record contract applies to — a record is a
-    `.md` file the index lists — and leaving them unmentioned at the operator
-    surface would make a file sitting in this tree that nothing validated
-    invisible exactly where a human goes looking. It is a report, not a
-    refusal: `.DS_Store` is not a broken record."""
+    `check` also NAMES every file the load stepped over. Those are non-Markdown
+    dotfiles, the one thing under `CONTEXT_DIR` no record contract applies to —
+    a record is a Markdown file the index lists, and `.hidden.md` is one — and
+    leaving them unmentioned at the operator surface would make a file sitting
+    in this tree that nothing validated invisible exactly where a human goes
+    looking. It is a report, not a refusal: `.DS_Store` is not a broken
+    record."""
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "check"
     if command not in ("check", "stamp") or len(args) > 2:
