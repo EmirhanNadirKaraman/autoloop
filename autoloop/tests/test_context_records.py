@@ -1,0 +1,788 @@
+"""The context-record contract, the stamping path, and the seeded records.
+
+ONE CLAIM, in three parts, and each part is here because its failure is SILENT:
+
+1. **Every file under `docs/context/` loads through one validator, and a
+   malformed record is refused BY NAME with the reason rather than skipped.** A
+   loader that skipped what it could not parse would report a healthy tree while
+   holding a broken record — the absent-evidence-reads-as-a-pass shape this
+   repository has already recorded twice (`docs/SECURITY.md`, brw-19c/brw-19d,
+   and the seeded lesson that collects them). So the refusals are asserted one
+   by one, by `code` and by the record being NAMED in the message, and the
+   loader is shown returning NOTHING when one file in a tree is bad.
+2. **Path fields are validated by the task registry's own
+   `_validate_approved_path`.** Asserted as a CALL (a spy the loader must
+   reach), not as two implementations agreeing on a sample: agreement today is
+   what drift looks like before it happens.
+3. **`last_verified_commit` is a measurement.** Every seeded record is either
+   stamped to a commit this repository resolves or explicitly `UNSTAMPED`, and
+   the test resolves HEAD itself through `GitGateway` rather than trusting a
+   value in a file. No agent in this loop can read HEAD
+   (`implement_executor.WRITE_ALLOWED_TOOLS` is Read/Grep/Glob/Edit/Write, and
+   the prompt carries no sha), so a sha in a seed record would be fabricated.
+
+Fixture-first, with the real-repository claims at the bottom — the fixtures say
+WHY each shape is refused, and the bottom section says the rule survives contact
+with this checkout's own records.
+
+There is no `pytest.skip` anywhere in this file, deliberately. The stamping and
+seed claims need a real repository, and skipping when one is absent would retire
+exactly the check that proves nobody typed a sha, while still reporting green.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from gitrepo import make_repo_from_template
+
+from autoloop import context_records, tasks
+from autoloop.context_records import (
+    CONTEXT_DIR,
+    FIELDS,
+    INDEX_NAME,
+    REQUIRED_SECTIONS,
+    UNSTAMPED,
+    ContextRecordError,
+    load_context_records,
+    main,
+    missing_paths,
+    parse_record,
+    stamp_records,
+    unverifiable_records,
+)
+from autoloop.errors import TaskGraphError
+from autoloop.git_gateway import GitGateway
+from autoloop.policy import PolicyConfig, PolicyEngine
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: A record that must parse. Every fixture below is this with one field moved,
+#: so a failure names the one thing that changed.
+VALID: dict[str, str] = {
+    "id": "ctx-fixture-one",
+    "kind": "feature",
+    "status": "active",
+    "summary": "A fixture record.",
+    "source_paths": "autoloop/context_records.py",
+    "test_paths": "autoloop/tests/test_context_records.py",
+    "task_ids": "ctx-02",
+    "last_verified_commit": UNSTAMPED,
+    "superseded_by": "",
+}
+
+
+def body_for(kind: str) -> str:
+    sections = REQUIRED_SECTIONS.get(kind, ("What this is",))
+    return "\n".join("## " + heading + "\n\nA pointer, not a copy.\n" for heading in sections)
+
+
+def record_text(body: str | None = None, **overrides: str) -> str:
+    fields = dict(VALID, **overrides)
+    lines = ["---"]
+    for key in FIELDS:
+        value = fields[key]
+        lines.append(key + ": " + value if value else key + ":")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines) + (body_for(fields["kind"]) if body is None else body)
+
+
+def id_of(text: str) -> str:
+    for line in text.split("\n"):
+        if line.startswith("id: "):
+            return line[4:]
+    return ""
+
+
+def build_tree(root: Path, records: dict[str, str], *, index: str | None = None) -> Path:
+    """Write `{relative path: text}` under `docs/context/`, with an index that
+    lists every record unless the caller states its own."""
+    base = root / CONTEXT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    for rel, text in records.items():
+        target = base / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    if index is None:
+        rows = "".join("- %s %s\n" % (id_of(text), rel) for rel, text in records.items())
+        index = "# Index\n\n" + rows
+    (base / INDEX_NAME).write_text(index, encoding="utf-8")
+    return base
+
+
+def sections_of(body: str) -> dict[str, str]:
+    """`{heading: the prose under it}` for every `## ` section in a body."""
+    sections: dict[str, list[str]] = {}
+    heading = ""
+    for line in body.split("\n"):
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            sections[heading] = []
+        elif heading:
+            sections[heading].append(line)
+    return {name: "\n".join(lines) for name, lines in sections.items()}
+
+
+def refusal(text: str, path: str = "docs/context/features/fixture.md") -> ContextRecordError:
+    with pytest.raises(ContextRecordError) as excinfo:
+        parse_record(text, path)
+    return excinfo.value
+
+
+# ---- the metadata block -------------------------------------------------------
+
+
+def test_a_valid_record_parses_every_field():
+    record = parse_record(record_text(), "docs/context/features/fixture.md")
+    assert record.id == "ctx-fixture-one"
+    assert record.kind == "feature"
+    assert record.status == "active"
+    assert record.summary == "A fixture record."
+    assert record.source_paths == ("autoloop/context_records.py",)
+    assert record.test_paths == ("autoloop/tests/test_context_records.py",)
+    assert record.task_ids == ("ctx-02",)
+    assert record.last_verified_commit == UNSTAMPED
+    assert record.stamped is False
+    assert record.superseded_by == ""
+    assert record.path == "docs/context/features/fixture.md"
+    assert "A pointer, not a copy." in record.body
+
+
+@pytest.mark.parametrize(
+    "text, code",
+    [
+        ("", "empty_record"),
+        ("   \n\n", "empty_record"),
+        ("# Not a record\n\nprose\n", "no_front_matter"),
+        ("---\nid: ctx-x\n\nbody\n", "unterminated_front_matter"),
+        (record_text().replace("\n", "\r\n"), "carriage_return"),
+    ],
+)
+def test_a_file_that_is_not_shaped_like_a_record_is_refused_by_path(text, code):
+    error = refusal(text)
+    assert error.code == code
+    assert "docs/context/features/fixture.md" in str(error)
+
+
+@pytest.mark.parametrize(
+    "line, code",
+    [
+        ("colour: blue", "unknown_field"),
+        ("id: ctx-fixture-two", "duplicate_field"),
+        ("  status: active", "indented_field"),
+        ("", "blank_field_line"),
+        ("no colon here", "bad_field_line"),
+        ("summary:no space", "bad_field_line"),
+    ],
+)
+def test_a_bad_metadata_line_is_refused_by_name(line, code):
+    text = record_text().replace("---\nid:", "---\n" + line + "\nid:", 1)
+    error = refusal(text)
+    assert error.code == code
+
+
+def test_a_missing_field_is_refused_and_named():
+    text = record_text().replace("task_ids: ctx-02\n", "")
+    error = refusal(text)
+    assert error.code == "missing_field"
+    assert "task_ids" in str(error)
+
+
+def test_a_padded_value_is_refused_rather_than_stripped():
+    error = refusal(record_text().replace("id: ctx-fixture-one", "id: ctx-fixture-one "))
+    assert error.code == "padded_field"
+
+
+def test_the_body_is_everything_after_the_block_and_a_body_line_cannot_be_a_field():
+    """A body line spelling a field name is BODY. The parser records the line it
+    found the commit on, so nothing later has to search the file for a key the
+    prose can also start a line with."""
+    body = "## Intent and boundaries\n\nlast_verified_commit: deadbeef\n"
+    text = record_text(body=body, kind="project")
+    record = parse_record(text, "docs/context/project.md")
+    assert record.last_verified_commit == UNSTAMPED
+    assert "last_verified_commit: deadbeef" in record.body
+    assert text.split("\n")[record.commit_line] == "last_verified_commit: " + UNSTAMPED
+
+
+# ---- the fields ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides, code",
+    [
+        ({"id": "ctx fixture"}, "bad_record_id"),
+        ({"id": "-leading-dash"}, "bad_record_id"),
+        ({"id": ""}, "bad_record_id"),
+        ({"kind": "note"}, "bad_kind"),
+        ({"kind": "Feature"}, "bad_kind"),
+        ({"status": "open"}, "bad_status"),
+        ({"summary": ""}, "empty_summary"),
+        ({"summary": "x" * 201}, "long_summary"),
+        ({"source_paths": ""}, "no_source_paths"),
+        ({"test_paths": ""}, "no_test_paths"),
+        ({"task_ids": "", "kind": "lesson"}, "no_task_ids"),
+        ({"task_ids": "not a task id!"}, "bad_task_id"),
+        ({"task_ids": "ctx-02 ctx-02"}, "duplicate_task_ids"),
+        ({"source_paths": "autoloop/tasks.py autoloop/tasks.py"}, "duplicate_source_paths"),
+    ],
+)
+def test_a_field_the_contract_refuses_is_named_with_its_reason(overrides, code):
+    error = refusal(record_text(**overrides))
+    assert error.code == code
+    if "id" in overrides:
+        # The id is the thing that failed, so the PATH is what names the record.
+        assert "docs/context/features/fixture.md" in str(error)
+    else:
+        assert "ctx-fixture-one" in str(error)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "abc123",
+        "0" * 39,
+        "0" * 41,
+        "A" * 40,
+        "HEAD",
+        "unstamped",
+        "",
+    ],
+)
+def test_a_last_verified_commit_that_is_neither_a_full_sha_nor_the_sentinel_is_refused(value):
+    error = refusal(record_text(last_verified_commit=value))
+    assert error.code == "bad_last_verified_commit"
+    assert "ctx-fixture-one" in str(error)
+
+
+@pytest.mark.parametrize("digits", [40, 64])
+def test_both_sha_shapes_the_registry_accepts_are_accepted_here(digits):
+    record = parse_record(
+        record_text(last_verified_commit="a" * digits), "docs/context/features/fixture.md"
+    )
+    assert record.stamped is True
+    assert tasks._COMMIT_SHA_RE.match(record.last_verified_commit)
+
+
+# ---- one path validator, not two ----------------------------------------------
+
+
+def test_path_fields_are_validated_by_the_task_registrys_own_function(monkeypatch):
+    """Asserted as a CALL. Two validators that agree on today's sample is what
+    drift looks like before it happens, so the claim is that this module reaches
+    `tasks._validate_approved_path` itself — not that a copy behaves like it."""
+    seen: list[str] = []
+    real = tasks._validate_approved_path
+
+    def spy(path):
+        seen.append(path)
+        return real(path)
+
+    monkeypatch.setattr(tasks, "_validate_approved_path", spy)
+    parse_record(
+        record_text(source_paths="autoloop/tasks.py autoloop/git_gateway.py"),
+        "docs/context/features/fixture.md",
+    )
+    assert seen == [
+        "autoloop/tasks.py",
+        "autoloop/git_gateway.py",
+        "autoloop/tests/test_context_records.py",
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "~/notes.md", "../outside.py", "autoloop/../tasks.py", "autoloop/*.py",
+     "autoloop\\tasks.py", "autoloop//tasks.py", "-rf", "autoloop/tasks.py:12"],
+)
+def test_a_path_shape_the_registry_refuses_is_refused_here_with_the_registrys_reason(path):
+    with pytest.raises(TaskGraphError) as registry_says:
+        tasks._validate_approved_path(path)
+    error = refusal(record_text(source_paths=path))
+    assert error.code == "bad_source_path"
+    assert "ctx-fixture-one" in str(error)
+    assert registry_says.value.args[0].split(":", 1)[1].strip()[:40] in str(error)
+
+
+def test_a_bad_test_path_is_refused_under_its_own_code():
+    assert refusal(record_text(test_paths="../elsewhere.py")).code == "bad_test_path"
+
+
+def test_a_path_containing_a_space_becomes_two_entries_and_is_caught_by_existence(tmp_path):
+    """The one thing the whitespace-separated list cannot express, stated rather
+    than argued away: no single entry may contain a space, because the registry's
+    own segment rule refuses whitespace, so a path with one parses as two. That
+    is not silent — both halves are pointers, and `missing_paths` reports each
+    one that does not exist."""
+    record = parse_record(
+        record_text(source_paths="auto loop.py"), "docs/context/features/fixture.md"
+    )
+    assert record.source_paths == ("auto", "loop.py")
+    assert missing_paths(record, tmp_path) == (
+        "auto",
+        "loop.py",
+        "autoloop/tests/test_context_records.py",
+    )
+    with pytest.raises(TaskGraphError):
+        tasks._validate_approved_path("auto loop.py")
+
+
+# ---- successors ---------------------------------------------------------------
+
+
+def test_superseded_without_a_successor_is_refused():
+    error = refusal(record_text(status="superseded"))
+    assert error.code == "missing_successor"
+    assert "ctx-fixture-one" in str(error)
+
+
+def test_a_successor_named_by_a_record_that_is_not_superseded_is_refused():
+    assert refusal(record_text(superseded_by="ctx-fixture-two")).code == "unexpected_successor"
+
+
+def test_a_record_cannot_supersede_itself():
+    error = refusal(record_text(status="superseded", superseded_by="ctx-fixture-one"))
+    assert error.code == "self_supersession"
+
+
+def test_two_successors_on_one_line_are_refused():
+    error = refusal(record_text(status="superseded", superseded_by="ctx-a ctx-b"))
+    assert error.code == "bad_successor"
+
+
+def test_a_successor_that_does_not_resolve_is_refused_by_the_loader(tmp_path):
+    build_tree(
+        tmp_path,
+        {
+            "features/one.md": record_text(
+                status="superseded", superseded_by="ctx-fixture-missing"
+            )
+        },
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "unknown_successor"
+    assert "ctx-fixture-missing" in str(excinfo.value)
+    assert "ctx-fixture-one" in str(excinfo.value)
+
+
+def test_a_resolving_successor_is_accepted(tmp_path):
+    build_tree(
+        tmp_path,
+        {
+            "features/one.md": record_text(status="superseded", superseded_by="ctx-fixture-two"),
+            "features/two.md": record_text(id="ctx-fixture-two"),
+        },
+    )
+    repository = load_context_records(tmp_path)
+    assert {record.id for record in repository.records} == {"ctx-fixture-one", "ctx-fixture-two"}
+    assert repository.by_id()["ctx-fixture-one"].superseded_by == "ctx-fixture-two"
+
+
+def test_a_cycle_of_successors_is_refused_rather_than_walked_forever(tmp_path):
+    build_tree(
+        tmp_path,
+        {
+            "features/one.md": record_text(status="superseded", superseded_by="ctx-fixture-two"),
+            "features/two.md": record_text(
+                id="ctx-fixture-two", status="superseded", superseded_by="ctx-fixture-one"
+            ),
+        },
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "successor_cycle"
+
+
+# ---- required sections, and the placeholder that would otherwise pass ---------
+
+
+@pytest.mark.parametrize("kind", sorted(REQUIRED_SECTIONS))
+def test_a_kind_with_required_sections_refuses_a_record_missing_one(kind):
+    dropped = REQUIRED_SECTIONS[kind][-1]
+    body = body_for(kind).replace("## " + dropped, "## Something else")
+    overrides = {"kind": kind, "status": "resolved" if kind == "incident" else "active"}
+    error = refusal(record_text(body=body, **overrides))
+    assert error.code == "missing_section"
+    assert dropped in str(error)
+
+
+@pytest.mark.parametrize("kind", ["project", "architecture", "decision", "feature"])
+def test_a_record_with_metadata_and_no_body_is_refused(kind):
+    error = refusal(record_text(body="\n", kind=kind))
+    assert error.code == "empty_body"
+
+
+# ---- the tree -----------------------------------------------------------------
+
+
+def test_the_loader_refuses_a_malformed_record_by_name_and_returns_nothing(tmp_path):
+    """The whole load fails. A loader that returned the good records and dropped
+    the bad one would report a healthy tree that is not one."""
+    build_tree(
+        tmp_path,
+        {
+            "features/good.md": record_text(),
+            "features/broken.md": record_text(id="ctx-fixture-two", kind="rumour"),
+        },
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "bad_kind"
+    assert "ctx-fixture-two" in str(excinfo.value)
+    assert "features/broken.md" in str(excinfo.value)
+
+
+def test_a_record_hidden_in_a_structural_file_is_refused_not_skipped(tmp_path):
+    """`README.md` and `index.md` are not parsed as records, so they are checked
+    for the record fence instead — otherwise renaming a broken record would move
+    it into the category nothing validates."""
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / "README.md").write_text(record_text(kind="rumour"), encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "record_in_structural_file"
+    assert "features/README.md" in str(excinfo.value)
+
+
+def test_a_structural_file_that_is_prose_is_reported_as_structural(tmp_path):
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / "README.md").write_text("# Features\n\nprose\n", encoding="utf-8")
+    repository = load_context_records(tmp_path)
+    assert repository.structural == (
+        "docs/context/features/README.md",
+        "docs/context/" + INDEX_NAME,
+    )
+
+
+def test_a_file_that_is_neither_a_record_nor_navigation_is_refused(tmp_path):
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / "features" / "notes.txt").write_text("loose\n", encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "foreign_file"
+    assert "notes.txt" in str(excinfo.value)
+
+
+def test_a_dotfile_is_ignored_and_said_so_rather_than_passed_over_silently(tmp_path):
+    base = build_tree(tmp_path, {"features/good.md": record_text()})
+    (base / ".DS_Store").write_bytes(b"\x00\x01")
+    repository = load_context_records(tmp_path)
+    assert repository.ignored == ("docs/context/.DS_Store",)
+    assert len(repository.records) == 1
+
+
+def test_two_records_may_not_share_an_id(tmp_path):
+    build_tree(
+        tmp_path,
+        {"features/one.md": record_text(), "features/two.md": record_text()},
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "duplicate_record_id"
+
+
+def test_a_record_the_index_does_not_list_is_refused(tmp_path):
+    build_tree(tmp_path, {"features/one.md": record_text()}, index="# Index\n\nnothing here\n")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "unindexed_record"
+    assert "ctx-fixture-one" in str(excinfo.value)
+
+
+def test_an_index_naming_the_id_but_not_the_path_is_still_refused(tmp_path):
+    build_tree(
+        tmp_path,
+        {"features/one.md": record_text()},
+        index="# Index\n\n- ctx-fixture-one\n",
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "unindexed_record"
+
+
+# ---- absent input is a refusal, never an empty pass ---------------------------
+
+
+def test_a_missing_context_directory_is_a_refusal(tmp_path):
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "missing_context_dir"
+
+
+def test_a_tree_with_no_index_is_a_refusal(tmp_path):
+    base = tmp_path / CONTEXT_DIR
+    (base / "features").mkdir(parents=True)
+    (base / "features" / "one.md").write_text(record_text(), encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "missing_index"
+
+
+def test_an_empty_context_directory_still_needs_an_index(tmp_path):
+    (tmp_path / CONTEXT_DIR).mkdir(parents=True)
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "missing_index"
+
+
+# ---- pointers that no longer resolve ------------------------------------------
+
+
+def test_missing_paths_names_every_pointer_that_moved(tmp_path):
+    build_tree(tmp_path, {"features/one.md": record_text()})
+    (tmp_path / "autoloop").mkdir()
+    (tmp_path / "autoloop" / "context_records.py").write_text("", encoding="utf-8")
+    repository = load_context_records(tmp_path)
+    record = repository.records[0]
+    assert missing_paths(record, tmp_path) == ("autoloop/tests/test_context_records.py",)
+    assert unverifiable_records(repository) == (
+        ("ctx-fixture-one", ("autoloop/tests/test_context_records.py",)),
+    )
+
+
+# ---- stamping -----------------------------------------------------------------
+
+
+class _FakeGit:
+    """A gateway that answers `head_sha` and nothing else — the claim under test
+    is what `stamp_records` does with the ANSWER, not how git produces it."""
+
+    def __init__(self, head: str):
+        self._head = head
+
+    def head_sha(self) -> str:
+        return self._head
+
+
+def stampable(root: Path) -> str:
+    """A repository with one record whose pointers all exist in it."""
+    make_repo_from_template(root)
+    build_tree(
+        root,
+        {
+            "project.md": record_text(
+                kind="project", source_paths="README.md", test_paths="", task_ids=""
+            )
+        },
+    )
+    return "docs/context/project.md"
+
+
+def test_stamping_writes_head_and_a_second_run_changes_nothing(tmp_path):
+    rel = stampable(tmp_path)
+    head = GitGateway(tmp_path, PolicyEngine(PolicyConfig())).head_sha()
+
+    first = stamp_records(tmp_path)
+    assert first.head_sha == head
+    assert first.stamped == ("ctx-fixture-one",)
+    assert first.already == ()
+    after_first = (tmp_path / rel).read_text(encoding="utf-8")
+    assert "last_verified_commit: " + head in after_first
+
+    second = stamp_records(tmp_path)
+    assert second.stamped == ()
+    assert second.already == ("ctx-fixture-one",)
+    assert (tmp_path / rel).read_text(encoding="utf-8") == after_first
+
+
+def test_stamping_changes_exactly_one_line_and_no_other_byte(tmp_path):
+    rel = stampable(tmp_path)
+    before = (tmp_path / rel).read_text(encoding="utf-8").split("\n")
+    stamp = stamp_records(tmp_path)
+    after = (tmp_path / rel).read_text(encoding="utf-8").split("\n")
+    differing = [index for index, _ in enumerate(before) if before[index] != after[index]]
+    assert len(before) == len(after)
+    assert len(differing) == 1
+    assert before[differing[0]] == "last_verified_commit: " + UNSTAMPED
+    assert after[differing[0]] == "last_verified_commit: " + stamp.head_sha
+
+
+def test_stamping_refuses_a_record_whose_pointers_do_not_exist_and_writes_nothing(tmp_path):
+    make_repo_from_template(tmp_path)
+    build_tree(
+        tmp_path,
+        {
+            "project.md": record_text(
+                kind="project", source_paths="README.md", test_paths="", task_ids=""
+            ),
+            "features/gone.md": record_text(id="ctx-fixture-two", source_paths="not/here.py"),
+        },
+    )
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "unverifiable_record"
+    assert "not/here.py" in str(excinfo.value)
+    for rel in ("docs/context/project.md", "docs/context/features/gone.md"):
+        assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("head", ["", "abc1234", "HEAD", "0" * 39, "Z" * 40])
+def test_stamping_refuses_a_head_that_is_not_a_full_sha(tmp_path, head):
+    rel = stampable(tmp_path)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path, git=_FakeGit(head))
+    assert excinfo.value.code == "head_unresolved"
+    assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
+
+
+def test_a_malformed_record_stops_stamping_before_anything_is_written(tmp_path):
+    rel = stampable(tmp_path)
+    base = tmp_path / CONTEXT_DIR
+    (base / "features").mkdir(parents=True, exist_ok=True)
+    (base / "features" / "broken.md").write_text("not a record\n", encoding="utf-8")
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "no_front_matter"
+    assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
+
+
+def test_an_already_stamped_record_is_left_at_the_commit_it_was_verified_at(tmp_path):
+    make_repo_from_template(tmp_path)
+    old = "b" * 40
+    build_tree(
+        tmp_path,
+        {
+            "project.md": record_text(
+                kind="project",
+                source_paths="README.md",
+                test_paths="",
+                task_ids="",
+                last_verified_commit=old,
+            )
+        },
+    )
+    stamp = stamp_records(tmp_path)
+    assert stamp.stamped == ()
+    assert old in (tmp_path / "docs/context/project.md").read_text(encoding="utf-8")
+    assert stamp.head_sha != old
+
+
+# ---- the entry point ----------------------------------------------------------
+
+
+def test_check_passes_on_a_valid_tree_and_names_what_is_unstamped(tmp_path, capsys):
+    stampable(tmp_path)
+    assert main(["check", str(tmp_path)]) == 0
+    assert "1 record(s) valid, 1 unstamped" in capsys.readouterr().out
+
+
+def test_check_fails_on_a_pointer_that_moved(tmp_path, capsys):
+    build_tree(tmp_path, {"features/one.md": record_text()})
+    assert main(["check", str(tmp_path)]) == 1
+    assert "unverifiable: ctx-fixture-one" in capsys.readouterr().err
+
+
+def test_a_refusal_is_reported_with_its_reason_and_exits_one(tmp_path, capsys):
+    assert main(["check", str(tmp_path)]) == 1
+    assert "missing_context_dir" in capsys.readouterr().err
+
+
+def test_stamp_through_the_entry_point_is_re_runnable(tmp_path, capsys):
+    stampable(tmp_path)
+    assert main(["stamp", str(tmp_path)]) == 0
+    assert "stamped 1" in capsys.readouterr().out
+    assert main(["stamp", str(tmp_path)]) == 0
+    assert "stamped 0" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [["explode"], ["check", "a", "b"], [""]])
+def test_an_unknown_verb_is_a_usage_error_not_a_pass(argv, capsys):
+    assert main(argv) == 2
+    assert "usage:" in capsys.readouterr().err
+
+
+# ---- this checkout's own records ----------------------------------------------
+
+
+def repo_gateway() -> GitGateway:
+    return GitGateway(REPO_ROOT, PolicyEngine(PolicyConfig()))
+
+
+def test_this_checkout_is_a_git_repository_so_the_claims_below_can_be_checked():
+    """Asserted rather than skipped. Every claim under this heading needs git,
+    and a skip would retire the check that proves no sha was typed by hand while
+    still reporting green — the failure this file exists to refuse."""
+    assert (REPO_ROOT / ".git").exists(), "the seeded records are graded against a real HEAD"
+
+
+def test_every_seeded_record_loads_through_the_one_validator():
+    repository = load_context_records(REPO_ROOT)
+    assert repository.records, "docs/context/ holds no records"
+    kinds = {record.kind for record in repository.records}
+    assert {"project", "architecture", "feature", "incident", "decision", "lesson"} == kinds
+    assert repository.structural, "the index and the category READMEs are structural"
+
+
+def test_every_seeded_records_source_and_test_paths_exist_in_this_checkout():
+    repository = load_context_records(REPO_ROOT)
+    assert unverifiable_records(repository) == ()
+
+
+def test_every_seeded_record_is_stamped_to_a_commit_that_resolves_or_explicitly_unstamped():
+    """HEAD is resolved HERE, by this test, through the gateway — the file's own
+    value is never taken as evidence about itself."""
+    git = repo_gateway()
+    head = git.head_sha()
+    assert tasks._COMMIT_SHA_RE.match(head)
+    # Exercised even when every record is unstamped, so the probe the loop below
+    # depends on is known to answer True for a commit that really exists.
+    assert git.object_exists(head) is True
+    for record in load_context_records(REPO_ROOT).records:
+        if record.last_verified_commit == UNSTAMPED:
+            continue
+        assert git.object_exists(record.last_verified_commit) is True, (
+            record.id + " names a commit this repository cannot resolve"
+        )
+
+
+def test_the_index_lists_every_seeded_record_by_id_and_by_path():
+    repository = load_context_records(REPO_ROOT)
+    index = (REPO_ROOT / CONTEXT_DIR / INDEX_NAME).read_text(encoding="utf-8")
+    for record in repository.records:
+        assert record.id in index
+        assert record.path[len(CONTEXT_DIR) + 1:] in index
+
+
+def test_no_seeded_record_is_a_placeholder():
+    """Placeholders make a validator's tests pass vacuously. Nothing here can
+    prove a record's prose is TRUE — no automated check can — but a stub body, an
+    empty section under a required heading, and an unfinished marker are all
+    refusable by shape, so they are refused."""
+    for record in load_context_records(REPO_ROOT).records:
+        assert len(record.body) > 400, record.id + " has a stub body"
+        assert record.source_paths
+        for marker in ("TODO", "FIXME", "XXX"):
+            assert marker not in record.body, record.id + " carries a " + marker
+        for heading, prose in sections_of(record.body).items():
+            assert len(prose.split()) >= 12, record.id + " says nothing under " + heading
+
+
+def test_the_context_tree_was_not_added_to_the_always_writable_tracker_paths():
+    """Adding `docs/context/` to `TRACKER_PATHS` would widen the write scope of
+    every task in the registry at once — the S31 refusal the seeded decision
+    record carries.
+
+    The CONTENTS of that tuple are pinned at `test_tasks.py:2414`, as an
+    equality over all six paths, which is where the registry's own claims
+    belong; restating them here would also spell four tracker names in evaluated
+    code, which is what makes a file count as a READER of them in
+    `validation._files_reading_documents`. What is asserted here is only what
+    THIS task could have broken: the list is the same length it was, and nothing
+    in it reaches the context tree.
+    """
+    assert len(tasks.TRACKER_PATHS) == 6
+    assert not any(entry.startswith(CONTEXT_DIR) for entry in tasks.TRACKER_PATHS)
+    assert not any(entry.startswith("docs/context") for entry in tasks.TRACKER_PATHS)
+
+
+def test_the_module_reaches_the_registrys_validator_rather_than_defining_one():
+    """A source-level claim, because the spy above proves today's call path and
+    this proves nobody added a second implementation beside it."""
+    source = (REPO_ROOT / "autoloop" / "context_records.py").read_text(encoding="utf-8")
+    assert "tasks._validate_approved_path(" in source
+    assert "def _validate_approved_path" not in source
+    assert "_APPROVED_PATH_SEGMENT_RE" not in source
+    assert context_records.tasks is tasks
