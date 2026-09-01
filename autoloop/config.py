@@ -579,14 +579,29 @@ class AutonomyConfig:
 #: (docs/AUTOLOOP.md, "Decision 4 — the fleet cap"), and a clamped value would
 #: read as configured while running a different fleet.
 #:
-#: EIGHT, chosen from what this repository already says about itself rather than
-#: from what a host could bear. The split plan prices its worked example at four
-#: lanes, and `audit.max_parallel_agents` (three) is the only other fan-out the
-#: loop ships — so eight refuses no value anyone has deliberately asked for,
-#: while still refusing the digit-slip an operator actually makes (40, 100)
-#: before it becomes that many clones of the repository. Raising it is one edit
-#: and one review; it is not a claim about what the scheduler can carry.
-MAX_LANES = 8
+#: THE NUMBER IS THIS CANDIDATE'S TO PICK, and the plan says so in as many
+#: words. docs/AUTOLOOP.md, "What this plan does not decide", lists "the hard
+#: ceiling on `lanes`" and then: "It should be measured against the executor's
+#: actual concurrency behaviour and the machine, not asserted; conc-02 picks a
+#: conservative number and says how it was chosen." So this comment is the
+#: required half of that sentence, and here is how:
+#:
+#: FOUR — the largest fleet the plan itself describes anywhere. Decision 1
+#: reasons about "four lanes sharing one clone", Decision 6 says "four lanes
+#: manufacture that continuously", and the measured prize/cost paragraph prices
+#: "a 4x multiplier" that "multiplies rework 4x as well". Four therefore refuses
+#: no value the plan has asked for — its own acceptance round (conc-10) is
+#: `lanes = 2` — while still refusing the digit-slip an operator actually makes
+#: (40, 100) before it becomes that many clones of the repository.
+#:
+#: IT IS NOT A MEASUREMENT and does not claim to be. Nothing in this repository
+#: can measure it: no lane exists yet, and the executor's concurrency behaviour
+#: on a given host is exactly what the plan says should decide this and exactly
+#: what cannot be observed from here. A measured number belongs to conc-10, the
+#: candidate that turns concurrency on and runs the end-to-end round; raising or
+#: lowering this is one edit and one review, which is the point of it being a
+#: named constant rather than a literal at the comparison.
+MAX_LANES = 4
 
 #: What a lane is CALLED, and the whole of the collision argument.
 #:

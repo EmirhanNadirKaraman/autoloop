@@ -819,11 +819,14 @@ workers_root = "~/.autoloop/workers"
 # that turns concurrency on. Setting it above 1 before then changes nothing —
 # it is validated and ignored — so leave it at 1.
 #
-# Whatever it is set to, values outside 1..8 are REFUSED at load rather than
+# Whatever it is set to, values outside 1..4 are REFUSED at load rather than
 # clamped: 0 and negatives (a fleet of no lanes dispatches nothing while reading
 # as configured), fractions and strings, `true` (a count, not a switch), and
 # anything above the ceiling in autoloop/config.py's MAX_LANES — each lane costs
-# its own clone of the repository and its own worker repositories.
+# its own clone of the repository and its own worker repositories. Four is the
+# largest fleet the split plan itself describes, not a measurement of this
+# machine; that constant's comment says how it was chosen and what raising it
+# would take.
 #
 # When it does start meaning something, read the plan's Decision 3 first: the
 # admission rule co-schedules two tasks that share only a directory entry such
