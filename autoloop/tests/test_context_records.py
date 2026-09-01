@@ -20,6 +20,14 @@ ONE CLAIM, in three parts, and each part is here because its failure is SILENT:
    value in a file. No agent in this loop can read HEAD
    (`implement_executor.WRITE_ALLOWED_TOOLS` is Read/Grep/Glob/Edit/Write, and
    the prompt carries no sha), so a sha in a seed record would be fabricated.
+   "Resolves" is asked of GIT, not of a regular expression: `b` forty times
+   passes `tasks._COMMIT_SHA_RE` and names nothing, so `load_context_records` —
+   the one mandatory path in — puts every non-sentinel value to the repository
+   and is shown here refusing an unknown object BY NAME, refusing a sha that
+   resolves to something that is not a commit, and refusing when git could not
+   answer at all. That last one is the fail-open case: a validator that accepted
+   a stamp because the repository was unreadable would pass exactly when nothing
+   could check it.
 
 Fixture-first, with the real-repository claims at the bottom — the fixtures say
 WHY each shape is refused, and the bottom section says the rule survives contact
@@ -35,7 +43,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from gitrepo import make_repo_from_template
+from gitrepo import make_repo_from_template, run_git
 
 from autoloop import context_records, tasks
 from autoloop.context_records import (
@@ -52,11 +60,16 @@ from autoloop.context_records import (
     stamp_records,
     unverifiable_records,
 )
-from autoloop.errors import TaskGraphError
+from autoloop.errors import GitError, TaskGraphError
 from autoloop.git_gateway import GitGateway
 from autoloop.policy import PolicyConfig, PolicyEngine
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Well-formed to `tasks._COMMIT_SHA_RE` and held by no repository on earth.
+#: Every "the shape check is not the check" claim below turns on this value
+#: passing the regular expression and failing git.
+UNKNOWN_SHA = "b" * 40
 
 #: A record that must parse. Every fixture below is this with one field moved,
 #: so a failure names the one thing that changed.
@@ -258,7 +271,13 @@ def test_a_last_verified_commit_that_is_neither_a_full_sha_nor_the_sentinel_is_r
 
 
 @pytest.mark.parametrize("digits", [40, 64])
-def test_both_sha_shapes_the_registry_accepts_are_accepted_here(digits):
+def test_both_sha_shapes_the_registry_accepts_pass_the_SHAPE_check(digits):
+    """A PARSE claim, and only that. `parse_record` never asks git — resolving
+    the value is `load_context_records`' job, below — so this says the two
+    lengths `tasks._COMMIT_SHA_RE` admits get that far, not that either one
+    names anything. Neither of these records would LOAD: `a` * 40 is in no
+    object database, and a 64-hex sha cannot resolve in a sha1 checkout at all.
+    """
     record = parse_record(
         record_text(last_verified_commit="a" * digits), "docs/context/features/fixture.md"
     )
@@ -543,31 +562,219 @@ def test_missing_paths_names_every_pointer_that_moved(tmp_path):
     )
 
 
+# ---- the commit is put to git, not to a regular expression --------------------
+
+
+def gateway_for(root) -> GitGateway:
+    return GitGateway(Path(root), PolicyEngine(PolicyConfig()))
+
+
+def head_of(root) -> str:
+    return gateway_for(root).head_sha()
+
+
+def project_record(commit: str = UNSTAMPED) -> str:
+    """The one record every repository fixture below holds: a project record
+    pointing at the `README.md` the template repository already contains, so its
+    pointers resolve and the only variable is the commit it claims."""
+    return record_text(
+        kind="project",
+        source_paths="README.md",
+        test_paths="",
+        task_ids="",
+        last_verified_commit=commit,
+    )
+
+
+def stamped_repo(root: Path, commit: str) -> str:
+    """A real repository whose one record claims `commit`."""
+    make_repo_from_template(root)
+    build_tree(root, {"project.md": project_record(commit)})
+    return "docs/context/project.md"
+
+
+class _SpyGit:
+    """The real gateway with every commit question recorded.
+
+    The same discipline as the `_validate_approved_path` spy above: the claim is
+    that the LOADER asks, so it is asserted as a call and not as a value that
+    happens to be right today.
+    """
+
+    def __init__(self, real: GitGateway):
+        self._real = real
+        self.asked: list[str] = []
+
+    def head_sha(self) -> str:
+        return self._real.head_sha()
+
+    def read_commit(self, oid: str) -> dict:
+        self.asked.append(oid)
+        return self._real.read_commit(oid)
+
+    def object_exists(self, oid: str) -> bool:
+        self.asked.append(oid)
+        return self._real.object_exists(oid)
+
+
+class _MuteGit:
+    """A repository that cannot answer: every probe raises, as a missing git, an
+    unreadable object database or a policy refusal all do."""
+
+    def head_sha(self) -> str:
+        raise GitError("no repository here")
+
+    def read_commit(self, oid: str) -> dict:
+        raise GitError("cat-file commit failed: not a repository")
+
+    def object_exists(self, oid: str) -> bool:
+        raise GitError("cat-file -e failed (rc=128): not a repository")
+
+
+class _ExplodingGit:
+    """A gateway nothing may touch. Any attribute access is the failure."""
+
+    def __getattr__(self, name):
+        raise AssertionError("the loader asked git " + name + " with nothing to resolve")
+
+
+def test_a_commit_this_repository_resolves_is_accepted(tmp_path):
+    make_repo_from_template(tmp_path)
+    head = head_of(tmp_path)
+    build_tree(tmp_path, {"project.md": project_record(head)})
+    record = load_context_records(tmp_path).records[0]
+    assert record.last_verified_commit == head
+    assert record.stamped is True
+
+
+def test_a_full_sha_this_repository_does_not_hold_is_refused_by_name(tmp_path):
+    """The shape check passes and the load still refuses — which is the whole
+    point: `tasks._COMMIT_SHA_RE` says the value COULD be a sha, and only git
+    says whether it is one."""
+    assert tasks._COMMIT_SHA_RE.match(UNKNOWN_SHA)
+    stamped_repo(tmp_path, UNKNOWN_SHA)
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "unknown_commit"
+    assert "ctx-fixture-one" in str(excinfo.value)
+    assert UNKNOWN_SHA in str(excinfo.value)
+    assert "docs/context/project.md" in str(excinfo.value)
+
+
+def test_a_sha_that_resolves_to_something_that_is_not_a_commit_is_refused(tmp_path):
+    """`object_exists` answers True for ANY object, so "it is in the database"
+    is not the claim a stamp makes. A blob's oid is a real object and a false
+    stamp."""
+    make_repo_from_template(tmp_path)
+    blob = run_git(tmp_path, "hash-object", "-w", "README.md").strip()
+    assert tasks._COMMIT_SHA_RE.match(blob)
+    build_tree(tmp_path, {"project.md": project_record(blob)})
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code == "unresolvable_commit"
+    assert "ctx-fixture-one" in str(excinfo.value)
+    assert blob in str(excinfo.value)
+
+
+def test_a_commit_git_cannot_be_asked_about_is_refused_rather_than_passed(tmp_path):
+    """THE fail-open case, and the deterministic statement of it: every probe
+    raises, as a missing repository, an unreadable object database or a policy
+    refusal each would. The record is refused by name — never accepted on git's
+    silence, which is what would make an unreadable repository read as a clean
+    bill of health."""
+    stamped_repo(tmp_path, UNKNOWN_SHA)
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path, git=_MuteGit())
+    assert excinfo.value.code == "unresolvable_commit"
+    assert "ctx-fixture-one" in str(excinfo.value)
+    assert UNKNOWN_SHA in str(excinfo.value)
+
+
+def test_a_stamped_record_in_a_tree_that_is_not_a_repository_is_refused(tmp_path):
+    """A smoke check of the same rule through the REAL gateway, with no
+    repository built under the tree. Which refusal comes back depends on whether
+    git found an enclosing repository to answer from — `tmp_path` is normally
+    outside one, but that is the environment's choice, not this suite's — so
+    only "not a pass" is asserted here. The claim itself is carried by the
+    `_MuteGit` test above, which does not depend on where the tree sits."""
+    build_tree(tmp_path, {"project.md": project_record(UNKNOWN_SHA)})
+    with pytest.raises(ContextRecordError) as excinfo:
+        load_context_records(tmp_path)
+    assert excinfo.value.code in ("unresolvable_commit", "unknown_commit")
+    assert "ctx-fixture-one" in str(excinfo.value)
+
+
+def test_the_loader_asks_git_about_the_stamped_commit_and_not_the_sentinel(tmp_path):
+    """Asserted as membership, not as a call sequence: WHICH probe answers is
+    `_verify_commit`'s business and may be reordered, while "the stamped value
+    was put to git and the sentinel was not" is the claim."""
+    make_repo_from_template(tmp_path)
+    head = head_of(tmp_path)
+    build_tree(
+        tmp_path,
+        {
+            "project.md": project_record(head),
+            "features/one.md": record_text(
+                source_paths="README.md",
+                test_paths="README.md",
+                last_verified_commit=UNSTAMPED,
+                id="ctx-fixture-two",
+            ),
+        },
+    )
+    spy = _SpyGit(gateway_for(tmp_path))
+    repository = load_context_records(tmp_path, git=spy)
+    assert len(repository.records) == 2
+    assert head in spy.asked
+    assert UNSTAMPED not in spy.asked
+    assert set(spy.asked) == {head}
+
+
+def test_a_tree_with_nothing_stamped_asks_git_nothing(tmp_path):
+    """The one case that asks git nothing, stated as behaviour so the exemption
+    cannot quietly grow: the set the check guards is the stamped records, and
+    here it is empty. Every member of a non-empty one reaches git or the load
+    raises."""
+    stampable(tmp_path)
+    repository = load_context_records(tmp_path, git=_ExplodingGit())
+    assert [record.stamped for record in repository.records] == [False]
+
+
 # ---- stamping -----------------------------------------------------------------
 
 
 class _FakeGit:
-    """A gateway that answers `head_sha` and nothing else — the claim under test
-    is what `stamp_records` does with the ANSWER, not how git produces it."""
+    """A gateway that answers `head_sha` with whatever it was handed and passes
+    every other question to a real one — the claim under test is what
+    `stamp_records` does with the ANSWER, not how git produces it.
 
-    def __init__(self, head: str):
+    The probes delegate rather than being absent: a fake missing a method the
+    code under test may call fails as an `AttributeError`, which reads as a
+    broken test rather than as the refusal it should be.
+    """
+
+    def __init__(self, head: str, real: GitGateway | None = None):
         self._head = head
+        self._real = real
 
     def head_sha(self) -> str:
         return self._head
 
+    def _delegate(self):
+        assert self._real is not None, "this fake was asked a question it cannot answer"
+        return self._real
+
+    def read_commit(self, oid: str) -> dict:
+        return self._delegate().read_commit(oid)
+
+    def object_exists(self, oid: str) -> bool:
+        return self._delegate().object_exists(oid)
+
 
 def stampable(root: Path) -> str:
-    """A repository with one record whose pointers all exist in it."""
+    """A repository with one UNSTAMPED record whose pointers all exist in it."""
     make_repo_from_template(root)
-    build_tree(
-        root,
-        {
-            "project.md": record_text(
-                kind="project", source_paths="README.md", test_paths="", task_ids=""
-            )
-        },
-    )
+    build_tree(root, {"project.md": project_record()})
     return "docs/context/project.md"
 
 
@@ -640,24 +847,58 @@ def test_a_malformed_record_stops_stamping_before_anything_is_written(tmp_path):
 
 
 def test_an_already_stamped_record_is_left_at_the_commit_it_was_verified_at(tmp_path):
+    """HEAD moves, the record does not. A stamp says "these pointers were
+    checked at this commit", so carrying it forward because the branch advanced
+    would assert a verification nobody performed. The old value is a REAL commit
+    of this repository — an arbitrary sha would not survive the load at all."""
     make_repo_from_template(tmp_path)
-    old = "b" * 40
+    old = head_of(tmp_path)
+    build_tree(tmp_path, {"project.md": project_record(old)})
+    run_git(tmp_path, "commit", "-q", "--allow-empty", "-m", "a later commit")
+
+    stamp = stamp_records(tmp_path)
+    assert stamp.head_sha != old
+    assert stamp.stamped == ()
+    assert stamp.already == ("ctx-fixture-one",)
+    assert "last_verified_commit: " + old in (
+        tmp_path / "docs/context/project.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_stamping_refuses_a_head_no_object_resolves_and_writes_nothing(tmp_path):
+    """A HEAD of the right SHAPE that names nothing is refused before a byte is
+    written. Otherwise the run would write a sha into the record and only then
+    discover, on the read-back, that nothing resolves it — leaving the file
+    changed and the tree unloadable."""
+    rel = stampable(tmp_path)
+    fake = _FakeGit(UNKNOWN_SHA, gateway_for(tmp_path))
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path, git=fake)
+    assert excinfo.value.code == "unknown_commit"
+    assert UNKNOWN_SHA in str(excinfo.value)
+    assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
+
+
+def test_stamping_refuses_when_an_already_stamped_record_no_longer_resolves(tmp_path):
+    """The load runs first, so a record carrying an unresolvable commit stops
+    the run — a stamping pass must never write into a tree it could not
+    validate."""
+    make_repo_from_template(tmp_path)
     build_tree(
         tmp_path,
         {
-            "project.md": record_text(
-                kind="project",
-                source_paths="README.md",
-                test_paths="",
-                task_ids="",
-                last_verified_commit=old,
-            )
+            "project.md": project_record(UNKNOWN_SHA),
+            "features/two.md": record_text(
+                id="ctx-fixture-two", source_paths="README.md", test_paths="README.md"
+            ),
         },
     )
-    stamp = stamp_records(tmp_path)
-    assert stamp.stamped == ()
-    assert old in (tmp_path / "docs/context/project.md").read_text(encoding="utf-8")
-    assert stamp.head_sha != old
+    rel = "docs/context/project.md"
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "unknown_commit"
+    assert UNSTAMPED in (tmp_path / "docs/context/features/two.md").read_text(encoding="utf-8")
+    assert UNKNOWN_SHA in (tmp_path / rel).read_text(encoding="utf-8")
 
 
 # ---- the entry point ----------------------------------------------------------
@@ -673,6 +914,16 @@ def test_check_fails_on_a_pointer_that_moved(tmp_path, capsys):
     build_tree(tmp_path, {"features/one.md": record_text()})
     assert main(["check", str(tmp_path)]) == 1
     assert "unverifiable: ctx-fixture-one" in capsys.readouterr().err
+
+
+def test_check_fails_on_a_commit_this_repository_cannot_resolve(tmp_path, capsys):
+    """`check` is a validation path like any other, so it inherits the loader's
+    refusal rather than needing its own copy of it."""
+    stamped_repo(tmp_path, UNKNOWN_SHA)
+    assert main(["check", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "unknown_commit" in err
+    assert "ctx-fixture-one" in err
 
 
 def test_a_refusal_is_reported_with_its_reason_and_exits_one(tmp_path, capsys):
