@@ -150,7 +150,10 @@ timeout_seconds = 900.0
 # Never point this at the repository: the prompt is self-contained, so the
 # reviewer has no business being started in the tree it is grading. `doctor`
 # fails if it is inside. A CONFIGURED directory that does not exist is refused,
-# never created, so a typo here cannot become the place your reviews run.
+# never created, so a typo here cannot become the place your reviews run —
+# CONFIGURED meaning this line is non-empty. Writing the default path out
+# ("~/.autoloop/codex-workdir") therefore opts OUT of having it created: leave
+# the value empty if you want autoloop to provision it.
 working_dir = ""
 # Substrings that mark a SPENT ALLOWANCE in a FAILED invocation — the window is
 # used up, waiting does not help, and the loop hands the reviewer role to

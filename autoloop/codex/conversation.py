@@ -121,7 +121,7 @@ from typing import Protocol
 
 from ..conversation import SubmitResult
 from ..errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
-from .preflight import ensure_working_dir, resolve_working_dir
+from .preflight import ensure_working_dir, resolve_working_dir, working_dir_is_default
 from .quota import (
     DEFAULT_QUOTA_PATTERNS,
     DEFAULT_RATE_LIMIT_PATTERNS,
@@ -187,6 +187,12 @@ class SubprocessCodexRunner:
         # refuses to run in an untrusted directory, and `~` is both untrusted
         # and full of the operator's files. See the module docstring.
         self._cwd = resolve_working_dir(cwd)
+        # PROVENANCE, kept beside the path because the path alone cannot carry
+        # it: an operator who spells the default out has CONFIGURED it, and only
+        # an unset one is autoloop's to create (`preflight.ensure_working_dir`).
+        # Read from the same predicate the resolution above branches on, so the
+        # two can never disagree about which input is the default.
+        self._cwd_is_default = working_dir_is_default(cwd)
         self._env = env
 
     @property
@@ -220,8 +226,10 @@ class SubprocessCodexRunner:
         # without this a working directory that is not there would be reported
         # as "the codex CLI was not found", sending the investigation after a
         # binary that is present. Creates the default directory and refuses a
-        # missing configured one; see `preflight.ensure_working_dir`.
-        cwd = ensure_working_dir(self._cwd)
+        # missing configured one — including one spelled out as the default
+        # path, which is why the provenance travels rather than being inferred
+        # from the path here; see `preflight.ensure_working_dir`.
+        cwd = ensure_working_dir(self._cwd, is_default=self._cwd_is_default)
         started = time.monotonic()
         try:
             proc = subprocess.run(

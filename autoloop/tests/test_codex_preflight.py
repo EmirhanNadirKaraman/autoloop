@@ -42,10 +42,12 @@ from autoloop.codex.preflight import (
     PREFLIGHT_STATUSES,
     PreflightInvocation,
     default_working_dir,
+    ensure_configured_working_dir,
     ensure_working_dir,
     preflight_argv,
     preflight_codex,
     resolve_working_dir,
+    working_dir_is_default,
 )
 from autoloop.codex.sandbox import DEFAULT_SANDBOX_ARGS, describe_sandbox
 from autoloop.codex.quota import (
@@ -408,6 +410,107 @@ def test_a_configured_tilde_is_expanded_rather_than_taken_literally(tmp_path, mo
     assert resolve_working_dir("~/reviews") == tmp_path / "reviews"
 
 
+def test_the_default_path_spelled_out_is_configured_and_is_never_created(
+    tmp_path, monkeypatch, on_path
+):
+    """Provenance is the SETTING, and this is the pair that says so.
+
+    Both arms name ONE absolute path, so nothing about the path can explain the
+    difference between them. `codex.working_dir = "~/.autoloop/codex-workdir"`
+    is a configured directory — the operator wrote it — and an absent one is
+    refused like any other; the same path left UNSET is autoloop's and is
+    created. Inferring provenance from the resolved path (`path ==
+    default_working_dir()`) collapses the two, and collapses them towards
+    CREATING, which is the fail-open: the one configured value it silently
+    provisions is the one an operator produces by copying the documented default
+    into their own config."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    default = default_working_dir()
+    assert not default.exists()
+    run = FakeRun()
+
+    # Both spellings an operator reaches it by: the absolute path, and the `~`
+    # form the documentation prints — which is the one that gets copied.
+    for spelling in (str(default), "~/" + "/".join(preflight.DEFAULT_WORKING_DIR_PARTS)):
+        result = preflight_codex(CodexConfig(working_dir=spelling), run=run)
+
+        assert (result.status, result.kind) == (
+            "fail",
+            preflight.WORKING_DIR_UNUSABLE,
+        ), spelling
+        assert str(default) in result.detail
+        assert not default.exists(), f"never created for {spelling}"
+        assert run.calls == [], "and nothing is launched to find out"
+
+    result = preflight_codex(CodexConfig(working_dir=""), run=run)
+
+    assert result.status == "ok", result.detail
+    assert default.is_dir()
+    (_argv, cwd), = run.calls
+    assert cwd == default
+
+
+def test_only_an_empty_setting_is_the_default_and_whitespace_is_not_empty(
+    tmp_path, monkeypatch
+):
+    """THE predicate, including the input that would make a tidier one create a
+    directory in the process's own cwd.
+
+    `working_dir_is_default` does not strip, because `resolve_working_dir`
+    branches on the same call: a stripping predicate would answer "unset" for
+    `"  "` while the resolution returned a relative `Path("  ")`, and the ensure
+    step would then create it wherever the loop happened to be running."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    assert working_dir_is_default("") is True
+    assert working_dir_is_default(None) is True
+    assert working_dir_is_default("  ") is False
+    assert working_dir_is_default(str(default_working_dir())) is False
+
+    with pytest.raises(BrowserError):
+        ensure_configured_working_dir("  ")
+    assert not (tmp_path / "  ").exists(), "never in the directory the loop runs from"
+
+
+def test_ensure_refuses_creation_unless_it_is_told_the_setting_was_unset(
+    tmp_path, monkeypatch
+):
+    """The parameter's default is the REFUSING one.
+
+    A caller that forgets to thread the provenance gets an error naming the
+    path, never a directory nobody asked for — so the failure mode of a future
+    caller is a stopped check rather than a silent creation."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    default = default_working_dir()
+
+    with pytest.raises(BrowserError) as excinfo:
+        ensure_working_dir(default)
+
+    assert str(default) in str(excinfo.value)
+    assert not default.exists()
+
+    assert ensure_working_dir(default, is_default=True) == default
+    assert default.is_dir()
+
+
+def test_ensure_creates_only_the_path_the_default_actually_resolves_to(
+    tmp_path, monkeypatch
+):
+    """The flag AND the path must agree, so a wrongly threaded `True` cannot
+    become a licence to create anything at all — a `$HOME` that moves between a
+    runner's construction and its spawn is the way that happens by accident."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    stray = tmp_path / "not-the-default"
+
+    with pytest.raises(BrowserError) as excinfo:
+        ensure_working_dir(stray, is_default=True)
+
+    assert str(stray) in str(excinfo.value)
+    assert str(default_working_dir()) in str(excinfo.value)
+    assert not stray.exists()
+
+
 def test_ensure_refuses_a_path_that_is_not_a_directory(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     afile = tmp_path / "afile"
@@ -585,13 +688,31 @@ def test_the_runner_reports_a_missing_working_dir_as_itself(tmp_path):
 def test_the_runner_creates_its_default_directory_but_never_a_configured_one(
     tmp_path, monkeypatch
 ):
+    """Through `SubprocessCodexRunner` rather than through `ensure_working_dir`,
+    because the runner is where the provenance has to SURVIVE a trip: it
+    resolves at construction and ensures at spawn, and the answer to "was this
+    setting empty" is not recoverable from the path in between.
+
+    Three arms over two directories. A configured absent path is refused; the
+    DEFAULT PATH SPELLED OUT is refused identically, because `cwd=` was given;
+    and only the unset one is created. The last arm uses a command that cannot
+    exist, so it reaches the exec and stops there — the directory is created
+    before the spawn either way, which is the whole point of ensuring first."""
     monkeypatch.setenv("HOME", str(tmp_path))
     default = default_working_dir()
     assert not default.exists()
 
-    assert ensure_working_dir(default) == default
-    assert default.is_dir()
-
     with pytest.raises(BrowserError):
-        ensure_working_dir(tmp_path / "configured-and-absent")
+        SubprocessCodexRunner(cwd=tmp_path / "configured-and-absent").run("anything")
     assert not (tmp_path / "configured-and-absent").exists()
+
+    with pytest.raises(BrowserError) as excinfo:
+        SubprocessCodexRunner(cwd=default).run("anything")
+    assert str(default) in str(excinfo.value)
+    assert not default.exists(), "spelling the default out makes it the operator's"
+
+    runner = SubprocessCodexRunner(command=("definitely-not-a-real-binary-xyz",))
+    with pytest.raises(BrowserError) as excinfo:
+        runner.run("anything")
+    assert "was not found" in str(excinfo.value), "the spawn was reached"
+    assert default.is_dir(), "and the unset default was provisioned on the way"

@@ -21,7 +21,10 @@ it is not one. What the directory still buys is real but
 small: codex trusts it rather than the operator's home, and a reviewer started
 outside the checkout is not one relative path from the tree it is grading.
 
-**Three separate things live here, and they are separate on purpose.**
+**Three separate jobs live here, and they are separate on purpose.**
+(`working_dir_is_default` and `ensure_configured_working_dir` belong to the
+first two — the predicate the resolution branches on, and the one-call form for
+a caller that still holds the setting.)
 
 * `resolve_working_dir` — the ONE place that decides what an empty
   `codex.working_dir` means. Both transports' runners and `doctor` call it, so
@@ -33,7 +36,12 @@ outside the checkout is not one relative path from the tree it is grading.
 * `ensure_working_dir` — creates the DEFAULT directory and refuses to create a
   CONFIGURED one. A default that provisions itself removes a failure mode
   nobody chose; silently creating a mistyped `codex.working_dir` would hide the
-  typo instead, so that raises with the path in the message.
+  typo instead, so that raises with the path in the message. Which of the two a
+  path is comes from the SETTING BEING EMPTY (`working_dir_is_default`), carried
+  to the call — never from the resolved path matching the default one. Inferring
+  it by path equality made `codex.working_dir = "~/.autoloop/codex-workdir"`,
+  spelled out and absent, provision itself like the unset default, which is the
+  one configured path the "a typo is never created for you" rule then missed.
 * `preflight_codex` — the sandbox policy, then one trivial invocation, from
   that directory, with the configured `sandbox_args`, graded on its EXIT CODE.
   It is what makes "selecting codex_cli is safe" checkable before a round
@@ -190,6 +198,27 @@ def default_working_dir() -> Path:
     return Path.home().joinpath(*DEFAULT_WORKING_DIR_PARTS)
 
 
+def working_dir_is_default(configured) -> bool:
+    """Was `codex.working_dir` left UNSET? THE one definition of PROVENANCE.
+
+    Separate from the path, and asked of the SETTING, because the two questions
+    have different answers for exactly one input: `codex.working_dir` spelled
+    out as `~/.autoloop/codex-workdir`. That is a configured directory whose
+    resolved path happens to equal the default, and `ensure_working_dir` used to
+    read the equality as "this one is ours" and create it — the single
+    configured path the "a typo is never created for you" rule missed.
+
+    `not configured` and nothing else: no strip, no normalisation, no
+    `os.path.normpath`. `resolve_working_dir` branches on this same call, so
+    whatever it calls default here is what it resolves TO the default there —
+    and a predicate that stripped whitespace would part company with it on
+    `"  "`, calling that unset while the resolution returned a relative
+    `Path("  ")`, which `ensure_working_dir` would then create in whatever
+    directory the loop happened to be running from.
+    """
+    return not configured
+
+
 def resolve_working_dir(configured) -> Path:
     """What `codex.working_dir` actually resolves to. THE one definition.
 
@@ -198,14 +227,18 @@ def resolve_working_dir(configured) -> Path:
     here: this is a pure function so `doctor` can report the path it grades
     without touching the filesystem, and so the runners can resolve at
     construction time.
+
+    It answers WHERE, never WHOSE: two different settings can resolve to one
+    path, so a caller that needs to know whether the operator named it asks
+    `working_dir_is_default` about the setting rather than comparing paths.
     """
-    if not configured:
+    if working_dir_is_default(configured):
         return default_working_dir()
     return Path(configured).expanduser()
 
 
-def ensure_working_dir(path) -> Path:
-    """The resolved directory, created if it is the DEFAULT one and missing.
+def ensure_working_dir(path, *, is_default: bool = False) -> Path:
+    """The resolved directory, created only when it is the UNSET default.
 
     The asymmetry is the point. The default is ours: an empty directory under
     the operator's home that exists only so the reviewer has somewhere to run,
@@ -213,6 +246,19 @@ def ensure_working_dir(path) -> Path:
     the operator's statement about where reviews happen — creating a mistyped
     one would silently run the reviewer somewhere they did not name, so a
     missing one raises with the path in the message.
+
+    `is_default` is that provenance, and it comes from the caller because only
+    the caller still has the setting (`working_dir_is_default`); by the time a
+    path arrives here the difference between "unset" and "spelled out as the
+    default" has been erased. It defaults to FALSE, the refusing value, so a
+    caller that forgets to thread it gets an error naming the path rather than a
+    directory nobody asked for.
+
+    Creation needs the flag AND the path to agree: a `True` threaded through
+    from somewhere that resolved a DIFFERENT default — a `$HOME` that moved
+    between construction and spawn, a caller that passes a literal — is refused
+    rather than acted on, because the flag alone is one bug away from being a
+    licence to create any path at all.
 
     Raises `BrowserError` (the transport-fault family every codex failure
     already arrives as), never `OSError`: a caller handling transport faults
@@ -226,12 +272,22 @@ def ensure_working_dir(path) -> Path:
             f"the codex working directory {path} exists but is not a directory. "
             "Set codex.working_dir to a directory the reviewer can run in."
         )
-    if path != default_working_dir():
+    if not is_default:
         raise BrowserError(
             f"codex.working_dir points at {path}, which does not exist. Create "
             "it (and trust it once with `codex`), or correct the setting — "
             "autoloop creates only its own default directory, so that a typo "
-            "here is not turned into a new directory nobody meant."
+            "here is not turned into a new directory nobody meant. What "
+            "provisions itself is an EMPTY codex.working_dir, not a path that "
+            "matches the default: spelling the default out makes it yours."
+        )
+    default = default_working_dir()
+    if path != default:
+        raise BrowserError(
+            f"refusing to create {path}: it was carried here as autoloop's own "
+            f"default reviewer directory, but the default resolves to {default}. "
+            "Create the directory by hand, or set codex.working_dir to one that "
+            "exists."
         )
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -241,6 +297,22 @@ def ensure_working_dir(path) -> Path:
             f"{exc}. Create it by hand, or set codex.working_dir."
         ) from exc
     return path
+
+
+def ensure_configured_working_dir(configured) -> Path:
+    """Resolve and ensure one `codex.working_dir` value, in one call.
+
+    For callers that hold the setting at the moment they need the directory
+    (`preflight_codex`), so the resolution and its provenance cannot be
+    separated by an edit. The runners cannot use it — they resolve at
+    construction and ensure at spawn, deliberately, so `doctor` can report a
+    path without a filesystem write — and carry the flag alongside the path
+    instead.
+    """
+    return ensure_working_dir(
+        resolve_working_dir(configured),
+        is_default=working_dir_is_default(configured),
+    )
 
 
 def _subprocess_invocation(argv: tuple[str, ...], cwd: Path) -> PreflightInvocation:
@@ -329,7 +401,7 @@ def preflight_codex(codex, *, run: PreflightRunner | None = None) -> PreflightRe
         return PreflightResult("fail", policy.detail, SANDBOX_UNCONFINED)
 
     try:
-        workdir = ensure_working_dir(resolve_working_dir(getattr(codex, "working_dir", "")))
+        workdir = ensure_configured_working_dir(getattr(codex, "working_dir", ""))
     except (BrowserError, OSError) as exc:
         return PreflightResult("fail", str(exc), WORKING_DIR_UNUSABLE)
 
@@ -444,8 +516,10 @@ __all__ = [
     "PreflightResult",
     "PreflightRunner",
     "default_working_dir",
+    "ensure_configured_working_dir",
     "ensure_working_dir",
     "preflight_argv",
     "preflight_codex",
     "resolve_working_dir",
+    "working_dir_is_default",
 ]

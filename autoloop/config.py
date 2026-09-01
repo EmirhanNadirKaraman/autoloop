@@ -224,7 +224,10 @@ class CodexConfig:
     #: Never point this inside the repository — `doctor` fails if it is, because
     #: a reviewer started in the checkout is one relative path from the tree it
     #: is grading. A CONFIGURED directory that does not exist is refused rather
-    #: than created, so a typo does not become a new directory nobody meant.
+    #: than created, so a typo does not become a new directory nobody meant —
+    #: and CONFIGURED means this key is non-empty, not that the path differs
+    #: from the default. Spelling `~/.autoloop/codex-workdir` out here makes it
+    #: yours: it is refused while absent, exactly like any other named path.
     working_dir: str = ""
     #: Substrings that identify a SPENT ALLOWANCE in a FAILED invocation — the
     #: window is used up and waiting does not help, so the loop parks or hands
