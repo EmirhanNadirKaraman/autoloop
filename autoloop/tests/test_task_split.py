@@ -47,7 +47,12 @@ from gitrepo import make_repo_from_template
 
 from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig
-from autoloop.contract import Decision, Decomposition, parse_response
+from autoloop.contract import (
+    NO_WANTED_DECISION,
+    Decision,
+    Decomposition,
+    parse_response,
+)
 from autoloop.errors import (
     GitCommandError,
     StateCorruptError,
@@ -108,6 +113,10 @@ def ok_validation(argv, **kwargs):
 
 
 def block(obj) -> str:
+    # See `test_orchestrator.block`: wanted-01 made the field a policy
+    # requirement on every directive, so fixtures answer it by default.
+    obj = dict(obj)
+    obj.setdefault("wanted_decision", NO_WANTED_DECISION)
     return "Reasoning...\n```json\n" + json.dumps(obj) + "\n```"
 
 

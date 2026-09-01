@@ -32,7 +32,12 @@ import pytest
 from autoloop import cli, health
 from autoloop.blockers import NO_TASK, BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig, load_config
-from autoloop.contract import Decision, Directive, parse_response
+from autoloop.contract import (
+    NO_WANTED_DECISION,
+    Decision,
+    Directive,
+    parse_response,
+)
 from autoloop.conversation import SubmitResult
 from autoloop.errors import ContractError, StateCorruptError, StateError
 from autoloop.lock import LoopLock
@@ -60,6 +65,10 @@ URL = "https://chatgpt.com/c/stop-livelock-test"
 
 
 def block(obj) -> str:
+    # See `test_orchestrator.block`: wanted-01 made the field a policy
+    # requirement on every directive, so fixtures answer it by default.
+    obj = dict(obj)
+    obj.setdefault("wanted_decision", NO_WANTED_DECISION)
     return f"Reasoning...\n```json\n{json.dumps(obj)}\n```"
 
 
