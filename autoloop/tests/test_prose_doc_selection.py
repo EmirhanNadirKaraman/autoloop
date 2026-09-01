@@ -459,7 +459,10 @@ DOCS_ONLY = tuple(sorted(TRACKERS))
 #: before/after pair, and what the remainder is made of, live in
 #: `test_test_selection.py`, which is where the opacity rule itself is pinned.
 DOCS_ONLY_SELECTED = 20
-SUITE_SIZE = 102
+#: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). Only
+#: the DENOMINATOR moved: the new file reads no tracker and spawns nothing, so a
+#: docs-only round still selects the same 20.
+SUITE_SIZE = 103
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

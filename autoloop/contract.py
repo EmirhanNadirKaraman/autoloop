@@ -199,6 +199,23 @@ PUSH_DECISIONS = frozenset({Decision.PUSH, Decision.COMMIT_AND_PUSH})
 # Decisions that require the review-integrity stamp.
 REVIEWED_DECISIONS = COMMIT_DECISIONS | PUSH_DECISIONS
 
+#: The `wanted_decision` answer that means "the vocabulary was adequate — the
+#: verb I used is the verb I wanted".
+#:
+#: ONE spelling in ONE place, read by the schema text the reviewer sees, by
+#: `policy.PolicyEngine._check_wanted_decision`'s correction, and by the two
+#: directives the loop issues to ITSELF. A second copy would agree today and
+#: disagree silently the first time this moves — the rule
+#: `note_merge.MAX_NOTE_LINE_CHARS` is already kept under.
+#:
+#: It is counted exactly like any other value and special-cased NOWHERE: a tally
+#: reading `none x412, split x9, defer x3` is evidence, where a tally of nothing
+#: cannot be told apart from a question that was never asked. That is the whole
+#: reason the question is now posed on EVERY reply rather than only when the
+#: reviewer judges that nothing in the list fits — a condition that held zero
+#: times across every directive measured to 2026-08-25.
+NO_WANTED_DECISION = "none"
+
 _TOP_LEVEL_KEYS = {
     "version",
     "decision",
@@ -217,7 +234,8 @@ _TOP_LEVEL_KEYS = {
     "notes",
     # The vocabulary gap the reviewer NAMES but never gets to use — see
     # `Directive.wanted_decision`. Listed here or every reply carrying it would
-    # die at `unknown_keys` before the field is read.
+    # die at `unknown_keys` before the field is read, which now means every
+    # reply: the schema asks for it on all of them.
     "wanted_decision",
 }
 _COMMIT_KEYS = {"message", "paths"}
@@ -399,9 +417,40 @@ class Directive:
     #: the contract no longer asks for it, so a legacy reply may omit it.
     question: str | None = None
     notes: str | None = None
-    #: The decision the reviewer WOULD have used, when none of the available
-    #: ones fit. A plain string, parsed, recorded, counted and rendered — and
-    #: STRUCTURALLY UNABLE TO BE ACTED ON.
+    #: The decision the reviewer WOULD have used — `NO_WANTED_DECISION` when
+    #: that is the one it did use. A plain string, parsed, recorded, counted and
+    #: rendered — and STRUCTURALLY UNABLE TO BE ACTED ON.
+    #:
+    #: **Asked on EVERY reply, since wanted-01 (2026-09-01).** It used to be
+    #: asked only "when none above fits", a condition that almost never holds:
+    #: the reviewer always finds something in the list to issue. Measured
+    #: 2026-08-25, the field had been used ZERO times across every directive in
+    #: the transcript and `orchestrator.wanted_decisions_file` did not exist,
+    #: because nothing had ever written to it — and a zero tally read as "the
+    #: vocabulary is complete" when nobody had actually been asked. The evidence
+    #: that a verb WAS missing sat outside the loop the whole time: brw-14
+    #: PASSED review on 2026-08-24 and parked on `review_packet_build_failed`
+    #: with a 416,193-byte range diff against a 400,000-byte cap, and five task
+    #: descriptions written that day carry a hand-written "produce a split plan
+    #: if this is too large" because the operator knew what the reviewer had no
+    #: way to say. So the QUESTION changed, not only the requirement: there is
+    #: now an explicit answer meaning the vocabulary was adequate, and the
+    #: answer is required.
+    #:
+    #: **Optional here, required by `policy.authorize_directive`.** Exactly the
+    #: layering `Decomposition` and `TaskSpec.approved_paths` already use, and
+    #: for a reason specific to this field: requiring it in the PARSER would be
+    #: a breaking wire change (PROTOCOL_VERSION stays 3) and would turn a
+    #: missing field into a MALFORMED reply — a `parse_error`, which feeds
+    #: `parse_budget_exhausted` and parks the loop. A policy denial is a
+    #: well-formed directive that is not authorized, and draws the corrective
+    #: re-prompt that `policy.check_denial_budget` already caps. Turning a
+    #: bookkeeping field into an outage is the one failure this must not have.
+    #:
+    #: A whitespace-only value is read HERE as absence for the same reason: a
+    #: reviewer that answers the question with `" "` has not answered it, and
+    #: the correction for a non-answer belongs on the denial budget rather than
+    #: on the much smaller parse-retry one.
     #:
     #: **Why it is a string and not a `Decision`.** If this value could ever
     #: become the verb that is dispatched, the reviewer would hold an unbounded
@@ -452,6 +501,23 @@ class Directive:
 #: enforces it, so there is no second copy for it to drift from — unlike
 #: `note_merge.MAX_NOTE_LINE_CHARS`, which a validator checks and a prompt
 #: states. A constant would advertise an enforcement that does not exist.
+#:
+#: **The `wanted_decision` clause becoming required (wanted-01, 2026-09-01) COST
+#: NOTHING and moved no ceiling.** The clause was three lines and 202 characters
+#: ("(optional) ... when none above fits ... Counted for the operator, and NEVER
+#: acted on"); it is three lines and 200 ("(required) ... or `none` if the list
+#: above was enough ... Counted, NEVER acted on"), a hand-summed net -2 against
+#: a ceiling asserted at 5,300 by `test_contract.py` and, more tightly, at 5,200
+#: by `test_split_decision.py`. "for the operator" is what paid for `none`: WHO
+#: reads the tally is reasoning, and this comment and `docs/AUTOLOOP.md`'s
+#: "Which verb the reviewer wanted" section carry reasoning at no per-turn cost,
+#: where the value the reviewer must be able to WRITE has to be in the prompt or
+#: it will never be written.
+#:
+#: The word `none` is a literal here rather than an interpolation — a plain
+#: string full of `{...}` shape examples that an f-string would make unreadable —
+#: so the literal and `NO_WANTED_DECISION` are pinned to each other by test
+#: instead, which is the same protection for the same drift.
 _RESPONSE_FORMAT = """\
 RESPONSE FORMAT — mandatory.
 Your ENTIRE reply is exactly one fenced JSON block (```json ... ```) and
@@ -485,8 +551,8 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
              you are answering; never approve from memory. A mismatched stamp
              is rejected.
   notes      (optional) at most 200 characters, on ONE line.
-  wanted_decision (optional) ONE word: the decision you WOULD have used when
-             none above fits. Counted for the operator, and NEVER acted on —
+  wanted_decision (required) ONE word: the decision you WOULD have used, or
+             `none` if the list above was enough. Counted, NEVER acted on —
              the loop still executes `decision`.
 NEVER put a literal line break inside a JSON string value — write \\n.
 A raw newline in a string is invalid JSON, and the reply is REJECTED.
@@ -820,16 +886,37 @@ def parse_response(text: str) -> Directive:
     if notes is not None and not isinstance(notes, str):
         raise ContractError("bad_type:notes", "'notes' must be a string when present")
 
-    # Accepted on EVERY decision, deliberately: the field says "none of these
-    # fitted", and the reviewer still had to send one of them, so forbidding it
-    # per-decision would forbid it exactly where it is used. Validated as a
-    # non-empty string and NOTHING else — never against `Decision` — see
+    # Accepted on EVERY decision, deliberately: the answer is a verb the
+    # reviewer WANTED, and the reviewer still had to send one of the real ones,
+    # so forbidding it per-decision would forbid it exactly where it is used.
+    # Validated for TYPE and NOTHING else — never against `Decision` — see
     # `Directive.wanted_decision` for why a value naming a real decision is a
-    # signal to keep rather than an error to raise. An omitted key stays None,
-    # which is byte-for-byte today's behaviour for every existing reply.
+    # signal to keep rather than an error to raise.
+    #
+    # AN OMITTED KEY STAYS None AND STILL PARSES, which is byte-for-byte the
+    # behaviour every reply written before this field existed depends on
+    # (PROTOCOL_VERSION stays 3). The requirement lives one layer up, in
+    # `policy.PolicyEngine._check_wanted_decision`, so that a reply which does
+    # not answer draws a budget-capped policy denial instead of a
+    # `parse_error` — the path that feeds `parse_budget_exhausted` and parks
+    # the loop. Now that the schema asks on every reply, that distinction is
+    # the difference between a bookkeeping field and an outage.
+    #
+    # A whitespace-only value joins the omitted key rather than raising: `" "`
+    # is a NON-ANSWER, not a malformed reply, and routing it to the parse-retry
+    # budget (2, loop_fatal on exhaustion) instead of the denial budget would
+    # be exactly the outage above, reached by the one input a model asked a new
+    # question is most likely to produce. A non-string is still refused here —
+    # that is a shape error, and there is nothing to count either way.
+    raw_wanted = data.get("wanted_decision")
     wanted_decision = None
-    if data.get("wanted_decision") is not None:
-        wanted_decision = _require_str("wanted_decision", data.get("wanted_decision"))
+    if raw_wanted is not None:
+        if not isinstance(raw_wanted, str):
+            raise ContractError(
+                "bad_type:wanted_decision",
+                "'wanted_decision' must be a string when present",
+            )
+        wanted_decision = raw_wanted.strip() or None
 
     scope_raw = data.get("scope")
     tasks_raw = data.get("tasks")

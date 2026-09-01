@@ -28,7 +28,7 @@ from autoloop import cli
 from autoloop.audit.agents import ClaudeCliRunner
 from autoloop.blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from autoloop.config import AutoloopConfig, BrowserConfig, load_config
-from autoloop.contract import Decision, Directive
+from autoloop.contract import NO_WANTED_DECISION, Decision, Directive
 from autoloop.errors import StateCorruptError, StateError, TaskGraphError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
@@ -114,12 +114,23 @@ def ready_task(tid="t1", approved_paths=("a.py",)) -> Task:
 
 
 def implement(task_id="t1") -> Directive:
-    return Directive(decision=Decision.IMPLEMENT, reason="do it", task_id=task_id)
+    # `wanted_decision` because policy denies a directive without one since
+    # wanted-01, and these two are handed straight to `authorize_directive`.
+    return Directive(
+        decision=Decision.IMPLEMENT,
+        reason="do it",
+        task_id=task_id,
+        wanted_decision=NO_WANTED_DECISION,
+    )
 
 
 def revise(task_id="t1", feedback="please fix it") -> Directive:
     return Directive(
-        decision=Decision.REVISE, reason="not quite", task_id=task_id, feedback=feedback
+        decision=Decision.REVISE,
+        reason="not quite",
+        task_id=task_id,
+        feedback=feedback,
+        wanted_decision=NO_WANTED_DECISION,
     )
 
 

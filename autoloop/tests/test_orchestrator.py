@@ -27,7 +27,12 @@ from gitrepo import make_repo_from_template
 
 from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.conversation import SubmitResult, register_provider
-from autoloop.contract import AUDIT_UNIT_PREFIX, Decision, Directive
+from autoloop.contract import (
+    AUDIT_UNIT_PREFIX,
+    NO_WANTED_DECISION,
+    Decision,
+    Directive,
+)
 from autoloop.errors import (
     GitCommandError,
     LoginExpiredError,
@@ -102,6 +107,12 @@ def ok_validation(argv, **kwargs):
 
 
 def block(obj) -> str:
+    # Every directive answers which verb the reviewer wanted since wanted-01,
+    # and `policy._check_wanted_decision` denies one that does not — so every
+    # reply built here answers "the verb I used is the verb I wanted" unless the
+    # caller supplies its own.
+    obj = dict(obj)
+    obj.setdefault("wanted_decision", NO_WANTED_DECISION)
     return f"Reasoning...\n```json\n{json.dumps(obj)}\n```"
 
 

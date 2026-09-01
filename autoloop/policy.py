@@ -31,6 +31,7 @@ from typing import Sequence
 from .contract import (
     AUDIT_TASK_ID,
     COMMIT_DECISIONS,
+    NO_WANTED_DECISION,
     PUSH_DECISIONS,
     RETIRED_DECISIONS,
     TASK_DECISIONS,
@@ -356,6 +357,10 @@ class PolicyEngine:
 
         A RETIRED decision (`ask_user` today) is refused here
         unconditionally — see the check below.
+
+        EVERY directive, whatever its decision, must also carry a
+        `wanted_decision` — see `_check_wanted_decision` for why the parser
+        still accepts its absence and this layer does not.
         """
         decision = directive.decision
         # Retired at runtime, and deliberately ahead of every configurable
@@ -377,6 +382,16 @@ class PolicyEngine:
         # match.
         if decision in RETIRED_DECISIONS:
             return retired_decision_verdict(decision)
+        # EVERY directive answers which verb the reviewer wanted — checked here,
+        # ahead of the configurable gates below, so that one code answers the
+        # question for every decision rather than whichever other gate happens
+        # to fire first. Behind the retirement check on purpose: a retired
+        # decision is unavailable whatever else the reply carries, and telling a
+        # reviewer to re-send an `ask_user` with one more field would be a
+        # correction that cannot succeed.
+        verdict = self._check_wanted_decision(directive)
+        if not verdict.allowed:
+            return verdict
         if decision in TASK_DECISIONS:
             if directive.task_id == AUDIT_TASK_ID:
                 # The audit pseudo-task: revise re-runs the audit with
@@ -449,6 +464,78 @@ class PolicyEngine:
                     f"direct push to protected branch '{current_branch}' is not allowed",
                 )
         return Verdict.ok()
+
+    def _check_wanted_decision(self, directive: Directive) -> Verdict:
+        """Every directive must answer which verb the reviewer wanted.
+
+        **The question, not only the requirement (wanted-01, 2026-09-01).** The
+        schema used to ask for `wanted_decision` only "when none above fits" — a
+        condition that effectively never holds, because the reviewer always
+        finds something in the list to issue. Measured 2026-08-25 the field had
+        been used ZERO times and `orchestrator.wanted_decisions_file` had never
+        been created, so the mechanism `contract.Directive.wanted_decision`
+        documents as how the NEXT missing verb is found — "by counting instead
+        of by someone happening to read a `reason` field" — had produced not one
+        data point, while the operator was hand-writing "produce a split plan if
+        this is too large" into task descriptions because the reviewer had no
+        way to say it. A tally of nothing is indistinguishable from a question
+        never asked; a tally of `none x412, split x9` is evidence. So the schema
+        now asks on every reply, with `NO_WANTED_DECISION` as the answer meaning
+        the vocabulary was adequate, and this is the gate that makes the answer
+        arrive.
+
+        **Here, rather than in the parser — the layering `Decomposition`
+        already uses.** Requiring the key in `parse_response` would be a
+        breaking wire change (PROTOCOL_VERSION stays 3) and would turn a missing
+        field into a MALFORMED reply: a `parse_error`, which spends
+        `max_parse_retries` and parks the loop `parse_budget_exhausted`. A
+        policy denial is a well-formed directive that is not authorized; it
+        re-prompts with this whole correction and is bounded by
+        `check_denial_budget`. Turning a bookkeeping field into an outage is the
+        one failure this change must not have, and the budget it draws on is
+        what prevents it.
+
+        **It authorizes nothing and forbids nothing.** The value is never read
+        by `orchestrator._dispatch`, never converted to a `Decision`, and never
+        validated against one — this method tests PRESENCE and nothing else, so
+        no answer a reviewer can write is refused here and no answer can select
+        a branch. A `wanted_decision` naming a real, powerful verb is counted
+        and then ignored, which is the bound the field is designed around
+        (`docs/SECURITY.md` finding #2's circular ownership) and the reason this
+        cannot become a second way to choose a decision.
+
+        **Ahead of the state-dependent gates, and before anything is spent.**
+        `_step_executing` authorizes before `_dispatch`, so a refusal here
+        happens before `mark_in_progress` and before `_open_attempt`: the
+        correction costs no `TaskExecution.attempt_count`.
+
+        The two directives the LOOP issues to itself
+        (`orchestrator._maybe_queue_autonomous_revise` and
+        `_consume_pending_autonomous_revise`) pass through this gate like any
+        other and carry `NO_WANTED_DECISION` for it — an exemption would be a
+        way for a directive to reach dispatch unanswered, and there is no
+        reviewer behind those two to ask.
+        """
+        # `.strip()` rather than a bare truthiness test: `parse_response` already
+        # reads a whitespace-only value as absence, and this layer must not
+        # depend on that to hold — a hand-built or future-parsed `" "` is a
+        # non-answer here too, and a gate that passes it would be a check that
+        # switches itself off for the one input it most needs to catch.
+        if (directive.wanted_decision or "").strip():
+            return Verdict.ok()
+        return Verdict.deny(
+            "wanted_decision_missing",
+            f"this `{directive.decision.value}` carries no `wanted_decision`, "
+            "and every directive must answer which verb you wanted — including "
+            "when the answer is the one you used. Send the SAME directive again "
+            "with `wanted_decision`: ONE word naming the decision you would "
+            "have used had the listed ones not been enough, or "
+            f"`{NO_WANTED_DECISION}` if the decision you chose is the decision "
+            "you wanted. The answer is COUNTED for the operator and NEVER acted "
+            "on — the loop still executes `decision`, so naming a real verb here "
+            "changes nothing about what happens next and is not a way to choose "
+            "one. Nothing was executed and no attempt was spent.",
+        )
 
     def _check_decomposition(
         self, directive: Directive, registry: TaskRegistry

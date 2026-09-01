@@ -36,7 +36,12 @@ import pytest
 
 from autoloop import cli, execution_records, orchestrator as orchestrator_module
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
-from autoloop.contract import RETIRED_DECISIONS, Decision, Directive
+from autoloop.contract import (
+    NO_WANTED_DECISION,
+    RETIRED_DECISIONS,
+    Decision,
+    Directive,
+)
 from autoloop.errors import GitCommandError, TaskGraphError, TemplateError
 from autoloop.inbox import (
     KIND_URGENT,
@@ -711,7 +716,16 @@ def test_the_urgent_kickoff_asks_for_a_directive_policy_will_authorize(config):
     # denies every implement of a repository task before the decomposition
     # check is reached — under it this test would pass on the wrong verdict.
     policy = PolicyEngine(PolicyConfig(implement_enabled=True))
-    bare = Directive(decision=Decision.IMPLEMENT, reason="urgent", task_id="codex-01")
+    # `wanted_decision` because this one goes through `authorize_directive`,
+    # which denies a directive that does not answer the wanted-verb question —
+    # without it the verdict below would be that denial rather than the
+    # decomposition one this test is about.
+    bare = Directive(
+        decision=Decision.IMPLEMENT,
+        reason="urgent",
+        task_id="codex-01",
+        wanted_decision=NO_WANTED_DECISION,
+    )
 
     # Unplanned: policy refuses a bare `implement`, so the kickoff must ask for
     # the plan rather than for the directive alone.
