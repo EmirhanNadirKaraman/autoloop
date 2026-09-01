@@ -30,10 +30,11 @@ conversation, a round summary or an implementation write-up.
 ## Entry points
 
 * `context_records.load_context_records(root, git=None)` — THE loader. Every
-  `.md` file under `docs/context/` is either a parsed record or one of the
-  structural names (`index.md`, `README.md`), which are themselves refused if
-  they open with the record fence. Anything else is named and refused. It is
-  also where a stamped record's commit is put to git.
+  Markdown file under `docs/context/`, a dotted name included, is either a
+  parsed record or one of the structural names (`index.md`, `README.md`), which
+  are themselves refused if they open with the record fence. A non-Markdown
+  dotfile is reported as ignored; anything else is named and refused. It is also
+  where a stamped record's commit is put to git.
 * `context_records.parse_record(text, path)` — one record: metadata block,
   field validation, per-kind sections.
 * `context_records.stamp_records(root, git=None)` — resolves HEAD through
@@ -128,12 +129,23 @@ and re-loads the tree to confirm what it wrote.
 * **A record hidden as navigation.** `README.md` and `index.md` are not parsed
   as records, so they are checked for the record fence instead — otherwise
   renaming a broken record would move it into the category nothing validates.
-* **A record hidden as a dotfile.** A leading dot is the one thing the contract
-  does not reach, because a record is a `.md` file the index lists and an
-  editor's droppings are not records. The loader RETURNS those names rather than
-  dropping them (`ContextRepository.ignored`) and `check` prints each one, so a
-  file under this tree that nothing validated is still said out loud. It is a
-  report and not a refusal: `.DS_Store` is not a broken record.
+* **A record hidden as a dotfile.** A leading dot buys nothing. Classification
+  is by SUFFIX and case-folded (`.hidden.MD` is one keystroke from `.hidden.md`
+  on a case-preserving filesystem), so a hidden Markdown file is parsed,
+  id-checked and index-checked like any other record and a malformed or
+  unindexed one is refused by name; a filename-first exemption would have
+  switched the contract off for exactly the file trying to leave it. Only a
+  NON-Markdown dropping is stepped over, and it
+  is RETURNED rather than dropped (`ContextRepository.ignored`) with `check`
+  printing each one, so a file under this tree that nothing validated is still
+  said out loud. That much is a report and not a refusal: `.DS_Store` is not a
+  broken record.
+* **A record as a symlink.** Refused outright (`symlinked_entry`), before the
+  name is classified. A DANGLING link is the reason it must be a refusal: it
+  answers False to both `is_file` and `is_dir`, so a sweep keeping only regular
+  files steps over it in silence — the same evasion as the dotted name, by a
+  different route. A link that resolves is refused too, because a record
+  validated as whatever it points at today is a different record tomorrow.
 * **A vacuous record.** Required sections and non-empty pointers are what stop a
   placeholder from passing; they cannot stop a record whose prose is wrong, and
   no automated check will.
