@@ -484,10 +484,13 @@ test_selection = "reachable"
 # any code.
 #
 # AND IT IS BOUNDED, which is the harder half. Each of the seven allows exactly
-# ONE self-issued revise per task per open blocker, counted on the blocker record
-# itself; the SAME refusal arriving again sets the task aside instead, recognised
-# by a digest stored on that record so it is still recognised after the record is
-# closed. The revise deliberately does not close its own blocker — a round
+# ONE self-issued revise per task and refusal identity — a digest of the
+# refusal's (code, question, detail), written to the blocker record when the
+# revise is issued and counted back across EVERY blocker record on disk, closed
+# ones included, so answering or archiving a record refunds nothing. The SAME
+# refusal arriving again sets the task aside instead; a DIFFERENT complaint under
+# the same code is feedback the agent has never been given and gets its own
+# revise. The revise deliberately does not close its own blocker — a round
 # completing means the round ran, not that the refusal cleared — so the record
 # stays open and `python -m autoloop blockers` lists it until it is answered or
 # the task is set aside. Nothing is rolled back, discarded or pushed on this
