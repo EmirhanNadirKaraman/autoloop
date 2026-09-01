@@ -646,25 +646,28 @@ class ConcurrencyConfig:
     """`[concurrency]` — how many tasks the loop runs at once (conc-02,
     2026-09-01).
 
-    ONE, and nothing reads it yet. Both halves of that sentence are deliberate.
+    ONE, and every reader of it is a reader of `> 1`. Both halves of that
+    sentence are deliberate.
 
     This is candidate 1 of the nine in docs/AUTOLOOP.md, "Running several tasks
     at once — the split plan". The setting lands first, alone, so that the eight
     candidates after it have one validated name to be written against instead of
-    each inventing their own; the fleet supervisor that consumes it is candidate
-    5, and candidate 9 is the one that may raise the value. Until then `lanes`
-    is accepted, validated and unread — every deployment behaves exactly as it
-    does today, because at `1` there is nothing for a reader to do differently.
-    That is the acceptance criterion the whole split carries: nothing before the
-    last candidate may change default behaviour.
+    each inventing their own; the fleet supervisor is candidate 5, and candidate
+    9 is the one that may raise the value. The first reader arrived with
+    conc-05: `cli._LaneEntry` takes a lane lease when this is above one and
+    takes nothing at all when it is one. Every deployment therefore behaves
+    exactly as it does today, because at `1` there is nothing for a reader to do
+    differently — which is the acceptance criterion the whole split carries:
+    nothing before the last candidate may change default behaviour.
 
     "A setting that loads and is then ignored is worse than a constant" is this
     repository's own rule (`_migrate_retired_tracker_paths`), and it is about a
     setting that is ignored FOREVER while reading as configured — a retired key
-    still in a live config. This one is ignored for the length of a planned
-    sequence, is refused rather than clamped when it names a fleet the loop
-    could not build, and has exactly one value that means anything today: `1`,
-    which is what it defaults to.
+    still in a live config. This one is read for the length of a planned
+    sequence by whichever mechanism has landed so far, is refused rather than
+    clamped when it names a fleet the loop could not build, and has exactly one
+    value that is a supported deployment today: `1`, which is what it defaults
+    to.
     """
 
     #: The fleet size: how many lanes the supervisor may run. `1` is the loop as

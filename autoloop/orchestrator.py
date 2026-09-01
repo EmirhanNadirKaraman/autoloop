@@ -352,7 +352,7 @@ from .blockers import (
     refusal_identity,
 )
 from .changeset_review import ChangesetBinding, build_changeset_packet
-from .config import AutoloopConfig
+from .config import AutoloopConfig, lane_id
 from .context import build_context, render_context
 from .conversation import (
     SendOutcome,
@@ -1311,6 +1311,7 @@ class Orchestrator:
         sleep=time.sleep,
         self_upgrade_enabled: bool = False,
         observed_checkout: ObservedCheckout | None = None,
+        lane_index: int = 0,
     ):
         self._config = config
         self._store = store
@@ -1553,6 +1554,25 @@ class Orchestrator:
         #: outcome but the exec itself moves the record out of `pending`, so
         #: nothing else would.
         self._declined_upgrades: set[str] = set()
+        #: WHICH LANE this state machine belongs to (conc-05). `0` — the only
+        #: value anything passes today — is the loop as it runs now, whose state
+        #: file is literally `state.json`; the fleet supervisor (candidate 5 of
+        #: docs/AUTOLOOP.md's split plan) is what will construct one per lane.
+        #:
+        #: Last in the signature and defaulted, so no existing construction site
+        #: moves. VALIDATED here rather than merely stored: `config.lane_id`
+        #: refuses a bool, a float and a negative, and this is the point at
+        #: which such a value is still cheap to reject — a lane whose id is
+        #: `_lane-True` would be a second spelling of lane 1 and would name a
+        #: directory beside a real lane's.
+        #:
+        #: The store this orchestrator was handed is NOT checked against the
+        #: lane's own path. Most of the suite builds an Orchestrator with a
+        #: `StateStore` wherever the test wanted one, and a constructor that
+        #: refused those would be enforcing a lane layout on code that has no
+        #: lanes. The path belongs to whoever built the store.
+        self.lane_index = lane_index
+        self.lane_id = lane_id(lane_index)
         #: Phase steps this orchestrator has actually taken, across every call
         #: to `run`. Public, and read by `cli._remaining_steps`.
         self.steps_taken = 0
