@@ -853,7 +853,13 @@ def run_validation_commands(
 # `pytest.importorskip`, a test that spawns a fresh interpreter, and a file that
 # does not parse at all. None of those are argued away — every such file is put
 # on the frontier UNCONDITIONALLY (`ImportGraph.opaque`), so it is reachable
-# from any change and therefore always selected. It also cannot see a
+# from any change and therefore always selected. What select-04 (2026-09-01)
+# changed is not that rule but WHICH FILES IT DESCRIBES: a dynamic import whose
+# module name is a constant this checkout does not own reaches nothing here,
+# and an interpreter name that never reaches a `subprocess` entry point is a
+# fixture rather than a spawn. Both are narrowings of ATTRIBUTION; every
+# uncertainty — a name that is not constant, an argv that cannot be read, a
+# file that will not parse — keeps the frontier answer. It also cannot see a
 # non-Python input: a `.toml` a test reads, a fixture, a markdown tracker, an
 # `.ini` that decides collection. The import graph models none of those, so
 # reachability is not what decides them — the next block is. Every judgement in
@@ -1120,6 +1126,41 @@ _DYNAMIC_IMPORT_CALLS = frozenset(
     }
 )
 
+#: The subset of the above whose FIRST POSITIONAL ARGUMENT is a module NAME, so
+#: a string constant there says exactly which module is being reached for. Those
+#: are the only ones select-04 (2026-09-01) resolves: a constant naming a module
+#: this repository does not own — `__import__("socket")`,
+#: `pytest.importorskip("asyncpg")` — cannot reach repository code by any route,
+#: so it is not evidence of hidden coupling.
+#:
+#: The five left out take something else: `spec_from_file_location(name, path)`
+#: imports from the PATH, so its name argument proves nothing about what is
+#: loaded; `run_path` takes a path; `exec_module`/`module_from_spec`/
+#: `load_module` take an already-built module or spec. Each of those stays
+#: opaque unconditionally, exactly as before.
+_NAMED_DYNAMIC_IMPORTS = frozenset(
+    {"__import__", "import_module", "importorskip", "run_module"}
+)
+
+#: The `subprocess` entry points that actually start a process. An interpreter
+#: reference is counted as evidence of a spawn only when it reaches one of
+#: these — see `_scan_module`.
+#:
+#: Matched against the names this file BOUND (`import subprocess as sp`,
+#: `from subprocess import Popen`) rather than by name alone, because `run` is
+#: also what `orch.run(max_steps=1)` is called and those are everywhere in this
+#: suite. That is the opposite choice from `_DYNAMIC_IMPORT_CALLS`, and for the
+#: opposite reason: there, matching wide costs an extra opaque file; here it
+#: would cost the narrowing entirely.
+#:
+#: WHAT THIS DOES NOT WATCH, stated because the previous rule covered it by
+#: accident: `os.execv`, `os.system`, `os.posix_spawn` and their relatives all
+#: start a process without touching `subprocess`. No file in this checkout uses
+#: one, and `test_test_selection.py::
+#: test_no_file_left_off_the_frontier_reaches_an_interpreter_around_subprocess`
+#: fails the round that introduces one rather than leaving it to be noticed.
+_SUBPROCESS_CALLS = frozenset({"run", "Popen", "check_output", "check_call"})
+
 #: String constants that mean "this file may launch a fresh interpreter", which
 #: can import anything in the repository without a single import statement.
 #: `sys.executable` is detected separately, as an attribute.
@@ -1131,6 +1172,18 @@ _DYNAMIC_IMPORT_CALLS = frozenset(
 #: frontier, dragging in everything that imports it. What the signal is actually
 #: about is a TEST that exercises repository code through a subprocess instead
 #: of an import, which is the coupling the graph cannot see.
+#:
+#: NARROWED ONE STEP FURTHER by select-04 (2026-09-01), from file KIND to
+#: FLOW. The sentence above is an argument about what the signal is for, and a
+#: test file that mentions an interpreter without ever launching one does not
+#: carry it: `test_validation_parallelism.py`'s `LEGACY_SERIAL` is a tuple
+#: describing what an operator's config.toml contains, and this repository —
+#: whose subject IS running validation commands — has that vocabulary
+#: everywhere. So the literal is counted only when it reaches a `subprocess`
+#: entry point (`_SUBPROCESS_CALLS`). It is NOT permission to narrow anything
+#: else: a spawn whose argv this cannot read is counted exactly as if it held
+#: an interpreter, which is what `_spawn_argv_is_inert` returning `False`
+#: means.
 _INTERPRETER_LITERALS = frozenset({"python", "python3"})
 
 #: How many entries the evidence line names before it counts the rest. The
@@ -1335,7 +1388,104 @@ def _python_files(root: Path) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
-def _scan_module(tree: ast.AST, rel: str) -> tuple[bool, set[str]]:
+def _names_an_interpreter(value: object) -> bool:
+    """Is this constant an interpreter, or a shell string that starts one?
+
+    Whole-token, never substring: `"python3"` and `"python3 -m pytest"` both
+    name one, `"/usr/bin/python3"` and `"pythonic"` do not. That is the same
+    vocabulary `_INTERPRETER_LITERALS` has always used — widening it is a
+    separate question, and widening it HERE while the module-level scan stayed
+    narrow would make the two halves disagree.
+    """
+    if not isinstance(value, str):
+        return False
+    return value in _INTERPRETER_LITERALS or bool(
+        _INTERPRETER_LITERALS & set(value.split())
+    )
+
+
+#: `_spawn_argv_verdict`'s three answers.
+_SPAWN_INERT = "inert"
+_SPAWN_INTERPRETER = "interpreter"
+_SPAWN_UNREADABLE = "unreadable"
+
+
+def _spawn_argv_verdict(call: ast.Call) -> str:
+    """What program does this `subprocess` call start?
+
+    `_SPAWN_INERT` only when the program is spelled out: the argv is a
+    list/tuple of constants (or one constant, for `shell=True`) and not one of
+    them names an interpreter. `subprocess.run(["git", "status"])` qualifies.
+    `_SPAWN_INTERPRETER` when it is spelled out AND one of them does.
+
+    EVERYTHING ELSE IS `_SPAWN_UNREADABLE`, which is where this fails closed.
+    `subprocess.run(["git", *args])` inside a `run_git(cwd, *args)` helper does
+    not qualify — `args` is a parameter and a caller could pass anything — and
+    neither does `subprocess.run(cmd)`, `subprocess.run(build_argv())`, or a
+    spawn with no argv argument at all. A file that mentions an interpreter AND
+    spawns something this cannot read is exactly the "the flow cannot be
+    established" case, and it keeps today's answer.
+    """
+    argv = None
+    if call.args:
+        argv = call.args[0]
+    else:
+        for keyword in call.keywords:
+            if keyword.arg == "args":
+                argv = keyword.value
+                break
+    if argv is None:
+        return _SPAWN_UNREADABLE
+    elements = argv.elts if isinstance(argv, (ast.List, ast.Tuple)) else [argv]
+    verdict = _SPAWN_INERT
+    for element in elements:
+        if not isinstance(element, ast.Constant):
+            return _SPAWN_UNREADABLE
+        if _names_an_interpreter(element.value):
+            verdict = _SPAWN_INTERPRETER
+    return verdict
+
+
+def _dynamic_import_leaves_the_repository(
+    call: ast.Call, called: str, owns_module
+) -> bool:
+    """Does this dynamic import demonstrably name a module this repo does not own?
+
+    Every `False` keeps the file opaque, and there are five separate ways to
+    get one: no resolver was supplied, the call is not one whose first
+    positional argument is a module NAME (`_NAMED_DYNAMIC_IMPORTS`), it has no
+    positional argument, that argument is not a string constant
+    (`import_module(name)`, `import_module(*parts)`, `import_module(f"{p}.x")`),
+    or the name is relative and so means nothing without the caller's package.
+    Only a constant, absolute, non-repository name narrows anything.
+    """
+    if owns_module is None or called not in _NAMED_DYNAMIC_IMPORTS:
+        return False
+    if not call.args:
+        return False
+    first = call.args[0]
+    if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+        return False
+    name = first.value
+    if not name or name.startswith("."):
+        return False
+    return not owns_module(name)
+
+
+def _attribute_base(node: ast.expr) -> str:
+    """The last segment of `node`'s own qualifier, or `""`.
+
+    `subprocess.run` -> `subprocess`; `orchestrator_module.subprocess.run` ->
+    `subprocess`; `orch.run` -> `orch`.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _scan_module(tree: ast.AST, rel: str, owns_module=None) -> tuple[bool, set[str]]:
     """Both questions `build_import_graph` asks of a parsed file, in ONE walk.
 
     These were two functions — `_file_is_opaque` and `_imported_modules` — until
@@ -1359,6 +1509,28 @@ def _scan_module(tree: ast.AST, rel: str) -> tuple[bool, set[str]]:
     regardless — so once the answer is `True` the remaining nodes only skip the
     opacity tests, which is what the `elif opaque` arm is for.
 
+    `owns_module` decides the dynamic-import half: a predicate answering "is
+    this dotted name a module in this checkout?", supplied by
+    `build_import_graph`, which is the only place that knows. **Omitting it
+    keeps every dynamic import opaque**, which is what any caller without a
+    file map has to get.
+
+    TWO NARROWINGS, both select-04 (2026-09-01), both of ATTRIBUTION rather
+    than of the conservative default:
+
+    * a dynamic import whose module name is a CONSTANT this repository does not
+      own (`__import__("socket")`, `pytest.importorskip("asyncpg")`) is not
+      evidence of hidden coupling — see `_dynamic_import_leaves_the_repository`
+      for the five ways that check declines to narrow;
+    * an interpreter literal or `sys.executable` counts only once a `subprocess`
+      entry point actually starts something this cannot read as an
+      interpreter-free constant argv — see `_spawn_argv_verdict`.
+
+    The second is why the walk can no longer stop at the first interpreter
+    literal: which `subprocess` names this file bound is not known until the
+    imports have all been seen, so the flags are collected and combined at the
+    end. `opaque` short-circuits on a dynamic import only.
+
     `imported` — every dotted module name this file names in an import
     statement. Relative imports are resolved against the file's own package, so
     `from .validation import x` inside `autoloop/orchestrator.py` yields
@@ -1371,10 +1543,26 @@ def _scan_module(tree: ast.AST, rel: str) -> tuple[bool, set[str]]:
     package = list(parts) if rel.endswith("__init__.py") else list(parts[:-1])
     opaque = False
     names: set[str] = set()
+    interpreter_seen = False
+    # `subprocess` under whatever name this file imported it as, plus any entry
+    # point pulled out of it by `from subprocess import ...`. Read off the
+    # imports rather than assumed, so `import subprocess as sp` cannot hide a
+    # spawn — and so `orch.run(max_steps=1)`, which shares a name with
+    # `subprocess.run` and nothing else, is not mistaken for one.
+    subprocess_aliases: set[str] = {"subprocess"}
+    bare_spawns: set[str] = set()
+    # Attributes named like a spawn, and the ids of the ones that are being
+    # CALLED. What is left over is a reference that escapes — `runner =
+    # subprocess.run` — which goes somewhere this cannot follow.
+    spawn_attributes: list[ast.Attribute] = []
+    spawn_callees: set[int] = set()
+    spawn_calls: list[ast.Call] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 names.add(alias.name)
+                if alias.name == "subprocess" and alias.asname:
+                    subprocess_aliases.add(alias.asname)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 # `level` counts dots: 1 = this package, 2 = its parent.
@@ -1392,6 +1580,12 @@ def _scan_module(tree: ast.AST, rel: str) -> tuple[bool, set[str]]:
             for alias in node.names:
                 if alias.name != "*":
                     names.add(".".join(filter(None, [base, alias.name])))
+            if node.module == "subprocess" and not node.level:
+                for alias in node.names:
+                    if alias.name == "*":
+                        bare_spawns |= _SUBPROCESS_CALLS
+                    elif alias.name in _SUBPROCESS_CALLS:
+                        bare_spawns.add(alias.asname or alias.name)
         elif opaque:
             continue
         elif isinstance(node, ast.Call):
@@ -1401,18 +1595,44 @@ def _scan_module(tree: ast.AST, rel: str) -> tuple[bool, set[str]]:
                 called = func.attr
             elif isinstance(func, ast.Name):
                 called = func.id
-            if called in _DYNAMIC_IMPORT_CALLS:
+            if called in _DYNAMIC_IMPORT_CALLS and not _dynamic_import_leaves_the_repository(
+                node, called, owns_module
+            ):
                 opaque = True
+            elif watch_interpreter and called in _SUBPROCESS_CALLS:
+                spawn_calls.append(node)
+                if isinstance(func, ast.Attribute):
+                    spawn_callees.add(id(func))
         elif watch_interpreter and isinstance(node, ast.Attribute):
             if (
                 node.attr == "executable"
                 and isinstance(node.value, ast.Name)
                 and node.value.id == "sys"
             ):
-                opaque = True
+                interpreter_seen = True
+            elif node.attr in _SUBPROCESS_CALLS:
+                spawn_attributes.append(node)
         elif watch_interpreter and isinstance(node, ast.Constant):
             if isinstance(node.value, str) and node.value in _INTERPRETER_LITERALS:
-                opaque = True
+                interpreter_seen = True
+    if watch_interpreter and not opaque:
+        starts_an_interpreter = False
+        unreadable = any(
+            id(attribute) not in spawn_callees
+            and _attribute_base(attribute.value) in subprocess_aliases
+            for attribute in spawn_attributes
+        )
+        for call in spawn_calls:
+            func = call.func
+            if isinstance(func, ast.Attribute):
+                if _attribute_base(func.value) not in subprocess_aliases:
+                    continue
+            elif func.id not in bare_spawns:
+                continue
+            verdict = _spawn_argv_verdict(call)
+            starts_an_interpreter |= verdict == _SPAWN_INTERPRETER
+            unreadable |= verdict == _SPAWN_UNREADABLE
+        opaque = starts_an_interpreter or (interpreter_seen and unreadable)
     return opaque, names
 
 
@@ -1497,6 +1717,25 @@ def build_import_graph(root: Path) -> ImportGraph:
             if prefix and not rel.startswith(prefix + "/"):
                 continue
             table.setdefault(".".join(parts_of[rel][depth_of_prefix:]), set()).add(rel)
+
+    def owner_of(rel: str):
+        """Does this checkout own a given module name, answered in `rel`'s own
+        import context — the same `by_root`/`roots_of` lookup the edge loop
+        below performs, so a dynamic import and a written one resolve
+        identically. A name matching nothing under any of `rel`'s roots is
+        stdlib, third-party, or nothing at all."""
+
+        def owns(name: str) -> bool:
+            segments = name.split(".")
+            for prefix in roots_of[rel]:
+                table = by_root[prefix]
+                for depth in range(1, len(segments) + 1):
+                    if table.get(".".join(segments[:depth])):
+                        return True
+            return False
+
+        return owns
+
     importers: dict[str, set[str]] = {}
     opaque: set[str] = set()
     for rel in files:
@@ -1506,7 +1745,7 @@ def build_import_graph(root: Path) -> ImportGraph:
         except (OSError, SyntaxError, ValueError):
             opaque.add(rel)
             continue
-        file_is_opaque, modules = _scan_module(tree, rel)
+        file_is_opaque, modules = _scan_module(tree, rel, owner_of(rel))
         if file_is_opaque:
             opaque.add(rel)
         for module in modules:

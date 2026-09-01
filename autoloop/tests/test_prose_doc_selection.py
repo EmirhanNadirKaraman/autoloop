@@ -453,6 +453,36 @@ def test_a_non_prose_path_under_docs_keeps_the_reference_token_treatment(tmp_pat
 
 DOCS_ONLY = tuple(sorted(TRACKERS))
 
+#: What a change-note-only round selects, out of the whole suite, measured on
+#: this checkout after select-04 (2026-09-01) took the files that spawn nothing
+#: off the opaque frontier. Stated as a NUMBER rather than as "fewer": the
+#: before/after pair, and what the remainder is made of, live in
+#: `test_test_selection.py`, which is where the opacity rule itself is pinned.
+DOCS_ONLY_SELECTED = 20
+SUITE_SIZE = 102
+
+
+def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
+    """The number this file's whole claim is about, on the round every task in
+    this repository makes.
+
+    Two things could make it drift and only one of them is a regression: the
+    suite growing (which moves the denominator, and is why it is asserted too)
+    and the attribution or the opaque frontier widening (which moves this one).
+    Asserted here rather than only in `test_test_selection.py` because a
+    docs-only round is what THIS file exists for, and because it is the round
+    where nothing but attribution and the frontier can select anything at all.
+    """
+    graph = real_graph()
+    chosen = real_round(*DOCS_ONLY)
+
+    assert not chosen.widened, chosen.reason
+    assert chosen.resolved == (), "no Python changed"
+    measured = (len(chosen.selected), len(graph.test_files))
+    assert measured == (DOCS_ONLY_SELECTED, SUITE_SIZE), (
+        f"(selected, suite) = {measured}; selected {sorted(chosen.selected)}"
+    )
+
 
 def test_a_docs_only_round_still_selects_test_docs_merge():
     """REQUIREMENT 1, and the reason it is asserted on a docs-only round.
