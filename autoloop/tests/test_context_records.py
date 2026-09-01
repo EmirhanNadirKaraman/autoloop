@@ -1,6 +1,6 @@
 """The context-record contract, the stamping path, and the seeded records.
 
-ONE CLAIM, in three parts, and each part is here because its failure is SILENT:
+ONE CLAIM, in four parts, and each part is here because its failure is SILENT:
 
 1. **Every file under `docs/context/` loads through one validator, and a
    malformed record is refused BY NAME with the reason rather than skipped.** A
@@ -28,6 +28,16 @@ ONE CLAIM, in three parts, and each part is here because its failure is SILENT:
    answer at all. That last one is the fail-open case: a validator that accepted
    a stamp because the repository was unreadable would pass exactly when nothing
    could check it.
+4. **A stamp is verified against the COMMIT it names, not against the working
+   tree.** `Path.exists` is equally True for a file that is untracked, one
+   staged and never committed, and one deleted from HEAD and restored on disk —
+   so a worktree check would let a run write HEAD into a record as evidence that
+   commit holds pointers it does not. Each of those three shapes has its own
+   test below, built as a real repository where the worktree and HEAD disagree,
+   and each asserts the refusal AND that every record still reads `UNSTAMPED`.
+   The inverse is asserted too, because conflating the two questions in the
+   other direction is just as wrong: a path the commit holds stamps fine even
+   after the worktree loses it.
 
 Fixture-first, with the real-repository claims at the bottom — the fixtures say
 WHY each shape is refused, and the bottom section says the rule survives contact
@@ -53,9 +63,11 @@ from autoloop.context_records import (
     REQUIRED_SECTIONS,
     UNSTAMPED,
     ContextRecordError,
+    commit_tree_paths,
     load_context_records,
     main,
     missing_paths,
+    missing_paths_in_tree,
     parse_record,
     stamp_records,
     unverifiable_records,
@@ -586,6 +598,17 @@ def project_record(commit: str = UNSTAMPED) -> str:
     )
 
 
+def pointing_at(path: str, record_id: str = "ctx-fixture-one") -> str:
+    """An UNSTAMPED project record whose only pointer is `path`.
+
+    A `project`, so `test_paths` and `task_ids` may be empty and the ONE thing
+    the record claims is that `path` belongs to whatever commit stamps it.
+    """
+    return record_text(
+        kind="project", source_paths=path, test_paths="", task_ids="", id=record_id
+    )
+
+
 def stamped_repo(root: Path, commit: str) -> str:
     """A real repository whose one record claims `commit`."""
     make_repo_from_template(root)
@@ -770,6 +793,68 @@ class _FakeGit:
     def object_exists(self, oid: str) -> bool:
         return self._delegate().object_exists(oid)
 
+    def tree_entries(self, tree: str) -> dict:
+        return self._delegate().tree_entries(tree)
+
+
+class _TreelessGit:
+    """Every commit question answered, and no tree ever listed.
+
+    What an unreadable object, a policy refusal or a repository that vanished
+    mid-run all look like from `ls-tree`'s side. Two tests turn on it and they
+    want OPPOSITE answers, which is why it is one double and not two: a run with
+    something pending must REFUSE (the tree is what the pointers are checked
+    against, and a tree nobody could read must not verify them by default),
+    while a run with nothing pending must SUCCEED, because it has no pointer to
+    check and therefore no business asking.
+    """
+
+    def __init__(self, real: GitGateway):
+        self._real = real
+
+    def head_sha(self) -> str:
+        return self._real.head_sha()
+
+    def read_commit(self, oid: str) -> dict:
+        return self._real.read_commit(oid)
+
+    def object_exists(self, oid: str) -> bool:
+        return self._real.object_exists(oid)
+
+    def tree_entries(self, tree: str) -> dict:
+        raise GitError("git ls-tree -r -z " + tree + " failed (rc=128): unreadable object")
+
+
+class _TreeSpyGit:
+    """The real gateway with every tree listing recorded, and `tree_of` fatal.
+
+    `tree_of` is `rev-parse <sha>^{tree}` — a second subprocess for a value the
+    commit object already carried, and one that dies with the same status for a
+    missing object as for an unreadable one, which is the distinction
+    `object_exists` exists to preserve. So reaching for it here is the failure,
+    not an implementation detail.
+    """
+
+    def __init__(self, real: GitGateway):
+        self._real = real
+        self.trees: list[str] = []
+
+    def head_sha(self) -> str:
+        return self._real.head_sha()
+
+    def read_commit(self, oid: str) -> dict:
+        return self._real.read_commit(oid)
+
+    def object_exists(self, oid: str) -> bool:
+        return self._real.object_exists(oid)
+
+    def tree_of(self, rev: str) -> str:
+        raise AssertionError("the stamp re-derived a tree it had already read from the commit")
+
+    def tree_entries(self, tree: str) -> dict:
+        self.trees.append(tree)
+        return self._real.tree_entries(tree)
+
 
 def stampable(root: Path) -> str:
     """A repository with one UNSTAMPED record whose pointers all exist in it."""
@@ -823,6 +908,184 @@ def test_stamping_refuses_a_record_whose_pointers_do_not_exist_and_writes_nothin
     assert excinfo.value.code == "unverifiable_record"
     assert "not/here.py" in str(excinfo.value)
     for rel in ("docs/context/project.md", "docs/context/features/gone.md"):
+        assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
+
+
+# ---- the stamp is checked against the COMMIT, not against the working tree ----
+#
+# Three shapes where `Path.exists()` says yes and the commit says no. Each is a
+# real repository whose worktree and HEAD DISAGREE, because that disagreement is
+# the entire bug: a worktree check writes HEAD into a record as evidence that
+# commit holds a pointer it has never held.
+
+
+def stamp_refusal(root: Path) -> ContextRecordError:
+    """`stamp_records` must refuse, and must have written nothing when it did.
+
+    The sweep is `rglob("*")` and not `rglob("*.md")` deliberately. A constrained
+    glob in evaluated code makes its file a declared READER of every document it
+    matches (`validation._names_document`), and `"*.md"` matches every tracker's
+    basename — measured here: it moved a docs-only round from 20 selected test
+    files to 21. A bare `"*"` discriminates nothing and is dropped by
+    `_glob_constrains`, which is exactly the case that rule exists for.
+    """
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(root)
+    for record in sorted(p for p in (root / CONTEXT_DIR).rglob("*") if p.is_file()):
+        if record.name not in (INDEX_NAME, "README.md"):
+            assert UNSTAMPED in record.read_text(encoding="utf-8"), record.name
+    return excinfo.value
+
+
+def test_stamping_refuses_a_pointer_that_is_only_an_untracked_file(tmp_path):
+    """On disk, in no commit. The worktree answers yes and the stamp must not."""
+    make_repo_from_template(tmp_path)
+    (tmp_path / "extra.py").write_text("x = 1\n", encoding="utf-8")
+    build_tree(tmp_path, {"project.md": pointing_at("extra.py")})
+    assert (tmp_path / "extra.py").exists()
+    error = stamp_refusal(tmp_path)
+    assert error.code == "unverifiable_record"
+    assert "extra.py" in str(error)
+    assert "ctx-fixture-one" in str(error)
+
+
+def test_stamping_refuses_a_pointer_that_exists_only_in_the_index(tmp_path):
+    """Staged and never committed — the case that distinguishes HEAD's tree from
+    the INDEX's. A run that read `write-tree` instead would accept this."""
+    make_repo_from_template(tmp_path)
+    (tmp_path / "staged.py").write_text("x = 1\n", encoding="utf-8")
+    run_git(tmp_path, "add", "staged.py")
+    assert run_git(tmp_path, "ls-files", "--", "staged.py").strip() == "staged.py"
+    build_tree(tmp_path, {"project.md": pointing_at("staged.py")})
+    error = stamp_refusal(tmp_path)
+    assert error.code == "unverifiable_record"
+    assert "staged.py" in str(error)
+
+
+def test_stamping_refuses_a_pointer_deleted_from_head_and_restored_on_disk(tmp_path):
+    """The sharpest of the three: the file was never absent from the worktree at
+    the moment anything looked, and the commit being stamped does not hold it."""
+    make_repo_from_template(tmp_path)
+    (tmp_path / "gone.py").write_text("x = 1\n", encoding="utf-8")
+    run_git(tmp_path, "add", "gone.py")
+    run_git(tmp_path, "commit", "-q", "-m", "add gone.py")
+    run_git(tmp_path, "rm", "gone.py")
+    run_git(tmp_path, "commit", "-q", "-m", "remove gone.py")
+    (tmp_path / "gone.py").write_text("x = 1\n", encoding="utf-8")
+    build_tree(tmp_path, {"project.md": pointing_at("gone.py")})
+    assert (tmp_path / "gone.py").exists()
+    error = stamp_refusal(tmp_path)
+    assert error.code == "unverifiable_record"
+    assert "gone.py" in str(error)
+
+
+def test_a_pointer_the_commit_holds_is_stamped_even_after_the_worktree_loses_it(tmp_path):
+    """The INVERSE fail-open, and the reason this is not just "be stricter": a
+    stamp says these pointers were in THAT commit, and they were. Refusing here
+    would mean the two questions had been conflated in the other direction."""
+    make_repo_from_template(tmp_path)
+    build_tree(tmp_path, {"project.md": pointing_at("README.md")})
+    (tmp_path / "README.md").unlink()
+    stamp = stamp_records(tmp_path)
+    assert stamp.stamped == ("ctx-fixture-one",)
+    assert "last_verified_commit: " + stamp.head_sha in (
+        tmp_path / "docs/context/project.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_a_directory_pointer_resolves_against_a_tree_that_lists_only_blobs(tmp_path):
+    """`ls-tree -r` emits no directory entries, and an approved path may end in
+    '/'. Without the ancestors synthesised alongside the blobs, a record naming
+    a directory the commit plainly contains would be refused as absent."""
+    make_repo_from_template(
+        tmp_path, files=(("README.md", "hello\n"), ("pkg/mod.py", "x = 1\n"))
+    )
+    build_tree(tmp_path, {"project.md": pointing_at("pkg/")})
+    assert stamp_records(tmp_path).stamped == ("ctx-fixture-one",)
+
+
+def test_a_pointer_that_is_only_a_prefix_of_a_real_path_is_still_refused(tmp_path):
+    """The boundary of the rule above: 'pkg/mo' is a prefix of 'pkg/mod.py' and
+    names nothing. Matching prefixes without the separator would accept it."""
+    make_repo_from_template(
+        tmp_path, files=(("README.md", "hello\n"), ("pkg/mod.py", "x = 1\n"))
+    )
+    build_tree(tmp_path, {"project.md": pointing_at("pkg/mo")})
+    error = stamp_refusal(tmp_path)
+    assert error.code == "unverifiable_record"
+    assert "pkg/mo" in str(error)
+
+
+def test_a_tree_git_cannot_list_refuses_rather_than_verifying_every_pointer(tmp_path):
+    """The fail-open shape for the new question. An unreadable tree must not
+    become a tree in which everything checks out, and it must not become one in
+    which nothing does either — it is a refusal naming the tree."""
+    rel = stampable(tmp_path)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path, git=_TreelessGit(gateway_for(tmp_path)))
+    assert excinfo.value.code == "unreadable_tree"
+    assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
+
+
+def test_a_run_with_nothing_pending_never_lists_a_tree(tmp_path):
+    """The exemption stated as behaviour so it cannot quietly grow: the set the
+    tree check guards is the PENDING records, and here it is empty. A gateway
+    that refuses every listing still completes the run."""
+    make_repo_from_template(tmp_path)
+    old = head_of(tmp_path)
+    build_tree(tmp_path, {"project.md": project_record(old)})
+    stamp = stamp_records(tmp_path, git=_TreelessGit(gateway_for(tmp_path)))
+    assert stamp.stamped == ()
+    assert stamp.already == ("ctx-fixture-one",)
+
+
+def test_the_stamp_lists_the_tree_of_the_commit_it_verified_and_asks_once(tmp_path):
+    stampable(tmp_path)
+    spy = _TreeSpyGit(gateway_for(tmp_path))
+    stamp = stamp_records(tmp_path, git=spy)
+    assert stamp.stamped == ("ctx-fixture-one",)
+    assert spy.trees == [gateway_for(tmp_path).read_commit(stamp.head_sha)["tree"]]
+
+
+def test_a_file_that_changes_under_the_run_leaves_every_record_untouched(
+    tmp_path, monkeypatch
+):
+    """Every refusal writes NOTHING, including the late one.
+
+    The sentinel re-read happens for all pending records before the first write,
+    so a file that changed underneath the run cannot be discovered halfway
+    through and leave some records stamped and some not. `project.md` sorts
+    AFTER `features/two.md`, so without that ordering `two.md` would already
+    carry the sha by the time `project.md` failed.
+    """
+    make_repo_from_template(tmp_path)
+    build_tree(
+        tmp_path,
+        {
+            "project.md": project_record(),
+            "features/two.md": record_text(
+                id="ctx-fixture-two", source_paths="README.md", test_paths="README.md"
+            ),
+        },
+    )
+    real_read = context_records._read
+    reads: list[str] = []
+
+    def racing_read(file, rel):
+        text = real_read(file, rel)
+        if rel == "docs/context/project.md":
+            reads.append(rel)
+            if len(reads) > 1:
+                return text.replace(
+                    "last_verified_commit: " + UNSTAMPED, "last_verified_commit: " + "c" * 40
+                )
+        return text
+
+    monkeypatch.setattr(context_records, "_read", racing_read)
+    with pytest.raises(ContextRecordError) as excinfo:
+        stamp_records(tmp_path)
+    assert excinfo.value.code == "record_changed_under_stamp"
+    for rel in ("docs/context/project.md", "docs/context/features/two.md"):
         assert UNSTAMPED in (tmp_path / rel).read_text(encoding="utf-8")
 
 
@@ -910,6 +1173,21 @@ def test_check_passes_on_a_valid_tree_and_names_what_is_unstamped(tmp_path, caps
     assert "1 record(s) valid, 1 unstamped" in capsys.readouterr().out
 
 
+def test_check_names_the_dotfiles_it_stepped_over_rather_than_passing_over_them(
+    tmp_path, capsys
+):
+    """The one category no record contract reaches — a record is a `.md` file the
+    index lists — so `check` says the file is there. Reported, not refused: a
+    `.DS_Store` is not a broken record, and a run that exited 1 on one would make
+    the operator surface useless. What must not happen is silence, which would
+    leave a file sitting under the context tree that nothing validated and
+    nothing mentioned."""
+    stampable(tmp_path)
+    (tmp_path / CONTEXT_DIR / ".hidden.md").write_text(record_text(), encoding="utf-8")
+    assert main(["check", str(tmp_path)]) == 0
+    assert "ignored (not a record): docs/context/.hidden.md" in capsys.readouterr().err
+
+
 def test_check_fails_on_a_pointer_that_moved(tmp_path, capsys):
     build_tree(tmp_path, {"features/one.md": record_text()})
     assert main(["check", str(tmp_path)]) == 1
@@ -987,6 +1265,41 @@ def test_every_seeded_record_is_stamped_to_a_commit_that_resolves_or_explicitly_
         assert git.object_exists(record.last_verified_commit) is True, (
             record.id + " names a commit this repository cannot resolve"
         )
+
+
+def test_every_seeded_records_pointers_are_checked_against_the_commit_it_names():
+    """The task's claim, stated over this checkout's own records: a record's
+    source and test paths exist AT THE COMMIT it names as last verified.
+
+    Not vacuous while every seed is on the sentinel — the else arm asserts the
+    only other thing a record is allowed to say, which is what makes "stamped or
+    explicitly unstamped" a dichotomy rather than a gap — and it becomes the
+    stronger half the moment the stamping path has run here.
+    """
+    git = repo_gateway()
+    for record in load_context_records(REPO_ROOT).records:
+        if not record.stamped:
+            assert record.last_verified_commit == UNSTAMPED, record.id
+            continue
+        tree = git.read_commit(record.last_verified_commit)["tree"]
+        held = commit_tree_paths(git, tree, record.id)
+        assert missing_paths_in_tree(record, held) == (), (
+            record.id + " names pointers its own last_verified_commit does not hold"
+        )
+
+
+def test_the_head_tree_of_this_checkout_holds_files_and_the_directories_above_them():
+    """`commit_tree_paths` measured against a real repository, so the membership
+    rule the stamp turns on is not left to the fixtures alone: a blob git lists,
+    a directory it never lists, and the prefix that must NOT match."""
+    git = repo_gateway()
+    head = git.head_sha()
+    held = commit_tree_paths(git, git.read_commit(head)["tree"], "HEAD")
+    assert "autoloop/tasks.py" in held
+    assert "autoloop" in held
+    assert "autoloop/tests" in held
+    assert "autoloop/task" not in held
+    assert "no/such/file.py" not in held
 
 
 def test_the_index_lists_every_seeded_record_by_id_and_by_path():

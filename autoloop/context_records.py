@@ -25,10 +25,15 @@ it refuses rather than skips. Every `.md` file under `docs/context/` is either a
 record it parsed or one of the two STRUCTURAL names (`index.md`, `README.md`) it
 reports as structural — and a structural document that opens with the record
 fence is refused too, so a malformed record cannot be renamed into the quiet
-category. A file that is neither is named and refused. "Loaded zero records" is
-never an answer: a missing `docs/context/` directory and a missing index are
-both refusals, because a validator that passes when its input is absent is the
-fail-open shape `docs/SECURITY.md` records twice for name-filtered rechecks.
+category. A file that is neither is named and refused. The ONE exemption is a
+leading dot: an editor's or the operating system's droppings cannot be records,
+because a record is a file the index lists. They are not dropped in silence
+either — the loader returns them as `ContextRepository.ignored` and `check`
+prints every one, so a file sitting in this tree that nothing validated is still
+said out loud. "Loaded zero records" is never an answer either: a missing
+`docs/context/` directory and a missing index are both refusals, because a
+validator that passes when its input is absent is the fail-open shape
+`docs/SECURITY.md` records twice for name-filtered rechecks.
 
 PATHS ARE VALIDATED BY `tasks._validate_approved_path` ITSELF, called through
 the module object rather than copied or re-implemented. A record naming a path
@@ -66,9 +71,18 @@ reaches git or the load raises. An all-UNSTAMPED tree — which is what this
 repository's seeds are until `stamp` runs — has nothing to resolve, so it asks
 nothing, and no unverified sha exists for it to have missed.
 
-Stamping VERIFIES BEFORE IT WRITES: every source and test path a pending record
-names must exist in the checkout, or nothing is stamped at all. A stamp whose
-paths were never checked would be decoration on a claim, which is the placeholder
+STAMPING VERIFIES BEFORE IT WRITES, AND VERIFIES AGAINST THE COMMIT IT IS ABOUT.
+Every source and test path a pending record names must be in the TREE of the
+commit being stamped — enumerated with `ls-tree -r` through the same gateway —
+or nothing is stamped at all. The WORKING TREE cannot answer that question:
+`Path.exists` is equally True for a file that is untracked, one staged but never
+committed, and one deleted from HEAD and restored on disk, and stamping any of
+those writes HEAD into a record as though that commit held evidence it does not.
+The other way to close it — refuse to stamp unless the worktree matches HEAD —
+is not available to a path whose whole job is to WRITE records into the worktree:
+the first record it stamped would forbid the second. So the question asked is the
+exact one the stamp claims to have answered, and a stamp whose paths were never
+checked at that commit would be decoration on a claim, which is the placeholder
 failure this format exists to make impossible.
 
 Stamping touches only records still carrying the sentinel. That is what makes it
@@ -640,11 +654,20 @@ def _gateway(root: Path, git=None) -> GitGateway:
     return git if git is not None else GitGateway(root, PolicyEngine(PolicyConfig()))
 
 
-def _verify_commit(git, oid: str, prefix: str) -> None:
-    """Refuse unless git itself resolves `oid` to a commit in this repository.
+def _verify_commit(git, oid: str, prefix: str) -> str:
+    """Refuse unless git itself resolves `oid` to a commit in this repository,
+    and return that commit's TREE id.
+
+    The tree comes back because the caller that needs it — `stamp_records`, which
+    has to ask what the commit CONTAINS — would otherwise spend a second
+    subprocess (`rev-parse <sha>^{tree}`) re-deriving a value this function
+    already read out of the commit object. Worse than the cost: `rev-parse` dies
+    with status 128 for a missing object exactly as it does for an unreadable
+    one, which is the "died is not an answer" ambiguity the two probes below
+    exist to avoid, so re-asking would reintroduce it after it had been settled.
 
     Two probes, in the order `cli._candidate_is_retired` and
-    `orchestrator._commit_is_present` already use — and for the same reason.
+    `orchestrator._commit_presence` already use — and for the same reason.
     `cat-file commit` (`read_commit`) dies with the same status for a missing
     object, a blob wearing a commit's name, a corrupt object, an I/O error and a
     policy refusal, so its failure alone proves only that the question went
@@ -652,11 +675,15 @@ def _verify_commit(git, oid: str, prefix: str) -> None:
     distinction (0 present, 1 absent, anything else raises), so a raise from the
     first leads to one more question rather than to a verdict.
 
-    What differs here is the FAIL DIRECTION, deliberately. Those callers treat
-    "git could not answer" as a quiet no and carry on; this one raises. A stamp
-    is a claim that somebody checked these pointers at a named commit, and
-    accepting it because the repository was unreadable would let the claim
-    through precisely when nothing could check it.
+    What an unanswered question AUTHORIZES is what differs, deliberately. Both
+    of those callers refuse to act on one and carry on: `_candidate_is_retired`
+    returns `""` — "still respect this candidate" — and `_commit_presence`
+    returns `None`, which authorizes nothing and leaves the record alone. In
+    both, silence withholds a destructive act. Here the act being authorized is
+    the opposite one — ACCEPTING a stamp — so silence must not withhold the
+    refusal instead: a stamp claims somebody checked these pointers at a named
+    commit, and passing it because the repository was unreadable would let the
+    claim through precisely when nothing could check it. Hence a raise.
 
     `prefix` names whose commit this is and quotes the value, so the caller's
     subject survives into the message: a reason with no name sends a reader
@@ -665,8 +692,9 @@ def _verify_commit(git, oid: str, prefix: str) -> None:
     detail = ""
     try:
         info = git.read_commit(oid)
-        if "tree" in info:
-            return
+        tree = info.get("tree", "")
+        if tree:
+            return tree
         detail = "git returned no tree header for it, so it is not a commit object"
     except (GitError, OSError) as exc:
         detail = str(exc)
@@ -781,14 +809,64 @@ def load_context_records(root, git=None) -> ContextRepository:
 
 
 def missing_paths(record: ContextRecord, root) -> tuple[str, ...]:
-    """The paths this record names that are not in the checkout at `root`.
+    """The paths this record names that are not in the CHECKOUT at `root`.
 
-    Empty means every pointer resolves. This is the check that makes
-    `last_verified_commit` mean something: a record whose sources have moved is
-    stale whatever its status says.
+    Empty means every pointer resolves in the tree as it stands right now. That
+    is the question `check` asks — "has a pointer moved since anyone looked" —
+    and it is deliberately NOT the question stamping asks. A stamp names a
+    COMMIT, and this function cannot see one: it answers True for an untracked
+    file, for one staged and never committed, and for one deleted from HEAD and
+    restored on disk. `missing_paths_in_tree` is the commit-shaped question, and
+    `stamp_records` uses that one.
     """
     root = Path(root)
     return tuple(rel for rel in record.referenced_paths if not (root / rel).exists())
+
+
+def commit_tree_paths(git, tree: str, subject: str) -> frozenset[str]:
+    """Every path the tree object `tree` holds: the blobs `ls-tree -r` lists,
+    plus every directory that is an ancestor of one.
+
+    The ancestors are synthesised HERE because `ls-tree -r` emits no directory
+    entries at all, while `tasks._validate_approved_path` accepts a trailing
+    slash as "everything under here" — so a record may legitimately name
+    `autoloop/tests/`, and a membership test over blobs alone would refuse it as
+    absent from a commit that plainly contains it.
+
+    Git failure RAISES rather than returning what it managed to read. An empty
+    or partial set would make every pointer look missing, which is loud rather
+    than silent — but it is loud about the wrong thing, and the honest statement
+    of "the repository could not tell us what this commit contains" is a refusal
+    naming the tree, not a per-record complaint about paths nobody checked.
+    """
+    try:
+        entries = git.tree_entries(tree)
+    except (GitError, OSError) as exc:
+        raise ContextRecordError(
+            "unreadable_tree",
+            f"{subject}, and git could not list what its tree '{tree}' contains "
+            f"({exc}) — nothing is stamped against a commit whose contents could not "
+            "be read, because a tree nobody could enumerate would otherwise verify "
+            "every pointer by default",
+        ) from exc
+    paths = set(entries)
+    for entry in entries:
+        segments = entry.split("/")
+        for depth in range(1, len(segments)):
+            paths.add("/".join(segments[:depth]))
+    return frozenset(paths)
+
+
+def missing_paths_in_tree(record: ContextRecord, tree_paths: frozenset[str]) -> tuple[str, ...]:
+    """The paths this record names that a commit's tree does not hold.
+
+    `tree_paths` comes from `commit_tree_paths`, so directories are already in
+    it. The trailing slash a record may write to mark a directory is stripped
+    for the comparison, exactly as `tasks._validate_approved_path` strips it
+    before checking segments — the same normalisation, so the two agree on what
+    a path is.
+    """
+    return tuple(rel for rel in record.referenced_paths if rel.rstrip("/") not in tree_paths)
 
 
 def unverifiable_records(repository: ContextRepository) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -815,18 +893,38 @@ def stamp_records(root, git=None) -> Stamp:
        and then put that sha to git like any other: an answer this repository
        cannot resolve back to a commit must never be written INTO a record,
        where the next load would refuse it after the file had already changed;
-    3. check every pending record's pointers FIRST, all of them, and refuse
-       without writing if any is missing;
-    4. rewrite exactly one line per record, the one the parser located;
-    5. re-load the tree and confirm each stamped record now reads back at that
+    3. enumerate what that COMMIT contains and check every pending record's
+       pointers against it — all of them, before any write — refusing if any is
+       missing. Against the commit's tree and not against the checkout, because
+       the sha about to be written is the commit's, and `Path.exists` cannot
+       tell a file that commit holds from one that is untracked, staged but
+       uncommitted, or deleted in HEAD and restored on disk;
+    4. re-read each pending file and confirm the line the parser located still
+       reads the sentinel — ALL of them, still before any write, so a file that
+       changed underneath the run cannot be discovered halfway through and leave
+       some records stamped and some not;
+    5. rewrite exactly one line per record, the one the parser located;
+    6. re-load the tree and confirm each stamped record now reads back at that
        commit, so the run's report is a measurement of the file rather than of
        the intention.
+
+    Steps 1-4 are the whole refusal surface and NONE of them has written a byte:
+    every way this function says no leaves the tree exactly as it found it. What
+    that does NOT cover, stated rather than implied: step 5 writes one file at a
+    time, so a filesystem failure partway through it (a full disk, a read-only
+    tree) can leave earlier records stamped and later ones on the sentinel. Every
+    record's new text is built in memory before the first write, so no individual
+    file is left half-written, and the run is re-runnable — a second one stamps
+    exactly what still carries the sentinel.
 
     One gateway for the whole run, passed into both loads, so every question
     this run asks is asked of one repository.
 
     Re-runnable: a record already carrying a commit is left alone, so a second
-    run over an unchanged tree writes nothing and reports it as `already`.
+    run over an unchanged tree writes nothing and reports it as `already`. When
+    NOTHING is pending the commit's tree is never enumerated — not a check
+    switching itself off, because the set it guards is exactly the pending
+    records and every member of a non-empty one is checked or the run raises.
     """
     root = Path(root)
     gateway = _gateway(root, git)
@@ -838,20 +936,24 @@ def stamp_records(root, git=None) -> Stamp:
             f"git answered {head!r} for HEAD, which is not a full commit sha; nothing is "
             "stamped from an answer that cannot be re-resolved",
         )
-    _verify_commit(gateway, head, f"git answered HEAD = '{head}'")
+    head_subject = f"git answered HEAD = '{head}'"
+    head_tree = _verify_commit(gateway, head, head_subject)
 
     pending = [record for record in repository.records if not record.stamped]
     already = tuple(record.id for record in repository.records if record.stamped)
-    for record in pending:
-        gone = missing_paths(record, root)
-        if gone:
-            raise ContextRecordError(
-                "unverifiable_record",
-                f"{_label(record.path, record.id)} names {', '.join(gone)}, which "
-                f"{'do' if len(gone) > 1 else 'does'} not exist in this checkout — a stamp "
-                "asserts these pointers were checked, so nothing here is stamped",
-            )
+    if pending:
+        tree_paths = commit_tree_paths(gateway, head_tree, head_subject)
+        for record in pending:
+            gone = missing_paths_in_tree(record, tree_paths)
+            if gone:
+                raise ContextRecordError(
+                    "unverifiable_record",
+                    f"{_label(record.path, record.id)} names {', '.join(gone)}, which "
+                    f"commit {head} does not contain — being in the checkout is not the "
+                    "claim a stamp makes, so nothing here is stamped",
+                )
 
+    rewritten: list[tuple[Path, str]] = []
     for record in pending:
         file = root / record.path
         lines = _read(file, record.path).split("\n")
@@ -861,10 +963,12 @@ def stamp_records(root, git=None) -> Stamp:
                 "record_changed_under_stamp",
                 f"{_label(record.path, record.id)} line {record.commit_line + 1} reads "
                 f"{current!r}, not the sentinel this run parsed; the file changed while it "
-                "was being stamped and nothing further is written",
+                "was being read and nothing at all is written",
             )
         lines[record.commit_line] = f"last_verified_commit: {head}"
-        file.write_text("\n".join(lines), encoding="utf-8")
+        rewritten.append((file, "\n".join(lines)))
+    for file, text in rewritten:
+        file.write_text(text, encoding="utf-8")
 
     stamped = tuple(record.id for record in pending)
     if stamped:
@@ -888,7 +992,14 @@ def main(argv: list[str] | None = None) -> int:
     stamped record's commit to git, since the load is what does that — and
     reports broken pointers; `stamp` does the same and then writes HEAD into
     every UNSTAMPED record. Exit 0 is a pass, 1 a refusal with the reason on
-    stderr, 2 a usage error."""
+    stderr, 2 a usage error.
+
+    `check` also NAMES every dotfile the load stepped over. Those are the one
+    thing under `CONTEXT_DIR` no record contract applies to — a record is a
+    `.md` file the index lists — and leaving them unmentioned at the operator
+    surface would make a file sitting in this tree that nothing validated
+    invisible exactly where a human goes looking. It is a report, not a
+    refusal: `.DS_Store` is not a broken record."""
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "check"
     if command not in ("check", "stamp") or len(args) > 2:
@@ -898,6 +1009,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "check":
             repository = load_context_records(root)
+            for rel in repository.ignored:
+                print(f"ignored (not a record): {rel}", file=sys.stderr)
             broken = unverifiable_records(repository)
             for record_id, gone in broken:
                 print(f"unverifiable: {record_id} names {', '.join(gone)}", file=sys.stderr)
