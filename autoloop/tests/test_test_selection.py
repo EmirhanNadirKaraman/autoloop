@@ -583,7 +583,9 @@ FLOOR_AFTER = 16
 #: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). The
 #: DENOMINATOR only: the new file reads no tracker and spawns no interpreter, so
 #: neither the docs-only selection nor the floor moved with it.
-SUITE_SIZE = 103
+#: 103 -> 104 when prov-01 added `test_codex_stdout_verdict.py` (2026-09-01),
+#: for the same reason and with the same effect — 20 and 24 are unchanged.
+SUITE_SIZE = 104
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
