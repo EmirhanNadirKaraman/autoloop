@@ -195,9 +195,10 @@ class CodexConfig:
     #: claimed from here: the flags are PRESENT in every invocation (the review
     #: turn and the preflight, from this one setting), and `doctor`'s preflight
     #: proves the configured build ACCEPTS them, because no codex binary runs in
-    #: this repository or in CI. Enforcement is codex's; `read-only` refuses
-    #: writes and command execution and does NOT confine reads. Nothing depends
-    #: on it doing so — the prompt is self-contained.
+    #: this repository or in CI. Enforcement is codex's; `read-only` restricts
+    #: WRITES, does NOT refuse command execution (commands still run under it,
+    #: sandboxed) and does NOT confine reads. Nothing depends on either — the
+    #: prompt is self-contained.
     #:
     #: `--skip-git-repo-check` may be added alongside (accept an untrusted
     #: working directory, which switches codex's own guard off everywhere;

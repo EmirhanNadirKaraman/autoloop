@@ -1356,7 +1356,9 @@ The confinement is `codex.sandbox_args`, and it ships set:
 * **`codex.sandbox_args = ["--sandbox", "read-only"]`** is the shipped policy.
   The reviewer answers from a self-contained packet — every turn re-sends its
   CONTEXT block, the full contract and the diff — so it needs no writes, no
-  commands and no repository. `codex/sandbox.py` reads the value as a policy
+  commands and no repository. That is what the seat NEEDS, not what the mode
+  refuses: read-only permits both commands and reads, as the last bullet below
+  states. `codex/sandbox.py` reads the value as a policy
   rather than as "set or not set", and it is FAIL-CLOSED: an empty list, a mode
   it cannot name, a dangling `--sandbox`, `--full-auto`'s wider
   `workspace-write` (allowed, with a warning) and a bypass flag are each graded
@@ -1381,9 +1383,15 @@ The confinement is `codex.sandbox_args`, and it ships set:
   in this repository or in CI, so a spelling your build rejects fails a check
   instead of your first review (`codex exec --help`).
 * **What is NOT claimed.** Enforcement is codex's; nothing here can prove a
-  sandbox held. And `read-only` refuses WRITES and command execution — it does
-  not confine READS. A read-only reviewer may still read the checkout and the
-  operator's home. Nothing in the loop depends on it not doing so.
+  sandbox held. And `read-only` is narrower than its name reads: it restricts
+  **WRITES**, it does **not** refuse COMMAND EXECUTION — commands still run
+  under it, sandboxed rather than refused — and it does not confine READS, so
+  the reviewer may read the checkout and the operator's home. Whether the mode
+  also closes the network is codex's own behaviour, is not verified from this
+  repository, and is claimed nowhere in it. Nothing in the loop depends on any
+  of that: the packet is self-contained. An earlier draft of this section said
+  read-only refused command execution; it does not, and selecting this seat on
+  that basis would be selecting it on a guarantee codex does not give.
 
 **Upgrading is one config line.** A `.autoloop/config.toml` written before this
 change carries `sandbox_args = []`, which is now an unconfined seat: `doctor`

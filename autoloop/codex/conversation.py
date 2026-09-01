@@ -66,10 +66,11 @@ rather than reviewing. What this repository can honestly claim about it is two
 things: the flags are PRESENT in the argv `subprocess.run` receives, between
 `command` and the prompt, and `doctor`'s preflight proves the configured build
 ACCEPTS them (no codex binary runs here or in CI, so nothing else is
-verifiable). Enforcement is codex's own, and `read-only` refuses writes and
-command execution WITHOUT confining reads — nothing here depends on it doing
-so, because the prompt is self-contained: every turn re-sends its CONTEXT block,
-the full contract and the diff, so the reviewer is never asked to read anything.
+verifiable). Enforcement is codex's own, and `read-only` restricts WRITES
+without refusing command execution — commands still run under it, sandboxed —
+and without confining reads. Nothing here depends on either, because the prompt
+is self-contained: every turn re-sends its CONTEXT block, the full contract and
+the diff, so the reviewer is never asked to read or run anything.
 
 The working directory still earns its default. Codex declines to run outside a
 TRUSTED directory, `~` is not one, trusting `~` would hand the reviewer every
