@@ -47,6 +47,25 @@ handed no sha in their prompt, so a sha appearing in a record an agent wrote is
 a fabricated measurement. Seed records therefore ship UNSTAMPED and stay that
 way until the stamping path has run.
 
+"A SHA THIS REPOSITORY RESOLVES" IS ASKED OF GIT, NOT OF A REGULAR EXPRESSION.
+The shape check (`tasks._COMMIT_SHA_RE`) only says the value could be a sha;
+`abcd...` forty times over passes it and names nothing. So `load_context_records`
+— the one mandatory path into this tree, the one `stamp_records` and the entry
+point both go through — puts every non-sentinel value to git through
+`GitGateway`, and REFUSES the record by name when git says the object database
+does not hold it (`unknown_commit`) or cannot answer at all
+(`unresolvable_commit`). The fail direction is the opposite of
+`cli._candidate_is_retired`'s, which returns "no answer" as a quiet no: a
+validator that accepted a stamp because git was unavailable would be the
+alarm-never-fires shape twice over, so an unanswerable question raises here.
+
+The gateway is built only when at least one record is stamped. That is not the
+guard switching itself off when its input is absent: the set it guards is
+`[record for record in records if record.stamped]`, and EVERY member of that set
+reaches git or the load raises. An all-UNSTAMPED tree — which is what this
+repository's seeds are until `stamp` runs — has nothing to resolve, so it asks
+nothing, and no unverified sha exists for it to have missed.
+
 Stamping VERIFIES BEFORE IT WRITES: every source and test path a pending record
 names must exist in the checkout, or nothing is stamped at all. A stamp whose
 paths were never checked would be decoration on a claim, which is the placeholder
@@ -614,12 +633,101 @@ def _load_structural(file: Path, rel: str) -> None:
         )
 
 
-def load_context_records(root) -> ContextRepository:
+def _gateway(root: Path, git=None) -> GitGateway:
+    """`GitGateway(root, PolicyEngine(PolicyConfig()))` unless a caller passed
+    one — the construction `cli.repo_fingerprint` already makes for a read-only
+    question about the checkout it is standing in."""
+    return git if git is not None else GitGateway(root, PolicyEngine(PolicyConfig()))
+
+
+def _verify_commit(git, oid: str, prefix: str) -> None:
+    """Refuse unless git itself resolves `oid` to a commit in this repository.
+
+    Two probes, in the order `cli._candidate_is_retired` and
+    `orchestrator._commit_is_present` already use — and for the same reason.
+    `cat-file commit` (`read_commit`) dies with the same status for a missing
+    object, a blob wearing a commit's name, a corrupt object, an I/O error and a
+    policy refusal, so its failure alone proves only that the question went
+    unanswered. `object_exists` is the one probe whose EXIT CODE carries the
+    distinction (0 present, 1 absent, anything else raises), so a raise from the
+    first leads to one more question rather than to a verdict.
+
+    What differs here is the FAIL DIRECTION, deliberately. Those callers treat
+    "git could not answer" as a quiet no and carry on; this one raises. A stamp
+    is a claim that somebody checked these pointers at a named commit, and
+    accepting it because the repository was unreadable would let the claim
+    through precisely when nothing could check it.
+
+    `prefix` names whose commit this is and quotes the value, so the caller's
+    subject survives into the message: a reason with no name sends a reader
+    through the whole tree.
+    """
+    detail = ""
+    try:
+        info = git.read_commit(oid)
+        if "tree" in info:
+            return
+        detail = "git returned no tree header for it, so it is not a commit object"
+    except (GitError, OSError) as exc:
+        detail = str(exc)
+    try:
+        present = git.object_exists(oid)
+    except (GitError, OSError) as exc:
+        raise ContextRecordError(
+            "unresolvable_commit",
+            f"{prefix}, and git could not answer whether this repository holds it "
+            f"({exc}) — an unanswerable question is not a pass, so this is refused "
+            "rather than accepted on git's silence",
+        ) from exc
+    if not present:
+        raise ContextRecordError(
+            "unknown_commit",
+            f"{prefix}, which git says this repository's object database does not "
+            "hold; the value is written by stamp_records from a resolved HEAD, never "
+            "by hand, and a sha nothing resolves is evidence of nothing",
+        )
+    raise ContextRecordError(
+        "unresolvable_commit",
+        f"{prefix}, and the object exists here but git could not read it as a "
+        f"commit ({detail})",
+    )
+
+
+def _verify_commits(root: Path, records: tuple[ContextRecord, ...], git=None) -> None:
+    """Put every stamped record's commit to git; UNSTAMPED records ask nothing.
+
+    The gateway is constructed only when something needs resolving — not a guard
+    that switches itself off, because the set it guards is exactly the stamped
+    records and every one of them is asked about. A tree in which nothing claims
+    a commit has no unverified sha in it to miss.
+    """
+    stamped = [record for record in records if record.stamped]
+    if not stamped:
+        return
+    gateway = _gateway(root, git)
+    for record in stamped:
+        _verify_commit(
+            gateway,
+            record.last_verified_commit,
+            f"{_label(record.path, record.id)} names last_verified_commit "
+            f"'{record.last_verified_commit}'",
+        )
+
+
+def load_context_records(root, git=None) -> ContextRepository:
     """THE loader for `docs/context/` — every file under it, one validation pass.
 
     Refuses, never skips. Absent input is a refusal too: no `docs/context/`
     directory and no `index.md` each raise, because "validated zero records
     successfully" is a pass nobody asked for.
+
+    Checks run cheapest-first — parse, ids, successors, index, and git last —
+    so a tree that fails on shape never reaches a subprocess. The last of them
+    is the one that makes a stamp mean something: every `last_verified_commit`
+    that is not the sentinel is put to git through `GitGateway` and refused by
+    name unless this repository resolves it to a commit. `git` is for a caller
+    that already has a gateway (`stamp_records` passes its own so one run asks
+    one repository); left None, one is built only if a record is stamped.
 
     Ordering is by repository-relative path, so two runs over the same tree
     return the same tuple and a caller may compare them.
@@ -666,6 +774,7 @@ def load_context_records(root) -> ContextRepository:
     frozen = tuple(records)
     _check_successors(frozen)
     _check_index(root, frozen)
+    _verify_commits(root, frozen, git)
     return ContextRepository(
         root=root, records=frozen, structural=tuple(structural), ignored=tuple(ignored)
     )
@@ -693,24 +802,19 @@ def unverifiable_records(repository: ContextRepository) -> tuple[tuple[str, tupl
     return tuple(broken)
 
 
-def _gateway(root: Path, git=None) -> GitGateway:
-    """`GitGateway(root, PolicyEngine(PolicyConfig()))` unless a caller passed
-    one — the construction `cli.repo_fingerprint` already makes for a read-only
-    question about the checkout it is standing in."""
-    return git if git is not None else GitGateway(root, PolicyEngine(PolicyConfig()))
-
-
 def stamp_records(root, git=None) -> Stamp:
     """Move every UNSTAMPED record to the commit this repository's HEAD names.
 
     THE stamping path, and the only supported writer of `last_verified_commit`.
     Order matters and each step is load-bearing:
 
-    1. load the whole tree, so a malformed record stops the run before anything
-       is written;
-    2. resolve HEAD through `GitGateway`, and refuse a value that is not a full
-       sha — an empty or abbreviated answer must never become a record's
-       evidence;
+    1. load the whole tree, so a malformed record — or one already carrying a
+       commit this repository cannot resolve — stops the run before anything is
+       written;
+    2. resolve HEAD through `GitGateway`, refuse a value that is not a full sha,
+       and then put that sha to git like any other: an answer this repository
+       cannot resolve back to a commit must never be written INTO a record,
+       where the next load would refuse it after the file had already changed;
     3. check every pending record's pointers FIRST, all of them, and refuse
        without writing if any is missing;
     4. rewrite exactly one line per record, the one the parser located;
@@ -718,18 +822,23 @@ def stamp_records(root, git=None) -> Stamp:
        commit, so the run's report is a measurement of the file rather than of
        the intention.
 
+    One gateway for the whole run, passed into both loads, so every question
+    this run asks is asked of one repository.
+
     Re-runnable: a record already carrying a commit is left alone, so a second
     run over an unchanged tree writes nothing and reports it as `already`.
     """
     root = Path(root)
-    repository = load_context_records(root)
-    head = _gateway(root, git).head_sha()
+    gateway = _gateway(root, git)
+    repository = load_context_records(root, git=gateway)
+    head = gateway.head_sha()
     if not isinstance(head, str) or not tasks._COMMIT_SHA_RE.match(head):
         raise ContextRecordError(
             "head_unresolved",
             f"git answered {head!r} for HEAD, which is not a full commit sha; nothing is "
             "stamped from an answer that cannot be re-resolved",
         )
+    _verify_commit(gateway, head, f"git answered HEAD = '{head}'")
 
     pending = [record for record in repository.records if not record.stamped]
     already = tuple(record.id for record in repository.records if record.stamped)
@@ -759,7 +868,7 @@ def stamp_records(root, git=None) -> Stamp:
 
     stamped = tuple(record.id for record in pending)
     if stamped:
-        written = load_context_records(root).by_id()
+        written = load_context_records(root, git=gateway).by_id()
         for record_id in stamped:
             if written[record_id].last_verified_commit != head:
                 raise ContextRecordError(
@@ -775,9 +884,11 @@ USAGE = "usage: python3 -m autoloop.context_records [check|stamp] [repository ro
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`check` (the default) validates the tree and reports broken pointers;
-    `stamp` does that and then writes HEAD into every UNSTAMPED record. Exit 0
-    is a pass, 1 a refusal with the reason on stderr, 2 a usage error."""
+    """`check` (the default) validates the tree — including putting every
+    stamped record's commit to git, since the load is what does that — and
+    reports broken pointers; `stamp` does the same and then writes HEAD into
+    every UNSTAMPED record. Exit 0 is a pass, 1 a refusal with the reason on
+    stderr, 2 a usage error."""
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "check"
     if command not in ("check", "stamp") or len(args) > 2:

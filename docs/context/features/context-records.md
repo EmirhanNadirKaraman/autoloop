@@ -29,10 +29,11 @@ conversation, a round summary or an implementation write-up.
 
 ## Entry points
 
-* `context_records.load_context_records(root)` — THE loader. Every `.md` file
-  under `docs/context/` is either a parsed record or one of the structural names
-  (`index.md`, `README.md`), which are themselves refused if they open with the
-  record fence. Anything else is named and refused.
+* `context_records.load_context_records(root, git=None)` — THE loader. Every
+  `.md` file under `docs/context/` is either a parsed record or one of the
+  structural names (`index.md`, `README.md`), which are themselves refused if
+  they open with the record fence. Anything else is named and refused. It is
+  also where a stamped record's commit is put to git.
 * `context_records.parse_record(text, path)` — one record: metadata block,
   field validation, per-kind sections.
 * `context_records.stamp_records(root, git=None)` — resolves HEAD through
@@ -56,19 +57,30 @@ conversation, a round summary or an implementation write-up.
   test path; an `incident` and a `lesson` name the task ids they are evidence
   from. A record pointing nowhere cannot be verified.
 * **`last_verified_commit` is a measurement.** It is `UNSTAMPED` or a full sha
-  git resolves. Stamping verifies every pointer BEFORE it writes, and touches
-  only records still on the sentinel — which is what makes it re-runnable and
-  keeps a stamp from asserting a verification nobody performed.
+  git resolves. The shape check is not the check: the loader asks `GitGateway`
+  about every non-sentinel value and refuses the record by name when the object
+  database does not hold it (`unknown_commit`), when it holds something that is
+  not a commit, or when git could not answer at all (`unresolvable_commit`).
+  That last direction is the opposite of `cli._candidate_is_retired`'s, on
+  purpose: accepting a stamp because the repository was unreadable would pass
+  exactly when nothing could check it.
+* Stamping verifies every pointer BEFORE it writes, verifies the HEAD it read
+  like any other commit, and touches only records still on the sentinel — which
+  is what makes it re-runnable and keeps a stamp from asserting a verification
+  nobody performed.
 
 ## Data flow
 
 `load_context_records` walks `docs/context/`, parses each record, then applies
-the checks that need more than one file: unique ids, successor resolution, and
-an index that lists every record by id and by path. `stamp_records` loads that
-tree first (a malformed record stops the run before anything is written), reads
-HEAD through the gateway, checks every pending record's pointers, rewrites the
-single metadata line the parser located, and re-loads the tree to confirm what
-it wrote.
+the checks that need more than one file — unique ids, successor resolution, an
+index that lists every record by id and by path — and last, the one that needs
+git: every stamped record's commit. Cheapest first, so a tree that fails on
+shape never reaches a subprocess, and a tree with nothing stamped never builds a
+gateway. `stamp_records` loads that tree first (a malformed record, or one
+stamped to a commit nothing resolves, stops the run before anything is written),
+reads HEAD through the gateway and resolves it, checks every pending record's
+pointers, rewrites the single metadata line the parser located, and re-loads the
+tree to confirm what it wrote.
 
 ## Tests and decisions
 
@@ -88,9 +100,10 @@ it wrote.
 * **A hand-typed sha.** No agent in this loop can read HEAD —
   `implement_executor.WRITE_ALLOWED_TOOLS` is Read/Grep/Glob/Edit/Write and the
   prompt carries no sha — so a sha appearing in a record an agent wrote is a
-  fabricated measurement. The shape check cannot tell the two apart; the test
-  requires every record to be `UNSTAMPED` or resolvable in this repository, and
-  a review refuses a typed one.
+  fabricated measurement. The shape check cannot tell the two apart, so the
+  loader asks git: a typed value that resolves to nothing is refused by name
+  before anything reads the record, and one that happens to name a real commit
+  is a review question, which is why a hand-typed sha is refused in review too.
 * **A stale stamp.** A record stays stamped to the commit it was verified at
   even as HEAD moves; that is the honest reading, but it means a stamp alone
   does not say the record is current. `check` reports moved pointers, and

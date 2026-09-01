@@ -17,7 +17,10 @@ into every record still carrying the `UNSTAMPED` sentinel, resolving it through
 **`last_verified_commit` is never typed by hand.** A write-capable agent in this
 loop has no shell and is handed no sha, so a sha in a record an agent wrote
 would be a fabricated measurement. `UNSTAMPED` is a stated gap, not a
-placeholder: it says no run has yet checked this record against a commit.
+placeholder: it says no run has yet checked this record against a commit. Any
+other value is put to git on every load and the record is refused by name unless
+this repository resolves it to a commit — including when git cannot be asked at
+all, because a check that passes when nothing could answer is not a check.
 
 A record POINTS at the document that carries the detail — `docs/SUMMARY.md`
 (what each file is for), `docs/AUTOLOOP.md` (how a mechanism behaves),
