@@ -73,7 +73,10 @@ The transcript also carries the ECHOED PROMPT, which is the whole review packet,
 so `submit` passes the prompt to the isolation for the same reason it passes it
 to `quota.classify`: text the loop SENT is not evidence about what came back. A
 packet that QUOTES a codex transcript — this repository's own task descriptions
-do — otherwise puts a `codex` marker and a directive inside the haystack.
+do — otherwise puts a `codex` marker and a directive inside the haystack. The
+argument is load-bearing on this seam, not advisory: `isolate_reply` refuses any
+message the prompt CONTAINS, which is the bound that survives a build re-wrapping
+its echo, and it can only apply to a prompt it was given.
 
 **Every non-zero exit leaves a record, and the prompt cannot classify it.**
 `submit` logs `codex_invocation_failed` on every failure — including the ones
@@ -380,16 +383,23 @@ class CodexConversation:
         # `prompt` — the FINAL one, for the same reason `classify` above is
         # given it: `codex exec` echoes the whole prompt back, so the surest way
         # to keep the loop's own text out of the answer is not to read it. The
-        # line rules do not depend on this argument; it narrows where they are
-        # applied. See `reply._anchor`.
+        # LINE rules do not depend on this argument; it narrows where they are
+        # applied. The containment refusal does depend on it and is inert
+        # without it — which is why it is passed here rather than left to a
+        # caller to remember, and why `reply.CodexReply.echo_anchor` records
+        # `inert` rather than leaving an absent guard to be inferred. See
+        # `reply._anchor` and `reply._is_echoed_text`.
         isolated = isolate_reply(result.stdout, prompt)
         if not isolated.text:
             # No verdict could be isolated: nothing on stdout, a role marker
-            # with no message under it, or two messages between which choosing
-            # by position is the rule the contract refuses. All three are a
-            # broken invocation, not a reply. Reporting REJECTED keeps it
-            # retryable; calling it CONFIRMED would hand the contract parser
-            # text it must refuse and spend a parse retry saying so.
+            # with no message under it, two messages between which choosing by
+            # position is the rule the contract refuses, or a message the PROMPT
+            # ITSELF contains — our own packet coming back, which no gate
+            # downstream of here would catch, since an echoed example carries
+            # this round's own request id and head sha. All four are a broken
+            # invocation, not a reply. Reporting REJECTED keeps it retryable;
+            # calling it CONFIRMED would hand the contract parser text it must
+            # refuse and spend a parse retry saying so.
             self._log(
                 "codex_invocation_failed",
                 failure_digest(

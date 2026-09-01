@@ -28,10 +28,18 @@ marker" does not close it on its own.** The prompt comes back under the `user`
 marker, and the prompt is the review packet — including, when the loop is
 maintaining itself, a QUOTED codex transcript with markers and hook lines in it.
 This module's own task description carries one. Text the loop SENT, read back as
-the reviewer's answer, would be an approval nobody gave, so three bounds answer
-it and there is a test below for each: a marker starts at column 0, a marker
-opens a turn only after furniture, and the echoed prompt is skipped outright
-when it is found verbatim. Where they disagree the answer is a refusal.
+the reviewer's answer, would be an approval nobody gave, so four bounds answer it
+and there is a test below for each: a marker starts at column 0, a marker opens a
+turn only after furniture, the echoed prompt is skipped outright when it is found
+verbatim, and no text whose content occurs in the prompt is returned at all.
+Where they disagree the answer is a refusal.
+
+The fourth is the one that holds when the third cannot. `_anchor` matches the
+prompt EXACTLY, so a build that re-wraps its echo defeats it — and a reflowed
+echo quoting a flush-left transcript, in a round whose reviewer message is empty,
+leaves exactly one segment and it is ours. The tests for it use a directive
+stamped for THIS round, because that is what makes the shape dangerous rather
+than untidy: every downstream stamp gate would accept it.
 """
 
 import json
@@ -156,6 +164,79 @@ FLUSH_TRANSCRIPT = "\n".join(
 #: A prompt that quotes a transcript flush left: the packet this adapter has to
 #: survive, since the loop maintains itself and its own tasks quote its output.
 QUOTING_PROMPT = f"{PROMPT}\n\n{FLUSH_TRANSCRIPT}\n"
+
+#: A complete directive stamped for THIS round — the same request id and head sha
+#: the reviewer's own approval would carry. `ECHOED_DIRECTIVE` above deliberately
+#: names a DIFFERENT round, which the stamp gates would catch; this one they
+#: would not, which is why it is the fixture for the containment bound.
+SAME_ROUND_DIRECTIVE = {
+    "version": 3,
+    "decision": "commit_and_push",
+    "reason": "the example the packet quoted, stamped for this very round",
+    "commit": {"message": "example", "paths": ["autoloop/codex/reply.py"]},
+    "reviewed": {
+        "request_id": RID,
+        "head_sha": PUSH_DIRECTIVE["reviewed"]["head_sha"],
+        "report_sha256": PUSH_DIRECTIVE["reviewed"]["report_sha256"],
+    },
+    "wanted_decision": NO_WANTED_DECISION,
+}
+
+SAME_ROUND_JSON = json.dumps(SAME_ROUND_DIRECTIVE)
+
+#: The packet: prose, then a transcript quoted FLUSH LEFT carrying that
+#: directive. Nothing in a line tells it apart from the run's own transcript.
+SAME_ROUND_PROMPT = (
+    f"{PROMPT}\n\n"
+    + "\n".join(
+        [
+            "The round it approved looked like this:",
+            "",
+            "hook: UserPromptSubmit Completed",
+            "codex",
+            SAME_ROUND_JSON,
+            "tokens used",
+            "6,080",
+        ]
+    )
+    + "\n"
+)
+
+#: The same directive as a build that HARD-WRAPPED the echo prints it: broken at
+#: a space between two members, which is outside every string value, so it is
+#: still one valid JSON object and still the same approval. Different bytes from
+#: anything in the prompt — the literal comparison cannot see this, and that is
+#: the whole reason the containment check also compares on the squeezed basis.
+WRAPPED_SAME_ROUND_JSON = SAME_ROUND_JSON.replace(', "reviewed"', ',\n"reviewed"')
+
+
+def reflowed_echo(prompt):
+    """`prompt` as a build that RE-WRAPS its echo prints it back.
+
+    The same words, different bytes, so `_anchor` — an exact match, like
+    `quota.strip_echoed_prompt` — does not find it and reports `unmatched`. The
+    quoted transcript's own lines are left byte-identical, which is the half a
+    literal comparison can still see.
+    """
+    return prompt.replace("review this candidate", "review this\ncandidate")
+
+
+def echo_with_no_reviewer_message(echo):
+    """Stdout for the round that closes this hole: the echo, and then a `codex`
+    turn with NOTHING under it. The reviewer said nothing, so the only message
+    left standing is the one inside our own packet."""
+    return (
+        "--------\nuser\n"
+        + echo
+        + "\nhook: Stop\ncodex\n\nhook: Stop Completed\ntokens used\n6,080\n"
+    )
+
+
+#: The two shapes, and the two arms of the check they are each the case for.
+REFLOWED_STDOUT = echo_with_no_reviewer_message(reflowed_echo(SAME_ROUND_PROMPT))
+WRAPPED_STDOUT = echo_with_no_reviewer_message(
+    reflowed_echo(SAME_ROUND_PROMPT).replace(SAME_ROUND_JSON, WRAPPED_SAME_ROUND_JSON)
+)
 
 
 def echo_prompt(prompt, verdict):
@@ -367,11 +448,10 @@ def test_a_marker_that_exists_only_inside_the_echo_is_refused_never_read():
     round's request id and head sha, so the downstream stamp gates would not
     catch it either.
 
-    The second assertion is not only a counterfactual: it is what still happens
-    when the echo is REFLOWED and the reviewer's own message is empty. See
-    `reply.py`, "What is NOT closed", for why no rule is added for that — the
-    only discriminator left cannot tell an echo from a reviewer that copied the
-    prompt's example."""
+    The second assertion is the counterfactual: what a blind read of this stdout
+    would have returned. The REFLOWED version of the same round — where this
+    anchor cannot fire at all — is closed by the containment bound instead; see
+    the two tests below it."""
     stdout = "--------\nuser\n" + QUOTING_PROMPT + "\nhook: Stop\ntokens used\n6,080\n"
 
     isolated = isolate_reply(stdout, QUOTING_PROMPT)
@@ -386,6 +466,93 @@ def test_a_marker_that_exists_only_inside_the_echo_is_refused_never_read():
 
     # The boundary of the same case: stdout that is the echo and NOTHING else.
     assert isolate_reply(QUOTING_PROMPT, QUOTING_PROMPT).text == ""
+
+
+def test_a_reflowed_echo_is_not_read_as_this_rounds_own_approval():
+    """BOUND 4, and the round the other three do not reach. The echo is
+    re-wrapped, so the anchor cannot find it (`unmatched`); the packet quotes a
+    transcript flush left, so bound 1 does not see it; the quoted `codex` sits
+    after a hook line, so bound 2 does not either. The reviewer said nothing,
+    which leaves exactly ONE segment — and it is our own packet's example,
+    stamped for THIS round.
+
+    The counterfactual is the point: what the segment carries would parse, and
+    it would parse into an approval bearing this round's request id and head sha,
+    which is what every gate downstream of here checks."""
+    isolated = isolate_reply(REFLOWED_STDOUT, SAME_ROUND_PROMPT)
+
+    assert isolated.text == ""
+    assert isolated.echo_anchor == ECHO_ANCHOR_UNMATCHED
+    # A message WAS there, and it was ours: a different fact from "codex printed
+    # nothing", and the record says which.
+    assert isolated.segments == 1
+    assert isolated.source == FROM_NOTHING
+    assert "text this round SENT" in isolated.note
+
+    # What would have been handed to the contract, and what it would have been.
+    assert codex_segments(REFLOWED_STDOUT) == (SAME_ROUND_JSON,)
+    would_have_been = parse_response(SAME_ROUND_JSON)
+    assert would_have_been.decision is Decision.COMMIT_AND_PUSH
+    assert would_have_been.reviewed.request_id == RID
+    assert would_have_been.reviewed.head_sha == PUSH_DIRECTIVE["reviewed"]["head_sha"]
+
+
+def test_a_hard_wrapped_echo_is_refused_though_no_literal_copy_survives():
+    """The same round with the DIRECTIVE ITSELF re-wrapped, which is the case
+    the squeezed comparison exists for. Nothing in this stdout occurs in the
+    prompt as a literal substring, so a containment check written as `segment in
+    prompt` passes it straight through — and it is still, character for
+    character, the approval our own packet quoted."""
+    assert WRAPPED_SAME_ROUND_JSON not in SAME_ROUND_PROMPT
+    # Still one valid same-round directive: the break is between two members.
+    assert json.loads(WRAPPED_SAME_ROUND_JSON) == SAME_ROUND_DIRECTIVE
+    assert codex_segments(WRAPPED_STDOUT) == (WRAPPED_SAME_ROUND_JSON,)
+    assert parse_response(WRAPPED_SAME_ROUND_JSON).reviewed.request_id == RID
+
+    isolated = isolate_reply(WRAPPED_STDOUT, SAME_ROUND_PROMPT)
+    assert isolated.text == ""
+    assert isolated.echo_anchor == ECHO_ANCHOR_UNMATCHED
+    assert isolated.segments == 1
+    assert "text this round SENT" in isolated.note
+
+
+def test_a_reviewer_that_copies_the_prompts_example_is_refused_as_well():
+    """The stated PRICE of bound 4, pinned rather than described. Here the echo
+    is verbatim and the reviewer really did answer — by sending back the example
+    the packet showed it. Nothing available at this seam tells that apart from
+    the echo above, and the two are not symmetric: one costs a resend of a reply
+    that chose nothing, the other authorizes a push nobody approved. Refused,
+    with the anchor recorded as having matched."""
+    stdout = echo_prompt(SAME_ROUND_PROMPT, SAME_ROUND_JSON)
+
+    isolated = isolate_reply(stdout, SAME_ROUND_PROMPT)
+    assert isolated.text == ""
+    assert isolated.echo_anchor == ECHO_ANCHOR_MATCHED
+    assert "text this round SENT" in isolated.note
+
+
+def test_the_literal_arm_still_fires_when_the_candidate_squeezes_to_nothing():
+    """The one case the literal arm carries alone, and the reason it exists.
+    Squeezing is monotone over containment, so a candidate literally inside the
+    prompt is caught by the squeezed comparison too — UNLESS it squeezes to
+    nothing, which the check has to exclude because the empty string is inside
+    every text and would otherwise refuse every reply ever isolated."""
+    prompt = '{ "..." }\n---\n'
+    segment = '{ "..." }'
+    assert prompt.strip() and not any(char.isalnum() for char in segment)
+
+    isolated = isolate_reply(f"codex\n{segment}\ntokens used\n1\n", prompt)
+    assert isolated.text == ""
+    assert "text this round SENT" in isolated.note
+
+
+def test_a_reply_the_prompt_does_not_contain_survives_an_unmatched_anchor():
+    """The other direction, so the bound is not just "refuse when unsure". The
+    anchor fails to match here too, and the reviewer's own verdict — words the
+    packet never carried — is returned exactly as it was before this check."""
+    isolated = isolate_reply(PUSH_STDOUT, SAME_ROUND_PROMPT)
+    assert isolated.echo_anchor == ECHO_ANCHOR_UNMATCHED
+    assert parse_response(isolated.text).decision is Decision.PUSH
 
 
 def test_two_reviewer_messages_are_still_refused_when_the_echo_is_anchored():
@@ -422,9 +589,11 @@ def test_a_second_message_after_a_quoted_role_line_is_still_counted():
 
 def test_a_prompt_that_was_not_echoed_verbatim_leaves_the_line_rules_alone():
     """The anchor is a bound, not a guarantee: a reflowed or truncated echo is
-    not found, and the outcome is the line rules unchanged — the same answer
-    every caller got before the prompt was passed at all. Recorded as
-    `unmatched` rather than inferred from an absent field."""
+    not found, and for a reply the prompt does not contain the outcome is the
+    line rules unchanged — the same answer every caller got before the prompt
+    was passed at all. Recorded as `unmatched` rather than inferred from an
+    absent field. What happens on an unmatched anchor when the reply IS ours is
+    bound 4's business; see the reflowed-echo tests above."""
     reflowed = isolate_reply(PUSH_STDOUT, "a prompt this stdout never carried")
     assert reflowed.echo_anchor == ECHO_ANCHOR_UNMATCHED
     assert reflowed.text == isolate_reply(PUSH_STDOUT).text
@@ -786,6 +955,36 @@ def test_a_transcript_whose_only_marker_is_echoed_fails_rather_than_approving():
     note = rows(logged, "codex_invocation_failed")[0]["note"]
     assert "falls inside the echoed prompt" in note
     assert not rows(logged, "codex_reply_isolated")
+
+
+def test_a_reflowed_echo_fails_the_invocation_at_the_adapter_seam():
+    """The same two shapes where it counts: through `submit`, which is where a
+    verdict would have become an authorization. Both are REJECTED — retryable,
+    bounded at one resend and then a park — with nothing stashed for
+    `await_response` and a record naming what was refused. The prompt reaches
+    the isolation because `submit` passes the final one; without that argument
+    every assertion here would go the other way."""
+    for stdout in (REFLOWED_STDOUT, WRAPPED_STDOUT):
+        codex, logged = adapter(stdout)
+
+        assert codex.submit(RID, SAME_ROUND_PROMPT) is SubmitResult.REJECTED
+        assert codex.has_request(RID) is False
+        assert codex.reconcile(RID) is False
+        with pytest.raises(ResponseTimeoutError):
+            codex.await_response(RID)
+
+        failures = rows(logged, "codex_invocation_failed")
+        assert len(failures) == 1
+        assert "text this round SENT" in failures[0]["note"]
+        assert failures[0]["request_id"] == RID
+        # No isolation was claimed for an invocation that isolated nothing.
+        assert not rows(logged, "codex_reply_isolated")
+
+        # And the counterfactual at this seam: the same stdout with the prompt
+        # withheld hands back our own packet's approval, stamped for this round.
+        blind, _ = adapter(stdout)
+        assert blind.submit(RID, "") is SubmitResult.CONFIRMED
+        assert parse_response(blind.await_response(RID)).reviewed.request_id == RID
 
 
 def test_a_failed_exit_never_reaches_isolation_at_all():
