@@ -62,13 +62,41 @@ path is empty by construction — the remedy is an operator raising a limit — 
 every entry is `RECOVER_UNAVAILABLE` with a budget of 0 and the set-aside fires
 on the first occurrence. `SESSION_CEILING_CODES` is the deliberate exclusion
 beside them, and is refused exactly like a hard halt.
+
+halt-04 (2026-09-01) adds the FOURTH half, `REFUSED_WORK_RECOVERIES`: seven
+codes that are none of the three above. Nothing transient failed, no record went
+stale and no counter ran out — the loop REFUSED the work a round produced, and
+then parked so a human could relay that refusal to the agent by hand. A refusal
+is feedback, so every one of them is instead returned to the agent as feedback:
+`RECOVER_BY_REVISING` re-dispatches the task with the refusal's own text as the
+`revise` feedback.
+
+THE REPEAT GUARD IS THE HARD PART, not the resend, and it is metered on the
+REFUSAL rather than on its code. `refusal_identity` digests one refusal's
+(code, question, detail); `BlockerStore.note_refusal_revise` spends that
+identity's single allowance at the moment a revise is issued, and
+`BlockerStore.refusal_revises` counts it back across every record on disk,
+closed ones included. So the SAME complaint arriving again sets the task aside,
+while a genuinely different complaint under the same code is feedback the agent
+has never been given and gets its own revise. That is why the meter is not
+keyed on (task, code): two occurrences of `post_commit_verification_failed` are
+routinely two different faults, and parking the second because the first spent
+the code's allowance would park work that had an answer.
+
+WHAT STOPS A CODE THAT CHURNS ITS TEXT, since the identity meter by itself does
+not: every self-issued revise is dispatched through the ordinary path, so it
+costs one of `MAX_TASK_ATTEMPTS` and one of `policy.max_review_rounds` exactly
+as a reviewer's does — and both ceilings are themselves set-aside codes in
+`EXHAUSTED_BUDGET_RECOVERIES`. A task whose refusals never repeat therefore
+ends at `attempt_count_ceiling`, quarantined, rather than looping.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -222,6 +250,28 @@ RECOVER_UNAVAILABLE = "none"
 #: transcript before it is cleared — so "no operator step" never means "no
 #: record of what was discarded".
 RECOVER_BY_REBUILDING_AT_HEAD = "rebuild_at_head"
+
+#: RETURN THE REFUSAL TO THE AGENT AS FEEDBACK (halt-04, 2026-09-01): re-dispatch
+#: the task as a `revise` whose `feedback` is the refusal text this park was
+#: about to show a human. The one action every entry in
+#: `REFUSED_WORK_RECOVERIES` takes.
+#:
+#: Distinct from `RECOVER_BY_RESUMING` in what it re-enters. A resume steps the
+#: SAME phase again and hopes a transient fault has passed; this runs a NEW round
+#: of work, with the reason the last one was refused in front of the agent that
+#: has to fix it. Nothing about the refused candidate is rolled back or
+#: discarded: `revise` continues the same execution record, the same worker
+#: repository and the same task branch, so the refused commit stays exactly where
+#: it is and the next round is built on top of it — the "park and report, never
+#: undo" rule every one of these sites already states.
+#:
+#: Distinct from `RECOVER_BY_REBUILDING_AT_HEAD` in what it costs and therefore
+#: in how it is bounded. A rebuild REMOVES the record that caused the fault, so
+#: the identical fault cannot recur off it; a revise removes nothing, so a second
+#: identical refusal is genuinely possible and the whole design turns on refusing
+#: it. See the repeat guard in the module docstring, and `max_attempts = 1` on
+#: every entry below.
+RECOVER_BY_REVISING = "revise"
 
 
 # ---- WHICH record a rebuild archives ----------------------------------------
@@ -713,16 +763,224 @@ EXHAUSTED_BUDGET_RECOVERIES: dict[str, AutonomousRecovery] = {
 }
 
 
+# ---- halt-04's half: REFUSED WORK, returned to the agent as feedback --------
+#
+# A refusal is feedback. Every code below is the loop telling an agent that what
+# it produced cannot be accepted and WHY — and then parking, so that a human can
+# read the reason and type it back in. That relay is the whole of the operator
+# step, which is why these are worth automating and why the automation is a
+# `revise` rather than a retry: nothing here will pass on a second reading of the
+# same tree.
+#
+# MEASURED 2026-08-24 over 131 resolved blocker records:
+# `post_commit_verification_failed` 7 parks / 14.0h; `review_feedback_unchanged`
+# 4 parks / 35.4h and the highest MEDIAN of any code at 5.92h — an operator who
+# does not know what to do with it quickly.
+#
+# EVERY ENTRY IS `max_attempts = 1`, and that number is the claim. One revise per
+# REFUSAL — per `refusal_identity`, not per (task, code) — metered on
+# `BlockerStore.refusal_revises`, which counts every record on disk and is blind
+# to phase, so the same complaint raised one phase along keeps spending the same
+# allowance rather than buying a second. `review_feedback_unchanged` exists as a
+# code precisely because a reviewer repeating itself is a recognised failure;
+# resending without that bound would convert a park into an infinite loop, which
+# is strictly worse than the park.
+#
+# KEYED ON THE REFUSAL BECAUSE A CODE IS NOT A COMPLAINT.
+# `post_commit_verification_failed` names five different checks and
+# `commit_refused` covers every reason git declined a commit; a second occurrence
+# saying something genuinely different is feedback the agent has never been
+# given, and refusing to hand it over because a sibling fault already spent the
+# code's allowance would park work that had an answer. What that costs is that a
+# code whose text changes every round is not bounded HERE, which is why the three
+# bounds below are load-bearing rather than decorative.
+#
+# THREE FURTHER BOUNDS ALREADY EXIST and are not re-implemented here, because a
+# fourth copy of a limit is a fourth place for it to disagree with itself:
+#
+#   * `orchestrator._revise_feedback_is_unchanged` refuses a `revise` whose
+#     feedback repeats the last one verbatim — which is exactly what a self-issued
+#     revise carrying an unchanged refusal would be;
+#   * `policy.max_review_rounds` refuses the round outright once the cap is
+#     reached (`review_round_cap`, itself a set-aside code above);
+#   * `MAX_TASK_ATTEMPTS` is charged before the executor runs, so every self-issued
+#     revise costs an attempt exactly as a reviewer's does and ends at
+#     `attempt_count_ceiling` — also a set-aside code above.
+#
+# WHAT THIS DOES NOT REACH, stated positively rather than left as a gap. Two of
+# the seven are raised at TWO sites: `push_not_descendant` and
+# `push_tree_mismatch` each have a changeset arm (`_dispatch_changeset_push`)
+# that names no task at all, because an operator's changeset has no roadmap task
+# by construction. A `revise` needs a task to revise, so that arm parks exactly
+# as it does today — `_autonomous_set_aside_task` answers `None` and the plan is
+# dropped, which is the same fail-closed path a park with no round in flight
+# already takes.
+REFUSED_WORK_RECOVERIES: dict[str, AutonomousRecovery] = {
+    entry.code: entry
+    for entry in (
+        AutonomousRecovery(
+            code="post_commit_verification_failed",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "MEASURED 2026-08-24: 7 parks, 14.0h. The park text already IS "
+                "the feedback — it names every failing check by name (ancestry, "
+                "an empty commit range, a worktree left dirty, failing "
+                "post-commit validation, validation that mutated the tree) and "
+                "the operator's whole step is relaying that list to the agent "
+                "that wrote the commit. The candidate is neither rolled back nor "
+                "pushed either way, so a revise round starts from exactly the "
+                "tree the refusal describes."
+            ),
+        ),
+        AutonomousRecovery(
+            code="commit_refused",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "The commit was refused BEFORE it happened — HEAD drift, or a "
+                "path list git would not accept — so nothing was committed and "
+                "nothing was rolled back. The exception text is the whole "
+                "diagnosis and the next round is the remedy. The one code here "
+                "whose round produced no candidate at all, which changes nothing "
+                "about the shape: `revise` continues the same execution record, "
+                "and a record with no candidate simply cuts its first one."
+            ),
+        ),
+        AutonomousRecovery(
+            code="review_feedback_unchanged",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "MEASURED 2026-08-24: 4 parks, 35.4h, and the highest median of "
+                "any code at 5.92h — the operator does not know what to do with "
+                "it quickly. The park says the reviewer asked for the same change "
+                "twice, so the executor did not alter what was asked; the "
+                "feedback IS on record and IS quoted in the park text. Returning "
+                "it once, labelled as a refusal rather than as a fresh reviewer "
+                "request, is the one move that can change the outcome. THE "
+                "SHARPEST CASE FOR THE BOUND: a second unchanged round is the "
+                "definition of this code, so what arrives the second time is the "
+                "identical refusal — which is exactly what the identity meter "
+                "recognises, and what `_revise_feedback_is_unchanged` would catch "
+                "even if the meter did not."
+            ),
+        ),
+        AutonomousRecovery(
+            code="review_packet_build_failed",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "The candidate passed post-commit review and could not be "
+                "PRESENTED — most often a range diff over the render cap, which "
+                "is a property of what was committed and therefore something the "
+                "next round can change. It is raised at two sites and both are "
+                "answerable by the agent: the build failure itself, and the "
+                "stat-only split ask the reviewer declined. Neither rolls the "
+                "commit back and neither pushes anything, so the revise is a "
+                "further round on the same branch and nothing else."
+            ),
+        ),
+        AutonomousRecovery(
+            code="approved_paths_missing",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "THE ENTRY WHOSE REVISE IS EXPECTED TO BE RE-REFUSED, and it is "
+                "here deliberately rather than in spite of that. The task carries "
+                "no `approved_paths`, the gate that says so runs before the "
+                "executor, and an agent cannot widen its own authorization — that "
+                "circularity is M1 finding #2 and it stays closed. So the "
+                "self-issued revise reaches the same gate, is refused identically, "
+                "and the repeat guard sets the task aside: one dispatch that runs "
+                "no agent and touches no repository, and then a quarantine the "
+                "loop works past. Skipping it because the loop can predict the "
+                "answer would be a pre-flight judgement about whether feedback "
+                "will help, which is exactly the judgement this table is not "
+                "entitled to make."
+            ),
+        ),
+        AutonomousRecovery(
+            code="push_not_descendant",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "An approved candidate that is not a descendant of the task base: "
+                "the reviewed line and the recorded line have parted, so nothing "
+                "is pushed. TASK ARM ONLY — the changeset arm names no task and "
+                "parks as it does today (see the note above this table). A revise "
+                "re-cuts the round on the recorded base and produces a candidate "
+                "an approval can be bound to, which is what the park asks a human "
+                "to arrange by hand."
+            ),
+        ),
+        AutonomousRecovery(
+            code="push_tree_mismatch",
+            action=RECOVER_BY_REVISING,
+            max_attempts=1,
+            why=(
+                "The reviewed candidate's TREE is no longer the tree that was "
+                "reviewed, so the approval no longer describes what would be "
+                "published and nothing is pushed. Same two arms and the same "
+                "restriction as `push_not_descendant`: the task arm revises, the "
+                "changeset arm parks. The remedy is a fresh round producing a "
+                "candidate that can be reviewed again — never a push of the tree "
+                "that drifted, which this path cannot reach at all."
+            ),
+        ),
+    )
+}
+
+
 #: THE table `autonomous_recovery` reads — halt-02's transport half, halt-03's
-#: stale-record half and halt-01's exhausted-budget half, merged. One lookup,
-#: one set of refusals: a caller that consulted `STALE_RECORD_RECOVERIES` or
-#: `EXHAUSTED_BUDGET_RECOVERIES` directly would bypass the refusals in
+#: stale-record half, halt-01's exhausted-budget half and halt-04's refused-work
+#: half, merged. One lookup, one set of refusals: a caller that consulted
+#: `STALE_RECORD_RECOVERIES`, `EXHAUSTED_BUDGET_RECOVERIES` or
+#: `REFUSED_WORK_RECOVERIES` directly would bypass the refusals in
 #: `autonomous_recovery`, which is why nothing does.
 AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
     **TRANSPORT_RECOVERIES,
     **STALE_RECORD_RECOVERIES,
     **EXHAUSTED_BUDGET_RECOVERIES,
+    **REFUSED_WORK_RECOVERIES,
 }
+
+
+def refusal_identity(code: str, question: str, detail: str) -> str:
+    """A stable digest of ONE refusal — the thing the repeat guard compares
+    (halt-04).
+
+    Over `code`, `question` and `detail` together, whitespace-collapsed and
+    case-folded, because those three are the whole of what `_to_needs_user` was
+    given and therefore the whole of what the agent is about to be shown. Same
+    normalisation rule and same deliberate non-fuzziness as
+    `orchestrator._normalise_feedback`: a re-wrap must not read as a new
+    refusal, and two genuinely different complaints must always be allowed to
+    be different.
+
+    **This IS the repeat guard's key**, and its exactness is the point: the
+    guard has to distinguish "the loop is saying the same thing again", which is
+    a loop and must stop, from "the loop is saying something new", which is
+    feedback the agent has never been given. A fuzzy digest would silently
+    collapse the second case into the first and park work that had an answer.
+
+    What it deliberately does NOT bound is a code whose text changes every
+    round — `post_commit_verification_failed` names a commit sha, so two
+    occurrences of the same underlying fault can digest differently. That case
+    is bounded elsewhere and on purpose: every self-issued revise costs an
+    attempt from `MAX_TASK_ATTEMPTS` and a round from `policy.max_review_rounds`,
+    both of which end in a set-aside code. Widening this digest to cover it would
+    trade a bounded churn for a guard that cannot tell two faults apart.
+
+    Returns `""` for a refusal with no text at all, which `refusal_revises` and
+    `orchestrator._refusal_revise_budget` both read as "no identity to meter" —
+    the textless refusal is refused outright rather than revised, so `""` can
+    never be stored and two absences can never read as a match.
+    """
+    normalised = " ".join(f"{code}\n{question}\n{detail}".split()).strip().lower()
+    if not normalised or normalised == code.strip().lower():
+        return ""
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
 def autonomous_recovery(code: str) -> AutonomousRecovery | None:
@@ -770,6 +1028,20 @@ class Blocker:
     #: to clear a dead blocker would forge exactly the operator confirmation
     #: `_RESOLUTION_PRECONDITIONS` exists to require.
     archived_reason: str = ""
+    #: Every `refusal_identity` this record has already been answered with a
+    #: self-issued `revise` (halt-04) — the repeat guard's memory, and the only
+    #: thing `refusal_revises` counts. Appended by `note_refusal_revise` at the
+    #: moment the loop commits to a revise, never on a park that merely happened,
+    #: so it records ACTIONS THE LOOP TOOK rather than occurrences it saw.
+    #:
+    #: Persisted on the blocker rather than on the execution record because a
+    #: refusal is not always about a task that HAS one (`approved_paths_missing`
+    #: is raised before any record exists) and because the blocker is the record
+    #: that already survives a set-aside deleting the session file. Empty on
+    #: every record written before this field existed and on every code
+    #: autonomous mode does not answer with a revise, which `load` supplies by
+    #: default and `refusal_revises` reads as "nothing spent here".
+    revised_refusals: list[str] = field(default_factory=list)
 
 
 #: Severity rank for primary selection — LOWER is more urgent. `loop_fatal`
@@ -873,9 +1145,24 @@ class BlockerStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return Blocker(**data)
+            blocker = Blocker(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(f"blocker record {path} is unreadable: {exc}") from exc
+        # halt-04: the meter's own field is type-checked once, here, rather than
+        # at every read. `refusal_revises` calls `.count` on it, and a
+        # hand-edited `revised_refusals` that is a string would count SUBSTRINGS
+        # while one that is `null` would raise an AttributeError out of a park
+        # handler. Either way the honest answer is the one this module gives
+        # everywhere else: a record we cannot read is not a record that says
+        # nothing was spent.
+        if not isinstance(blocker.revised_refusals, list) or not all(
+            isinstance(entry, str) for entry in blocker.revised_refusals
+        ):
+            raise StateCorruptError(
+                f"blocker record {path} is unreadable: `revised_refusals` is not "
+                "a list of refusal identities"
+            )
+        return blocker
 
     def next_id(self, task_id: str) -> str:
         """`f"blk-{task_id}-{n:03d}"` for the next free `n` — scans existing
@@ -905,7 +1192,21 @@ class BlockerStore:
     def record(self, *, task_id, kind, code, question, detail, phase, now,
                session_id: str = "") -> "Blocker":
         """Idempotent upsert. Returns the existing open blocker for this
-        condition with its recurrence count bumped, or a new one."""
+        condition with its recurrence count bumped, or a new one.
+
+        Deliberately does NOT touch `revised_refusals`: this method records that
+        a fault was SEEN, and the repeat guard meters what the loop DID about it
+        (`note_refusal_revise`). `replace` carries the field over unnamed, which
+        is what keeps a bump from blanking the guard's memory of an episode while
+        claiming to update it.
+
+        WHAT `replace` CARRIES OVER IS THE LIST OBJECT, not a copy — `bumped` and
+        `existing` share one. That is why `note_refusal_revise` REBINDS the field
+        to a new list rather than appending to it, and why anything else writing
+        this field must do the same: an in-place `.append` here would write
+        through both records at once, and through whichever other record a caller
+        still holds.
+        """
         existing = self.find_open(task_id, code, phase)
         if existing is not None:
             from dataclasses import replace
@@ -925,6 +1226,68 @@ class BlockerStore:
         )
         self.save(fresh)
         return fresh
+
+    def note_refusal_revise(self, blocker_id: str, fingerprint: str) -> "Blocker":
+        """Spend this refusal identity's one revise allowance, on this record
+        (halt-04). THE ONLY WRITER of `Blocker.revised_refusals`.
+
+        Called at the moment the loop COMMITS to a self-issued revise — before
+        the round is queued, never after it returns. A process that dies between
+        the two leaves the attempt spent and the round unrun, which is the safe
+        direction: the next occurrence of that refusal is set aside rather than
+        revised a second time. The reverse order would let a crash refund an
+        attempt the loop had already decided to make.
+
+        An EMPTY fingerprint RAISES rather than being appended. `refusal_identity`
+        returns `""` for a refusal with no text, and a stored `""` would be a
+        meter entry that every other textless refusal matched — a task set aside
+        on two absences rather than on a repeat. Its one caller refuses a
+        textless refusal a step earlier, so reaching here with one is a bug and
+        is reported as one.
+        """
+        if not fingerprint:
+            raise StateError("a refusal with no identity cannot be metered")
+        blocker = self.load(blocker_id)
+        if blocker is None:
+            raise StateError(f"no blocker with id '{blocker_id}'")
+        blocker.revised_refusals = [*blocker.revised_refusals, fingerprint]
+        self.save(blocker)
+        return blocker
+
+    def refusal_revises(self, task_id: str, fingerprint: str) -> int:
+        """How many self-issued revises this task has already been given for THIS
+        refusal identity — halt-04's meter, read by
+        `orchestrator._refusal_revise_budget`.
+
+        Keyed on the refusal rather than on its code, which is the whole of the
+        repeat guard: the same complaint twice is a loop and must stop, while a
+        different complaint under the same code is feedback the agent has never
+        been given. `refusal_identity` folds the code into the digest already, so
+        this is blind to code and to phase without needing to be told either —
+        the same phase-blindness `open_recurrences` has, and for the same reason.
+
+        **Counts CLOSED records as well as open ones.** An operator answering the
+        blocker, `archive_stale` retiring its session and `close_recovered` all
+        end the episode, and a meter that forgot the attempt at that moment would
+        hand the identical refusal a fresh allowance every time a record went
+        away. Nothing in this package deletes a blocker record, so the memory is
+        permanent by construction rather than by a record being left open.
+
+        An empty `fingerprint` counts NOTHING and returns 0 — `""` may never
+        match `""`. Its caller refuses a textless refusal outright rather than
+        metering it, so that 0 can never license one.
+
+        Reads through `all_blockers`, so a corrupt record RAISES rather than
+        reading as "nothing spent", which would be the fail-open answer: a
+        further revise licensed by evidence that could not be read.
+        """
+        if not fingerprint:
+            return 0
+        return sum(
+            blocker.revised_refusals.count(fingerprint)
+            for blocker in self.all_blockers()
+            if blocker.task_id == task_id
+        )
 
     def archive_stale(self, blocker_id: str, reason: str) -> "Blocker":
         """Close a blocker that belongs to a RETIRED session, recording a

@@ -29,6 +29,39 @@ rewrites.
 Status is one of `pending`, `in_progress`, `blocked`, `completed`, `retired`,
 `shipped_elsewhere`, `quarantined`. Only `completed` satisfies a dependency.
 
+## Blocker record
+
+`blockers/<id>.json`, one per blocker, id `blk-<task>-<NNN>` (zero padded, so
+filename order is chronological within a task). `id`, `task_id`, `kind`
+(`task_fatal` | `loop_fatal`), `code`, `question`, `detail`, `phase`,
+`created_at`, `resolved_at`, `answer`, `recurrences`, `last_seen_at`,
+`session_id`, `archived_reason`, `revised_refusals`.
+
+`task_id` is `(loop)` for a blocker tied to no registry task; task ids cannot
+contain parentheses, so the two never collide. `answer` means an operator
+responded; `archived_reason` means the loop closed the record itself and is
+never written into `answer`.
+
+`recurrences` counts how many times the same (task, code, phase) has re-parked,
+and autonomous recovery meters its per-code budget on the sum of it across every
+OPEN record for a (task, code) — deliberately blind to phase, so a fault that
+migrates one phase along keeps spending one allowance.
+
+`revised_refusals` is a list of refusal identities — each a digest of one
+refusal's (code, question, detail) — that autonomous mode has already answered
+with a self-issued `revise`. It records ACTIONS, not occurrences: an entry is
+appended at the moment a revise is issued, never on a park that merely happened.
+The repeat guard meters one revise per identity and counts across CLOSED records
+too, so answering or archiving a blocker cannot refund an allowance. Empty on
+every record written before it existed and on every code autonomous mode does not
+answer with a revise. A value that is not a list of strings is treated as a
+corrupt record and RAISES, because "we cannot read the meter" must not read as
+"nothing was spent".
+
+Readers are tolerant of missing keys (each has a default) and INTOLERANT of
+unreadable ones: a record that fails to decode raises rather than reading as
+absent, because "no blocker" and "a blocker we cannot read" must not look alike.
+
 ## Transcript event
 
 `{"ts", "type", "iteration", "request_id", "data"}`. An operation that records
