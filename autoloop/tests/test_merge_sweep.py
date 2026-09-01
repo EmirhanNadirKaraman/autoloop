@@ -1401,6 +1401,76 @@ def test_a_candidate_at_the_head_STILL_shuts_the_gate_after_the_head_moves(tmp_p
     )
 
 
+def test_a_record_ORPHANED_of_its_task_does_not_hold_the_whole_sweep(tmp_path):
+    """The 2026-08-27 case, end to end and through real git.
+
+    `audit-0002` is not a task: absent from the registry, no worker directory,
+    never published, and — after `git filter-repo` rewrote every sha — bound to
+    a base this repository cannot place. That last fact put it in the gate's
+    fail-closed arm, which is correct for a record describing live work and
+    catastrophic for this one: `auto_merge_enabled` was on and NOTHING in the
+    repository could merge, with `select-02` published and waiting behind it.
+
+    The exclusion is reached through `cli._merge_window_blockers`, called not
+    copied, so the sweep gets it for free — and reports it, because a record an
+    operator now has to retire by hand must not vanish from the transcript.
+    """
+    b = build(tmp_path)
+    b.config.workers_root.mkdir(parents=True, exist_ok=True)
+    candidate = b.publish("select-02", {"a.py": "one\n"})
+    b.execution_store.save(
+        TaskExecution(
+            task_id="audit-0002",
+            task_branch="autoloop/audit-0002",
+            worktree_path="",
+            task_base_sha="278b93107ac6",      # rewritten away by the extraction
+            candidate_sha="8d96c52aeca4",
+            review_round=1,
+        )
+    )
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.SWEPT, (
+        f"one dead record must not hold the repository: {result.reasons}"
+    )
+    assert result.merged == ["select-02"]
+    assert contains(b.repo, b.head(), candidate)
+    assert b.entries("merge_sweep_deferred") == []
+    notes = [e["data"]["note"] for e in b.entries("merge_sweep_window_note")]
+    assert any("audit-0002" in note and "NOT in flight" in note for note in notes), (
+        f"excluded is not dropped — the record must be named: {notes}"
+    )
+
+
+def test_a_record_orphaned_of_its_task_but_WORKER_BACKED_still_defers_it(tmp_path):
+    """The other side of the same rule, in the same place. A worker repo where
+    the next dispatch would have created one may hold a round's work, so the
+    record is not inert and the sweep still refuses — the whole sweep, exactly
+    as it always did."""
+    b = build(tmp_path)
+    (b.config.workers_root / "audit-0002").mkdir(parents=True)
+    before = b.head()
+    b.publish("select-02", {"a.py": "one\n"})
+    b.execution_store.save(
+        TaskExecution(
+            task_id="audit-0002",
+            task_branch="autoloop/audit-0002",
+            worktree_path="",
+            task_base_sha="278b93107ac6",
+            candidate_sha="8d96c52aeca4",
+            review_round=1,
+        )
+    )
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.DEFERRED
+    assert result.merged == []
+    assert b.head() == before
+    assert any("audit-0002" in reason for reason in result.reasons), result.reasons
+
+
 def test_an_executing_phase_defers_the_sweep(tmp_path):
     """The other half of the same predicate: an agent may be mid-write in the
     checkout. Reached through `cli._merge_window_blockers`, called not copied."""
