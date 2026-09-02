@@ -2487,13 +2487,22 @@ class Orchestrator:
                     # finished); belt and braces for the step that completes
                     # against a state file some other path wrote.
                     self.state.rate_limit_retry_not_before = None
+                    # WHICH fleet episode this lane was inside, read before the
+                    # field is cleared and passed down rather than re-read: the
+                    # clear below must name the episode this lane OBSERVED, and
+                    # a method that looked the id up for itself would find the
+                    # blank it had just written.
+                    ended_episode = self.state.fleet_throttle_episode
+                    self.state.fleet_throttle_episode = ""
                     self._store.save(self.state)
                     # And the FLEET's copy of the same fact (conc-11), inside
                     # this guard rather than beside it: the evidence is a lane
                     # that was itself throttled and has now been served, which
-                    # is exactly what the guard tests. No-op at one lane, where
-                    # there is no shared record.
-                    self._end_fleet_throttle()
+                    # is exactly what the guard tests. It ends THAT episode and
+                    # not whatever episode happens to be on disk — another lane
+                    # may have opened a newer one while this one was recovering.
+                    # No-op at one lane, where there is no shared record.
+                    self._end_fleet_throttle(ended_episode)
 
     def _step(self, phase: Phase) -> None:
         # halt-04's self-issued `revise` is dispatched HERE, ahead of the phase
@@ -3845,9 +3854,9 @@ class Orchestrator:
             )
             return FLEET_THROTTLE_PARKED
 
-    def _end_fleet_throttle(self) -> None:
+    def _end_fleet_throttle(self, episode_id: str) -> None:
         """A step COMPLETED in this lane, so the account is serving requests
-        again: end the fleet's episode.
+        again: end THE EPISODE THIS LANE OBSERVED, and no other.
 
         Called from `run`'s `else` branch, and only from inside the same
         `if self.state.rate_limit_backoffs:` guard the per-lane reset lives in.
@@ -3859,6 +3868,24 @@ class Orchestrator:
         reset the streak it never observed, and the escalation would never
         reach `max_rate_limit_backoffs`.
 
+        THE GUARD ALONE IS NOT ENOUGH, and that is what `episode_id` is for. It
+        establishes that this lane was inside SOME episode, not that the record
+        on disk is still that one. Between the retry that served this lane and
+        this call, another lane can meet the limit again and open the NEXT
+        episode: an unconditional clear would delete a live deadline and the
+        counter that had just escalated to `n + 1`, so admission reopens
+        mid-window and the streak restarts — `max_rate_limit_backoffs`
+        unreachable, with nothing saying so. `FleetThrottleStore.clear` compares
+        under the same mutex `observe` takes, so the episode cannot change
+        between the comparison and the unlink.
+
+        AN EMPTY `episode_id` CLEARS NOTHING. A lane reaches this with one only
+        when it never observed a fleet episode at all — a state file written
+        before the field existed, or a counter left over from a single-lane run
+        of the same state directory — and "I cannot name what I was inside" is
+        not evidence about any record. The window still expires on its own
+        deadline; only the grace-length streak inheritance is paid for it.
+
         BEST EFFORT, and it must be: this runs in `run`'s `else` block, where a
         raise is caught by none of the `except` clauses above it. A clear that
         fails leaves a record whose window has already expired, and
@@ -3869,15 +3896,33 @@ class Orchestrator:
         throttle = self._fleet_throttle_store()
         if throttle is None:
             return
+        if not episode_id:
+            return
         try:
-            throttle.clear()
+            ended = throttle.clear(episode_id)
         except (StateError, OSError) as exc:
             self._log(
                 "fleet_throttle_clear_failed",
                 data={
                     "reason_code": "rate_limited",
                     "lane": self.lane_id,
+                    "episode_id": episode_id,
                     "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return
+        if not ended:
+            # Not a failure: the episode this lane was inside is already over,
+            # or another lane has opened a newer one that this lane has no
+            # standing to end. Logged because "the completed step did not clear
+            # the record" is otherwise invisible, and it is the exact fact an
+            # operator needs when the fleet stays held after a lane recovered.
+            self._log(
+                "fleet_throttle_clear_skipped",
+                data={
+                    "reason_code": "rate_limited",
+                    "lane": self.lane_id,
+                    "episode_id": episode_id,
                 },
             )
 
@@ -4339,6 +4384,12 @@ class Orchestrator:
             # ONE LANE. Byte-identical to what this handler has always done:
             # its own counter, its own schedule, its own stamp.
             state.rate_limit_backoffs += 1
+            # And no episode to name, so the field is emptied rather than left
+            # holding whatever a previous, differently-configured run of this
+            # state directory put there. It keeps the invariant
+            # `_end_fleet_throttle` relies on total: the id always describes the
+            # episode the CURRENT counter came from, or is empty.
+            state.fleet_throttle_episode = ""
             delay = self._rate_limit_delay(state.rate_limit_backoffs)
         else:
             # A FLEET. The episode is the fleet's, so the counter is SET to it
@@ -4348,6 +4399,11 @@ class Orchestrator:
             # attempts"), the budget check and the log entry all speak about
             # episodes rather than about this lane's share of them.
             state.rate_limit_backoffs = episode.backoffs
+            # WHICH episode, not merely how many. Persisted beside the counter
+            # so the step that eventually completes ends this episode and not a
+            # newer one another lane opened in the meantime, and so that still
+            # holds across the restart the counter itself is persisted for.
+            state.fleet_throttle_episode = episode.episode_id
             jitter = self._rate_limit_release_jitter()
             # The whole of what this lane still owes: the fleet's shared
             # deadline plus this lane's own release offset. A joiner therefore
@@ -4393,6 +4449,9 @@ class Orchestrator:
             entry["fleet_observations"] = episode.observations
             entry["fleet_opened_by"] = episode.opened_by
             entry["fleet_retry_not_before"] = episode.retry_not_before
+            # Which episode, so a transcript reader can follow one episode from
+            # the lanes that met it to the lane that ended it.
+            entry["fleet_episode_id"] = episode.episode_id
         self._log("rate_limited", data=entry)
         if not verdict.allowed:
             waited = state.rate_limit_wait_seconds

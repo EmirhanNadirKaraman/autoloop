@@ -35,10 +35,15 @@ Six parts, and each section below is one of them:
    read, the delay sequence and the persisted stamp are today's, and the park
    text is byte-identical.
 
-Two sections sit outside that six: the setting and what `health` shows, and the
+Three sections sit outside that six: the setting and what `health` shows; the
 one shape of requirement 2 that does not arrive through the queue at all — an
 EMPTY queue, where the caller's hold condition has nothing to hold, so the term
-that answers it is the plan's own `fleet_throttled` rather than its `held`.
+that answers it is the plan's own `fleet_throttled` rather than its `held`; and
+ENDING an episode, the half of the record's lifecycle the six do not reach.
+Opening and joining are decided under the mutex; the clear was not, and an
+unconditional one lets a lane that waited out episode *n* delete episode *n + 1*
+between another lane's opening it and its own completed step — a live deadline
+and an escalated counter erased by a lane that never saw either.
 
 No git repository, no subprocess and no agent: every claim here is about a
 small JSON file, a registry and a handler. The two places more than that is
@@ -1345,3 +1350,251 @@ def test_an_audit_round_that_meets_the_limit_joins_the_open_episode(tmp_path):
     ), "it waits out the REMAINDER of the open window, not a fresh copy"
     joined = entries(config, "rate_limited")[-1]
     assert joined["fleet_episode"] == 1 and joined["fleet_observations"] == 2
+
+
+# ---- ending an episode: which one, exactly ------------------------------------
+#
+# The half of the record's lifecycle the sections above do not reach. Opening and
+# joining are decided under the mutex; ENDING one was not — a completing lane
+# unlinked the file whatever it held. That is fine while the record can only ever
+# be the episode that lane observed, and it stops being fine the moment another
+# lane can open the next one in between, which is the ordinary shape of a fleet:
+# lane 0's retry succeeds, lane 1 meets the limit again, and lane 0's completed
+# step then deletes a live deadline and a counter that had just escalated.
+#
+# The identity is `FleetThrottle.episode_id`, mirrored into the observing lane's
+# own state file so it survives the process, and the clear compares against it
+# under the same mutex `observe` takes.
+
+
+def reopen_lane(config: AutoloopConfig, lane_index: int = 0):
+    """Another PROCESS over the same lane: everything is rebuilt, and the state
+    is LOADED from that lane's file rather than made fresh.
+
+    `build_lane` writes a new `LoopState` over whatever was there, which is what
+    every other test here wants and is exactly wrong for a durability claim.
+    """
+    store = StateStore(lane_state_file(config.state_dir, lane_index))
+    state = store.load()
+    assert state is not None, "nothing was persisted for this lane"
+    task_store = TaskStore(config.tasks_file)
+    registry = task_store.load() or TaskRegistry()
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=None,
+        executor=None,
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=lambda: None,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=ManifestStore(config.manifests_dir),
+        lane_index=lane_index,
+    )
+    orch._sleep = lambda _seconds: None
+    return orch
+
+
+def completes_a_step(orch: Orchestrator) -> None:
+    """Drive one step that finishes, which is `run`'s only evidence that the
+    account is serving requests again — and therefore the only thing that ends an
+    episode."""
+    orch.state.phase = Phase.READY.value
+    orch._step = lambda phase: setattr(orch.state, "phase", Phase.STOPPED.value)
+    orch.run(max_steps=1)
+
+
+def test_clear_removes_only_the_episode_it_names(tmp_path):
+    """The store's side of it, on its own: a clear naming an episode that is no
+    longer the stored one changes nothing and says so."""
+    config = make_config(tmp_path, lanes=2)
+    lane0, _ = build_lane(config, 0)
+    store = throttle_store(config)
+    opened = store.observe(delay_for=lane0._rate_limit_delay, lane_id="_lane-0")
+    assert opened.episode_id, "an episode that opens is named"
+
+    assert store.clear("episode-nobody-opened") is False
+    survivor = store.load()
+    assert survivor is not None and survivor.episode_id == opened.episode_id
+
+    assert store.clear(opened.episode_id) is True
+    assert store.load() is None
+    assert store.clear(opened.episode_id) is False, "and it is idempotent"
+
+
+def test_a_newer_episode_survives_the_older_lane_s_completed_step(tmp_path):
+    """THE RACE THE UNCONDITIONAL CLEAR LOST, and the reason the comparison is
+    not decoration.
+
+    Lane 0 waits out episode 1 and its retry is served. Before its step
+    completes, lane 1 meets the limit again — the window has closed, so that is
+    episode 2, at `previous + 1`, with a live deadline the whole fleet is now
+    inside. An unlink of "the record" would erase that deadline and put the
+    streak back to zero: admission reopens mid-window, `_rate_limit_delay` starts
+    over at 60s, and `max_rate_limit_backoffs` stops being reachable — the guard
+    switching itself off, with nothing saying so.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane0, _ = build_lane(config, 0)
+    throttled(lane0)
+    store = throttle_store(config)
+    first = store.load()
+    assert lane0.state.fleet_throttle_episode == first.episode_id
+
+    lane1, _ = build_lane(config, 1)
+    second = store.observe(
+        delay_for=lane1._rate_limit_delay,
+        lane_id="_lane-1",
+        now=first.deadline() + timedelta(seconds=3),
+    )
+    assert second.backoffs == 2, "a new episode, and the streak escalated"
+    assert second.episode_id != first.episode_id
+
+    completes_a_step(lane0)
+
+    surviving = store.load()
+    assert surviving is not None, "episode 2 was erased by a lane that never saw it"
+    assert surviving.episode_id == second.episode_id
+    assert surviving.backoffs == 2, "and the escalated counter is still there"
+    assert surviving.retry_not_before == second.retry_not_before
+    # The lane's OWN reset is unaffected — it really was served.
+    assert lane0.state.rate_limit_backoffs == 0
+    assert lane0.state.fleet_throttle_episode == ""
+    skipped = entries(config, "fleet_throttle_clear_skipped")
+    assert skipped and skipped[-1]["episode_id"] == first.episode_id, "not silent"
+
+
+def test_a_fresh_episode_one_is_not_the_old_episode_one(tmp_path):
+    """Why the identity cannot be `backoffs`, which is the cheap version of this
+    fix and is wrong.
+
+    A throttle arriving long after the last window closed starts a FRESH streak,
+    so it is episode 1 again — the same number the earlier episode carried. A
+    lane comparing on that number would delete the new one.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane0, _ = build_lane(config, 0)
+    store = throttle_store(config)
+    now = datetime.now(timezone.utc)
+    first = store.observe(delay_for=lane0._rate_limit_delay, lane_id="_lane-0", now=now)
+    fresh = store.observe(
+        delay_for=lane0._rate_limit_delay,
+        lane_id="_lane-1",
+        now=now + timedelta(hours=4),
+    )
+
+    assert (first.backoffs, fresh.backoffs) == (1, 1), "the same number"
+    assert fresh.episode_id != first.episode_id, "and not the same episode"
+    assert store.clear(first.episode_id) is False
+    assert store.load().episode_id == fresh.episode_id
+
+
+def test_every_lane_in_one_episode_names_the_same_id(tmp_path):
+    """One episode is ONE id however many lanes met it — the join copies the
+    opener's — so any lane that was inside it may end it, and none of them can
+    end anything else."""
+    config = make_config(tmp_path, lanes=3)
+    lanes = [build_lane(config, index)[0] for index in range(3)]
+
+    for lane in lanes:
+        throttled(lane)
+
+    record = throttle_store(config).load()
+    assert (record.backoffs, record.observations) == (1, 3)
+    assert {lane.state.fleet_throttle_episode for lane in lanes} == {record.episode_id}
+
+    completes_a_step(lanes[2])
+    assert throttle_store(config).load() is None, "a joiner may end its own episode"
+
+
+def test_the_observed_episode_id_outlives_the_process(tmp_path):
+    """Persisted beside the counter, and for the counter's reason: the episode
+    outlives the process that met it.
+
+    Held only in memory, a lane killed mid-back-off would come back unable to
+    name what it observed, so its completed step would end nothing and the record
+    would sit there with the streak on it — the next throttle inside the grace
+    escalating from a limit that had in fact lifted.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane0, _ = build_lane(config, 0)
+    throttled(lane0)
+    opened = throttle_store(config).load()
+
+    resumed = reopen_lane(config, 0)
+    assert resumed.state.fleet_throttle_episode == opened.episode_id
+    completes_a_step(resumed)
+
+    assert throttle_store(config).load() is None, "the episode it observed ended"
+
+
+def test_a_lane_that_cannot_name_an_episode_clears_nothing(tmp_path):
+    """The fail-closed direction of the empty id, which is what a state file
+    written before the field existed carries.
+
+    "I cannot name what I was inside" is not evidence about any record, so it
+    ends none. The cost is bounded and paid by the deadline: the window still
+    expires on its own.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane0, _ = build_lane(config, 0)
+    throttled(lane0)
+    lane0.state.fleet_throttle_episode = ""
+
+    completes_a_step(lane0)
+
+    assert fleet_throttle_file(config.state_dir).exists(), "no id, no clear"
+    assert lane0.state.rate_limit_backoffs == 0, "the lane's own reset still happens"
+
+
+def test_a_record_nobody_can_read_is_not_deleted_by_a_completed_step(tmp_path):
+    """The same rule the rest of this store keeps, on the one path that used to
+    break it: an unconditional unlink removed a record it had never read.
+
+    A record nobody can read is not a fleet that is free — it is what holds
+    admission (`HOLD_RATE_LIMITED`) and what `health` reports as `unreadable`.
+    Deleting it on the way past would be that alarm switched off by the loop
+    itself. It is refused and logged instead, so an operator has both the file
+    and the reason.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane0, _ = build_lane(config, 0)
+    throttled(lane0)
+    path = fleet_throttle_file(config.state_dir)
+    path.write_text("{ not json at all", encoding="utf-8")
+
+    completes_a_step(lane0)
+
+    assert path.exists(), "a record nobody can read is not a fleet that is free"
+    assert entries(config, "fleet_throttle_clear_failed"), "and it is not silent"
+    assert lane0.state.rate_limit_backoffs == 0, "the lane itself still recovered"
+
+
+def test_at_one_lane_a_completed_step_still_reads_no_record_at_all(tmp_path):
+    """The `lanes = 1` criterion on this path too: the id is never written, the
+    store is never built, and a stray record in the state directory is neither
+    read nor removed."""
+    config = make_config(tmp_path, lanes=1)
+    lane, _ = build_lane(config, 0)
+    throttled(lane)
+    assert lane.state.fleet_throttle_episode == ""
+    # A record left behind by a multi-lane run of the same directory.
+    stray = FleetThrottle(
+        backoffs=3,
+        retry_not_before=(
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(timespec="milliseconds"),
+        opened_at="x",
+        opened_by="_lane-1",
+        observations=2,
+        updated_at="x",
+        episode_id="somebody-else-s-episode",
+    )
+    throttle_store(config).save(stray)
+
+    completes_a_step(lane)
+
+    assert lane.state.rate_limit_backoffs == 0
+    assert throttle_store(config).load().episode_id == "somebody-else-s-episode"
