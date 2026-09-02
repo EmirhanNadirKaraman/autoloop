@@ -676,6 +676,31 @@ class ConcurrencyConfig:
     #: above; `0` and negatives are refused rather than read as "off", because
     #: the "off" this section could mean IS `1`.
     lanes: int = 1
+    #: How far apart N lanes are released from ONE fleet-wide rate-limit window
+    #: (conc-11). The fleet shares a single `retry_not_before` instant; each lane
+    #: adds `orchestrator.release_jitter_seconds(lane_index, lanes, this)` to it
+    #: before re-probing, so the lanes do not resynchronise on the tick the
+    #: window expires and hit the account together — which is the thundering
+    #: herd the shared window would otherwise merely delay by one wait.
+    #:
+    #: SMALL AND BOUNDED, and bounded is the operative half: the spread is
+    #: strictly less than this value, so an operator reading `health` sees one
+    #: fleet deadline plus an offset they can state, rather than a wait they
+    #: cannot predict. Five seconds spreads four lanes by 1.25s each — enough
+    #: that four re-probes are four requests the server sees separately, and
+    #: nothing like enough to matter against a 60-second first back-off.
+    #:
+    #: IN `[concurrency]` RATHER THAN `[browser]`, where the other two
+    #: rate-limit settings live, for the reason the whole of conc-11 is gated on
+    #: `lanes > 1`: this one exists only because there is a fleet, it is exactly
+    #: zero at one lane (`release_jitter_seconds` returns `0.0` there), and
+    #: putting it beside `rate_limit_backoff_seconds` would have added a key to
+    #: the section a single-lane deployment reads.
+    #:
+    #: `0.0` disables the spread and is a supported value: every lane then
+    #: releases on the shared deadline, which is still ONE episode — the
+    #: coalescing is the fleet record's job, not the jitter's.
+    rate_limit_release_jitter_seconds: float = 5.0
 
 
 #: The longest `[notify].timeout_seconds` this loop will accept. The round pays
@@ -1918,8 +1943,12 @@ def _load_concurrency_section(data: dict) -> ConcurrencyConfig:
     _check_keys(
         "concurrency", raw, {f.name for f in dataclasses.fields(ConcurrencyConfig)}
     )
+    jitter = _load_release_jitter(raw)
     if "lanes" not in raw:
-        return ConcurrencyConfig()
+        # `jitter` and not `ConcurrencyConfig()`: a config that names the spread
+        # and leaves `lanes` at its default must not have the spread silently
+        # dropped on the way past this early return.
+        return ConcurrencyConfig(rate_limit_release_jitter_seconds=jitter)
     lanes = raw["lanes"]
     # `bool` BEFORE `int`, exactly as `autonomy.max_recovery_attempts` orders
     # it, and for the same reason: `True` IS an int in Python and is `>= 1`, so
@@ -1953,7 +1982,54 @@ def _load_concurrency_section(data: dict) -> ConcurrencyConfig:
             "one to guess at. Raise MAX_LANES in autoloop/config.py if you "
             "really want more, so the decision is a reviewed commit."
         )
-    return ConcurrencyConfig(lanes=lanes)
+    return ConcurrencyConfig(lanes=lanes, rate_limit_release_jitter_seconds=jitter)
+
+
+#: The largest `[concurrency].rate_limit_release_jitter_seconds` this loop will
+#: accept, and a REFUSAL rather than a clamp, in this section's own style. The
+#: spread exists to stop N lanes re-probing in unison; a value big enough to be
+#: a wait in its own right stops being a spread and starts being an unpredictable
+#: back-off — the thing the setting's own docstring promises it is not. A minute
+#: is the outer limit that still reads as "small", the same shape
+#: `MAX_NOTIFY_TIMEOUT_SECONDS` uses for the same kind of promise.
+MAX_RELEASE_JITTER_SECONDS = 60.0
+
+
+def _load_release_jitter(raw: dict) -> float:
+    """`[concurrency].rate_limit_release_jitter_seconds`, validated.
+
+    Absent is the default. `bool` BEFORE the numeric check, exactly as `lanes`
+    orders it and for the same reason: `True` is an `int`, so `true` would
+    otherwise load as a one-second spread while reading as a switch somebody
+    turned on.
+    """
+    if "rate_limit_release_jitter_seconds" not in raw:
+        return ConcurrencyConfig().rate_limit_release_jitter_seconds
+    value = raw["rate_limit_release_jitter_seconds"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            "concurrency.rate_limit_release_jitter_seconds must be a number of "
+            f"seconds, got {value!r}. It is how far apart N lanes are released "
+            "from one shared rate-limit window; delete the key entirely for the "
+            f"default of {ConcurrencyConfig().rate_limit_release_jitter_seconds}, "
+            "or set 0 to release every lane on the shared deadline."
+        )
+    if value < 0:
+        raise ConfigError(
+            "concurrency.rate_limit_release_jitter_seconds must be at least 0, "
+            f"got {value!r} — a negative spread would release a lane BEFORE the "
+            "fleet's own deadline, which is the re-probe the window exists to "
+            "stop. 0 is the 'no spread' value."
+        )
+    if value > MAX_RELEASE_JITTER_SECONDS:
+        raise ConfigError(
+            "concurrency.rate_limit_release_jitter_seconds must be at most "
+            f"{MAX_RELEASE_JITTER_SECONDS}, got {value!r} — this is a spread "
+            "across lanes, not a back-off. Raise browser."
+            "rate_limit_backoff_seconds if the loop should wait longer before "
+            "re-probing; that setting is the one an operator reads as a wait."
+        )
+    return float(value)
 
 
 def load_config(path: Path) -> AutoloopConfig:

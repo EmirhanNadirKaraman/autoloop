@@ -1010,6 +1010,143 @@ the whole fleet idle. `os.execv` still replaces one process holding one lock, so
 nothing about the handoff, the token, the one-shot marker or the decline set
 changes.
 
+### A second interaction the plan omitted: one account allowance, N lanes
+
+Everything above this line was written without the words *rate limit*, *quota*,
+*throttle* or *backoff* appearing once, and that omission is a scheduling
+decision made by default. The existing back-off was designed for one loop:
+
+```
+browser.rate_limit_backoff_seconds     = 60      first wait
+browser.rate_limit_backoff_max_seconds = 600     ceiling
+policy.max_rate_limit_backoffs         = 6       then it parks
+delay = base * 2^(n-1), capped
+state: LoopState.rate_limit_backoffs, rate_limit_retry_not_before
+```
+
+Decision 2 gives every lane its own state file, so those last two fields become
+N independent counters — against **one** account allowance. `prov-02` measured
+that ceiling rather than assuming it: codex signed in with a ChatGPT account
+(`auth mode: chatgpt`, `stored API key: false`) draws on the same allowance the
+browser provider used, and that limit parked the loop for four hours on
+2026-08-17. At `lanes = 4` the unmodified design gives all four lanes the same
+limit at about the same time, four private records of it, the same deterministic
+60s computed four times, four re-probes on the same instant — and up to
+`4 x 6 = 24` throttled attempts spent discovering one limit a single lane would
+have found in 6. Every one of those extra attempts is a request against an
+allowance already known to be exhausted, which is the exact behaviour
+`_rate_limit_delay`'s own docstring says the escalation exists to prevent:
+"re-probing on a fixed short interval is itself a request stream — a slower
+version of the hammering this exists to stop."
+
+**conc-11's answer: the throttle is scoped to the FLEET.** One shared record,
+`state_dir/fleet_throttle.json`, beside the fleet lock and for the lock's own
+reason — one state directory is one account's fleet, so "this account is
+throttled" is a fact about the directory rather than about a lane. It holds one
+`retry_not_before` and one consecutive-episode counter, and five things follow
+from it:
+
+* **Coalescing.** A lane that meets the limit while the window is open JOINS
+  that episode: the counter does not move, the deadline is not extended, and the
+  lane waits out what remains rather than a fresh copy of it. A lane that meets
+  it after the window closed opens the next episode at `previous + 1`, so the
+  escalation is exactly the single-lane one — 60, 120, 240 — and never a fixed
+  interval. Read, decision and write happen inside one cross-process mutex
+  (`tasks.task_file_mutex`), because "read the record, decide, write it" done
+  outside one is how two lanes both open episode 1.
+* **Ending one is a compare-and-clear.** An episode carries an `episode_id`,
+  minted where it opens and copied by every lane that joins it; a lane records
+  the id it observed in its own state file, and the step that eventually
+  completes removes the shared record only while that id still matches — under
+  the same mutex. The unconditional version was wrong in a way a single-lane
+  test cannot see: between the retry that served one lane and its clear, another
+  lane can meet the limit again and open episode `n + 1`, and deleting that
+  erases a deadline the fleet is inside and a counter that had just escalated.
+  Admission would reopen mid-window and the streak would restart at 1, so
+  `max_rate_limit_backoffs` would stop being reachable — the guard switching
+  itself off, silently, at the moment it is needed most. `backoffs` is not an
+  identity for this: episode 1, then hours later a fresh episode 1, carry the
+  same number.
+* **Admission.** `FleetSupervisor.plan` holds every READY task
+  (`HOLD_RATE_LIMITED`) while the window is open, and holds — never passes — when
+  the record cannot be read; `cli._run_continuous` sleeps on that plan rather
+  than opening a session, with a queue or without one (see THE EMPTY QUEUE
+  below). A lane already mid-round finishes or parks by the existing rules; it
+  is admission that stops.
+* **A bounded release.** The shared deadline is one instant; lane *k* adds
+  `k/lanes` of `[concurrency] rate_limit_release_jitter_seconds` (5s by default)
+  before re-probing, so N lanes do not resynchronise on the tick the window
+  expires. Deterministic rather than random: the spread must be small, bounded
+  and *stateable* by an operator reading `health`, and a random draw is none of
+  the three.
+* **One budget for the fleet.** `max_rate_limit_backoffs` is checked against the
+  shared episode number, by a lane that merely joined an episode as much as by
+  the one that opened it. Checking only the opener would park that lane at the
+  sixth episode while the others waited forever on a fleet that had stopped.
+
+The record is not swept by anything, so streak inheritance is bounded: a
+throttle arriving more than one previous delay after the last window closed
+starts a fresh streak. Without that bound a fleet that parked at the sixth
+episode would leave a record making the *next* run's first throttle — hours
+later, about a different limit — open episode 7 and park on the spot. The
+escalation's premise is that the waits are consecutive, and two throttles an
+hour apart are not.
+
+**THE EMPTY QUEUE, which the admission bullet reaches through a second term.**
+That bullet arrives at `plan` through the QUEUE, and there is one shape of it no
+queue can carry. `cli._run_continuous` slept on a plan when the fleet was
+draining, or when the queue had entries and every one of them was held — so an
+**empty** queue held nothing, that read as "no fleet objection", and the
+iteration fell through to `_select_and_kickoff`, which on a changed repository
+fingerprint opens an audit session: a ChatGPT request against the allowance the
+fleet is waiting out, and a silent one, since `_log_fleet_hold` sits on the
+branch that was skipped. The plan already carried the answer
+(`FleetPlan.fleet_throttled`, set on exactly the same tick) and what was missing
+was one term in that condition, which is now there: `plan.draining or
+plan.fleet_throttled or (plan.held and not plan.admitted)`. It arrived one round
+late, under a scope adjustment for `autoloop/cli.py` — conc-11's own paths did
+not include that file, so its first round recorded the exact term and the exact
+regression test rather than reaching outside them.
+
+Admission is still refused a TICK at a time, so a round can meet the limit from
+somewhere no gate sees: a lane admitted in the instant before the window opened,
+and a lane an operator's lowered cap cut out of the fleet, are both in flight
+where `plan` has no say. Two things bound what such a round costs, and neither
+depends on the gate. It does NOT cost an extra episode — its own first request
+meets the same limit, and `_join_fleet_throttle` JOINS the open window, so
+`observations` grows and `backoffs` does not — which is why the claim ("N lanes
+throttled by one limit produce ONE backoff episode") never rested on admission
+control alone. What it costs is the wasted request, and it is not silent: the
+round writes the ordinary `rate_limited` entry with the fleet's own episode and
+observation counts on it.
+
+All of it is pinned rather than argued, in `test_fleet_throttle.py`'s last
+section: a plan taken with an EMPTY queue still carries `fleet_throttled` and
+the shared deadline (`held == ()` asserted as the distinct fact a `held`-only
+condition misreads); the real `cli._run_continuous` is driven two iterations
+deep with an open window and an empty queue, leaving no session file, no audit
+fingerprint and exactly one `fleet_hold` entry carrying the shared deadline —
+then reaching the selection on the very tick after the window expires, so the
+term is a gate and not a wedge; the same loop over a record nobody can DECODE
+holds and says which of the two it is, since an empty queue leaves `held` empty
+for that reason as well; the same loop over the same record at **one lane**
+reaches the selection on the FIRST iteration and logs no hold at all; and an
+audit-shaped round that does meet the limit leaves the record at one episode and
+two observations.
+
+Gating it inside `Orchestrator.run` instead — the alternative site, and the only
+one available before the scope adjustment — was considered and rejected: the
+only hook there is the step loop, `Phase.READY` recurs between the turns of a
+live round (a dozen transitions set it), and a gate on it would stall lanes
+*mid-round*, which is precisely what "a lane already mid-round finishes or parks
+by the existing rules; it is admission that stops" rules out.
+
+**And at `lanes = 1` none of this exists.** No record is written, none is read,
+`release_jitter_seconds` returns `0.0`, and `_handle_rate_limited` runs the line
+it has always run. The gate is `lanes > 1` in `FleetSupervisor.from_config` and
+in `Orchestrator._fleet_throttle_store`, which is the same structural device
+Decision 2 uses for lane 0's state file.
+
 ### The split, in dependency order
 
 Nine candidates. Each is independently reviewable and each leaves the loop

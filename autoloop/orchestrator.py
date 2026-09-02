@@ -445,6 +445,7 @@ from .state import (
     LANES_DIRNAME,
     TERMINAL_PHASES,
     ChunkedDelivery,
+    FleetThrottleStore,
     LastResponse,
     LoopState,
     PendingRequest,
@@ -454,6 +455,7 @@ from .state import (
     StateStore,
     StopRepetitionStore,
     abort_requested,
+    fleet_throttle_file,
     lane_paths,
     packet_outstanding_reason,
     postcommit_binding_from_record,
@@ -1289,6 +1291,16 @@ HOLD_LANE_UNREADABLE = "lane_unreadable"
 HOLD_AT_CAP = "fleet_at_cap"
 HOLD_SCOPE_CONFLICT = "scope_conflict"
 HOLD_IN_FLIGHT = "already_in_flight"
+#: The ACCOUNT is throttled, so no lane may start a round (conc-11). One
+#: allowance, N lanes: the limit is a fact about the fleet, and admitting a lane
+#: into a window another lane opened is a request against an allowance already
+#: known to be exhausted. Carried with the shared deadline appended, so a reader
+#: sees when it lifts rather than only that it has not.
+#:
+#: Also the answer when the fleet's throttle record cannot be READ — a gate that
+#: passes when what it needs is missing is not a gate, and this is the one whose
+#: absence looks exactly like "the account is fine".
+HOLD_RATE_LIMITED = "fleet_rate_limited"
 #: The one word `FleetSupervisor.plan` never produces, because the condition is
 #: invisible from inside it: THIS LANE is not in the fleet at all — its index is
 #: at or above `[concurrency] lanes`, which is what an operator lowering the cap
@@ -1309,6 +1321,59 @@ HOLD_LANE_RETIRED = "lane_outside_the_fleet"
 #: hold from every other refused directive without matching on prose. The reason
 #: text carries one of the `HOLD_*` words above inside it.
 FLEET_HOLD_DENIAL_CODE = "fleet_admission_held"
+
+#: What `FleetPlan.throttled_until` carries when the fleet's throttle record
+#: exists and cannot be READ. A sentinel rather than an empty string, because
+#: "no window is open" and "nobody can tell whether one is" are the two answers
+#: this whole record exists to keep apart — collapsing them is the fail-open
+#: where the alarm never fires and nothing says so.
+FLEET_THROTTLE_UNREADABLE = "unreadable"
+
+#: What `Orchestrator._join_fleet_throttle` answers when it could not read the
+#: fleet's throttle record and has PARKED instead. A sentinel rather than
+#: `None`, because `None` already means "one lane, there is no shared record at
+#: all" — collapsing the two would run the single-lane back-off on a fleet whose
+#: shared counter nobody can see, which is the fail-open the record exists to
+#: close, arriving through the record's own error path.
+FLEET_THROTTLE_PARKED = object()
+
+
+def release_jitter_seconds(lane_index: int, lanes: int, ceiling: float) -> float:
+    """How long after the fleet's SHARED deadline lane `lane_index` re-probes.
+
+    ZERO AT ONE LANE, unconditionally, and that is the point rather than an
+    optimisation: at `lanes = 1` the delay sequence, the persisted stamp and the
+    park behaviour have to be byte-identical to today's, and a spread of `0.0`
+    is what makes that structural instead of a claim somebody has to keep
+    checking.
+
+    DETERMINISTIC, not random, and the task's own constraint is the argument:
+    the spread must be "enough to spread N lanes, not enough to make the wait
+    unpredictable to an operator reading `health`". Every lane already knows its
+    own index and the fleet size, so an even fan-out — lane *k* releases
+    `k/lanes` of the ceiling after the shared deadline — spreads N lanes
+    perfectly and by a number `health` can state, where a random draw would
+    spread them only on average and would make two runs of the same test
+    disagree. `random.random()` here would also have to be seeded to be
+    testable, and a seeded random spread is a deterministic one wearing a
+    disguise.
+
+    The divisor is `max(lanes, lane_index + 1)` rather than `lanes`, so a lane
+    the operator's LOWERED CAP left running above the cap gets a slot of its
+    own instead of colliding with `lane_index % lanes` — the retired lane is
+    exactly the one that is still making requests while the supervisor cannot
+    see it, so it is the last one that should re-probe in unison with somebody.
+
+    The result is STRICTLY LESS than `ceiling` (the largest numerator is
+    `divisor - 1`), which is what lets the setting's own documentation promise a
+    bound an operator can rely on.
+    """
+    if lanes <= 1 or ceiling <= 0:
+        return 0.0
+    if lane_index <= 0:
+        return 0.0
+    divisor = max(lanes, lane_index + 1)
+    return float(ceiling) * (lane_index / divisor)
 
 
 def session_task_id(state: LoopState) -> str | None:
@@ -1380,6 +1445,18 @@ class FleetPlan:
     #: Is a self-upgrade waiting for the fleet to empty (Decision "an
     #: interaction the scheduler must answer")?
     draining: bool
+    #: The fleet's shared `retry_not_before` instant when the account is inside a
+    #: rate-limit window, `FLEET_THROTTLE_UNREADABLE` when the record could not
+    #: be read, and `""` — the ordinary state — when neither (conc-11).
+    #:
+    #: APPENDED LAST and defaulted, so every existing positional construction of
+    #: this record still builds.
+    throttled_until: str = ""
+
+    @property
+    def fleet_throttled(self) -> bool:
+        """Is the fleet inside a rate-limit window (or unable to tell)?"""
+        return bool(self.throttled_until)
 
     @property
     def free_lanes(self) -> int:
@@ -1415,11 +1492,21 @@ class FleetPlan:
 
     def describe(self) -> str:
         """One line for the transcript and for an operator reading it."""
-        return (
+        line = (
             f"{len(self.admitted)} admitted, {len(self.held)} held; "
             f"{len(self.occupants)}/{self.lanes} lanes busy"
-            + (" (draining for a self-upgrade)" if self.draining else "")
         )
+        if self.draining:
+            line += " (draining for a self-upgrade)"
+        # Appended only when it applies, so the ordinary line is unchanged — and
+        # it carries the HOLD WORD ITSELF rather than prose about it, for the
+        # reason the `HOLD_*` values exist: a reader (and a test) matches on a
+        # word, never on a sentence somebody reworded.
+        if self.throttled_until == FLEET_THROTTLE_UNREADABLE:
+            line += f" ({HOLD_RATE_LIMITED}: the fleet's own record is unreadable)"
+        elif self.throttled_until:
+            line += f" ({HOLD_RATE_LIMITED} until {self.throttled_until})"
+        return line
 
 
 def lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
@@ -1600,11 +1687,14 @@ class FleetSupervisor:
     that reaches a self-upgrade boundary (conc-06, `docs/AUTOLOOP.md`
     Decisions 3 and 4).
 
-    **It decides; it does not dispatch.** `plan()` is a pure function of the
-    registry, the busy lanes and whether an upgrade is pending. It never
+    **It decides; it does not dispatch.** `plan()` is a function of the
+    registry, the busy lanes, whether an upgrade is pending, and — since
+    conc-11 — whether the ACCOUNT is inside a rate-limit window. It never
     mutates the registry, never opens a session and never charges an attempt —
     a task it does not admit stays exactly `pending`, which is the whole of
-    Decision 3's "the task stays queued" promise.
+    Decision 3's "the task stays queued" promise. The two files it consults
+    (the lanes' state, the fleet throttle record) are READ; nothing here
+    creates either, so a plan leaves the state directory byte-identical.
 
     **TWO callers turn that decision into behaviour, and both are needed.**
     `cli._run_continuous` gates whether a lane OPENS a session at all — the cap
@@ -1628,7 +1718,12 @@ class FleetSupervisor:
     N=1 acceptance criterion is made structural.
     """
 
-    def __init__(self, lanes: int, trackers: tuple[str, ...] = TRACKER_PATHS):
+    def __init__(
+        self,
+        lanes: int,
+        trackers: tuple[str, ...] = TRACKER_PATHS,
+        throttle: FleetThrottleStore | None = None,
+    ):
         if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
             raise ValueError(
                 f"fleet size must be an integer of at least 1, got {lanes!r} — "
@@ -1638,11 +1733,50 @@ class FleetSupervisor:
             )
         self.lanes = lanes
         self._trackers = tuple(trackers)
+        #: The fleet's shared rate-limit record (conc-11), or `None` for a
+        #: supervisor that is not asked about the account at all. APPENDED LAST
+        #: and defaulted, so every existing construction — `FleetSupervisor(2)`
+        #: in the tests, and `_refused_outside_fleet_admission`'s own — keeps
+        #: exactly today's behaviour.
+        self._throttle = throttle
 
     @classmethod
     def from_config(cls, config) -> "FleetSupervisor":
-        """The one built from `[concurrency] lanes`."""
-        return cls(config.concurrency.lanes)
+        """The one built from `[concurrency] lanes`.
+
+        WIRED TO THE FLEET THROTTLE ONLY ABOVE ONE LANE, the same structural
+        gate `cli._fleet_plan` uses to answer `None` at `lanes = 1`: a
+        single-lane deployment has no fleet to coordinate, its back-off is
+        entirely `LoopState`'s two fields, and no `fleet_throttle.json` is ever
+        written or read for it.
+        """
+        lanes = config.concurrency.lanes
+        throttle = (
+            FleetThrottleStore(fleet_throttle_file(config.state_dir))
+            if lanes > 1
+            else None
+        )
+        return cls(lanes, throttle=throttle)
+
+    def _throttle_window(self, now: datetime | None) -> str:
+        """`FleetPlan.throttled_until` for this tick: the shared deadline while
+        the account is throttled, `FLEET_THROTTLE_UNREADABLE` when the record
+        cannot be read, `""` otherwise.
+
+        **NEVER RAISES**, and that is a requirement rather than a courtesy:
+        `cli._fleet_plan` has no `try` around it, so an exception here would
+        leave `_run_continuous` by traceback — no park, no blocker, no
+        heartbeat, which is the one exit shape this loop went out of its way to
+        eliminate. An unreadable record therefore becomes a HOLD, which is also
+        the honest reading of it: nothing known is not permission.
+        """
+        if self._throttle is None:
+            return ""
+        try:
+            record = self._throttle.window(now)
+        except (StateError, OSError):
+            return FLEET_THROTTLE_UNREADABLE
+        return record.retry_not_before if record is not None else ""
 
     def plan(
         self,
@@ -1650,6 +1784,7 @@ class FleetSupervisor:
         occupants: "tuple[LaneOccupant, ...] | list[LaneOccupant]" = (),
         upgrade_pending: bool = False,
         first: str = "",
+        now: datetime | None = None,
     ) -> FleetPlan:
         """Which READY tasks may start now, and why each of the others may not.
 
@@ -1663,15 +1798,28 @@ class FleetSupervisor:
            Admitting it into a second lane would run one task twice.
         2. `HOLD_DRAINING` — an upgrade is pending, so nothing new is admitted
            until the fleet is empty and the boundary is reached.
-        3. `HOLD_LANE_UNREADABLE` — a lane's state, or an occupant's scope,
+        3. `HOLD_RATE_LIMITED` — the ACCOUNT is inside a rate-limit window
+           (conc-11), or the record that would say so cannot be read. One
+           allowance backs every lane, so admitting one here is a request
+           against an allowance the fleet has already watched run out. Below
+           the drain because a drain ENDS (the fleet empties and the boundary
+           is taken) while a throttle merely expires, and a fleet holding for
+           both should report the one it is going somewhere with.
+        4. `HOLD_LANE_UNREADABLE` — a lane's state, or an occupant's scope,
            could not be read. The gate needs both to answer, and a gate that
            passes when what it needs is missing is not a gate.
-        4. `HOLD_AT_CAP` — every lane is busy (or already spoken for by an
+        5. `HOLD_AT_CAP` — every lane is busy (or already spoken for by an
            earlier admission this tick).
-        5. `HOLD_SCOPE_CONFLICT` — this task declares an entry that a lane
+        6. `HOLD_SCOPE_CONFLICT` — this task declares an entry that a lane
            already holds, or that a task admitted earlier this tick declares.
            Checked against BOTH, so one tick cannot co-schedule a conflicting
            pair by admitting them together.
+
+        THE THROTTLE IS READ ONCE PER TICK, before the loop, and only read: a
+        plan leaves the state directory byte-identical, which is what the cap's
+        own test asserts around this call. A lane already mid-round is not
+        touched by it either — it finishes or parks by the existing rules, and
+        what stops is ADMISSION.
 
         `first` moves ONE id to the head of the queue, and it exists for one
         caller: `Orchestrator._refused_outside_fleet_admission`, which asks this
@@ -1689,6 +1837,7 @@ class FleetSupervisor:
         own call) leaves the order exactly as the registry gave it.
         """
         occupants = tuple(occupants)
+        throttled_until = self._throttle_window(now)
         unreadable_lane = any(not occupant.readable for occupant in occupants)
         held_ids = {occupant.task_id for occupant in occupants if occupant.task_id}
         # The registry's own view of what is in flight, unioned with the lanes'.
@@ -1724,6 +1873,19 @@ class FleetSupervisor:
             if upgrade_pending:
                 held.append((task.id, HOLD_DRAINING))
                 continue
+            if throttled_until:
+                held.append(
+                    (
+                        task.id,
+                        f"{HOLD_RATE_LIMITED}: "
+                        + (
+                            "the fleet's throttle record cannot be read"
+                            if throttled_until == FLEET_THROTTLE_UNREADABLE
+                            else f"the account is throttled until {throttled_until}"
+                        ),
+                    )
+                )
+                continue
             if unreadable_lane or unknown_scope:
                 held.append((task.id, HOLD_LANE_UNREADABLE))
                 continue
@@ -1744,6 +1906,7 @@ class FleetSupervisor:
             held=tuple(held),
             occupants=occupants,
             draining=bool(upgrade_pending),
+            throttled_until=throttled_until,
         )
 
     def _first_conflict(
@@ -2324,7 +2487,22 @@ class Orchestrator:
                     # finished); belt and braces for the step that completes
                     # against a state file some other path wrote.
                     self.state.rate_limit_retry_not_before = None
+                    # WHICH fleet episode this lane was inside, read before the
+                    # field is cleared and passed down rather than re-read: the
+                    # clear below must name the episode this lane OBSERVED, and
+                    # a method that looked the id up for itself would find the
+                    # blank it had just written.
+                    ended_episode = self.state.fleet_throttle_episode
+                    self.state.fleet_throttle_episode = ""
                     self._store.save(self.state)
+                    # And the FLEET's copy of the same fact (conc-11), inside
+                    # this guard rather than beside it: the evidence is a lane
+                    # that was itself throttled and has now been served, which
+                    # is exactly what the guard tests. It ends THAT episode and
+                    # not whatever episode happens to be on disk — another lane
+                    # may have opened a newer one while this one was recovering.
+                    # No-op at one lane, where there is no shared record.
+                    self._end_fleet_throttle(ended_episode)
 
     def _step(self, phase: Phase) -> None:
         # halt-04's self-issued `revise` is dispatched HERE, ahead of the phase
@@ -3558,6 +3736,196 @@ class Orchestrator:
         delay = base * (2 ** max(0, backoffs - 1))
         return min(delay, ceiling) if ceiling else delay
 
+    # ---- the fleet's one throttle (conc-11) ---------------------------------
+    #
+    # One account allowance, N lanes. The three helpers below are the whole of
+    # this loop's side of it, and every one of them is a no-op at `lanes = 1`:
+    # `_fleet_lanes` answers 1, `_fleet_throttle_store` answers `None`, and
+    # `_rate_limit_release_jitter` answers 0.0 — so the single-lane back-off is
+    # not merely unchanged, it is unreachable from here.
+
+    def _fleet_lanes(self) -> int:
+        """`[concurrency] lanes`, read defensively.
+
+        `_refused_outside_fleet_admission`'s reading, borrowed rather than
+        rewritten: a config with no `[concurrency]` section (a hand-built one in
+        a test) or a value this build cannot read is ONE lane, which is the
+        answer that changes nothing.
+        """
+        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            return 1
+        return lanes
+
+    def _fleet_throttle_store(self) -> FleetThrottleStore | None:
+        """The fleet's shared throttle record, or `None` at one lane.
+
+        A METHOD rather than an attribute set in `__init__`, unlike
+        `_stop_repetitions` beside it, for one reason worth stating: several
+        tests (and `_browser_orch` in `test_rounds_and_restart.py`) replace
+        `self._config` AFTER construction, and a store bound at construction
+        time would then describe a fleet the orchestrator no longer has. It
+        reads two attributes and builds a small object; nothing here is worth
+        caching.
+        """
+        if self._fleet_lanes() <= 1:
+            return None
+        return FleetThrottleStore(fleet_throttle_file(self._config.state_dir))
+
+    def _rate_limit_release_jitter(self) -> float:
+        """This lane's own offset past the fleet's shared deadline.
+
+        Exactly `0.0` at one lane, so `_await_rate_limit_deadline`'s clamp and
+        the persisted stamp are byte-identical to today's there. The ceiling
+        comes from `[concurrency] rate_limit_release_jitter_seconds`, read
+        defensively for `_fleet_lanes`' reason — a hand-built config in a test
+        may have no such field, and a spread of zero is the reading that changes
+        nothing.
+        """
+        ceiling = getattr(
+            getattr(self._config, "concurrency", None),
+            "rate_limit_release_jitter_seconds",
+            0.0,
+        )
+        if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)):
+            return 0.0
+        return release_jitter_seconds(self.lane_index, self._fleet_lanes(), ceiling)
+
+    def _join_fleet_throttle(self, phase: Phase, now: datetime):
+        """Record this lane's throttle in the FLEET's one episode, and answer
+        with the episode it belongs to.
+
+        Three answers, and the caller must tell them apart:
+
+        * a `FleetThrottle` — this is a fleet, and this observation either
+          OPENED an episode or JOINED one another lane already opened. Either
+          way the counter it carries is the fleet's, not this lane's.
+        * `None` — one lane. There is no shared record, nothing was written, and
+          the caller takes exactly the path it always has.
+        * `FLEET_THROTTLE_PARKED` — the record exists and could not be read, and
+          this method has already parked. The caller must RETURN.
+
+        THE PARK IS THE POINT OF THE THIRD ANSWER. Everything here runs inside
+        `run`'s `except RateLimitedError:` clause, and an exception raised
+        inside an `except` block is caught by none of its siblings — not even
+        the `StateError` clause below it, which exists precisely because two
+        runs once left by traceback with no park, no blocker and no heartbeat.
+        So the raise is caught HERE and turned into the ordinary `loop_fatal`
+        park this loop answers every unreadable store with.
+
+        Degrading to "just use this lane's own counter" instead would be the
+        fail-open: the fleet would go back to N independent back-offs at exactly
+        the moment its shared record is in trouble, and nothing would say so.
+        """
+        throttle = self._fleet_throttle_store()
+        if throttle is None:
+            return None
+        try:
+            return throttle.observe(
+                delay_for=self._rate_limit_delay,
+                lane_id=self.lane_id,
+                now=now,
+            )
+        except (StateError, OSError) as store_exc:
+            path = fleet_throttle_file(self._config.state_dir)
+            self._log(
+                "fleet_throttle_unreadable",
+                data={
+                    "reason_code": "rate_limited",
+                    "phase": phase.value,
+                    "lane": self.lane_id,
+                    "path": str(path),
+                    "error": f"{type(store_exc).__name__}: {store_exc}",
+                },
+            )
+            self._to_needs_user(
+                f"the fleet's shared rate-limit record at {path} could not be "
+                f"read: {store_exc}. Every lane reads that record to find out "
+                "whether this account is already inside a back-off window, so a "
+                "lane that cannot read it cannot tell one throttle from six and "
+                "must not wait on a counter nobody can see. Inspect the file; if "
+                "it cannot be repaired, delete it once you are sure no lane is "
+                "still waiting out a limit, then resume with `python -m autoloop "
+                "run --retry`.",
+                resume_phase=phase.value,
+                kind="loop_fatal",
+                code="fleet_throttle_unreadable",
+                detail=f"phase={phase.value} lane={self.lane_id} path={path}",
+            )
+            return FLEET_THROTTLE_PARKED
+
+    def _end_fleet_throttle(self, episode_id: str) -> None:
+        """A step COMPLETED in this lane, so the account is serving requests
+        again: end THE EPISODE THIS LANE OBSERVED, and no other.
+
+        Called from `run`'s `else` branch, and only from inside the same
+        `if self.state.rate_limit_backoffs:` guard the per-lane reset lives in.
+        That guard is what keeps this honest rather than fail-open: the lane
+        clearing the record is one that WAS itself inside the episode and has
+        now been served, which is the same evidence the single-lane reset has
+        always used. "Any completed step in any lane clears it" would be the
+        wrong rule — a lane doing local work (validation, git, an agent) would
+        reset the streak it never observed, and the escalation would never
+        reach `max_rate_limit_backoffs`.
+
+        THE GUARD ALONE IS NOT ENOUGH, and that is what `episode_id` is for. It
+        establishes that this lane was inside SOME episode, not that the record
+        on disk is still that one. Between the retry that served this lane and
+        this call, another lane can meet the limit again and open the NEXT
+        episode: an unconditional clear would delete a live deadline and the
+        counter that had just escalated to `n + 1`, so admission reopens
+        mid-window and the streak restarts — `max_rate_limit_backoffs`
+        unreachable, with nothing saying so. `FleetThrottleStore.clear` compares
+        under the same mutex `observe` takes, so the episode cannot change
+        between the comparison and the unlink.
+
+        AN EMPTY `episode_id` CLEARS NOTHING. A lane reaches this with one only
+        when it never observed a fleet episode at all — a state file written
+        before the field existed, or a counter left over from a single-lane run
+        of the same state directory — and "I cannot name what I was inside" is
+        not evidence about any record. The window still expires on its own
+        deadline; only the grace-length streak inheritance is paid for it.
+
+        BEST EFFORT, and it must be: this runs in `run`'s `else` block, where a
+        raise is caught by none of the `except` clauses above it. A clear that
+        fails leaves a record whose window has already expired, and
+        `FleetThrottleStore.observe`'s grace is what bounds the cost of that —
+        the next throttle inherits the streak only if it arrives while the
+        previous episode is still plausibly the same incident.
+        """
+        throttle = self._fleet_throttle_store()
+        if throttle is None:
+            return
+        if not episode_id:
+            return
+        try:
+            ended = throttle.clear(episode_id)
+        except (StateError, OSError) as exc:
+            self._log(
+                "fleet_throttle_clear_failed",
+                data={
+                    "reason_code": "rate_limited",
+                    "lane": self.lane_id,
+                    "episode_id": episode_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return
+        if not ended:
+            # Not a failure: the episode this lane was inside is already over,
+            # or another lane has opened a newer one that this lane has no
+            # standing to end. Logged because "the completed step did not clear
+            # the record" is otherwise invisible, and it is the exact fact an
+            # operator needs when the fleet stays held after a lane recovered.
+            self._log(
+                "fleet_throttle_clear_skipped",
+                data={
+                    "reason_code": "rate_limited",
+                    "lane": self.lane_id,
+                    "episode_id": episode_id,
+                },
+            )
+
     def _rate_limit_deadline(self) -> datetime | None:
         """The persisted `retry_not_before` instant, or `None` when no wait is
         in progress.
@@ -3612,11 +3980,24 @@ class Orchestrator:
         the record, which is why `browser.rate_limit_backoff_max_seconds` is
         deliberately kept under the monitor's 45-minute staleness threshold.
         The clamp is what keeps that ceiling meaning what it says.
+
+        THE CLAMP CARRIES THIS LANE'S RELEASE OFFSET (conc-11), and without it
+        the spread would exist on the fresh path and quietly vanish on the
+        resumed one: a fleet lane's stamp is the shared deadline PLUS its own
+        jitter, so a clamp computed from the un-jittered schedule would clip
+        exactly the offset that stops N lanes re-probing in unison. Read from
+        `lane_index` and the config rather than from the fleet record — it is a
+        pure function of the two, so this path opens no file and cannot raise
+        where `run` could not catch it. Exactly `0.0` at one lane, which is what
+        keeps this line byte-identical there.
         """
         deadline = self._rate_limit_deadline()
         if deadline is None:
             return
-        planned = self._rate_limit_delay(self.state.rate_limit_backoffs)
+        planned = (
+            self._rate_limit_delay(self.state.rate_limit_backoffs)
+            + self._rate_limit_release_jitter()
+        )
         remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
         remaining = min(planned, max(0.0, remaining))
         self._log(
@@ -3938,6 +4319,21 @@ class Orchestrator:
         on whatever process is running when it expires. See that method for the
         restart-storm this closes.
 
+        **AND ON A FLEET, THE EPISODE IS THE FLEET'S** (conc-11). One account
+        allowance backs every lane, so a throttle is a fact about the account
+        and not about the lane that happened to meet it. Above one lane this
+        handler joins `state.FleetThrottleStore`'s single record before doing
+        anything else: a lane arriving inside an open window JOINS that episode
+        — the shared counter does not move, the shared deadline is not extended,
+        and this lane waits out what REMAINS of it plus its own small release
+        offset — while a lane arriving after the window has closed opens the
+        next episode, at `previous + 1`, so the delay doubles exactly as it does
+        for a single lane. `max_rate_limit_backoffs` is then checked against
+        that shared number, by joiner and opener alike, which is what makes the
+        fleet park after six episodes rather than after six per lane. At
+        `lanes = 1` there is no record, nothing above happens, and every line of
+        this handler is the one that has always run.
+
         The phase is left untouched, so the loop re-enters the step it was in
         and republishes its heartbeat. **That re-entry IS the re-probe**, and
         the streak is reset only when it completes (`run`'s `else` branch).
@@ -3975,26 +4371,88 @@ class Orchestrator:
         # unprobed evidence would refuse a real fault, hours later, the recovery
         # it is owed.
         self._rate_limit_browser_restarted = False
-        state.rate_limit_backoffs += 1
+        now = datetime.now(timezone.utc)
+        episode = self._join_fleet_throttle(phase, now)
+        if episode is FLEET_THROTTLE_PARKED:
+            # The shared record could not be read, and `_join_fleet_throttle`
+            # has already parked naming it. Returning here is what keeps the
+            # refusal a refusal: falling through would run this lane's own
+            # back-off against a fleet counter nobody can see, which is the
+            # guard quietly switching itself off.
+            return
+        if episode is None:
+            # ONE LANE. Byte-identical to what this handler has always done:
+            # its own counter, its own schedule, its own stamp.
+            state.rate_limit_backoffs += 1
+            # And no episode to name, so the field is emptied rather than left
+            # holding whatever a previous, differently-configured run of this
+            # state directory put there. It keeps the invariant
+            # `_end_fleet_throttle` relies on total: the id always describes the
+            # episode the CURRENT counter came from, or is empty.
+            state.fleet_throttle_episode = ""
+            delay = self._rate_limit_delay(state.rate_limit_backoffs)
+        else:
+            # A FLEET. The episode is the fleet's, so the counter is SET to it
+            # rather than incremented: two lanes meeting one limit inside one
+            # window must leave one increment behind them, not two, and this is
+            # also what makes the park text below ("across N throttled
+            # attempts"), the budget check and the log entry all speak about
+            # episodes rather than about this lane's share of them.
+            state.rate_limit_backoffs = episode.backoffs
+            # WHICH episode, not merely how many. Persisted beside the counter
+            # so the step that eventually completes ends this episode and not a
+            # newer one another lane opened in the meantime, and so that still
+            # holds across the restart the counter itself is persisted for.
+            state.fleet_throttle_episode = episode.episode_id
+            jitter = self._rate_limit_release_jitter()
+            # The whole of what this lane still owes: the fleet's shared
+            # deadline plus this lane's own release offset. A joiner therefore
+            # waits the REMAINDER of the open window rather than a fresh copy
+            # of it — the wait is calendar time in which the account makes no
+            # requests, and the seconds another lane has already spent count.
+            #
+            # CLAMPED to what the schedule prescribes, exactly as
+            # `_await_rate_limit_deadline` clamps its own remainder and for the
+            # same reason: the deadline comes off a file, and a hand-edited or
+            # clock-skewed one must not become an arbitrarily long sleep inside
+            # a step this loop publishes no heartbeat during.
+            owed = (episode.deadline() + timedelta(seconds=jitter) - now).total_seconds()
+            delay = min(
+                max(0.0, owed), self._rate_limit_delay(episode.backoffs) + jitter
+            )
+        # ONE budget for the fleet, and it is checked for a JOINER as well as
+        # for the lane that opened the episode. Checking only the opener would
+        # park that lane at the sixth episode while the other three released,
+        # re-probed, joined a seventh and waited on a fleet that had already
+        # stopped — `max_rate_limit_backoffs` meaning something different for
+        # each lane, which is the counting bug in a new place.
         verdict = self._policy.check_rate_limit_backoff_budget(state.rate_limit_backoffs)
-        delay = self._rate_limit_delay(state.rate_limit_backoffs)
-        self._log(
-            "rate_limited",
-            data={
-                "phase": phase.value,
-                "error": str(exc),
-                "reason_code": "rate_limited",
-                "stage": getattr(exc, "stage", ""),
-                "backoffs": state.rate_limit_backoffs,
-                "backoff_seconds": delay,
-                "waited_seconds": state.rate_limit_wait_seconds,
-                # What the browser looked like when this was classified, so a
-                # reader of the transcript can tell a modal that was actually
-                # seen from a default reached because nothing could be asked.
-                "classification": classification,
-                "evidence": evidence,
-            },
-        )
+        entry = {
+            "phase": phase.value,
+            "error": str(exc),
+            "reason_code": "rate_limited",
+            "stage": getattr(exc, "stage", ""),
+            "backoffs": state.rate_limit_backoffs,
+            "backoff_seconds": delay,
+            "waited_seconds": state.rate_limit_wait_seconds,
+            # What the browser looked like when this was classified, so a
+            # reader of the transcript can tell a modal that was actually
+            # seen from a default reached because nothing could be asked.
+            "classification": classification,
+            "evidence": evidence,
+        }
+        if episode is not None:
+            # Added only for a fleet, so a single-lane transcript is unchanged.
+            # `observations` is the claim made legible: 4 against `backoffs` of
+            # 1 is four lanes throttled by one limit producing ONE episode.
+            entry["fleet_episode"] = episode.backoffs
+            entry["fleet_observations"] = episode.observations
+            entry["fleet_opened_by"] = episode.opened_by
+            entry["fleet_retry_not_before"] = episode.retry_not_before
+            # Which episode, so a transcript reader can follow one episode from
+            # the lanes that met it to the lane that ended it.
+            entry["fleet_episode_id"] = episode.episode_id
+        self._log("rate_limited", data=entry)
         if not verdict.allowed:
             waited = state.rate_limit_wait_seconds
             # The session ends here. If a task had a candidate out for review,
@@ -4048,12 +4506,29 @@ class Orchestrator:
                     "no page target means this was never a rate limit, and a "
                     "restart IS the remedy."
                 )
+            if episode is None:
+                fleet_note = ""
+            else:
+                # Only for a fleet, so the single-lane park is byte-identical.
+                # An operator reading "6 throttled attempts" on a four-lane run
+                # would otherwise reasonably read it as this lane's six out of
+                # twenty-four, which is the arithmetic conc-11 removed.
+                fleet_note = (
+                    f"This is a FLEET of {self._fleet_lanes()} lanes sharing ONE "
+                    f"account allowance, so the {state.rate_limit_backoffs} "
+                    "back-offs above are the fleet's shared episodes "
+                    f"({fleet_throttle_file(self._config.state_dir)}), counted "
+                    "once each however many lanes met them — the last was met by "
+                    f"{episode.observations} lane(s). Every lane is held by it; "
+                    "running more lanes cannot get past it, because there is one "
+                    "allowance behind all of them. "
+                )
             self._to_needs_user(
                 f"{verdict.reason}: ChatGPT has rate limited this account "
                 f"('Too many requests — please wait a few minutes before trying "
                 f"again') and it has not lifted across {state.rate_limit_backoffs} "
                 f"throttled attempts and {waited:g}s of completed waiting. "
-                f"{verdict_text} Leave the account idle for a "
+                f"{fleet_note}{verdict_text} Leave the account idle for a "
                 "while (an hour is usually more than enough), then resume with "
                 "`python -m autoloop run --retry`. If it keeps happening, raise "
                 "browser.rate_limit_backoff_seconds so the loop waits longer "
@@ -4103,8 +4578,33 @@ class Orchestrator:
         # hammer again. The elapsed total is deliberately NOT credited here:
         # crediting a wait that has not happened yet is how a killed process
         # comes back believing it already waited.
+        #
+        # ON A FLEET this is the shared deadline PLUS this lane's release
+        # offset, which is what `delay` already is — so the per-lane stamp still
+        # means exactly what it has always meant ("this lane may not touch the
+        # account before this instant"), a restart resumes it through the
+        # unchanged `_await_rate_limit_deadline`, and the fleet record beside it
+        # keeps the one un-jittered instant an operator reads.
+        #
+        # WHICH INSTANT THE STAMP IS MEASURED FROM IS NOT THE SAME QUESTION ON
+        # THE TWO PATHS, and collapsing it was a real regression:
+        #
+        # * ONE LANE reads the clock HERE, at the persist site, which is where
+        #   this handler has always read it. Reusing the `now` captured above
+        #   for `_join_fleet_throttle` would move the stamp earlier by whatever
+        #   the classification, the budget check and the transcript write cost —
+        #   microseconds today, and no test can see it, which is exactly why it
+        #   has to be restored structurally rather than argued about. `lanes = 1`
+        #   is asserted to be byte-identical to today's, and "identical to within
+        #   a margin somebody measured once" is a different claim.
+        # * A FLEET must keep `now`. `delay` there is `owed` — the REMAINDER of
+        #   the shared window, computed against that captured instant — so a
+        #   second clock read here would add the elapsed time twice and push this
+        #   lane's stamp past the shared deadline plus its own offset, quietly
+        #   desynchronising it from the window it just joined.
+        stamp_at = now if episode is not None else datetime.now(timezone.utc)
         state.rate_limit_retry_not_before = (
-            datetime.now(timezone.utc) + timedelta(seconds=delay)
+            stamp_at + timedelta(seconds=delay)
         ).isoformat(timespec="milliseconds")
         self._store.save(state)
         # `delay` itself, not the clock difference: this process opened the
@@ -6910,6 +7410,18 @@ class Orchestrator:
                     for occupant in fleet_occupants(self._config)
                     if occupant.lane_index != self.lane_index
                 )
+                # DELIBERATELY WITHOUT THE FLEET THROTTLE (conc-11), which is
+                # why this builds a supervisor by hand rather than calling
+                # `FleetSupervisor.from_config`. What conc-11 stops is
+                # ADMISSION — a lane OPENING a round while the account is inside
+                # a rate-limit window — and this gate is the other question: a
+                # session that is already open, being told which task to work.
+                # Holding here would refuse the reviewer's directive and charge
+                # `max_policy_denials` for a condition that clears itself in
+                # seconds, so a throttle could park a round the throttle was
+                # never about. The lane cannot walk past the limit either way:
+                # its next step raises `RateLimitedError` and JOINS the open
+                # episode rather than opening a second one, which is the claim.
                 plan = FleetSupervisor(lanes).plan(
                     self._registry,
                     occupants,

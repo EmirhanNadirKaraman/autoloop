@@ -599,7 +599,12 @@ FLOOR_AFTER = 16
 #: DENOMINATOR again: it plans against in-memory registries, reaches its
 #: trackers through `tasks.TRACKER_PATHS` instead of naming one, resolves no
 #: `__file__` and spawns nothing, so 20 and 24 are unchanged once more.
-SUITE_SIZE = 108
+#: 108 -> 109 when conc-11 added `test_fleet_throttle.py` (2026-09-02), the
+#: DENOMINATOR again: it works on one small JSON record and two orchestrators
+#: under `tmp_path`, names no tracker, resolves no `__file__`, and its only
+#: concurrency is `threading` — which is not a spawn entry point under the rule
+#: above — so 20 and 24 are unchanged once more.
+SUITE_SIZE = 109
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
