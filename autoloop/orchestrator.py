@@ -4526,8 +4526,26 @@ class Orchestrator:
         # account before this instant"), a restart resumes it through the
         # unchanged `_await_rate_limit_deadline`, and the fleet record beside it
         # keeps the one un-jittered instant an operator reads.
+        #
+        # WHICH INSTANT THE STAMP IS MEASURED FROM IS NOT THE SAME QUESTION ON
+        # THE TWO PATHS, and collapsing it was a real regression:
+        #
+        # * ONE LANE reads the clock HERE, at the persist site, which is where
+        #   this handler has always read it. Reusing the `now` captured above
+        #   for `_join_fleet_throttle` would move the stamp earlier by whatever
+        #   the classification, the budget check and the transcript write cost —
+        #   microseconds today, and no test can see it, which is exactly why it
+        #   has to be restored structurally rather than argued about. `lanes = 1`
+        #   is asserted to be byte-identical to today's, and "identical to within
+        #   a margin somebody measured once" is a different claim.
+        # * A FLEET must keep `now`. `delay` there is `owed` — the REMAINDER of
+        #   the shared window, computed against that captured instant — so a
+        #   second clock read here would add the elapsed time twice and push this
+        #   lane's stamp past the shared deadline plus its own offset, quietly
+        #   desynchronising it from the window it just joined.
+        stamp_at = now if episode is not None else datetime.now(timezone.utc)
         state.rate_limit_retry_not_before = (
-            now + timedelta(seconds=delay)
+            stamp_at + timedelta(seconds=delay)
         ).isoformat(timespec="milliseconds")
         self._store.save(state)
         # `delay` itself, not the clock difference: this process opened the
