@@ -38,14 +38,21 @@ lane adds `k/lanes` of `[concurrency] rate_limit_release_jitter_seconds` on top
 before re-probing. `opened_at`, `opened_by` (lane id) — who started the episode.
 `observations` (int ≥ 1) — how many lanes have met THIS episode; `4` beside
 `backoffs = 1` is four lanes throttled by one limit producing one episode.
-`updated_at`.
+`episode_id` (string) — names this episode: minted where one opens, carried
+unchanged by every lane that joins it, never reused, and mirrored into the
+observing lane's `state.json` as `fleet_throttle_episode`. `updated_at`.
 
 Written atomically (temp file with the writer's pid in its name, then
 `os.replace`) and mutated only under `tasks.task_file_mutex`, so the
-read-decide-write of joining an episode cannot race. **Absent at `lanes = 1`,
-and never created there.** A record that cannot be read is refused rather than
-read as "no throttle": admission holds and the next throttled lane parks naming
-the file.
+read-decide-write of joining an episode cannot race. Ending an episode is a
+COMPARE-and-clear under that same mutex: a lane whose step completes removes the
+record only while its `episode_id` still matches, because between its retry and
+its clear another lane can have opened the next episode, and deleting that would
+erase a live deadline and an escalated counter. An `episode_id` of `""` — a
+record written by hand, or a lane that never observed one — clears nothing.
+**Absent at `lanes = 1`, and never created there.** A record that cannot be read
+is refused rather than read as "no throttle": admission holds and the next
+throttled lane parks naming the file.
 
 ## Task
 

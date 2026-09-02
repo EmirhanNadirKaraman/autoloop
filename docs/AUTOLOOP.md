@@ -1043,7 +1043,7 @@ version of the hammering this exists to stop."
 `state_dir/fleet_throttle.json`, beside the fleet lock and for the lock's own
 reason — one state directory is one account's fleet, so "this account is
 throttled" is a fact about the directory rather than about a lane. It holds one
-`retry_not_before` and one consecutive-episode counter, and four things follow
+`retry_not_before` and one consecutive-episode counter, and five things follow
 from it:
 
 * **Coalescing.** A lane that meets the limit while the window is open JOINS
@@ -1054,6 +1054,19 @@ from it:
   interval. Read, decision and write happen inside one cross-process mutex
   (`tasks.task_file_mutex`), because "read the record, decide, write it" done
   outside one is how two lanes both open episode 1.
+* **Ending one is a compare-and-clear.** An episode carries an `episode_id`,
+  minted where it opens and copied by every lane that joins it; a lane records
+  the id it observed in its own state file, and the step that eventually
+  completes removes the shared record only while that id still matches — under
+  the same mutex. The unconditional version was wrong in a way a single-lane
+  test cannot see: between the retry that served one lane and its clear, another
+  lane can meet the limit again and open episode `n + 1`, and deleting that
+  erases a deadline the fleet is inside and a counter that had just escalated.
+  Admission would reopen mid-window and the streak would restart at 1, so
+  `max_rate_limit_backoffs` would stop being reachable — the guard switching
+  itself off, silently, at the moment it is needed most. `backoffs` is not an
+  identity for this: episode 1, then hours later a fresh episode 1, carry the
+  same number.
 * **Admission.** `FleetSupervisor.plan` holds every READY task
   (`HOLD_RATE_LIMITED`) while the window is open, and holds — never passes — when
   the record cannot be read; `cli._run_continuous` sleeps on that plan rather
