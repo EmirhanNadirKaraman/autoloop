@@ -46,6 +46,33 @@ into `MergeDeferralStore` and the next completion retries it. A deferred merge
 is a normal state, not a fault. Parking would take a loop that is working and
 stop it over an integration step that can simply happen later.
 
+## At `lanes > 1` the gate returns a DEBT as well as a verdict
+
+The blanket block above is a fleet-wide mutual exclusion, and with N lanes N−1
+of them hold exactly the record it names — so the window would essentially never
+open (docs/AUTOLOOP.md, "Decision 6 — merging is serialised and rebase-aware").
+There the predicate reports a bound candidate as a `MergeObligation` instead,
+and this module is what makes that safe. Three steps, in this order and no
+other:
+
+1. **Mark, before the merge.** Every bound candidate's record gets
+   `rereview_owed_base` set (`_mark_rereview_owed`). A candidate that cannot be
+   marked defers the whole merge.
+2. **Merge**, exactly as below — the merge itself is not lane-aware at all.
+3. **Carry forward, after the merge** (`_discharge_rereview`, through the
+   injected callable): the head is merged INTO each task's own branch and its
+   record is advanced onto the new candidate, so the approval that was taken
+   against the old one no longer matches and `_dispatch_task_push` refuses it.
+
+Step 1 exists for step 3's failure path. A conflict, a dirty worker, a missing
+worker repo or a process that dies between 2 and 3 all leave a reviewed
+candidate whose sha and tree are unchanged — every push-time check would pass,
+and the approval taken against a base that has since moved would publish. The
+marker is what refuses that, and it is on disk before the head moves.
+
+At `lanes = 1` none of this is reachable: the same record is a REASON, and
+`attempt` returns `DEFERRED` before step 1.
+
 ## Failure discipline
 
 Every failure here swallows to a transcript log. By the time this runs, the
@@ -115,6 +142,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import note_merge
+from .blockers import BlockerStore
 from .config import AutoloopConfig
 from .errors import GitError, StateCorruptError
 from .git_gateway import GitGateway
@@ -133,6 +161,43 @@ CONFLICT = "conflict"                # aborted cleanly, base unchanged
 FAILED = "failed"                    # something went wrong; nothing was pushed
 SKIPPED = "skipped"                  # not applicable (no record, not completed, ...)
 DISABLED = "disabled"                # policy.auto_merge_enabled is false
+
+@dataclass(frozen=True)
+class MergeObligation:
+    """One candidate bound to the head this merge is about to move, and the
+    debt that moving it creates (conc-03, docs/AUTOLOOP.md Decision 6).
+
+    Minted by `cli._merge_window_blockers` — the SAME walk that decides the
+    window, at the same site, past the same exemptions — and never by a second
+    enumeration of the executions directory. A second implementation that
+    drifted by one case is the failure that module's own docstring exists to
+    prevent, and here the drift would be in the fail-open direction: a record
+    the window wrote off as an obligation but the merger never saw is a
+    candidate whose base moves with nothing recorded against it.
+
+    Only ever produced at `lanes > 1`. At one lane such a record shuts the
+    window, so the merge that would create the debt never runs.
+    """
+
+    task_id: str
+    #: The reviewed candidate, as the record named it at window time. Carried
+    #: for the transcript and the blocker text; the discharge re-reads the
+    #: record rather than trusting this.
+    candidate_sha: str
+    #: The base the candidate was bound to — the head this merge moves.
+    base_sha: str
+    worktree_path: str = ""
+
+
+#: The blocker code a carry-forward refusal parks under. THE SAME CODE
+#: `orchestrator._rebase_execution_if_stale` has always used for "this record's
+#: base moved and the candidate could not be carried past it", because it is the
+#: same condition arrived at from the other side — the merge that moved the head
+#: rather than the dispatch that noticed it had moved. A second code would split
+#: the most common blocker in this system's history into two halves that
+#: `blockers.AUTONOMOUS_RECOVERIES`, `health` and every operator query would
+#: have to learn about separately.
+CARRY_FORWARD_BLOCKER_CODE = "task_base_behind_head"
 
 #: Everything under here is the loop's OWN code. A merge that touches one of
 #: these paths changed the program this process is running, and a running
@@ -411,6 +476,7 @@ class AutoMerger:
         log,
         deferrals: MergeDeferralStore | None = None,
         upgrades: "UpgradeStore | None" = None,
+        carry_forward=None,
     ):
         self._config = config
         self._git = git
@@ -418,6 +484,27 @@ class AutoMerger:
         self._execution_store = execution_store
         self._registry = registry
         self._log = log
+        #: `(task_id, head) -> refusal` — how a candidate bound to the head this
+        #: merge moves is carried onto the new head. `""` means it was carried
+        #: forward and the record advanced; any other string is the reason the
+        #: obligation could not be discharged.
+        #:
+        #: INJECTED rather than built here, and REQUIRED before a merge that
+        #: creates an obligation may run. The carry-forward fetches into a worker
+        #: repository from the LOOP-OWNED OBSERVED CLONE (`orchestrator.
+        #: _worker_fetch_root`, and see `_carry_reviewed_candidate_past`'s own
+        #: comment on why): that path is resolved by the orchestrator and is not
+        #: derivable from anything this module holds. Building a substitute out
+        #: of `self._git.repo_root` would point every carried-forward worker's
+        #: `.git/FETCH_HEAD` at the primary checkout — the one tree nothing
+        #: watches — which is exactly the invariant esc-02 established.
+        #:
+        #: `None` is therefore FAIL-CLOSED, not fail-open: `attempt` DEFERS a
+        #: merge whose obligations it has no way to discharge, which is the same
+        #: outcome the shut window produces today and mutates nothing. The
+        #: startup sweep (`cli._sweep_backlog_on_startup`) has no orchestrator
+        #: and takes that branch.
+        self._carry_forward = carry_forward
         self._deferrals = deferrals or MergeDeferralStore(config.merge_deferrals_dir)
         #: Where a merge that changed the loop's own code is recorded. Written
         #: here and read at the restart boundary (`orchestrator.run`), never
@@ -566,7 +653,15 @@ class AutoMerger:
 
         if not already_merged:
             # 7. THE GATE. Same predicate as `merge-window`, called not copied.
-            reasons, notes = cli._merge_window_blockers(self._config, seen, self._git)
+            #    `obligations` is the fleet half of it (conc-03): at `lanes > 1`
+            #    a candidate bound to this head is reported rather than blocking,
+            #    and comes back here as the debt this merge takes on. Always an
+            #    empty list at one lane — such a record is a REASON there, and
+            #    this method returns below without touching anything.
+            obligations: list[MergeObligation] = []
+            reasons, notes = cli._merge_window_blockers(
+                self._config, seen, self._git, obligations=obligations
+            )
             # The gate's notes are the ONLY report of a record that is being
             # ignored rather than respected — a published-but-unretired record,
             # or one a `release` left behind. `merge-window` prints them to the
@@ -584,10 +679,50 @@ class AutoMerger:
                     "not restore it to exactly this state",
                 )
 
+            if obligations and self._carry_forward is None:
+                # Fail closed, and BEFORE any mutation: a merge whose debts this
+                # process cannot discharge is one that would strand every
+                # candidate the window just waved past. Deferring is what the
+                # shut window does today, so this costs a retry and nothing else.
+                return self._defer(
+                    execution,
+                    f"{len(obligations)} candidate(s) are bound to this head "
+                    "and owe a re-review ("
+                    + ", ".join(o.task_id for o in obligations)
+                    + "), and this process has no way to carry them forward — "
+                    "no carry-forward was wired in, so the observed checkout a "
+                    "worker repository must fetch from cannot be resolved here",
+                )
+            # WRITTEN BEFORE THE MERGE, and this order is the whole guarantee.
+            # See `_mark_rereview_owed`: every way the carry-forward below can
+            # fail leaves a record whose candidate still matches the approval
+            # taken against THIS base, and the marker is what refuses it. A
+            # candidate that could not be marked defers the merge — an obligation
+            # nothing recorded is one nothing downstream would enforce.
+            unmarked, marked = self._mark_rereview_owed(obligations, head)
+            if unmarked:
+                return self._defer(
+                    execution,
+                    "a candidate bound to this head could not be recorded as "
+                    f"owing a re-review — {unmarked}",
+                )
+
             outcome = self._merge(execution, candidate, base_branch, head)
             if outcome != MERGED:
+                if outcome == CONFLICT:
+                    # The abort restored the exact head this started from and
+                    # `_abort` verified it, so no base moved and no candidate
+                    # owes anything. FAILED is deliberately not restored: that
+                    # path leaves the merge in the checkout on purpose, so the
+                    # debt it created is real.
+                    self._restore_rereview_marks(marked)
                 return outcome      # CONFLICT (aborted) or FAILED (unverified)
             merged_head = self._git.head_sha()
+            # The head has moved: discharge the debts recorded a moment ago,
+            # before the push and before this method can return anything else.
+            # Guarded internally — a discharge problem never converts a merge
+            # that landed into a failure (see `_discharge_rereview`).
+            self._discharge_rereview(obligations, merged_head)
             # Recorded off the VERIFIED merge, before the push. The push
             # publishes the base; it does not decide what code is in this
             # checkout, and a push that is refused (a protected base branch,
@@ -727,6 +862,208 @@ class AutoMerger:
                 "reason": reason,
             },
         )
+
+    # ---- the re-review obligation (conc-03) ---------------------------------
+    #
+    # Reachable only at `lanes > 1`, because `cli._merge_window_blockers` only
+    # produces an obligation there — at one lane the same record is a REASON and
+    # `attempt` has already returned `DEFERRED` before any of this runs.
+    #
+    # The order is the claim: MARK every bound candidate, then merge, then carry
+    # each one forward. Written the other way round — carry forward, then mark
+    # what could not be carried — every failure of the carry (a conflict, a
+    # dirty worker, a worker repo that is gone, a process that dies in between)
+    # leaves a record whose `candidate_sha` and tree still match the approval
+    # taken against the base this merge just moved, and `_dispatch_task_push`
+    # would publish it. That is "pushed on its old approval", reachable only on
+    # the error path, which is where a guard like this one usually dies.
+
+    def _mark_rereview_owed(self, obligations, head: str) -> tuple[str, list]:
+        """Record on each bound candidate's own record that the loop is about to
+        move the head past it. Returns `(reason, marked)`: `reason` is `""` when
+        every one of them was marked and otherwise the reason the caller must
+        DEFER with, having mutated nothing that matters; `marked` is
+        `[(task_id, previous_value)]`, which is what `_restore_rereview_marks`
+        needs if the merge then aborts without moving the head.
+
+        A record that cannot be read or written is a refusal, never a skip: the
+        whole point of the marker is that it is there when the carry-forward is
+        not, so a candidate nobody could mark is one whose approval nothing
+        downstream would refuse.
+
+        Marks already written are put back to whatever they held before, so a
+        merge that never happened cannot leave a task owing a review nobody
+        asked for. Best effort — a failure to restore leaves the marker SET,
+        which costs a re-review and refuses a push, and is the direction to fail
+        in.
+        """
+        restore: list[tuple[str, str]] = []
+        for obligation in obligations:
+            reason, previous = self._write_rereview_marker(
+                obligation.task_id, obligation.base_sha or head
+            )
+            if reason:
+                self._restore_rereview_marks(restore)
+                self._log(
+                    "auto_merge_rereview_mark_failed",
+                    data={
+                        "task_id": obligation.task_id,
+                        "head": head,
+                        "reason": reason,
+                        "restored": [task_id for task_id, _was in restore],
+                    },
+                )
+                return f"task {obligation.task_id}: {reason}", []
+            restore.append((obligation.task_id, previous))
+            self._log(
+                "auto_merge_rereview_owed",
+                data={
+                    "task_id": obligation.task_id,
+                    "candidate_sha": obligation.candidate_sha,
+                    "base_sha": obligation.base_sha,
+                    "head": head,
+                },
+            )
+        return "", restore
+
+    def _restore_rereview_marks(self, marked) -> None:
+        """Put each record's `rereview_owed_base` back to what it held before
+        this attempt marked it. Best effort — a failure leaves the marker SET,
+        which costs a re-review and refuses a push, and is the direction to fail
+        in.
+
+        Reached from exactly two places, and NEITHER of them is "the merge
+        failed": a mark that could not be completed, and a merge that CONFLICTED
+        and therefore aborted back to the exact head it started from
+        (`_abort` verifies that). A merge that ran and failed VERIFICATION is
+        deliberately not one of them — that path leaves the base moved on
+        purpose, so the debt it created is real.
+        """
+        for task_id, previous in marked:
+            self._write_rereview_marker(task_id, previous)
+
+    def _write_rereview_marker(self, task_id: str, value: str) -> tuple[str, str]:
+        """Set (or clear) one record's `rereview_owed_base`. Returns
+        `(reason, previous_value)`; `reason` is `""` on success.
+
+        Loads and saves the WHOLE record rather than patching the file, so this
+        goes through the same atomic write, the same schema and the same
+        `TaskExecutionStore` invariants every other writer uses.
+        """
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
+            return f"its execution record could not be read ({exc})", ""
+        if execution is None:
+            return "its execution record is gone", ""
+        previous = getattr(execution, "rereview_owed_base", "") or ""
+        execution.rereview_owed_base = value
+        try:
+            self._execution_store.save(execution)
+        except (StateCorruptError, OSError) as exc:
+            return f"its execution record could not be written ({exc})", previous
+        return "", previous
+
+    def _discharge_rereview(self, obligations, merged_head: str) -> None:
+        """Carry every marked candidate onto the head this merge just produced.
+
+        NEVER RAISES AND NEVER CHANGES THE MERGE'S OUTCOME. By the time this
+        runs the merge is verified and in the checkout; letting a problem here
+        propagate would reach `merge_sweep._attempt`'s broad `except`, come back
+        as `FAILED`, and stop a sweep after a branch that actually landed —
+        turning a bookkeeping fault into a halt. Same discipline as everything
+        else in this module, applied per obligation so one refusal does not hide
+        the next one.
+
+        A refusal PARKS the task it is about (`task_base_behind_head`) and
+        leaves the marker set, so the candidate is still refused at push time.
+        Nothing about the worker repository or the execution record is discarded
+        — `_carry_reviewed_candidate_past` aborts its own merge and reports the
+        conflicted paths, and this writes a blocker beside it.
+        """
+        for obligation in obligations:
+            try:
+                refusal = self._carry_forward(obligation.task_id, merged_head)
+            except Exception as exc:      # noqa: BLE001 - deliberate; see above
+                refusal = f"{type(exc).__name__}: {exc}"
+            if refusal:
+                self._park_carry_forward_refused(obligation, merged_head, refusal)
+                continue
+            self._log(
+                "auto_merge_candidate_carried_forward",
+                data={
+                    "task_id": obligation.task_id,
+                    "old_base": obligation.base_sha,
+                    "new_base": merged_head,
+                    "reviewed_candidate": obligation.candidate_sha,
+                },
+            )
+
+    def _park_carry_forward_refused(
+        self, obligation, merged_head: str, refusal: str
+    ) -> None:
+        """One task, parked on `task_base_behind_head` because the head moved
+        under its reviewed candidate and it could not be carried past.
+
+        A BLOCKER RECORD AND NOTHING ELSE. This module has no lane's state file
+        to move to `needs_user` and must not invent one — the task whose base
+        moved usually belongs to another lane entirely. What stops that
+        candidate being published is `rereview_owed_base`, which is still set:
+        the park is how an operator finds out, not how the refusal is enforced.
+
+        Swallowed like every other failure here, for the same reason: the merge
+        has already landed.
+        """
+        self._log(
+            "auto_merge_carry_forward_refused",
+            data={
+                "task_id": obligation.task_id,
+                "candidate_sha": obligation.candidate_sha,
+                "old_base": obligation.base_sha,
+                "head": merged_head,
+                "reason": refusal,
+            },
+        )
+        try:
+            BlockerStore(self._config.blockers_dir).record(
+                task_id=obligation.task_id,
+                kind="task_fatal",
+                code=CARRY_FORWARD_BLOCKER_CODE,
+                question=(
+                    f"task {obligation.task_id}: its recorded base "
+                    f"{obligation.base_sha[:12]} is behind the branch head "
+                    f"{merged_head[:12]} — the loop merged another task while a "
+                    "review round had already run against candidate "
+                    f"{obligation.candidate_sha[:12]}. The head could not be "
+                    f"merged into the task branch either — {refusal}. Nothing "
+                    "was discarded: the worker repository and the execution "
+                    "record are exactly as they were, and the candidate is "
+                    "recorded as owing a re-review, so it cannot be pushed on "
+                    "the approval it already has. Either publish or abandon "
+                    "that candidate, or archive "
+                    f".autoloop/executions/{obligation.task_id}.json to start "
+                    "fresh at the current head."
+                ),
+                detail=(
+                    f"base={obligation.base_sha} head={merged_head} "
+                    f"candidate={obligation.candidate_sha} refusal={refusal}"
+                ),
+                # There is no lane phase to name from here: this runs inside an
+                # integration step, not inside the parked task's own round. A
+                # literal rather than a borrowed `Phase` value, because writing
+                # someone else's phase would be a claim about a state machine
+                # this module never read.
+                phase="auto_merge",
+                now=utcnow_iso(),
+            )
+        except Exception as exc:      # noqa: BLE001 - a park must not undo a merge
+            self._log(
+                "auto_merge_error",
+                data={
+                    "task_id": obligation.task_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
     def _note_loop_code_merge(
         self, task_id: str, candidate: str, pre_head: str, new_head: str
