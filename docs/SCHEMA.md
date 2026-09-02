@@ -20,6 +20,32 @@ rewrites.
 | `pending_upgrade.json` | object | A merge that changed loop code, and whether the handoff happened. |
 | `wanted_decisions.json` | object | `{verb: count}` — the verbs reviewers said they WOULD have used, `none` included. Evidence for a human; enforces nothing, so an unreadable file is read as empty and rewritten. |
 | `LOCK` | text | One holder per state dir. Never stolen. |
+| `fleet_throttle.json` | object | The fleet's ONE rate-limit episode (conc-11). Written only at `[concurrency] lanes > 1`. See below. |
+
+## Fleet throttle record
+
+`fleet_throttle.json`, beside `LOCK` and for the lock's own reason: one state
+directory is one account's fleet, so "this account is throttled" is a fact about
+the directory rather than about a lane. N lanes draw on ONE ChatGPT allowance,
+and per-lane state files would otherwise turn one limit into N independent
+back-offs.
+
+`backoffs` (int ≥ 1) — the fleet's CONSECUTIVE-episode count, what
+`policy.max_rate_limit_backoffs` is checked against and what
+`_rate_limit_delay` doubles from. Episodes, never observations.
+`retry_not_before` (ISO 8601, UTC) — the one shared, un-jittered deadline; each
+lane adds `k/lanes` of `[concurrency] rate_limit_release_jitter_seconds` on top
+before re-probing. `opened_at`, `opened_by` (lane id) — who started the episode.
+`observations` (int ≥ 1) — how many lanes have met THIS episode; `4` beside
+`backoffs = 1` is four lanes throttled by one limit producing one episode.
+`updated_at`.
+
+Written atomically (temp file with the writer's pid in its name, then
+`os.replace`) and mutated only under `tasks.task_file_mutex`, so the
+read-decide-write of joining an episode cannot race. **Absent at `lanes = 1`,
+and never created there.** A record that cannot be read is refused rather than
+read as "no throttle": admission holds and the next throttled lane parks naming
+the file.
 
 ## Task
 

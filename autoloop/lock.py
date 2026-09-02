@@ -87,6 +87,24 @@ lets two processes into one lane.
 place they interact is the self-upgrade handoff, where the fleet lock is armed
 to SURVIVE `os.execv` and the lease is released so that it does not. See
 `LaneLease`'s own docstring for both halves.
+
+## The other fleet-scoped record: `fleet_throttle.json` (conc-11)
+
+`state.FleetThrottleStore` keeps ONE rate-limit episode — a shared
+`retry_not_before` and a shared consecutive-back-off counter — in a file BESIDE
+`state_dir/LOCK`, and it is there for the reason the lock is: one state
+directory is one account's fleet, so "this account is throttled" is a fact about
+the directory rather than about any lane. N lanes draw on ONE ChatGPT allowance,
+and conc-05's per-lane state files would otherwise have turned one limit into N
+independent counters.
+
+**It is NOT a lock and takes none of the semantics above.** It is never
+acquired, never owned, never adopted across `os.execv`, and holding it is not a
+thing a process does — every lane reads it and any lane may write it. What it
+borrows is the location and one discipline: a record it cannot READ is refused
+rather than read as "no throttle" (see that class), the same direction
+`LaneLease.read` fails in. `unlock` does not touch it, and neither does
+`break_stale`; nothing here does.
 """
 
 from __future__ import annotations

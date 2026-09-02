@@ -836,3 +836,20 @@ workers_root = "~/.autoloop/workers"
 # autoloop/note_merge.py switches itself off silently when that is broken, so
 # concurrency raises the price of breaking it.
 lanes = 1
+# How far apart the lanes are released from ONE shared rate-limit window
+# (conc-11). N lanes draw on ONE ChatGPT account allowance, so a throttle is a
+# fact about the fleet and not about a lane: the fleet keeps a single
+# `fleet_throttle.json` beside its lock with one deadline and one
+# consecutive-back-off counter, every lane that meets the limit inside that
+# window JOINS the episode instead of starting its own, and the whole fleet
+# parks after policy.max_rate_limit_backoffs episodes however many lanes
+# observed them.
+#
+# This value only spreads the RELEASE. Without it four lanes would wait out one
+# window and re-probe on the same tick, which is four requests into an allowance
+# that has just run out; with it lane k releases k/lanes of this value after the
+# shared deadline, so the spread is always strictly less than the value itself
+# and `health` can state it. 0 disables the spread (still one episode — the
+# coalescing is the record's job, not the jitter's), values above 60 are
+# refused, and at lanes = 1 it is exactly 0 and no fleet record is ever written.
+rate_limit_release_jitter_seconds = 5.0

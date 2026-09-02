@@ -477,7 +477,12 @@ DOCS_ONLY_SELECTED = 20
 #: `tasks.TRACKER_PATHS` rather than by spelling them, and resolves no
 #: `__file__` — so it reads no document under either half of the rule above and
 #: the same 20 hold. The DENOMINATOR only.
-SUITE_SIZE = 108
+#: 108 -> 109 when conc-11 added `test_fleet_throttle.py` (2026-09-02): it works
+#: on one small JSON record and two orchestrators under `tmp_path`, names its
+#: trackers not at all, resolves no `__file__`, and its only concurrency is
+#: `threading` — which is not a spawn under the opacity rule — so the same 20
+#: once more. The DENOMINATOR only.
+SUITE_SIZE = 109
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
