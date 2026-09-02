@@ -37,6 +37,14 @@ admission rule, and reaches a self-upgrade boundary by draining.**
    of dispatching blind, and that a lane the operator's LOWERED CAP removed from
    the fleet — the one hold `plan` cannot see, because `lane_occupants` never
    walks that far — dispatches nothing at any cap.
+6. **And the OTHER half of that lowered cap: the cut lane is still counted.**
+   Section 7 is the mirror of section 6's last case, asked from the lanes still
+   inside the cap. A live session at an index the new cap no longer reaches is
+   invisible to `lane_occupants` by design, so `fleet_occupants` is what every
+   scheduling decision reads: it costs a slot, it contributes its scope, and —
+   the failure this section exists for — `fleet_idle` is False while it runs, so
+   a pending upgrade drains until it, not merely until the in-cap lanes, is
+   terminal.
 
 No git repository, no subprocess and no agent: every claim here is about a
 registry, a small JSON file and a predicate. The two places the real loop is
@@ -73,15 +81,19 @@ from autoloop.orchestrator import (
     HOLD_LANE_RETIRED,
     HOLD_LANE_UNREADABLE,
     HOLD_SCOPE_CONFLICT,
+    UNLISTABLE_LANES_INDEX,
     FleetSupervisor,
     LaneOccupant,
     Orchestrator,
+    fleet_occupants,
     lane_occupants,
+    retired_lane_occupants,
     session_task_id,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.transcript import TranscriptLogger
 from autoloop.state import (
+    LANES_DIRNAME,
     LoopState,
     Phase,
     StateStore,
@@ -1233,4 +1245,289 @@ def test_a_cut_lane_still_finishes_the_arc_it_already_holds(tmp_path):
     )
 
     assert dispatched == ["t1"], "the arc this lane owns still finishes"
+    assert orch.state.policy_denials == 0
+
+
+# ---- 7. the lane a lowered cap cut out is still IN the fleet -------------------
+#
+# Section 6's last two tests ask the lowered cap from inside the lane it removed:
+# that lane starts nothing. This section asks the same edit from the lanes still
+# INSIDE the cap, which is where it can do damage — the cut lane is still running
+# a round, and a supervisor that cannot see it counts a free slot the fleet does
+# not have and, worse, reads the fleet as IDLE and replaces the process at a
+# self-upgrade boundary with that round still going. `lane_occupants` stays the
+# narrow scan (the fleet the config describes); `fleet_occupants` is the union
+# every scheduling decision is taken against.
+
+
+def test_a_lane_above_the_cap_is_counted_by_the_fleet_scan(tmp_path):
+    """The two scans, side by side, on one state directory. The narrow one
+    answers "how big is the fleet the config describes" and must not change —
+    section 6 relies on it — and the union answers "which lanes hold a round"."""
+    config = make_config(tmp_path, lanes=2)
+    a_busy_lane(config, 3, "t1")
+
+    assert lane_occupants(config) == (), "the narrow scan stops at the cap"
+    occupants = fleet_occupants(config)
+
+    assert [(o.lane_index, o.task_id, o.readable) for o in occupants] == [
+        (3, "t1", True)
+    ]
+    assert occupants[0].lane_id == lane_id(3)
+    assert retired_lane_occupants(config) == occupants
+
+
+def test_the_cap_counts_the_lanes_the_operator_cut_out(tmp_path):
+    """THE CAP, against the fleet that is actually running. Two lanes were cut
+    to two, and the two cut lanes are still mid-round: the fleet is already at
+    its cap, so nothing may start beside them. The second plan is the accounting
+    this replaces — the narrow scan admits two, which would be four rounds under
+    a cap of two — and holding costs the held tasks nothing, byte for byte."""
+    config = make_config(tmp_path, lanes=2)
+    registry = registry_of(a_task("x"), a_task("y"), a_task("t1"), a_task("t2"))
+    TaskStore(config.tasks_file).save(registry)
+    a_busy_lane(config, 2, "x")
+    a_busy_lane(config, 3, "y")
+    before = tree_bytes(config.state_dir)
+
+    plan = FleetSupervisor.from_config(config).plan(registry, fleet_occupants(config))
+
+    assert plan.admitted == () and plan.free_lanes == 0
+    assert not plan.fleet_idle
+    assert plan.hold_reason("t1") == HOLD_AT_CAP
+    assert plan.hold_reason("x") == HOLD_IN_FLIGHT
+    narrow = FleetSupervisor.from_config(config).plan(registry, lane_occupants(config))
+    assert admitted_ids(narrow) == ["t1", "t2"], (
+        "the accounting this replaces: two more rounds under a cap of two"
+    )
+    assert [t.status for t in registry.all_tasks()] == ["pending"] * 4
+    assert tree_bytes(config.state_dir) == before, "planning wrote something"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+
+
+def test_one_cut_lane_costs_one_slot_and_no_more(tmp_path):
+    """The bound on the test above: a cut lane costs the slot it is using and
+    not the fleet. One of two lanes is left, and one task starts in it."""
+    config = make_config(tmp_path, lanes=2)
+    registry = registry_of(a_task("x"), a_task("t1"), a_task("t2"))
+    a_busy_lane(config, 3, "x")
+
+    plan = FleetSupervisor.from_config(config).plan(registry, fleet_occupants(config))
+
+    assert admitted_ids(plan) == ["t1"]
+    assert plan.free_lanes == 1 and not plan.fleet_idle
+    assert plan.hold_reason("t2") == HOLD_AT_CAP
+
+
+def test_a_pending_upgrade_waits_for_the_lane_the_cap_cut_out(
+    tmp_path, monkeypatch
+):
+    """THE DRAIN, against the fleet that is actually running — the failure this
+    round exists to close, driven through the real `cli._run_continuous`.
+
+    Iteration one: an upgrade is pending and the cut lane 3 is mid-round under a
+    cap of two. `fleet_idle` is False, so no boundary is taken and nothing is
+    admitted; the fake sleep is where that lane finishes. Iteration two: the
+    fleet is empty and the boundary is REACHED.
+
+    With the narrow scan this test takes the boundary on iteration one — the cut
+    lane is invisible, the fleet reads as idle, and `os.execv` replaces the
+    process with a round still running in it. The `fleet_hold` assertions are
+    what fail there: no tick ever held anything."""
+    config = upgrade_config(tmp_path, lanes=2)
+    # Two tasks, one of them the cut lane's own: an id a lane holds is
+    # `HOLD_IN_FLIGHT` before it is anything else, so t2 is what carries the
+    # drain's own reason.
+    TaskStore(config.tasks_file).save(registry_of(a_task("t1"), a_task("t2")))
+    cut_lane = StateStore(lane_state_file(config.state_dir, 3))
+    mid_round = LoopState(session_id="lane-three", conversation_url=URL)
+    mid_round.phase = Phase.EXECUTING.value
+    mid_round.current_task = {"task_id": "t1"}
+    cut_lane.save(mid_round)
+    monkeypatch.setattr(
+        cli,
+        "_select_and_kickoff",
+        lambda *a, **k: pytest.fail("a drain must admit nothing"),
+    )
+    boundaries: list = []
+
+    def reached(cfg, lock, args=None, lane=None):
+        boundaries.append(cfg.pending_upgrade_file)
+        raise StopTheLoop()
+
+    monkeypatch.setattr(cli, "_self_upgrade_at_boundary", reached)
+
+    def finish_the_cut_lane(seconds):
+        if seconds != cli.CONTINUOUS_POLL_SECONDS:
+            return
+        assert boundaries == [], "the boundary was taken with a cut lane running"
+        done = cut_lane.load()
+        done.phase = Phase.STOPPED.value
+        cut_lane.save(done)
+
+    monkeypatch.setattr(cli.time, "sleep", finish_the_cut_lane)
+    # The accounting this replaces, asserted as a VALUE rather than left to a
+    # second-order consequence below: with the narrow scan the very first tick
+    # reads the fleet as idle and reaches the boundary — `os.execv`, with lane 3
+    # mid-round. The day that stops being true, this line is what says so.
+    stale = FleetSupervisor.from_config(config).plan(
+        registry_of(a_task("t1"), a_task("t2")),
+        lane_occupants(config),
+        upgrade_pending=True,
+    )
+    assert stale.upgrade_boundary, "the cut lane was already visible to the cap scan"
+
+    with pytest.raises(StopTheLoop):
+        cli._run_continuous(continuous_args(), config)
+
+    assert len(boundaries) == 1, "reached once the cut lane went terminal, not before"
+    held = fleet_hold_entries(config)
+    assert held, "the tick that waited for the cut lane recorded nothing"
+    assert held[0]["draining"] is True and HOLD_DRAINING in held[0]["held"]
+    assert held[0]["busy"] == 1 and held[0]["lanes"] == 2, (
+        "the count an operator reads is the fleet that is running, cap or no cap"
+    )
+    assert "1/2 lanes busy" in held[0]["detail"]
+
+
+def test_a_lane_may_not_dispatch_beside_the_lane_the_cap_cut_out(tmp_path):
+    """The dispatch site, against the same fleet. Lane 3 was cut out of a fleet
+    of two and is still running n1, which declares `autoloop/cli.py`; this lane
+    is directed at t2, which declares the same file.
+
+    n1's registry row is deliberately still `pending` — the race the plan
+    documents, where a lane names a task before its row catches up — so the ONLY
+    evidence that n1 is running is the cut lane's own state file. Without the
+    retired scan there is no occupant, no held scope, and t2 dispatches straight
+    into the file n1 is editing."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config,
+        tasks=[
+            a_task("n1", ["autoloop/cli.py"]),
+            a_task("t2", ["autoloop/cli.py"]),
+            a_task("t3", ["autoloop/health.py"]),
+        ],
+    )
+    a_busy_lane(config, 3, "n1")
+    assert orch._registry.get("n1").status == "pending"
+    before = config.tasks_file.read_bytes()
+
+    orch._dispatch_executor(implement("t2"))
+
+    assert dispatched == [], "the held task did not start"
+    assert orch._registry.get("t2").status == "pending"
+    assert config.tasks_file.read_bytes() == before, "the registry was not written"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+    outbox = orch.state.outbox or ""
+    assert HOLD_SCOPE_CONFLICT in outbox and "autoloop/cli.py" in outbox
+
+    orch._dispatch_executor(implement("t3"))
+
+    assert dispatched == ["t3"], "the slot the cut lane leaves is still a slot"
+
+
+def test_a_lanes_directory_that_cannot_be_listed_holds_the_fleet(tmp_path):
+    """FAIL-CLOSED on the listing itself, which is the one read this scan adds.
+    A `lanes` path that is not a directory answers ONE unreadable occupant
+    rather than "no cut lanes": a scan that reports nothing when it can see
+    nothing raises the effective cap exactly when the state dir is in trouble.
+    Note that the narrow scan sees nothing wrong here at all."""
+    config = make_config(tmp_path, lanes=2)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    (config.state_dir / LANES_DIRNAME).write_text("not a directory", encoding="utf-8")
+    registry = registry_of(a_task("t1"))
+
+    assert lane_occupants(config) == (), "the narrow scan sees nothing to worry about"
+    occupants = fleet_occupants(config)
+
+    assert [(o.lane_index, o.readable) for o in occupants] == [
+        (UNLISTABLE_LANES_INDEX, False)
+    ]
+    assert UNLISTABLE_LANES_INDEX < 0, "it must never equal a lane's own index"
+    plan = FleetSupervisor.from_config(config).plan(registry, occupants)
+    assert plan.admitted == () and plan.hold_reason("t1") == HOLD_LANE_UNREADABLE
+
+
+def test_the_unlistable_stand_in_is_not_mistaken_for_this_lane(tmp_path):
+    """The sharpest fail-open this scan could have had. The dispatch gate drops
+    the occupant whose index is its OWN — the slot it is already in — so an
+    unreadable stand-in numbered like a lane would be dropped by exactly the
+    lane that asked, and the fail-closed hold would switch itself off. It is
+    numbered `-1`, no lane's index, so the refusal survives the exclusion."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1", ["autoloop/cli.py"])])
+    (config.state_dir / LANES_DIRNAME).write_text("not a directory", encoding="utf-8")
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == [], "a fleet the gate cannot enumerate refuses"
+    assert orch._registry.get("t1").status == "pending"
+    assert HOLD_LANE_UNREADABLE in (orch.state.outbox or "")
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+
+
+def test_no_lanes_directory_at_all_is_no_cut_lane_rather_than_a_hold(tmp_path):
+    """The one fail-OPEN answer this scan gives, and the reasoning that makes it
+    safe, pinned rather than left in a comment: a missing `lanes/` directory
+    means no lane above zero has ever written state, and lane 0 can never be the
+    cut one because a fleet of zero lanes does not exist. If either half ever
+    stops holding — lane 0 moving under `lanes/`, or a cap below one — this is
+    where it should fail."""
+    config = make_config(tmp_path, lanes=2)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+
+    assert not (config.state_dir / LANES_DIRNAME).exists()
+    assert retired_lane_occupants(config) == ()
+    assert fleet_occupants(config) == lane_occupants(config) == ()
+    assert lane_paths(config.state_dir, 0).state_dir == config.state_dir
+    assert lane_paths(config.state_dir, 1).state_dir.parent == (
+        config.state_dir / LANES_DIRNAME
+    )
+    with pytest.raises(ValueError):
+        FleetSupervisor(0)
+
+
+def test_a_stray_directory_beside_the_lanes_is_not_a_lane(tmp_path):
+    """The other direction: a name `config.lane_id` does not produce is not a
+    lane, however busy it looks. Invented occupants would hold the whole fleet
+    on whatever an operator left in that directory — and `_lane-03` is the sharp
+    one, because `int()` reads it as 3 while no lane is ever called that.
+
+    The in-cap lane is here to pin the other half: the two scans partition the
+    lanes at the cap and never count one twice."""
+    config = make_config(tmp_path, lanes=2)
+    a_busy_lane(config, 1, "t1")
+    a_busy_lane(config, 3, "t2")
+    strays = ("notes", "_lane-03", "_lane-", "_lane-abc", f"{lane_id(3)}x")
+    busy_looking = LoopState(session_id="stray", conversation_url=URL)
+    busy_looking.phase = Phase.EXECUTING.value
+    for stray in strays:
+        StateStore(config.state_dir / LANES_DIRNAME / stray / "state.json").save(
+            busy_looking
+        )
+
+    occupants = fleet_occupants(config)
+
+    assert [(o.lane_index, o.task_id) for o in occupants] == [(1, "t1"), (3, "t2")]
+    assert all(o.readable for o in occupants)
+
+
+def test_at_one_lane_no_scan_walks_past_lane_zero(tmp_path):
+    """The acceptance criterion, at the scan this round adds. A single-lane
+    deployment consults no scheduler — `_fleet_plan` answers `None` and the
+    dispatch gate returns before it reads anything — so a lane directory left
+    behind beside it changes nothing about today's dispatch sequence. That is
+    the deliberate bound: `lanes = 1` behaves exactly as it does today, and the
+    cut lanes stop themselves (`HOLD_LANE_RETIRED`, at any cap)."""
+    config = make_config(tmp_path, lanes=1)
+    a_busy_lane(config, 3, "n1")
+    orch, dispatched = build_lane(config, tasks=[a_task("t1", ["autoloop/cli.py"])])
+
+    assert cli._fleet_plan(config, orch._registry, set()) is None
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"]
     assert orch.state.policy_denials == 0

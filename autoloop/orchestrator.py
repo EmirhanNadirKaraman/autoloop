@@ -352,7 +352,7 @@ from .blockers import (
     refusal_identity,
 )
 from .changeset_review import ChangesetBinding, build_changeset_packet
-from .config import AutoloopConfig, lane_id
+from .config import LANE_ID_PREFIX, AutoloopConfig, lane_id
 from .context import build_context, render_context
 from .conversation import (
     SendOutcome,
@@ -442,6 +442,7 @@ from .prompts import (
 )
 from .state import (
     EXECUTION_ABORTED,
+    LANES_DIRNAME,
     TERMINAL_PHASES,
     ChunkedDelivery,
     LastResponse,
@@ -1295,6 +1296,12 @@ HOLD_IN_FLIGHT = "already_in_flight"
 #: so such a lane is absent from its own occupant list rather than counted, and
 #: a plan computed for it would see a free slot that does not exist.
 #: `Orchestrator._refused_outside_fleet_admission` answers it before it plans.
+#:
+#: That is only half of the lowered cap, and the other half is not a hold at
+#: all: the lanes still INSIDE the cap have to SEE that session, or they count a
+#: free slot the fleet does not have and drain to an upgrade boundary while it
+#: is mid-round. `retired_lane_occupants` is that half — the same lane, read
+#: from outside instead of asked from within.
 HOLD_LANE_RETIRED = "lane_outside_the_fleet"
 
 #: The verdict code `Orchestrator._refused_outside_fleet_admission` denies a
@@ -1434,27 +1441,158 @@ def lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]
     the lane that is in trouble, which is the fail-open direction.
 
     Reads only; opens no lease, takes no lock, and writes nothing.
+
+    THE FLEET THE CONFIG DESCRIBES, which is not always the fleet that holds
+    work: a cap the operator LOWERED under a running fleet leaves live sessions
+    at indices this range no longer reaches. Those are `retired_lane_occupants`,
+    and `fleet_occupants` is the union every scheduling decision is taken
+    against. This one stays narrow on purpose — it is what sizes the fleet the
+    config asks for, and a scan that quietly walked further would be answering a
+    different question from the one its name asks.
     """
     count = int(config.concurrency.lanes) if lanes is None else int(lanes)
     found: list[LaneOccupant] = []
     for index in range(count):
-        paths = lane_paths(config.state_dir, index)
-        try:
-            state = StateStore(paths.state_file).load()
-        except (StateError, OSError, ValueError, TypeError):
-            found.append(LaneOccupant(index, paths.lane_id, None, False))
-            continue
-        if state is None:
-            continue  # no session in that lane at all
-        try:
-            phase = Phase(state.phase)
-        except ValueError:
-            found.append(LaneOccupant(index, paths.lane_id, None, False))
-            continue
-        if phase in TERMINAL_PHASES:
-            continue
-        found.append(LaneOccupant(index, paths.lane_id, session_task_id(state)))
+        occupant = _lane_occupant(config.state_dir, index)
+        if occupant is not None:
+            found.append(occupant)
     return tuple(found)
+
+
+def _lane_occupant(state_dir, index: int) -> LaneOccupant | None:
+    """One lane, read from its own state file: the occupant it holds, or `None`
+    when that lane is free.
+
+    ONE implementation, two scanners (`lane_occupants` and
+    `retired_lane_occupants`). A lane the cap cut out is judged by exactly the
+    predicate an in-cap lane is judged by — busy is "the state file exists and
+    its phase is not terminal", unreadable is busy — because two spellings of
+    "is this lane running something" are two chances to disagree, and the one
+    that disagrees is the one that lets the fleet exceed its cap.
+    """
+    paths = lane_paths(state_dir, index)
+    try:
+        state = StateStore(paths.state_file).load()
+    except (StateError, OSError, ValueError, TypeError):
+        return LaneOccupant(index, paths.lane_id, None, False)
+    if state is None:
+        return None  # no session in that lane at all
+    try:
+        phase = Phase(state.phase)
+    except ValueError:
+        return LaneOccupant(index, paths.lane_id, None, False)
+    if phase in TERMINAL_PHASES:
+        return None
+    return LaneOccupant(index, paths.lane_id, session_task_id(state))
+
+
+#: The `lane_index` of the one occupant that is not a lane: the fail-closed
+#: stand-in `retired_lane_occupants` returns when it cannot LIST the lanes
+#: directory at all. Negative, so it can never equal a real lane index and can
+#: therefore never be mistaken for "this lane" by
+#: `Orchestrator._refused_outside_fleet_admission`'s own-slot exclusion — an
+#: occupant that excluded itself would be a fail-closed guard that switches
+#: itself off in exactly the lane that asks.
+UNLISTABLE_LANES_INDEX = -1
+
+
+def _lane_index_of(name: str) -> int | None:
+    """The lane index a directory name under `lanes/` denotes, or `None` when
+    the name is not one `config.lane_id` produces.
+
+    ROUND-TRIPPED rather than parsed: `lane_id(index) == name` is what rejects
+    `_lane-03`, `_lane-1x`, a unicode-digit spelling `int()` would happily
+    accept, and anything an operator left beside the lanes. The alternative —
+    treating an unrecognised name as a lane — would invent occupants out of
+    stray directories and hold the whole fleet on one of them.
+    """
+    if not name.startswith(LANE_ID_PREFIX):
+        return None
+    suffix = name.removeprefix(LANE_ID_PREFIX)
+    if not (suffix.isascii() and suffix.isdigit()):
+        return None
+    index = int(suffix)
+    return index if lane_id(index) == name else None
+
+
+def retired_lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
+    """Lanes the operator's LOWERED CAP cut out of the fleet that are still
+    holding a round.
+
+    THE MIRROR OF `HOLD_LANE_RETIRED`, and the half a scheduler cannot see from
+    `range(lanes)`. Lowering `[concurrency] lanes` from 4 to 2 does not end the
+    sessions in lanes 2 and 3; it only stops `lane_occupants` walking that far.
+    Without this scan the supervisor counts two free lanes while four rounds
+    run, and — the sharper failure — reads `fleet_idle` as True and reaches a
+    self-upgrade boundary with two lanes mid-round, which is the one thing the
+    drain exists to prevent.
+
+    Found by LISTING `state_dir/lanes/` rather than by walking a bound, because
+    the bound would have to be guessed: `config.MAX_LANES` is this build's
+    ceiling and a lane opened by a build with a higher one is exactly the state
+    a hardcoded range misses. Lane 0 is never retired — `lanes >= 1` always, so
+    index 0 is always inside the cap — which is why a lanes directory that does
+    not exist at all is `()` and not a fail-closed hold: every lane that could
+    be retired lives under it (`state.lane_paths`).
+
+    FAIL-CLOSED ON THE LISTING ITSELF. A `lanes` path that cannot be listed —
+    permissions, a file where the directory should be — answers one UNREADABLE
+    occupant (`UNLISTABLE_LANES_INDEX`) rather than "no retired lanes", for the
+    reason `lane_occupants` treats an unreadable lane as busy: a scan that
+    reports nothing when it can see nothing raises the effective cap exactly
+    when the state directory is in trouble.
+
+    THE RESIDUAL, stated where the code is: a retired lane whose process DIED
+    leaves a non-terminal state file behind, and this counts it forever — the
+    fleet stops admitting and never reaches an upgrade boundary until an
+    operator removes that lane's directory. That is the same stale-session
+    liveness gap an in-cap lane already has (a round whose process died is
+    conc-08's subject, and the lane LEASE is the evidence it will judge that
+    with); it is inherited here deliberately rather than answered with a second
+    liveness rule that would drift from conc-08's.
+
+    Reads only; opens no lease, takes no lock, and writes nothing.
+    """
+    count = int(config.concurrency.lanes) if lanes is None else int(lanes)
+    root = Path(config.state_dir) / LANES_DIRNAME
+    try:
+        names = sorted(entry.name for entry in root.iterdir())
+    except FileNotFoundError:
+        return ()  # no lane above 0 has ever written state here
+    except OSError:
+        return (LaneOccupant(UNLISTABLE_LANES_INDEX, LANES_DIRNAME, None, False),)
+    found: list[LaneOccupant] = []
+    for name in names:
+        index = _lane_index_of(name)
+        if index is None or index < count:
+            continue  # not a lane, or one `lane_occupants` already walked
+        occupant = _lane_occupant(config.state_dir, index)
+        if occupant is not None:
+            found.append(occupant)
+    return tuple(found)
+
+
+def fleet_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
+    """Every lane that is holding a round — the fleet as it IS, which is what
+    every scheduling decision is taken against.
+
+    `lane_occupants` (the fleet the config describes) plus
+    `retired_lane_occupants` (the lanes a lowered cap cut out and did not stop).
+    Both callers of `FleetSupervisor.plan` in production feed it this rather
+    than the narrow scan: the cap is a cap over the rounds actually running, and
+    the drain waits for the last of them, not for the last one inside the
+    current `[concurrency] lanes`.
+
+    Nothing this adds can widen admission. An occupant only ever removes a free
+    slot, marks an id in flight, contributes a scope to conflict against, or —
+    unreadable — holds everything; and `FleetPlan.fleet_idle` is `not
+    occupants`, so a retired lane can only ever DELAY a boundary, never bring
+    one forward. It cannot reopen admission into a retired lane either: which
+    lane a session opens in is the process's own `lane_index`, and
+    `Orchestrator._refused_outside_fleet_admission` refuses that lane's
+    dispatches outright (`HOLD_LANE_RETIRED`).
+    """
+    return lane_occupants(config, lanes) + retired_lane_occupants(config, lanes)
 
 
 class FleetSupervisor:
@@ -6698,10 +6836,17 @@ class Orchestrator:
         cuts the same lanes out that 4 -> 2 does. It costs one attribute
         comparison and reads no file, so lane 0 at `lanes = 1` — the only lane a
         single-lane deployment has — is untouched by it. `lane_occupants` itself
-        is deliberately NOT widened: `cli._fleet_plan` is the supervisor's own
-        view of the fleet it is sizing, it never opens a lane at or above the
-        cap, and a scan that walked further would have to guess how much
-        further.
+        is deliberately NOT widened: it answers "how big is the fleet the config
+        describes", which is the question `cli._fleet_plan` sizes itself with.
+
+        THE MIRROR OF THAT CASE, asked from the lanes still INSIDE the cap, is
+        what `fleet_occupants` answers and why this reads it rather than
+        `lane_occupants`: the lane the operator cut out is still running a
+        round, still holds a task and still holds that task's scope, so a lane
+        that cannot see it would admit a conflicting task beside it and count a
+        free slot the fleet does not have. `retired_lane_occupants` finds it by
+        listing `state_dir/lanes/` — no guess about how far to walk — and
+        counting it can only ever hold MORE, never admit more.
 
         The gate FAILS CLOSED when it cannot answer: an unreadable neighbour is
         already `HOLD_LANE_UNREADABLE` inside `plan`, and an exception anywhere
@@ -6756,10 +6901,13 @@ class Orchestrator:
             try:
                 # This lane is not one of its own occupants: it is mid-round by
                 # construction here, so counting the slot it already holds would
-                # make every dispatch above one lane read as a full fleet.
+                # make every dispatch above one lane read as a full fleet. Every
+                # OTHER lane holding a round is counted, retired ones included —
+                # this lane is inside the cap (the check above returned
+                # otherwise), so the exclusion never drops one of those.
                 occupants = tuple(
                     occupant
-                    for occupant in lane_occupants(self._config)
+                    for occupant in fleet_occupants(self._config)
                     if occupant.lane_index != self.lane_index
                 )
                 plan = FleetSupervisor(lanes).plan(

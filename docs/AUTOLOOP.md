@@ -855,6 +855,20 @@ tick in the transcript and shown by `health` and the dashboard, because a fleet
 sitting at its cap and a fleet with nothing to do look identical from outside
 and must not read identically.
 
+**Lowering the cap under a running fleet has two halves, and conc-06 shipped
+the first one alone before the second was found.** The edit does not end the
+sessions in the lanes it cuts out. From INSIDE such a lane the answer is
+`HOLD_LANE_RETIRED`: it finishes the arc it already holds — that is what every
+drain here waits for — and starts nothing new. From the lanes still inside the
+cap the answer has to be that those sessions are still COUNTED, and a scan over
+`range(lanes)` cannot see them: without it the fleet reads as having free slots
+it does not have, and as idle while a cut lane is mid-round, which reaches the
+self-upgrade boundary below and replaces the process out from under it.
+Occupancy is therefore read from the lanes' own directory rather than from the
+current cap (`orchestrator.fleet_occupants`), and a lanes directory that cannot
+be listed holds the fleet rather than reading as empty. Neither half is reached
+at `lanes = 1`, where nothing consults a scheduler at all.
+
 `lanes = 1` must remain a supported configuration behaving exactly as today —
 that is the brief's DEGRADE TO ONE bound, and it is how a broken lane gets
 turned off rather than debugged in production.
