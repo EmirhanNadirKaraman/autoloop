@@ -453,6 +453,7 @@ from .state import (
     StateStore,
     StopRepetitionStore,
     abort_requested,
+    lane_paths,
     packet_outstanding_reason,
     postcommit_binding_from_record,
     stop_repetition_file,
@@ -465,6 +466,7 @@ from .tasks import (
     TaskRegistry,
     TaskState,
     TaskStore,
+    co_schedule_conflict,
     effective_approved_paths,
     unauthorized_paths,
 )
@@ -1270,6 +1272,328 @@ class RepresentedCandidate:
     #: re-reading git — the same field, on the same rule, as
     #: `_finish_postcommit` sets.
     packet_diff: str
+
+
+#: WHY the fleet supervisor left a READY task in the queue this tick, as values
+#: rather than as prose (conc-06, `docs/AUTOLOOP.md` Decision 4). A fleet
+#: sitting at its cap and a fleet with nothing to do look identical from
+#: outside, so the reason is recorded once per tick and must be a word a reader
+#: can match on rather than a sentence somebody reworded.
+#:
+#: Every one of them means the SAME thing about the task: it stays `pending` in
+#: the registry, untouched, charged no attempt, quarantined by nothing, and
+#: dispatched as soon as the reason goes away (Decision 3's last paragraph).
+HOLD_DRAINING = "draining_for_self_upgrade"
+HOLD_LANE_UNREADABLE = "lane_unreadable"
+HOLD_AT_CAP = "fleet_at_cap"
+HOLD_SCOPE_CONFLICT = "scope_conflict"
+HOLD_IN_FLIGHT = "already_in_flight"
+
+
+def session_task_id(state: LoopState) -> str | None:
+    """The task a saved session names, or `None` when it names none and when
+    its two records disagree.
+
+    `Orchestrator._active_task_id`'s question asked from OUTSIDE the
+    orchestrator — the fleet supervisor reads other lanes' state files and has
+    no instance to ask. It calls that class's own `_task_id_in` rather than
+    re-deriving "which id does this record hold", so the shape-defensiveness
+    (non-dict, missing key, non-string, blank, untrimmed) has exactly one
+    implementation; the class is defined below this function and resolved at
+    call time, which is what lets the helper sit beside its only caller.
+
+    Disagreement answers `None` for the same reason it does there: a session
+    whose execution record and dispatch record name different tasks is one the
+    loop cannot attribute, and picking either would be a guess. The supervisor
+    treats `None` as "this lane holds something it cannot name" — which costs a
+    lane, never a wrong attribution.
+    """
+    recorded = Orchestrator._task_id_in(getattr(state, "task_execution", None))
+    dispatched = Orchestrator._task_id_in(getattr(state, "current_task", None))
+    if recorded is not None and dispatched is not None and recorded != dispatched:
+        return None
+    return recorded if recorded is not None else dispatched
+
+
+@dataclass(frozen=True)
+class LaneOccupant:
+    """One lane the fleet supervisor found BUSY, and what it holds.
+
+    `task_id` is `None` when the lane is mid-round but names no task — a fresh
+    session on the audit kickoff is exactly that, and it is an ordinary state,
+    not a fault. Such a lane costs a slot and constrains nothing else.
+
+    `readable` is False when the lane's state could not be read AT ALL (a
+    corrupt file, an unknown schema version, an unparseable phase, an I/O
+    error). That is the fail-closed case and it is deliberately NOT the same as
+    "names no task": a lane whose state cannot be read might hold anything, so
+    the supervisor admits nothing beside it rather than guessing that it holds
+    nothing. `lane_occupants` counts it as busy for the same reason.
+    """
+
+    lane_index: int
+    lane_id: str
+    task_id: str | None = None
+    readable: bool = True
+
+
+@dataclass(frozen=True)
+class FleetPlan:
+    """What the supervisor decided this tick. A VALUE, and nothing in producing
+    it writes anything: no registry mutation, no state file, no execution
+    record, no attempt. A task this plan does not admit is a task that was
+    never touched.
+    """
+
+    #: The fleet size the plan was computed against (`[concurrency] lanes`).
+    lanes: int
+    #: The READY tasks that may start now, in `ready_in_dispatch_order`, at
+    #: most one per free lane.
+    admitted: tuple[Task, ...]
+    #: `(task_id, reason)` for every READY task that was not admitted, in the
+    #: same order — one of the `HOLD_*` words above, with the conflicting file
+    #: entries appended for `HOLD_SCOPE_CONFLICT`.
+    held: tuple[tuple[str, str], ...]
+    #: The busy lanes the plan was computed against.
+    occupants: tuple[LaneOccupant, ...]
+    #: Is a self-upgrade waiting for the fleet to empty (Decision "an
+    #: interaction the scheduler must answer")?
+    draining: bool
+
+    @property
+    def free_lanes(self) -> int:
+        """Lanes with nothing in them. Never negative: more occupants than
+        lanes means the cap was lowered under a running fleet, and the answer
+        to that is "admit nothing", not "admit a negative number"."""
+        return max(0, self.lanes - len(self.occupants))
+
+    @property
+    def fleet_idle(self) -> bool:
+        """No lane is running anything — the state a drain is waiting for."""
+        return not self.occupants
+
+    @property
+    def upgrade_boundary(self) -> bool:
+        """The drain has arrived: an upgrade is pending AND every lane is
+        empty, so the process may replace itself with the whole fleet idle.
+
+        THE POINT OF THE DRAIN, and the half that must not be forgotten:
+        withholding admission alone would leave the record `pending` forever
+        while the loop slept next to it — the silent-no-outcome failure
+        `docs/AUTOLOOP.md` says concurrency must not reintroduce. The caller
+        acts on this by reaching the boundary, not by waiting for one.
+        """
+        return self.draining and self.fleet_idle
+
+    def hold_reason(self, task_id: str) -> str:
+        """Why `task_id` was not admitted, or `""` if it was (or is not READY)."""
+        for held_id, reason in self.held:
+            if held_id == task_id:
+                return reason
+        return ""
+
+    def describe(self) -> str:
+        """One line for the transcript and for an operator reading it."""
+        return (
+            f"{len(self.admitted)} admitted, {len(self.held)} held; "
+            f"{len(self.occupants)}/{self.lanes} lanes busy"
+            + (" (draining for a self-upgrade)" if self.draining else "")
+        )
+
+
+def lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
+    """Which lanes are BUSY right now, read from the lanes' own state files.
+
+    The lane state file is the authority for "is this lane running something",
+    because that is the file the lane's own phase machine writes (conc-05,
+    Decision 2/7: `phase` belongs to a lane). A lane is busy exactly when its
+    state file exists and its phase is not terminal — the same
+    `TERMINAL_PHASES` test `cli._run_continuous` applies to its own session, so
+    a lane the loop would treat as at a clean boundary is a lane this counts as
+    free.
+
+    UNREADABLE IS BUSY, never free. Every failure mode of the read — a corrupt
+    file, a schema version this build does not support, a phase string that is
+    not a `Phase`, an unreadable path — produces an occupant with
+    `readable=False` rather than an absent one. A supervisor that skipped what
+    it could not read would silently RAISE the fleet's effective cap on exactly
+    the lane that is in trouble, which is the fail-open direction.
+
+    Reads only; opens no lease, takes no lock, and writes nothing.
+    """
+    count = int(config.concurrency.lanes) if lanes is None else int(lanes)
+    found: list[LaneOccupant] = []
+    for index in range(count):
+        paths = lane_paths(config.state_dir, index)
+        try:
+            state = StateStore(paths.state_file).load()
+        except (StateError, OSError, ValueError, TypeError):
+            found.append(LaneOccupant(index, paths.lane_id, None, False))
+            continue
+        if state is None:
+            continue  # no session in that lane at all
+        try:
+            phase = Phase(state.phase)
+        except ValueError:
+            found.append(LaneOccupant(index, paths.lane_id, None, False))
+            continue
+        if phase in TERMINAL_PHASES:
+            continue
+        found.append(LaneOccupant(index, paths.lane_id, session_task_id(state)))
+    return tuple(found)
+
+
+class FleetSupervisor:
+    """Scheduling across N lanes: the cap, the admission rule, and the drain
+    that reaches a self-upgrade boundary (conc-06, `docs/AUTOLOOP.md`
+    Decisions 3 and 4).
+
+    **It decides; it does not dispatch.** `plan()` is a pure function of the
+    registry, the busy lanes and whether an upgrade is pending. It never
+    mutates the registry, never opens a session and never charges an attempt —
+    a task it does not admit stays exactly `pending`, which is the whole of
+    Decision 3's "the task stays queued" promise. The caller (`cli.
+    _run_continuous`) is what turns an admission into a session.
+
+    **The queue is the registry.** No second data structure: the order is
+    `TaskRegistry.ready_in_dispatch_order`, which is `next_ready()`'s own
+    ordering — the urgent pin, then priority, then id. A supervisor that sorted
+    for itself would be a second implementation of the pin.
+
+    **At `lanes = 1` this is the loop.** `plan()` with one lane, nothing busy
+    and nothing pending admits exactly `next_ready()` and holds the rest, which
+    is what the single-lane loop does today. `cli` does not consult it at
+    `lanes = 1` at all — see `cli._fleet_plan` for why that gate is where the
+    N=1 acceptance criterion is made structural.
+    """
+
+    def __init__(self, lanes: int, trackers: tuple[str, ...] = TRACKER_PATHS):
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            raise ValueError(
+                f"fleet size must be an integer of at least 1, got {lanes!r} — "
+                "`config.load_config` refuses anything else at load time "
+                "(`concurrency.lanes`), and a supervisor built by hand must not "
+                "be the one place a fleet of zero or of `True` lanes exists"
+            )
+        self.lanes = lanes
+        self._trackers = tuple(trackers)
+
+    @classmethod
+    def from_config(cls, config) -> "FleetSupervisor":
+        """The one built from `[concurrency] lanes`."""
+        return cls(config.concurrency.lanes)
+
+    def plan(
+        self,
+        registry: TaskRegistry,
+        occupants: "tuple[LaneOccupant, ...] | list[LaneOccupant]" = (),
+        upgrade_pending: bool = False,
+    ) -> FleetPlan:
+        """Which READY tasks may start now, and why each of the others may not.
+
+        The checks are applied in this order, and the order is what decides
+        which reason is REPORTED for a task several of them would hold:
+
+        1. `HOLD_IN_FLIGHT` — the fleet already holds this id. Belt and braces
+           against the one race the two records make possible: a lane writes
+           its state file and the registry row separately, so for an instant a
+           task can be held by a lane while its row still reads `pending`.
+           Admitting it into a second lane would run one task twice.
+        2. `HOLD_DRAINING` — an upgrade is pending, so nothing new is admitted
+           until the fleet is empty and the boundary is reached.
+        3. `HOLD_LANE_UNREADABLE` — a lane's state, or an occupant's scope,
+           could not be read. The gate needs both to answer, and a gate that
+           passes when what it needs is missing is not a gate.
+        4. `HOLD_AT_CAP` — every lane is busy (or already spoken for by an
+           earlier admission this tick).
+        5. `HOLD_SCOPE_CONFLICT` — this task declares a file entry that a lane
+           already holds, or that a task admitted earlier this tick declares.
+           Checked against BOTH, so one tick cannot co-schedule a conflicting
+           pair by admitting them together.
+        """
+        occupants = tuple(occupants)
+        unreadable_lane = any(not occupant.readable for occupant in occupants)
+        held_ids = {occupant.task_id for occupant in occupants if occupant.task_id}
+        # The registry's own view of what is in flight, unioned with the lanes'.
+        # NEITHER SOURCE IS SUFFICIENT ALONE: a lane writes its state file and
+        # the registry row at different moments, so a task can be `in_progress`
+        # with no lane naming it (a round whose process died — `conc-08`'s
+        # subject) and can be named by a lane while its row is still `pending`.
+        # Reads the stored status via `in_progress_tasks`, never `state_of`,
+        # which raises on a graph with a dangling `depends_on`.
+        held_ids |= {task.id for task in registry.in_progress_tasks()}
+        # The scopes the fleet is already committed to. An id nothing in the
+        # registry can describe is scope-UNKNOWN, not scope-empty: the gate
+        # cannot prove a conflict does not exist, so it stops admitting rather
+        # than admitting blind.
+        held_scopes: list[tuple[str, tuple[str, ...]]] = []
+        unknown_scope = False
+        for held_id in sorted(held_ids):
+            if registry.has(held_id):
+                held_scopes.append((held_id, registry.get(held_id).approved_paths))
+            else:
+                unknown_scope = True
+
+        free = max(0, self.lanes - len(occupants))
+        admitted: list[Task] = []
+        held: list[tuple[str, str]] = []
+        for task in registry.ready_in_dispatch_order():
+            if task.id in held_ids:
+                held.append((task.id, HOLD_IN_FLIGHT))
+                continue
+            if upgrade_pending:
+                held.append((task.id, HOLD_DRAINING))
+                continue
+            if unreadable_lane or unknown_scope:
+                held.append((task.id, HOLD_LANE_UNREADABLE))
+                continue
+            if len(admitted) >= free:
+                held.append((task.id, HOLD_AT_CAP))
+                continue
+            conflict = self._first_conflict(task, held_scopes, admitted)
+            if conflict is not None:
+                other, entries = conflict
+                held.append(
+                    (task.id, f"{HOLD_SCOPE_CONFLICT}: {other} ({', '.join(entries)})")
+                )
+                continue
+            admitted.append(task)
+        return FleetPlan(
+            lanes=self.lanes,
+            admitted=tuple(admitted),
+            held=tuple(held),
+            occupants=occupants,
+            draining=bool(upgrade_pending),
+        )
+
+    def _first_conflict(
+        self,
+        task: Task,
+        held_scopes: list[tuple[str, tuple[str, ...]]],
+        admitted: list[Task],
+    ) -> tuple[str, tuple[str, ...]] | None:
+        """The first task already scheduled that `task` may not run beside, and
+        the file entries the two share.
+
+        `tasks.co_schedule_conflict` is the whole rule and this adds nothing to
+        it: declared paths only, file entries only, universal trackers
+        excluded. Deterministic — the lanes' scopes are walked in sorted id
+        order and this tick's admissions in admission order — so the reason a
+        task is held does not depend on dict iteration.
+        """
+        for other_id, other_paths in held_scopes:
+            entries = co_schedule_conflict(
+                task.approved_paths, other_paths, self._trackers
+            )
+            if entries:
+                return other_id, entries
+        for other in admitted:
+            entries = co_schedule_conflict(
+                task.approved_paths, other.approved_paths, self._trackers
+            )
+            if entries:
+                return other.id, entries
+        return None
 
 
 class Orchestrator:
