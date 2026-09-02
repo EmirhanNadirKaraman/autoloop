@@ -785,12 +785,18 @@ survive the universal tracker grant.** Every task's `effective_approved_paths`
 is its declared list UNION the six shared documentation trackers, so an overlap
 gate computed over the effective list would find an overlap between any two
 tasks and nothing would ever co-schedule. The gate is therefore computed over
-**declared** `approved_paths` only, and only at **file granularity**:
+**declared** `approved_paths` only, less an enumerated set of entries every
+task shares:
 
-* **Gates.** Two co-scheduled tasks must not both declare the same *file* entry
-  (an entry not ending in `/`) outside the six universal trackers. A same-file
-  declaration is the strongest advance signal that both lanes will edit the same
-  file, which is the case no resolver handles.
+* **Gates.** Two co-scheduled tasks must not both declare the same entry —
+  a file such as `autoloop/cli.py`, or a directory such as `autoloop/` — outside
+  the exempt entries the bullets below list. A same-entry declaration is the
+  strongest advance signal that both lanes will edit the same file, which is the
+  case no resolver handles. Entries are compared for EQUALITY, so a broad scope
+  and a narrow one inside it (`autoloop/` beside `autoloop/cli.py`) are not an
+  overlap here; that residual is deliberate, and steps 1–4 above are what
+  answers it — a containment rule would make every whole-package scope
+  serialise the fleet to buy a cost rather than a guarantee.
 * **Does not gate: the four append-only trackers** (`docs/SUMMARY.md`,
   `docs/TESTS.md`, `docs/SECURITY.md`, `docs/COMMON_ERRORS.md`). Every task
   appends to them by construction, and `note_merge.py` exists to resolve exactly
@@ -799,13 +805,19 @@ tasks and nothing would ever co-schedule. The gate is therefore computed over
   `note_merge.MAX_NOTE_LINE_CHARS`. The resolver switches itself off silently
   when that discipline is broken, so concurrency raises the price of breaking
   it, and the enabling candidate must say so in the operator docs.
-* **Does not gate: a shared directory entry** such as `autoloop/tests/`, which
-  nearly every task declares. Gating on it would serialise the fleet and buy
-  nothing; two tasks adding different files under it do not conflict.
+* **Does not gate: `autoloop/tests/`**, which nearly every task declares because
+  nearly every task adds a test. Gating on it would serialise the fleet and buy
+  nothing; two tasks adding different files under it do not conflict. That
+  argument is about THAT directory and does not generalise to directory entries
+  as a shape: two tasks both declaring `autoloop/` are two scopes each
+  authorized to write every file the other one touches, which is the case the
+  gate exists for. So the exemption is an enumerated list — one entry today,
+  matched exactly, never by prefix, so a task naming one file *inside* the tree
+  gates on it like any other file.
 * **Does not gate, and is a stated residual: `CLAUDE.md` and `docs/SCHEMA.md`.**
   They are universally granted, they have no resolver, and a conflict in either
   deliberately stops a merge because they carry claims that need a human. A task
-  that *declares* one of them explicitly gates like any other file entry; a task
+  that *declares* one of them explicitly gates like any other entry; a task
   that writes one it never declared is the residual. Its cost is bounded: the
   serialised merge finds the conflict, the second candidate parks, and a human
   reads two files. That is the designed behaviour of those two trackers, not a
@@ -814,6 +826,20 @@ tasks and nothing would ever co-schedule. The gate is therefore computed over
 When the gate fires the task **stays queued** — `pending` in the registry,
 untouched, dispatched as soon as the conflicting lane finishes. It is never
 failed, never charged an attempt, and never quarantined.
+
+The gate therefore has to be applied at BOTH ends, and this is where the plan
+as first written was short. Admission decides whether a lane **opens a
+session** — but which task that session then dispatches is the reviewer's
+directive against the roadmap, so a lane that opened because something else was
+admissible can be directed at a held task. Deferring that to the candidate that
+turns concurrency on would leave "conflict-aware admission" enforced nowhere a
+conflicting pair is actually chosen, so conc-06 closes it: the dispatch site
+asks the same plan about the one task the directive names and refuses it while
+it is held, on the same corrective re-prompt every other refused directive
+takes, and with the task left `pending`, unattempted and untouched. What stays a
+residual is only the ORDER inside one lane — a directive may name any admissible
+READY task rather than the head of the queue — which is what policy has always
+authorized and costs the fleet nothing.
 
 ### Decision 4 — the fleet cap
 
@@ -828,6 +854,20 @@ READY task simply is not selected this tick. The reason is recorded once per
 tick in the transcript and shown by `health` and the dashboard, because a fleet
 sitting at its cap and a fleet with nothing to do look identical from outside
 and must not read identically.
+
+**Lowering the cap under a running fleet has two halves, and conc-06 shipped
+the first one alone before the second was found.** The edit does not end the
+sessions in the lanes it cuts out. From INSIDE such a lane the answer is
+`HOLD_LANE_RETIRED`: it finishes the arc it already holds — that is what every
+drain here waits for — and starts nothing new. From the lanes still inside the
+cap the answer has to be that those sessions are still COUNTED, and a scan over
+`range(lanes)` cannot see them: without it the fleet reads as having free slots
+it does not have, and as idle while a cut lane is mid-round, which reaches the
+self-upgrade boundary below and replaces the process out from under it.
+Occupancy is therefore read from the lanes' own directory rather than from the
+current cap (`orchestrator.fleet_occupants`), and a lanes directory that cannot
+be listed holds the fleet rather than reading as empty. Neither half is reached
+at `lanes = 1`, where nothing consults a scheduler at all.
 
 `lanes = 1` must remain a supported configuration behaving exactly as today —
 that is the brief's DEGRADE TO ONE bound, and it is how a broken lane gets
