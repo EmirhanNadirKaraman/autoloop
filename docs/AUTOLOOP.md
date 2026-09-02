@@ -1077,6 +1077,38 @@ later, about a different limit — open episode 7 and park on the spot. The
 escalation's premise is that the waits are consecutive, and two throttles an
 hour apart are not.
 
+**ONE RESIDUAL, named here rather than left to be discovered.** The admission
+bullet is true of every tick that has something in the queue, and there is one
+shape it does not reach. `cli._run_continuous` sleeps on a plan when the fleet
+is draining, or when the queue has entries and every one of them is held — so an
+**empty** queue holds nothing, falls through to `_select_and_kickoff`, and on a
+changed repository fingerprint opens an audit session: a ChatGPT request against
+the allowance the fleet is waiting out. The plan already carries the answer
+(`FleetPlan.fleet_throttled`, which is set on exactly the same tick); what is
+missing is one term in that condition — `autoloop/cli.py`, in `_run_continuous`,
+`plan.draining or (plan.held and not plan.admitted)` becoming `plan.draining or
+plan.fleet_throttled or (plan.held and not plan.admitted)` (line 2351 as of
+2026-09-02). It is unclosed because `cli.py` is outside conc-11's approved
+paths, not because it is acceptable, and it belongs to whichever round may edit
+that file.
+
+Two things bound how bad it is, and both are worth stating so the next round
+sizes it correctly. It does NOT cost an extra episode: the audit session's own
+first request meets the same limit, and `_join_fleet_throttle` JOINS the open
+window — `observations` grows, `backoffs` does not — so the claim ("N lanes
+throttled by one limit produce ONE backoff episode") survives it. What it costs
+is the wasted request, and one thing worse than the request: `_log_fleet_hold`
+is on the same skipped branch, so the transcript says nothing at all. A
+throttled fleet with an empty queue is the one shape of this that is invisible
+as well as wasteful.
+
+Gating it inside `Orchestrator.run` instead — the obvious in-scope alternative —
+was considered and rejected: the only hook there is the step loop, `Phase.READY`
+recurs between the turns of a live round (a dozen transitions set it), and a
+gate on it would stall lanes *mid-round*, which is precisely what "a lane
+already mid-round finishes or parks by the existing rules; it is admission that
+stops" rules out.
+
 **And at `lanes = 1` none of this exists.** No record is written, none is read,
 `release_jitter_seconds` returns `0.0`, and `_handle_rate_limited` runs the line
 it has always run. The gate is `lanes > 1` in `FleetSupervisor.from_config` and

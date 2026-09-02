@@ -84,6 +84,7 @@ from autoloop.state import (
 from autoloop.tasks import CO_SCHEDULE_EXEMPT_PATHS, Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
 from autoloop import health as health_module
+from autoloop import orchestrator as orchestrator_module
 
 URL = "https://chatgpt.com/c/fleet-throttle-test"
 
@@ -265,6 +266,32 @@ def test_the_second_lane_does_not_extend_the_shared_deadline(tmp_path):
     record = throttle_store(config).load()
     assert record.retry_not_before == opened, "the window is the one that opened"
     assert (record.backoffs, record.observations) == (1, 3)
+
+
+def test_a_joiner_never_waits_longer_than_the_schedule_prescribes(tmp_path):
+    """The remainder a joiner serves is CLAMPED, and the clamp is not cosmetic.
+
+    The shared deadline comes off a file N processes write and an operator can
+    hand-edit, and the sleep happens INSIDE a step — between two heartbeats. A
+    stamp a year out (a bad edit, or a backward system-clock jump, which look
+    identical from here) would otherwise become a year-long sleep in a loop
+    whose monitor calls 45 minutes stale, which is the same reason
+    `_await_rate_limit_deadline` clamps its own remainder.
+
+    Bounded rather than refused, deliberately: the lane re-probes on the
+    schedule and JOINS the same episode again, so a nonsense deadline costs
+    extra observations and never an extra episode.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane1, taken = build_lane(config, 1)
+    seed_episode(config, backoffs=1, opens_in=365 * 24 * 3600)
+
+    throttled(lane1)
+
+    offset = release_jitter_seconds(1, 2, JITTER)
+    assert taken == [BASE + offset], "one schedule, not one year"
+    record = throttle_store(config).load()
+    assert (record.backoffs, record.observations) == (1, 2)
 
 
 def test_a_window_that_has_closed_escalates_exactly_as_one_lane_would(tmp_path):
@@ -867,6 +894,79 @@ def test_at_one_lane_the_persisted_stamp_is_todays(tmp_path):
     logged = entries(config, "rate_limited")[-1]
     assert logged["backoff_seconds"] == 60.0
     assert "fleet_episode" not in logged, "no fleet keys on a single-lane run"
+
+
+class _ScriptedClock:
+    """`datetime` with a scripted `now()`, so a test can see WHICH clock read a
+    stamp was computed from rather than only that it landed near the right
+    second.
+
+    Every other attribute is the real class (`__getattr__`), so
+    `fromisoformat` — the only other `datetime` call `orchestrator` makes — is
+    untouched. Substituted for one call and undone by `monkeypatch`.
+    """
+
+    def __init__(self, first: datetime, later: datetime):
+        self._moments = [first, later]
+        self.reads: list[datetime] = []
+
+    def now(self, tz=None):
+        moment = self._moments[min(len(self.reads), len(self._moments) - 1)]
+        self.reads.append(moment)
+        return moment
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
+
+
+def test_at_one_lane_the_stamp_is_measured_at_the_persist_site(monkeypatch, tmp_path):
+    """The single-lane stamp is `<the clock read where the state is saved> +
+    delay` — the call site this handler has always used — and NOT the earlier
+    read the fleet record needs.
+
+    `test_at_one_lane_the_persisted_stamp_is_todays` above cannot see this and
+    is not evidence for it: on a real clock the two reads are microseconds
+    apart and that test asserts to within half a second, so it passes either
+    way. A scripted clock separates them by an hour, which is what makes the two
+    call sites give visibly different answers.
+    """
+    config = make_config(tmp_path, lanes=1)
+    lane, _ = build_lane(config, 0)
+    episode_read = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    persist_read = episode_read + timedelta(hours=1)
+    clock = _ScriptedClock(episode_read, persist_read)
+    monkeypatch.setattr(orchestrator_module, "datetime", clock)
+
+    stamp = throttled_stamp(lane)
+
+    # Two reads, in this order: the one `_join_fleet_throttle` is handed (a
+    # no-op at one lane) and the one the stamp is measured from.
+    assert len(clock.reads) == 2
+    assert stamp == persist_read + timedelta(seconds=BASE)
+
+
+def test_on_a_fleet_the_stamp_is_measured_from_the_episode_read(monkeypatch, tmp_path):
+    """The other half of the same rule, and the reason it is a conditional
+    rather than a straight revert: a fleet lane's `delay` is the REMAINDER of the
+    shared window measured against the episode read, so a second clock read at
+    the persist site would count the elapsed time twice and put this lane's
+    stamp past the deadline it just joined.
+
+    Asserted as an equality against the fleet record's own deadline plus this
+    lane's offset — the invariant `_await_rate_limit_deadline` resumes on.
+    """
+    config = make_config(tmp_path, lanes=2)
+    lane, _ = build_lane(config, 1)
+    episode_read = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    clock = _ScriptedClock(episode_read, episode_read + timedelta(hours=1))
+    monkeypatch.setattr(orchestrator_module, "datetime", clock)
+
+    stamp = throttled_stamp(lane)
+
+    record = throttle_store(config).load()
+    offset = release_jitter_seconds(1, 2, JITTER)
+    assert stamp == record.deadline() + timedelta(seconds=offset)
+    assert stamp == episode_read + timedelta(seconds=BASE + offset)
 
 
 def test_at_one_lane_the_park_text_is_unchanged(tmp_path):
