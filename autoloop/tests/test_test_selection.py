@@ -604,7 +604,12 @@ FLOOR_AFTER = 16
 #: under `tmp_path`, names no tracker, resolves no `__file__`, and its only
 #: concurrency is `threading` — which is not a spawn entry point under the rule
 #: above — so 20 and 24 are unchanged once more.
-SUITE_SIZE = 109
+#: 109 -> 110 when conc-03b added `test_merge_rereview.py` (2026-09-03), the
+#: DENOMINATOR again: it names no tracker, resolves no `__file__`, and its
+#: `run_git` hands an unreadable argv to `subprocess.run` with no interpreter
+#: literal anywhere in the file — so neither term of the opacity rule above
+#: holds and 20 and 24 are unchanged once more.
+SUITE_SIZE = 110
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

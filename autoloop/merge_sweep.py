@@ -288,6 +288,25 @@ condition, which is the "part of it" this exists to avoid. `attempt` still
 re-checks the gate per branch, and that check stays: it is the race guard for
 a window that shuts mid-sweep.
 
+**And at `lanes > 1` it is the race guard for the re-review obligation too**
+(conc-03, docs/AUTOLOOP.md Decision 6). Each merge inside a sweep moves the base
+for every candidate that is not it, so the obligation cannot be computed once at
+the start: a candidate bound to the head before branch 1 is bound to a DIFFERENT
+head before branch 2, and one carried forward onto branch 1's merge is bound to
+that. Because the obligation is minted by the same per-branch gate call
+`attempt` already makes, a three-branch sweep evaluates it three times, marks
+before each merge and carries forward after each one — the sweep contributes
+nothing to it except the sequence, exactly as it contributes nothing to the
+merge rules themselves.
+
+The all-or-nothing property is untouched by all of that. The sweep-wide gate
+still runs first and still defers everything or nothing; a merge whose
+obligations this process cannot discharge DEFERS (`AutoMerger` fails closed on a
+missing carry-forward), which stops the sweep at that branch through
+`_CONTINUE_ON` exactly as any other deferral does; and a carry-forward that
+REFUSES parks the task it is about without changing the merge's outcome, so it
+neither halts the sweep nor merges anything extra.
+
 ## No state of its own
 
 There is no sweep queue on disk. The work-list is re-derived from git ancestry
@@ -593,6 +612,7 @@ class BacklogSweeper:
         registry,
         log,
         merger=None,
+        carry_forward=None,
     ):
         self._config = config
         self._git = git
@@ -615,6 +635,14 @@ class BacklogSweeper:
             execution_store=execution_store,
             registry=registry,
             log=log,
+            #: Passed straight through, never built here. See `AutoMerger`'s own
+            #: field: at `lanes > 1` a merge that moves the head past a bound
+            #: candidate has to carry that candidate forward, and the fetch
+            #: source for it is the loop-owned observed clone, which only the
+            #: orchestrator can resolve. `None` — the startup sweep, which has no
+            #: orchestrator — makes such a merge DEFER, which is exactly what the
+            #: shut window does at one lane and mutates nothing.
+            carry_forward=carry_forward,
         )
 
     # ---- entry point --------------------------------------------------------
@@ -2304,7 +2332,9 @@ def _ident_timestamp(ident: str) -> float:
 # ---- construction -----------------------------------------------------------
 
 
-def sweep_backlog(config: AutoloopConfig, *, git=None, log=None) -> SweepResult:
+def sweep_backlog(
+    config: AutoloopConfig, *, git=None, log=None, carry_forward=None
+) -> SweepResult:
     """Build the collaborators and sweep. The single entry point for both
     callers — `run`'s startup hook and the `merge-backlog` command — so the
     two cannot drift into sweeping different things.
@@ -2312,6 +2342,14 @@ def sweep_backlog(config: AutoloopConfig, *, git=None, log=None) -> SweepResult:
     `GitGateway(Path.cwd(), ...)` matches every other gateway construction in
     `cli.py`: the operator runs the command from the checkout, and the loop
     process runs there too.
+
+    `carry_forward` is `None` for both of today's callers, and deliberately: a
+    startup hook and an operator command have no orchestrator, so neither can
+    resolve the observed clone a carried-forward worker must fetch from. At
+    `lanes > 1` that makes a merge with obligations DEFER rather than strand
+    them — see `AutoMerger`'s own field. It is a parameter rather than a
+    hard-coded `None` so a caller that HAS one (a lane's own round) does not
+    have to rebuild the sweeper by hand to pass it.
     """
     from . import cli
 
@@ -2326,6 +2364,7 @@ def sweep_backlog(config: AutoloopConfig, *, git=None, log=None) -> SweepResult:
         execution_store=TaskExecutionStore(config.executions_dir),
         registry=registry,
         log=logger,
+        carry_forward=carry_forward,
     ).sweep()
 
 

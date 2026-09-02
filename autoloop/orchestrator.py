@@ -8813,7 +8813,13 @@ class Orchestrator:
             )
             return
         cap = self._policy.config.max_review_rounds
-        if cap and execution.review_round >= cap:
+        # `carried_review_rounds` is the rounds a carry-forward reset off
+        # `review_round` (conc-03). Counted here so a base that moves under a
+        # task cannot buy it fresh review rounds — the same "a moving base must
+        # refill no budget" rule `_carry_reviewed_candidate_past` applies to the
+        # two attempt counters. Always 0 at `lanes = 1`, so this reads exactly
+        # as it always has there.
+        if cap and execution.review_round + execution.carried_review_rounds >= cap:
             self._park_round_cap(execution, worktree_git, directive, state, task)
             return
         # Unlimited rounds are only safe with this: a reviewer repeating itself
@@ -11747,6 +11753,15 @@ class Orchestrator:
         # Only here — a packet exists and is about to become `outbox`. A packet
         # that could not be built consumed no review round either.
         execution.review_round += 1
+        # And the re-review a moved base owed is now the review being sent, so
+        # the obligation is discharged HERE and nowhere else (conc-03). Not when
+        # the carry-forward succeeded: a candidate carried onto a new head that
+        # nobody has looked at again is exactly what must stay unpushable. This
+        # line is a no-op assignment at `lanes = 1`, where the field is never
+        # set — the packet built above is rendered from `task_base_sha..
+        # candidate_sha`, which the carry-forward already moved, so what goes
+        # out is the carried candidate against its new base.
+        execution.rereview_owed_base = ""
         # Stamped BEFORE the save below, so the round's classification and the
         # review round it earned reach disk together. `sent_for_review` is also
         # the outcome `_note_round_fault` looks for: a session that then dies on
@@ -12188,6 +12203,42 @@ class Orchestrator:
                 )
                 return
         execution = self._execution_store.load(binding.task_id)
+        # BEFORE the staleness check below, and it is a different question:
+        # that one asks whether the record still names the approved candidate,
+        # this one whether the base under that candidate MOVED while the
+        # approval was outstanding (conc-03, docs/AUTOLOOP.md Decision 6).
+        #
+        # Both shapes of the failure land here. A carry-forward that SUCCEEDED
+        # advanced `candidate_sha`, so the check below would refuse anyway — but
+        # it would refuse `loop_fatal`, stopping every lane over one task's
+        # ordinary re-review, and it would say "a later round advanced it",
+        # which is not what happened. A carry-forward that REFUSED left the sha
+        # and the tree untouched, so every check below PASSES and only this one
+        # stands between an approval taken against a base that has since moved
+        # and a publish. That is why the marker is written before the merge
+        # rather than derived from the record afterwards.
+        #
+        # `task_fatal`: one task waits for a re-review, the fleet keeps running.
+        # Unreachable at `lanes = 1`, where nothing ever sets the field.
+        owed = getattr(execution, "rereview_owed_base", "") if execution is not None else ""
+        if owed:
+            self._to_needs_user(
+                f"task {binding.task_id}: push refused — the branch head moved "
+                f"past base {owed[:12]} while candidate "
+                f"{binding.candidate_sha[:12]} was approved, so that approval "
+                "was given against a base this task is no longer on. The "
+                "candidate was carried forward onto the new head and OWES A "
+                "RE-REVIEW; nothing was pushed. Re-review the carried-forward "
+                "candidate before approving it again.",
+                kind="task_fatal",
+                code="push_rereview_owed",
+                task_id=binding.task_id,
+                detail=(
+                    f"approved={binding.candidate_sha} "
+                    f"recorded={execution.candidate_sha} owed_base={owed}"
+                ),
+            )
+            return
         if execution is None or execution.candidate_sha != binding.candidate_sha:
             self._to_needs_user(
                 f"task {binding.task_id}: push refused — the reviewed candidate "
@@ -12430,6 +12481,14 @@ class Orchestrator:
                 registry=self._registry,
                 log=self._log,
                 deferrals=self._merge_deferrals,
+                # How a candidate bound to the head this merge moves is carried
+                # onto the new one (conc-03). Only ever consulted at
+                # `lanes > 1`, where the merge window reports such a candidate
+                # as an obligation instead of blocking; at one lane the window
+                # is shut and the merger never asks. Passing it from HERE is
+                # what makes the observed clone the fetch source — see
+                # `_carry_candidate_past_for_merge`.
+                carry_forward=self._carry_candidate_past_for_merge,
             ).after_completion(task_id)
         except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
             self._log(
@@ -16056,6 +16115,128 @@ class Orchestrator:
         )
         return ""
 
+    def _carry_candidate_past_for_merge(self, task_id: str, head: str) -> str:
+        """Discharge one re-review obligation: carry this task's reviewed
+        candidate onto `head`, the commit a merge just moved the branch to, and
+        ADVANCE the record onto the merge that did it. `""` on success;
+        otherwise the reason `auto_merge` must park `task_base_behind_head`
+        with.
+
+        This is `AutoMerger`'s injected `carry_forward` and exists only at
+        `lanes > 1` (conc-03, docs/AUTOLOOP.md Decision 6). It lives here rather
+        than in `auto_merge.py` for one reason: the carry-forward FETCHES into a
+        worker repository, and the only policy-legal, esc-02-compatible source
+        for that fetch is this loop's own observed clone, which no other object
+        can resolve.
+
+        **Three differences from `_rebase_execution_if_stale`'s use of the same
+        machinery, and each of them is the concurrency half of the claim.**
+
+        1. **`candidate_sha` is ADVANCED to the merge commit.** There, the
+           carry-forward happens at the START of a new round, and the round's own
+           commit advances the candidate a moment later; the reviewed sha is
+           transient and preserving it is right. Here there is no new round: the
+           candidate is a reviewed object with an approval possibly already bound
+           to it, and leaving the sha alone would leave `_dispatch_task_push`'s
+           binding checks matching. Advancing it makes both of them disagree —
+           the sha AND the tree — which is what "never pushed on its old
+           approval" is enforced by. The merge commit is the right new candidate:
+           its two parents are the reviewed candidate and `head`, and
+           `task_base_sha` is now `head`, so the `diff-tree` every review
+           artifact is built from (`task_base_sha..candidate_sha`) is exactly
+           this task's net change against the base the reviewer will see —
+           mainline's own work is on both sides of it and cancels.
+        2. **`review_round` is reset**, which is what the plan asks for in as
+           many words ("the record's review round is reset so the loop asks for
+           the new review instead of parking"). The rounds it discards are added
+           to `carried_review_rounds` rather than dropped, so
+           `policy.max_review_rounds` is not refilled and
+           `_rebase_execution_if_stale` still sees a record that has been
+           reviewed. A moving base must refill no budget — the same rule
+           `_carry_reviewed_candidate_past` states about the two attempt counters.
+        3. **`rereview_owed_base` is left SET.** The obligation is discharged by
+           the re-review being asked for, not by the carry-forward succeeding;
+           `_dispatch_task_postcommit` clears it at the one line where a new
+           packet is actually sent.
+
+        The observed clone is synchronised HERE, and deliberately not through
+        `_synchronise_observed_checkout`: that helper parks `loop_fatal` when it
+        cannot, and this runs immediately after a merge that already landed,
+        inside a module whose whole discipline is that an integration problem
+        must never stop a working loop. A clone that cannot be brought to `head`
+        is returned as a refusal, so the cost is one parked task instead of a
+        stopped fleet.
+        """
+        if self._execution_store is None:
+            return "this process has no execution store to carry it with"
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
+            return f"its execution record could not be read ({exc})"
+        if execution is None:
+            return "its execution record is gone"
+        if self._registry is None or not self._registry.has(task_id):
+            # The branch to merge into is named by the task, and the merge
+            # message names it too. A record with no task behind it is not one
+            # to carry anywhere.
+            return "the registry has no task by that id"
+        task = self._registry.get(task_id)
+        if self._observed is not None:
+            # The carry-forward fetches `head` from this clone, and git's
+            # `upload-pack` refuses an unadvertised sha — so the commit has to
+            # be present AND pinned there before the fetch, exactly as
+            # `_rebase_execution_if_stale` arranges for its own call.
+            try:
+                violations = self._observed.synchronize(self._git.repo_root, [head])
+            except (GitError, OSError) as exc:
+                return (
+                    f"the observed checkout at {self._observed.path} could not be "
+                    f"synchronised to {head[:12]}: {type(exc).__name__}: {exc}"
+                )
+            if violations:
+                return (
+                    f"the observed checkout at {self._observed.path} could not be "
+                    f"brought to {head[:12]} — " + "; ".join(violations)
+                )
+        refusal = self._carry_reviewed_candidate_past(execution, task, head)
+        if refusal:
+            return refusal
+        reviewed = execution.candidate_sha
+        worker = GitGateway(Path(execution.worktree_path), self._policy, env=worker_env())
+        try:
+            tip = worker.head_sha()
+            commit_count = len(worker.commit_list(head, tip))
+        except (GitError, OSError) as exc:
+            # The base HAS moved on the record by now (`_carry_reviewed_
+            # candidate_past` saved it), so this is a refusal rather than a
+            # silent pass: the marker stays set, the push stays refused, and the
+            # operator gets the park. Nothing was discarded either way.
+            return (
+                f"its worker branch tip could not be read after the carry-forward: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        execution.candidate_sha = tip
+        execution.candidate_commit_count = commit_count
+        execution.carried_review_rounds += execution.review_round
+        execution.review_round = 0
+        self._execution_store.save(execution)
+        self._log(
+            "execution_candidate_advanced_for_rereview",
+            data={
+                "task_id": task_id,
+                "new_base": head,
+                "reviewed_candidate": reviewed,
+                "candidate_sha": tip,
+                "candidate_commit_count": commit_count,
+                # Both halves of the budget rule, asserted in the transcript
+                # rather than argued: the rounds moved, they were not forgotten.
+                "review_round": execution.review_round,
+                "carried_review_rounds": execution.carried_review_rounds,
+                "rereview_owed_base": execution.rereview_owed_base,
+            },
+        )
+        return ""
+
     def _rebase_execution_if_stale(
         self, execution: TaskExecution, task: Task, *, worker_reusable: bool = False
     ):
@@ -16074,6 +16255,13 @@ class Orchestrator:
         instead (either way this dispatch stops here).
 
         Three cases, deliberately different:
+
+        "Reviewed" below means `review_round > 0 OR carried_review_rounds > 0`.
+        The second term is conc-03's: a carry-forward performed by a MERGE
+        resets `review_round` (docs/AUTOLOOP.md Decision 6 asks for it in as
+        many words) and moves the rounds it discards there, so a record that has
+        been reviewed keeps reading as reviewed. It is zero at `lanes = 1` and
+        on every record written before that field existed.
 
         * Nothing reviewed yet (review_round == 0) -- re-base. The worker is
           QUARANTINED rather than deleted, so a refused candidate stays on disk
@@ -16117,9 +16305,19 @@ class Orchestrator:
         if not self._git.is_descendant(head, base):
             return execution
 
-        if execution.review_round > 0 and self._reconcile_published_execution(execution, task):
+        # "Has a reviewer already seen a candidate for this record?" —
+        # `review_round` alone until conc-03, which resets it on a carry-forward
+        # and moves the rounds to `carried_review_rounds`. Reading only the
+        # former would send a record that HAS been reviewed down the re-base
+        # branch below, which quarantines the worker and blanks `candidate_sha`
+        # — the guard switching itself off on exactly the record a moved base
+        # just carried forward. `carried_review_rounds` is 0 at `lanes = 1` and
+        # on every record written before it existed, so both tests below are
+        # identities there.
+        reviewed = execution.review_round > 0 or execution.carried_review_rounds > 0
+        if reviewed and self._reconcile_published_execution(execution, task):
             return None
-        if execution.review_round > 0:
+        if reviewed:
             # Same re-synchronisation the re-base branch below does, and for the
             # same reason: `head` was read at the top of this method, AFTER the
             # caller's own boundary sync, so an operator committing in between

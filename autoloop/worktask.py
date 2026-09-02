@@ -120,6 +120,47 @@ class TaskExecution:
     candidate_sha: str = ""  # read from HEAD only AFTER git commit returns
     candidate_commit_count: int = 0
     review_round: int = 0
+    #: Non-empty while this record OWES A RE-REVIEW because the loop moved the
+    #: branch head past the base its candidate was bound to (conc-03,
+    #: docs/AUTOLOOP.md Decision 6). The value is the base sha the candidate was
+    #: bound to at the moment the move began.
+    #:
+    #: WRITTEN BEFORE THE MERGE THAT MOVES THE HEAD, never after — the same
+    #: "write before the risky operation" rule `CommitIntent` and
+    #: `_dispatch_task_push`'s push intent follow, and here it is the whole of
+    #: the guarantee. Set it afterwards and every way the carry-forward can fail
+    #: (a conflict, a dirty worker, a process that dies between the merge and the
+    #: carry) leaves a record whose `candidate_sha` still matches the approval
+    #: that was taken against the OLD base, which `_dispatch_task_push` would
+    #: then publish — the one thing "never merged or pushed on its old approval"
+    #: forbids, reachable only on the error path.
+    #:
+    #: Cleared at exactly one site: `_dispatch_task_postcommit` where
+    #: `review_round` is incremented, i.e. where a NEW review packet is actually
+    #: sent. The obligation is discharged by the re-review happening, not by the
+    #: carry-forward succeeding — a carried-forward candidate nobody has looked
+    #: at again is precisely what must not be pushed.
+    #:
+    #: EMPTY AT `lanes = 1`, always: the merge window is shut whenever a
+    #: candidate is bound to the head there, so nothing ever moves the head past
+    #: one and no site ever writes this.
+    rereview_owed_base: str = ""
+    #: Review rounds this record earned BEFORE a carry-forward reset
+    #: `review_round` (conc-03). docs/AUTOLOOP.md Decision 6 requires the round
+    #: to be reset so the loop asks for the new review; this field is what keeps
+    #: that from refilling a budget or switching a guard off:
+    #:
+    #: * `policy.max_review_rounds` is checked against
+    #:   `review_round + carried_review_rounds`, so a task cannot buy fresh
+    #:   rounds by having its base moved under it;
+    #: * `_rebase_execution_if_stale` treats "has been reviewed" as
+    #:   `review_round > 0 or carried_review_rounds > 0`, so a later base move
+    #:   still carries the candidate forward instead of taking the re-base branch
+    #:   that quarantines the worker and blanks `candidate_sha`.
+    #:
+    #: Zero at `lanes = 1` and on every record written before this field
+    #: existed, which is what makes both readings above identities there.
+    carried_review_rounds: int = 0
     #: Normalised text of the most recent `revise` feedback. Compared
     #: against the next one: identical feedback twice means the reviewer
     #: is asking for something the executor did not change, so another
