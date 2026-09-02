@@ -17,7 +17,7 @@ import json
 import os
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -145,6 +145,15 @@ if TYPE_CHECKING:
 # budget only ever authorizes a re-run on a transport that declares
 # `idempotent_submit`, i.e. one whose failed invocation provably appended
 # nothing anywhere.
+#
+# NOT bumped for the fleet throttle's episode identity either
+# (`LoopState.fleet_throttle_episode`). Same shape again: a new field defaulting
+# to `""`, and `""` is the truth rather than a guess for a state file written
+# before it existed — that lane cannot name a fleet episode it observed, because
+# no build that could name one had ever run. The direction of the default is the
+# safe one: an empty id clears NOTHING (`orchestrator._end_fleet_throttle`), so
+# the worst it costs is a record left to expire on its own deadline, never a
+# window erased out from under the fleet.
 SCHEMA_VERSION = 3
 
 
@@ -625,6 +634,21 @@ class LoopState:
     #: this deadline before EVERY step, so the wait survives the process that
     #: began it.
     rate_limit_retry_not_before: str | None = None
+    #: The `FleetThrottle.episode_id` of the fleet episode this lane last
+    #: observed, or `""` when it has observed none. Written beside the counter
+    #: above and cleared with it, and read for exactly one purpose: a lane whose
+    #: step COMPLETES ends the episode it was itself inside, and only that one
+    #: (`orchestrator._end_fleet_throttle`).
+    #:
+    #: PERSISTED rather than held in memory for the reason the deadline above
+    #: is: the episode outlives the process that met it. A lane that is killed
+    #: mid-back-off and comes back to complete a step would otherwise be unable
+    #: to name what it observed, so the record would sit there with the streak
+    #: it left behind and the next throttle inside the grace would escalate from
+    #: a limit that had in fact lifted.
+    #:
+    #: Always `""` at one lane, where no fleet record exists at all.
+    fleet_throttle_episode: str = ""
     parse_retries: int = 0
     #: Consecutively refused directives in THIS session, spent against
     #: `policy.max_policy_denials` by all three of `_handle_policy_denial`,
@@ -1309,3 +1333,460 @@ class StopRepetitionStore:
             )
         self.save(record)
         return record
+
+
+# ---- the fleet's one throttle record (conc-11) -------------------------------
+#
+# One account allowance, N lanes. Everything below exists so the fleet observes
+# ONE back-off episode where N independent counters would have observed N.
+#
+# `LoopState.rate_limit_backoffs` and `rate_limit_retry_not_before` are PER
+# LANE, and conc-05 gave every lane its own state file — so at four lanes the
+# shipped escalation becomes four counters that each compute the same
+# deterministic 60s, re-probe at the same instant, and can spend 4 x 6 = 24
+# throttled attempts discovering one limit a single lane would have found in 6.
+# Every one of those extra attempts is a request against an allowance already
+# exhausted, which is the exact thing `Orchestrator._rate_limit_delay`'s
+# docstring says the escalation exists to prevent.
+#
+# The record below is the fleet's answer: one deadline and one consecutive
+# counter, in the state directory rather than in any lane's state file.
+
+
+#: Filename of the fleet-wide throttle record under `AutoloopConfig.state_dir`
+#: — BESIDE `lock.LOCK_FILENAME`, and there for the lock's own reason: one state
+#: directory is one account's fleet, so the file that says "this account is
+#: throttled" belongs to the directory and not to a lane. It is not a lock and
+#: takes none of the lock's semantics; see `lock.py`'s module docstring, which
+#: points here.
+#:
+#: Derived rather than added to `AutoloopConfig`, exactly like
+#: `STOP_REPETITION_FILENAME` above: a store a construction site can forget to
+#: pass is a shared throttle that is silently not shared.
+#:
+#: WRITTEN ONLY AT `lanes > 1`. At one lane there is no fleet to coordinate, the
+#: two `LoopState` fields are the whole mechanism exactly as they are today, and
+#: no new file appears under the state dir — the same structural spelling of the
+#: `lanes = 1` acceptance criterion `lane_paths` uses for lane 0's state file.
+FLEET_THROTTLE_FILENAME = "fleet_throttle.json"
+
+
+def fleet_throttle_file(state_dir: Path) -> Path:
+    """Where `FleetThrottleStore` keeps the fleet's one record."""
+    return Path(state_dir) / FLEET_THROTTLE_FILENAME
+
+
+#: The shortest window an episode ever opens, however short the configured
+#: back-off is. It exists for ONE degenerate setting and it is not cosmetic:
+#: `browser.rate_limit_backoff_seconds = 0` would otherwise close every window
+#: in the instant it opened, so four lanes meeting one limit together would open
+#: FOUR episodes — the exact miscount this record exists to remove, reappearing
+#: at a config an operator is allowed to write.
+#:
+#: It does NOT lengthen the wait anyone serves: `Orchestrator._handle_rate_
+#: limited` clamps what a lane waits to `_rate_limit_delay(backoffs)` plus its
+#: own offset, so at a zero back-off the lanes still wait zero and only the
+#: COALESCING window is a second long. At every shipped setting `max(delay, 1s)`
+#: is the delay, and this constant is invisible.
+FLEET_THROTTLE_MIN_WINDOW_SECONDS = 1.0
+
+#: The shortest gap after a window closes that still reads as the SAME incident,
+#: whatever the configured schedule says. `observe`'s grace is normally the
+#: previous episode's own delay; this is the floor under it, and it closes the
+#: same zero-back-off hole from the other side — with a grace of zero, every
+#: throttle would start a fresh streak at 1, so the escalation would never reach
+#: `max_rate_limit_backoffs` and the fleet would never park.
+#:
+#: A minute, because that is the shape of the claim being made ("two throttles
+#: within a minute are one incident") and because it is exactly the shipped
+#: first back-off, where it therefore changes nothing. Raising the floor can
+#: only make the fleet escalate and park SOONER, never wait longer.
+FLEET_THROTTLE_MIN_GRACE_SECONDS = 60.0
+
+
+def new_episode_id(opened_at: str, lane_id: str) -> str:
+    """A token naming ONE episode, minted where an episode OPENS.
+
+    It exists so `FleetThrottleStore.clear` can be a COMPARE-and-clear. Without
+    an identity the only thing a completing lane could say is "remove the
+    record", and between the retry that served it and the clear another lane
+    can have opened the NEXT episode — so the lane would delete a deadline and
+    a counter it never observed, reopening admission for a fleet that is inside
+    a live window. `backoffs` is not that identity: episode 1 followed hours
+    later by a fresh episode 1 carries the same number, so comparing on it
+    would erase the newer one exactly when the streak restarted.
+
+    The uuid is what makes it unique rather than merely descriptive: `opened_at`
+    is millisecond-resolution and a frozen or coarse clock can hand two
+    consecutive episodes the same stamp. The stamp and the lane are kept in
+    front of it anyway, because this string is read by a person looking at a
+    transcript.
+    """
+    return f"{opened_at}#{lane_id or '-'}#{uuid.uuid4().hex[:12]}"
+
+
+@dataclass
+class FleetThrottle:
+    """ONE back-off episode, as every lane in the fleet sees it.
+
+    `backoffs` is the CONSECUTIVE-episode count the whole fleet shares — the
+    number `policy.max_rate_limit_backoffs` is checked against and the number
+    `Orchestrator._rate_limit_delay` doubles from. It counts EPISODES, never
+    observations: four lanes meeting one limit inside one window leave it at 1.
+
+    `retry_not_before` is the single instant the window closes, un-jittered.
+    Each lane adds its own small bounded offset to it when it computes its own
+    release (`orchestrator.release_jitter_seconds`) — so the fleet has one
+    operator-readable deadline and the lanes still do not re-probe in unison.
+
+    `observations` is how many times this one episode has been MET — normally
+    once per lane, since a lane waits the window out before it re-probes, but it
+    counts observations rather than distinct lanes and a lane that meets the
+    limit twice inside one window contributes two. Diagnostic rather than
+    load-bearing, and it is the field that makes the claim legible:
+    `observations = 4` with `backoffs = 1` is four lanes throttled by one limit
+    producing one episode, which is precisely what conc-11 asserts.
+
+    `opened_by` is the lane id that opened the episode, kept so a transcript
+    reader can tell the opener from the three lanes that joined it.
+
+    `episode_id` NAMES this episode, and it is what makes ending one safe: a
+    lane clears the episode it observed and no other (`FleetThrottleStore.
+    clear`). Minted by `new_episode_id` where an episode opens, carried
+    unchanged by every lane that joins it, and never reused. It defaults to `""`
+    for a record written by a build that predates it or by hand — such a record
+    is readable, but no lane will clear it, which is the safe direction.
+
+    `deadline()` RAISES on a stamp it cannot parse. That is safe for every
+    record `FleetThrottleStore.load` returns — it validates the stamp before
+    handing one back — and is a caller's problem only for a record built by
+    hand.
+    """
+
+    backoffs: int
+    retry_not_before: str
+    opened_at: str
+    opened_by: str
+    observations: int = 1
+    updated_at: str = ""
+    episode_id: str = ""
+
+    def deadline(self) -> datetime:
+        """The instant this window closes, always tz-aware.
+
+        A naive stamp is read as UTC for `orchestrator._rate_limit_deadline`'s
+        reason: everything this loop writes is tz-aware, so a naive one came
+        from a hand edit, and comparing it to an aware `now` would raise rather
+        than answer.
+        """
+        moment = datetime.fromisoformat(self.retry_not_before)
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+    def is_open(self, now: datetime) -> bool:
+        """Is the fleet still inside this episode's window at `now`?"""
+        return now < self.deadline()
+
+
+class FleetThrottleStore:
+    """The fleet's one `FleetThrottle` record, as a small JSON file.
+
+    THE WHOLE CLAIM RESTS ON `observe` BEING ATOMIC. "Read the record, decide
+    whether a window is open, write the new one" is a read-modify-write on a
+    file N processes share, and the version of it that looks correct in a
+    single-threaded test — computing "are we throttled?" outside the hold and
+    passing the answer in — is exactly the one that fails: two lanes both read
+    the same expired deadline and both open an episode, which is the bug this
+    record exists to remove, rebuilt inside its own fix. So the read, the
+    decision and the write happen inside ONE mutex hold.
+
+    Same crash-safety rule as `StopRepetitionStore` above and
+    `blockers.BlockerStore`: a corrupt record RAISES (`StateCorruptError`)
+    rather than reading as absent. Reading an unreadable record as "no throttle
+    in progress" would restart the episode count on every observation, so the
+    fleet would never reach `max_rate_limit_backoffs` and never park — the
+    guard switched off silently, which is the failure shape this whole
+    mechanism exists to end. `Orchestrator._handle_rate_limited` turns the
+    raise into a `loop_fatal` park naming this file, and
+    `orchestrator.FleetSupervisor.plan` turns it into a HOLD; neither reads it
+    as permission.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def _mutex(self):
+        """The cross-process mutex `observe` and `clear` take.
+
+        BORROWED from `tasks.task_file_mutex` rather than written a second time.
+        It is already the repository's answer to "serialise a read-modify-write
+        on a shared JSON file across processes AND across threads" — an `flock`
+        under a re-entrant in-process `RLock` — and a second implementation of
+        that is a second chance to disagree about it, with two lanes in one
+        episode-opening race as the thing that disagrees.
+
+        Imported HERE rather than at module level because `tasks` imports this
+        module (`utcnow_iso`), so the module-level edge would be a real cycle.
+        Same device, for the same reason, as `lane_paths`' `config.lane_id`.
+        """
+        from .tasks import task_file_mutex
+
+        return task_file_mutex(self.path)
+
+    def load(self) -> FleetThrottle | None:
+        """The stored episode, `None` when there is none, `StateCorruptError`
+        when there is one this cannot be trusted to read.
+
+        TYPES ARE CHECKED, not merely unpacked, for `StopRepetitionStore.load`'s
+        reason and with one addition of its own: `backoffs` is compared against
+        `max_rate_limit_backoffs` and fed to `_rate_limit_delay`, where a
+        hand-edited `"3"` would raise `TypeError` from inside an `except
+        RateLimitedError:` block — a place `run()`'s handler chain cannot catch,
+        so the process would end with a traceback and no park. `bool` is an
+        `int` in Python, so `True` is refused before the integer check for the
+        same reason a `"pid": true` is in `lock.LaneLease.read`.
+
+        THE STAMP IS PARSED HERE, so `FleetThrottle.deadline()` is total for
+        every record this hands back. An unparseable one is a window nobody can
+        serve and a hold nobody can lift; it is refused rather than discarded,
+        which is the opposite of `orchestrator._rate_limit_deadline`'s rule for
+        the PER-LANE stamp — deliberately, because that one is bounded by a
+        counter that survives it, and this one IS the counter.
+        """
+        if not self.path.exists():
+            return None
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None  # cleared between the check and the read
+        except OSError as exc:
+            raise StateCorruptError(
+                f"fleet throttle record {self.path} cannot be read: {exc}. Until "
+                "it can be, nothing knows whether this account is throttled."
+            ) from exc
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise TypeError(f"expected a JSON object, got {type(data).__name__}")
+            record = FleetThrottle(**data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise StateCorruptError(
+                f"fleet throttle record {self.path} is unreadable: {exc}. A record "
+                "that cannot be read is NOT an account that is free — remove it "
+                "only once you are sure no lane is waiting out a limit."
+            ) from exc
+        for name in ("backoffs", "observations"):
+            value = getattr(record, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise StateCorruptError(
+                    f"fleet throttle record {self.path} has a non-integer {name} "
+                    f"{value!r}"
+                )
+            if value < 1:
+                raise StateCorruptError(
+                    f"fleet throttle record {self.path} has {name} {value}, which "
+                    "no writer produces"
+                )
+        for name in (
+            "retry_not_before",
+            "opened_at",
+            "opened_by",
+            "updated_at",
+            "episode_id",
+        ):
+            if not isinstance(getattr(record, name), str):
+                raise StateCorruptError(
+                    f"fleet throttle record {self.path} has a non-string {name}"
+                )
+        try:
+            record.deadline()
+        except (TypeError, ValueError) as exc:
+            raise StateCorruptError(
+                f"fleet throttle record {self.path} has an unreadable "
+                f"retry_not_before {record.retry_not_before!r}: {exc}"
+            ) from exc
+        return record
+
+    def save(self, record: FleetThrottle) -> None:
+        """Temp file then `os.replace`, so a concurrent `load` sees the old
+        bytes or the new ones and never a half-written record.
+
+        The temp name carries this process's pid: N lanes write this file, and
+        one shared `.tmp` name is two writers clobbering each other's partial
+        write and then renaming the result over the record.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+        tmp.write_text(
+            json.dumps(asdict(record), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, self.path)
+
+    def clear(self, episode_id: str | None = None) -> bool:
+        """End ONE episode — the one `episode_id` names — and answer whether
+        this call is what ended it.
+
+        COMPARE-AND-CLEAR, and the comparison is the point. "A lane completed a
+        step, so remove the record" is only true of the episode that lane was
+        actually inside. Between its successful retry and this call another lane
+        can have met the limit again and opened the NEXT episode: an
+        unconditional unlink would then delete a deadline the fleet is currently
+        inside and a counter that had just escalated, so admission reopens, the
+        streak restarts at 1 and `max_rate_limit_backoffs` stops being
+        reachable — the guard switching itself off, silently, at the moment it
+        is needed most.
+
+        The load, the comparison and the unlink happen inside ONE mutex hold,
+        the same one `observe` takes, so the episode cannot change underneath
+        the decision. Doing the read outside would rebuild the race one line
+        further out.
+
+        `None` means UNCONDITIONAL — no lane passes it; it is there for an
+        operator-facing caller that means "remove this file whatever it says".
+        An `episode_id` that no longer matches the stored record answers `False`
+        and leaves the record exactly as it was, which is also the answer for a
+        record that is already gone.
+
+        A record that cannot be READ raises (`StateCorruptError`) rather than
+        being unlinked, which is the rule stated at the top of this class
+        applied to the one path that used to break it: a record nobody can read
+        is not a fleet that is free — it is what holds admission and what
+        `health` reports as `unreadable` — and deleting it unread would be the
+        loop switching off its own alarm. `Orchestrator._end_fleet_throttle`
+        logs the refusal rather than failing the step.
+        """
+        with self._mutex():
+            if episode_id is not None:
+                record = self.load()
+                if record is None or record.episode_id != episode_id:
+                    return False
+            existed = self.path.exists()
+            self.path.unlink(missing_ok=True)
+            return existed
+
+    def window(self, now: datetime | None = None) -> FleetThrottle | None:
+        """The record IF the fleet is inside its window right now, else `None`.
+
+        Reads; never writes, never creates the file. `FleetSupervisor.plan` is
+        the caller, and planning is asserted to leave the state directory
+        byte-identical.
+        """
+        record = self.load()
+        if record is None:
+            return None
+        return record if record.is_open(now or datetime.now(timezone.utc)) else None
+
+    def observe(
+        self,
+        *,
+        delay_for,
+        lane_id: str = "",
+        now: datetime | None = None,
+    ) -> FleetThrottle:
+        """Record that a lane has met the account limit, and answer with the
+        episode it belongs to.
+
+        Three outcomes, decided inside one mutex hold:
+
+        * **JOIN** — the fleet is already inside an open window. The counter
+          does NOT move and the deadline is NOT extended; only `observations`
+          grows. This is the whole of "N lanes throttled by one limit produce
+          ONE backoff episode".
+        * **ESCALATE** — the window has closed, but not long ago: a new episode
+          opens at `previous + 1`, so the delay doubles exactly as it does for
+          a single lane. "Not long ago" is the previous episode's OWN delay
+          (`delay_for(previous.backoffs)`) — see below.
+        * **OPEN AFRESH** — the last window closed longer ago than that, so
+          this throttle is not consecutive with it and the streak starts at 1.
+
+        A JOIN keeps the opener's `episode_id`; BOTH of the other two mint a new
+        one. That includes ESCALATE, which inherits the streak but is a
+        different episode, and it is what stops the lane that observed episode
+        *n* from clearing episode *n + 1* — see `clear`.
+
+        BOTH BOUNDS ARE FLOORED (`FLEET_THROTTLE_MIN_WINDOW_SECONDS`,
+        `FLEET_THROTTLE_MIN_GRACE_SECONDS`), and the floors are what make the
+        two rules above TOTAL rather than true only for the shipped schedule.
+        At `browser.rate_limit_backoff_seconds = 0` — a setting an operator may
+        write — an unfloored window would close in the instant it opened, so
+        four lanes meeting one limit together would open four episodes, and an
+        unfloored grace would restart the streak at 1 every time, so the fleet
+        would never park. Neither floor is reachable at any default: `max(60, 1)`
+        is 60 and `max(60, 60)` is 60.
+
+        THE GRACE IS WHAT KEEPS THE RECORD FROM BECOMING A POISON PILL. Nothing
+        sweeps this file: a fleet that parks at the sixth episode, or whose
+        process is killed, leaves a record saying `backoffs = 6` with a long-
+        expired deadline, and inheriting it unconditionally would make the next
+        run's FIRST throttle — hours later, a different limit — open episode 7
+        and park on the spot. The escalation's premise is that the waits are
+        CONSECUTIVE, and two throttles an hour apart are not. One previous
+        delay of slack is enough for the real sequence (a lane releases at the
+        deadline plus its jitter, re-probes, and is throttled again within
+        seconds) and short enough that a fresh incident starts fresh.
+
+        `delay_for` is `Orchestrator._rate_limit_delay` — passed in rather than
+        recomputed here, because the schedule belongs to the orchestrator's
+        config and a second copy of `base * 2 ** (n - 1)` would disagree with it
+        the first time either moves.
+        """
+        now = now or datetime.now(timezone.utc)
+        stamp = now.isoformat(timespec="milliseconds")
+        with self._mutex():
+            previous = self.load()
+            if previous is not None and previous.is_open(now):
+                joined = FleetThrottle(
+                    backoffs=previous.backoffs,
+                    retry_not_before=previous.retry_not_before,
+                    opened_at=previous.opened_at,
+                    opened_by=previous.opened_by,
+                    observations=previous.observations + 1,
+                    updated_at=stamp,
+                    # The joiner takes the OPENER's identity: one episode is one
+                    # id however many lanes met it, so every lane inside this
+                    # window later names the same episode when it clears.
+                    episode_id=previous.episode_id,
+                )
+                self.save(joined)
+                return joined
+            backoffs = 1
+            if previous is not None:
+                grace = max(
+                    FLEET_THROTTLE_MIN_GRACE_SECONDS,
+                    _non_negative_seconds(delay_for(previous.backoffs)),
+                )
+                if now < previous.deadline() + timedelta(seconds=grace):
+                    backoffs = previous.backoffs + 1
+            delay = max(
+                FLEET_THROTTLE_MIN_WINDOW_SECONDS,
+                _non_negative_seconds(delay_for(backoffs)),
+            )
+            opened = FleetThrottle(
+                backoffs=backoffs,
+                retry_not_before=(now + timedelta(seconds=delay)).isoformat(
+                    timespec="milliseconds"
+                ),
+                opened_at=stamp,
+                opened_by=lane_id,
+                observations=1,
+                updated_at=stamp,
+                # A NEW identity, minted here and nowhere else. An ESCALATION
+                # is a new episode, so it gets a new id even though it inherits
+                # the streak — which is what stops the lane that observed
+                # episode n from clearing episode n+1.
+                episode_id=new_episode_id(stamp, lane_id),
+            )
+            self.save(opened)
+            return opened
+
+
+def _non_negative_seconds(value) -> float:
+    """A delay from `delay_for`, coerced to a number of seconds that
+    `timedelta` will accept.
+
+    A negative one would put the deadline in the past — a window that is closed
+    the instant it opens, so every lane would open its own episode and the
+    coalescing this record exists for would be off with nothing saying so.
+    `_rate_limit_delay` already clamps its inputs at zero; this is the same
+    clamp asked of whatever a caller passes.
+    """
+    return max(0.0, float(value))

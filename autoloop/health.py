@@ -106,7 +106,7 @@ from .merge_sweep import (
     SWEEP_IDLE_EVENT,
 )
 from .stall import DEFAULT_CEILING_SECONDS
-from .state import Phase, StateStore
+from .state import FleetThrottleStore, Phase, StateStore, fleet_throttle_file
 from .tasks import TaskStore
 from .worktask import (
     ATTEMPT_FAULT,
@@ -200,6 +200,52 @@ VERDICT_CODES = (
 
 
 @dataclass(frozen=True)
+class FleetThrottleView:
+    """The fleet's shared rate-limit window, as `health` reports it (conc-11).
+
+    N lanes draw on ONE account allowance, so a throttle is a fact about the
+    account: the fleet keeps one deadline and one consecutive-episode counter in
+    `state.fleet_throttle_file`, and every lane honours both. Without this field
+    the whole of that is invisible from outside — a fleet holding every lane for
+    ten minutes and a fleet with nothing to do read identically, which is the
+    ambiguity `orchestrator.HOLD_*` exists to remove one level down.
+
+    `retry_not_before` is the SHARED, un-jittered instant. Each lane adds its own
+    offset on top, strictly less than `release_spread_max_seconds`, so an
+    operator can state when the fleet resumes without predicting a random draw —
+    which is the whole reason the spread is deterministic.
+
+    `unreadable` is the record's own fail-closed answer surfaced here: a record
+    nobody can read holds admission for the whole fleet
+    (`orchestrator.HOLD_RATE_LIMITED`), and a monitor that showed nothing in
+    that state would be the alarm that never fires.
+    """
+
+    #: Is the window still open at the moment `health` looked? False for a
+    #: record whose deadline has passed — kept, rather than dropped, because a
+    #: just-expired episode is what the next throttle escalates from.
+    open: bool
+    #: The fleet's consecutive-episode count — what
+    #: `policy.max_rate_limit_backoffs` is checked against, ONCE for the fleet.
+    backoffs: int
+    #: The shared deadline, as written.
+    retry_not_before: str
+    #: How many lanes have met THIS episode. `4` beside `backoffs = 1` is four
+    #: lanes throttled by one limit producing one episode.
+    observations: int
+    #: The lane that opened it.
+    opened_by: str
+    #: Seconds left on the shared window, floored at zero.
+    seconds_remaining: float
+    #: `[concurrency] rate_limit_release_jitter_seconds` — the bound on each
+    #: lane's own offset past the deadline above, not a draw from it.
+    release_spread_max_seconds: float
+    #: Set when the record exists and could not be read; every other field is
+    #: then a placeholder and the fleet is admitting nothing.
+    unreadable: str = ""
+
+
+@dataclass(frozen=True)
 class Health:
     code: str
     needs_attention: bool
@@ -227,6 +273,14 @@ class Health:
     #: red light after six hours. `asdict` renders it as a nested object and
     #: `None` as `null`, so a reader gains a key and loses nothing.
     held_merge_sweep: HeldSweep | None = None
+    #: The fleet's shared rate-limit window (conc-11), or `None` when this is a
+    #: single-lane deployment, when no record exists, or when the window has
+    #: expired. Carried on EVERY verdict for `stranded_tasks`' reason: a fleet
+    #: sitting out a throttle co-occurs happily with an open blocker or a loop
+    #: that is not running, and both of those return long before any late check
+    #: could fire. `asdict` renders it as a nested object and `None` as `null`,
+    #: so a reader gains a key and loses nothing.
+    fleet_throttle: "FleetThrottleView | None" = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -1145,6 +1199,79 @@ def last_transcript_event(path: Path) -> datetime | None:
     return None
 
 
+def fleet_throttle_view(config, now: datetime | None = None) -> FleetThrottleView | None:
+    """The fleet's shared rate-limit record, read for an operator (conc-11).
+
+    `None` at one lane — there is no such record and no file is ever written for
+    a single-lane deployment — and `None` when the fleet has never been
+    throttled.
+
+    NEVER RAISES. `health` is what a monitor runs on a schedule against a loop
+    it is not part of, and a reader that died on a corrupt record would report
+    nothing at all about a loop that is, at that moment, admitting nothing. The
+    corrupt case is reported as itself (`unreadable`) instead.
+    """
+    lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
+    if not isinstance(lanes, int) or isinstance(lanes, bool) or lanes <= 1:
+        return None
+    spread = getattr(
+        getattr(config, "concurrency", None),
+        "rate_limit_release_jitter_seconds",
+        0.0,
+    )
+    spread = 0.0 if isinstance(spread, bool) or not isinstance(spread, (int, float)) else float(spread)
+    store = FleetThrottleStore(fleet_throttle_file(config.state_dir))
+    try:
+        record = store.load()
+    except (StateError, OSError) as exc:
+        return FleetThrottleView(
+            open=True,  # nothing known is not permission — see HOLD_RATE_LIMITED
+            backoffs=0,
+            retry_not_before="",
+            observations=0,
+            opened_by="",
+            seconds_remaining=0.0,
+            release_spread_max_seconds=spread,
+            unreadable=f"{type(exc).__name__}: {exc}",
+        )
+    if record is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    deadline = record.deadline()
+    return FleetThrottleView(
+        open=record.is_open(now),
+        backoffs=record.backoffs,
+        retry_not_before=record.retry_not_before,
+        observations=record.observations,
+        opened_by=record.opened_by,
+        seconds_remaining=max(0.0, (deadline - now).total_seconds()),
+        release_spread_max_seconds=spread,
+    )
+
+
+def _with_fleet_throttle(config, verdict: Health, now: datetime | None) -> Health:
+    """`verdict`, plus the fleet's shared throttle window.
+
+    Applied to EVERY verdict rather than being a check of its own, for
+    `_with_strands`' reason: a fleet sitting out a limit co-occurs with an open
+    blocker, a parked lane and a loop that is not running, all of which return
+    long before a late check could fire.
+
+    It never changes the CODE and never sets `needs_attention`. A throttle is
+    not a fault — it is the loop doing exactly the right thing about somebody
+    else's server — and a monitor that went red every time an account was busy
+    is the alarm people learn to ignore. The one condition here that DOES need a
+    human, an unreadable record, reaches them through the park
+    `orchestrator._join_fleet_throttle` raises on the first lane that meets a
+    limit, which is an open blocker and already turns this verdict red; the
+    `unreadable` field is what names the file when they look.
+    """
+    view = fleet_throttle_view(config, now)
+    if view is None:
+        return verdict
+    return replace(verdict, fleet_throttle=view)
+
+
 def check(
     config,
     now: datetime | None = None,
@@ -1171,15 +1298,29 @@ def check(
     because a task nothing will schedule needs a human sooner than a backlog
     that has already waited days. Both are carried in their own field and in the
     detail either way.
+
+    A FOURTH step wraps all three (conc-11) and takes no part in that ordering:
+    `_with_fleet_throttle` attaches the fleet's shared rate-limit window to
+    whatever verdict came back, and changes neither the code nor
+    `needs_attention`. A throttled account is the loop behaving correctly about
+    somebody else's server, not a fault — but it is invisible from outside
+    without this, and "every lane held for ten minutes" and "nothing to do" must
+    not read identically.
     """
-    return _with_held_sweep(
+    return _with_fleet_throttle(
         config,
-        _with_strands(
+        _with_held_sweep(
             config,
-            _judge(config, now, silence_minutes, agent_probe, work_probe, sleep_probe),
+            _with_strands(
+                config,
+                _judge(
+                    config, now, silence_minutes, agent_probe, work_probe, sleep_probe
+                ),
+            ),
+            now,
+            held_sweep_hours,
         ),
         now,
-        held_sweep_hours,
     )
 
 
