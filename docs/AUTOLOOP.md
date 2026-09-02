@@ -1090,7 +1090,10 @@ missing is one term in that condition — `autoloop/cli.py`, in `_run_continuous
 plan.fleet_throttled or (plan.held and not plan.admitted)` (line 2351 as of
 2026-09-02). It is unclosed because `cli.py` is outside conc-11's approved
 paths, not because it is acceptable, and it belongs to whichever round may edit
-that file.
+that file. A scope adjustment adding it was REQUESTED on 2026-09-02 rather than
+taken — the request is the change note in `docs/SUMMARY.md`, so the next round
+inherits the exact term and the exact regression test instead of rediscovering
+them.
 
 Two things bound how bad it is, and both are worth stating so the next round
 sizes it correctly. It does NOT cost an extra episode: the audit session's own
@@ -1101,6 +1104,16 @@ is the wasted request, and one thing worse than the request: `_log_fleet_hold`
 is on the same skipped branch, so the transcript says nothing at all. A
 throttled fleet with an empty queue is the one shape of this that is invisible
 as well as wasteful.
+
+Both of those bounds are pinned rather than argued — `test_fleet_throttle.py`'s
+last section asserts that a plan taken with an EMPTY queue still carries
+`fleet_throttled` and the shared deadline (so closing this needs nothing from
+the supervisor), and that the audit-shaped observation the fall-through leaks
+leaves the record at one episode and two observations, with the ordinary
+`rate_limited` entry naming both. What is NOT pinned, and cannot be from inside
+these paths, is the fix's own regression: that a throttled fleet with an empty
+queue opens no audit session and logs the hold. That test belongs with the term,
+in `cli.py`.
 
 Gating it inside `Orchestrator.run` instead — the obvious in-scope alternative —
 was considered and rejected: the only hook there is the step loop, `Phase.READY`

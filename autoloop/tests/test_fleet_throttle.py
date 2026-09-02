@@ -35,6 +35,12 @@ Six parts, and each section below is one of them:
    read, the delay sequence and the persisted stamp are today's, and the park
    text is byte-identical.
 
+Two sections sit outside that six: the setting and what `health` shows, and the
+ONE residual `docs/AUTOLOOP.md` names against requirement 2 — an EMPTY queue,
+where the caller's hold condition has nothing to hold — pinned there as the two
+facts that bound it, since the term that closes it lives in a file outside this
+task's approved paths.
+
 No git repository, no subprocess and no agent: every claim here is about a
 small JSON file, a registry and a handler. The one place real concurrency is
 needed is section 1's last test, which drives two THREADS through `observe` at
@@ -70,6 +76,7 @@ from autoloop.orchestrator import (
     FleetSupervisor,
     Orchestrator,
     release_jitter_seconds,
+    session_task_id,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import (
@@ -1090,3 +1097,90 @@ def test_health_carries_no_fleet_throttle_when_there_is_none(tmp_path):
 
     assert verdict.fleet_throttle is None
     assert '"fleet_throttle": null' in verdict.to_json()
+
+
+# ---- the empty queue: the residual, and the bound that survives it -----------
+#
+# `docs/AUTOLOOP.md` records ONE residual against requirement 2, and it is a
+# residual rather than a defect of anything below: `cli._run_continuous` sleeps
+# on a plan when the fleet is draining, or when the queue has entries and every
+# one of them is held. An EMPTY queue holds nothing, so that condition is False
+# and the iteration falls through to `_select_and_kickoff`, which on a changed
+# repository fingerprint opens an audit session — one request against the
+# allowance the fleet is waiting out. Closing it is one term in that condition
+# (`plan.fleet_throttled`), in a file outside this task's approved paths.
+#
+# What CAN be pinned here is the pair of facts the residual's size rests on, and
+# both are load-bearing enough that a reader should not have to take the prose's
+# word for them: the supervisor's answer is already complete on exactly that
+# tick, and the leaked round costs an OBSERVATION rather than an EPISODE — so
+# the claim ("N lanes throttled by one limit produce ONE backoff episode, not
+# N") holds while the term is missing.
+
+
+def test_the_plan_reports_the_window_with_nothing_in_the_queue(tmp_path):
+    """The tick the caller falls through on, asked of the supervisor directly.
+
+    Nothing in `plan` needs to change for the residual to close: `admitted` is
+    empty, `held` is empty BECAUSE THERE IS NOTHING TO HOLD — not because
+    anything was allowed — and `fleet_throttled` carries the shared deadline on
+    the same tick. An empty `held` is precisely what the caller's condition
+    misreads as "no fleet objection", so it is asserted as the distinct fact it
+    is rather than folded into "nothing was admitted".
+    """
+    config = make_config(tmp_path, lanes=2)
+    empty = registry_of()
+    lane0, _ = build_lane(config, 0)
+    throttled(lane0)
+
+    plan = FleetSupervisor.from_config(config).plan(empty)
+
+    assert plan.admitted == ()
+    assert plan.held == (), "an empty queue holds nothing — the shape at issue"
+    assert plan.fleet_throttled, "and the answer is on the plan all the same"
+    assert plan.throttled_until == throttle_store(config).load().retry_not_before
+    assert HOLD_RATE_LIMITED in plan.describe(), "a reader is told which it is"
+
+
+def test_the_audit_round_an_empty_queue_leaks_costs_no_extra_episode(tmp_path):
+    """The residual's bound, and the reason THE CLAIM survives it.
+
+    The leaked round is an audit: a fresh session that names no task at all
+    (`_start_new_session` opens on the audit kickoff). Its own first request
+    meets the same account limit, and `_join_fleet_throttle` is keyed on the
+    shared record alone — nothing in it reads the task, or the absence of one —
+    so that observation JOINS the open window like any other lane's.
+    `observations` grows, `backoffs` does not, the shared deadline is not
+    extended, and one limit is still one episode.
+
+    So what the residual costs is the wasted request, never an extra back-off —
+    and not silence either, at the moment it costs anything: the leaked round
+    writes the ordinary `rate_limited` entry with the fleet's own episode and
+    observation counts on it. The tick the fleet held nothing is the part that
+    goes unlogged, and that is the caller's `_log_fleet_hold`, not this record.
+    """
+    config = make_config(tmp_path, lanes=2)
+    working, _ = build_lane(config, 0)
+    working.state.current_task = {"task_id": "t1", "title": "task t1"}
+    working._store.save(working.state)
+    throttled(working)
+    opened = throttle_store(config).load()
+
+    # Lane 1 at a clean boundary with an empty queue: the audit session, which
+    # names no task — the discriminator, asserted rather than assumed.
+    audit_lane, taken = build_lane(config, 1)
+    assert session_task_id(working.state) == "t1"
+    assert session_task_id(audit_lane.state) is None, "an audit names no task"
+
+    throttled(audit_lane)
+
+    record = throttle_store(config).load()
+    assert (opened.backoffs, record.backoffs) == (1, 1), "one limit, one episode"
+    assert record.observations == 2, "the leaked round is an observation"
+    assert record.retry_not_before == opened.retry_not_before, "and extends nothing"
+    assert audit_lane.state.rate_limit_backoffs == 1
+    assert taken and taken[0] == pytest.approx(
+        BASE + release_jitter_seconds(1, 2, JITTER), abs=2.0
+    ), "it waits out the REMAINDER of the open window, not a fresh copy"
+    leaked = entries(config, "rate_limited")[-1]
+    assert leaked["fleet_episode"] == 1 and leaked["fleet_observations"] == 2
