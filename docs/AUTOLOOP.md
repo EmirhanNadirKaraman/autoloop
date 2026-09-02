@@ -1056,8 +1056,10 @@ from it:
   outside one is how two lanes both open episode 1.
 * **Admission.** `FleetSupervisor.plan` holds every READY task
   (`HOLD_RATE_LIMITED`) while the window is open, and holds — never passes — when
-  the record cannot be read. A lane already mid-round finishes or parks by the
-  existing rules; it is admission that stops.
+  the record cannot be read; `cli._run_continuous` sleeps on that plan rather
+  than opening a session, with a queue or without one (see THE EMPTY QUEUE
+  below). A lane already mid-round finishes or parks by the existing rules; it
+  is admission that stops.
 * **A bounded release.** The shared deadline is one instant; lane *k* adds
   `k/lanes` of `[concurrency] rate_limit_release_jitter_seconds` (5s by default)
   before re-probing, so N lanes do not resynchronise on the tick the window
@@ -1077,50 +1079,54 @@ later, about a different limit — open episode 7 and park on the spot. The
 escalation's premise is that the waits are consecutive, and two throttles an
 hour apart are not.
 
-**ONE RESIDUAL, named here rather than left to be discovered.** The admission
-bullet is true of every tick that has something in the queue, and there is one
-shape it does not reach. `cli._run_continuous` sleeps on a plan when the fleet
-is draining, or when the queue has entries and every one of them is held — so an
-**empty** queue holds nothing, falls through to `_select_and_kickoff`, and on a
-changed repository fingerprint opens an audit session: a ChatGPT request against
-the allowance the fleet is waiting out. The plan already carries the answer
-(`FleetPlan.fleet_throttled`, which is set on exactly the same tick); what is
-missing is one term in that condition — `autoloop/cli.py`, in `_run_continuous`,
-`plan.draining or (plan.held and not plan.admitted)` becoming `plan.draining or
-plan.fleet_throttled or (plan.held and not plan.admitted)` (line 2351 as of
-2026-09-02). It is unclosed because `cli.py` is outside conc-11's approved
-paths, not because it is acceptable, and it belongs to whichever round may edit
-that file. A scope adjustment adding it was REQUESTED on 2026-09-02 rather than
-taken — the request is the change note in `docs/SUMMARY.md`, so the next round
-inherits the exact term and the exact regression test instead of rediscovering
-them.
+**THE EMPTY QUEUE, which the admission bullet reaches through a second term.**
+That bullet arrives at `plan` through the QUEUE, and there is one shape of it no
+queue can carry. `cli._run_continuous` slept on a plan when the fleet was
+draining, or when the queue had entries and every one of them was held — so an
+**empty** queue held nothing, that read as "no fleet objection", and the
+iteration fell through to `_select_and_kickoff`, which on a changed repository
+fingerprint opens an audit session: a ChatGPT request against the allowance the
+fleet is waiting out, and a silent one, since `_log_fleet_hold` sits on the
+branch that was skipped. The plan already carried the answer
+(`FleetPlan.fleet_throttled`, set on exactly the same tick) and what was missing
+was one term in that condition, which is now there: `plan.draining or
+plan.fleet_throttled or (plan.held and not plan.admitted)`. It arrived one round
+late, under a scope adjustment for `autoloop/cli.py` — conc-11's own paths did
+not include that file, so its first round recorded the exact term and the exact
+regression test rather than reaching outside them.
 
-Two things bound how bad it is, and both are worth stating so the next round
-sizes it correctly. It does NOT cost an extra episode: the audit session's own
-first request meets the same limit, and `_join_fleet_throttle` JOINS the open
-window — `observations` grows, `backoffs` does not — so the claim ("N lanes
-throttled by one limit produce ONE backoff episode") survives it. What it costs
-is the wasted request, and one thing worse than the request: `_log_fleet_hold`
-is on the same skipped branch, so the transcript says nothing at all. A
-throttled fleet with an empty queue is the one shape of this that is invisible
-as well as wasteful.
+Admission is still refused a TICK at a time, so a round can meet the limit from
+somewhere no gate sees: a lane admitted in the instant before the window opened,
+and a lane an operator's lowered cap cut out of the fleet, are both in flight
+where `plan` has no say. Two things bound what such a round costs, and neither
+depends on the gate. It does NOT cost an extra episode — its own first request
+meets the same limit, and `_join_fleet_throttle` JOINS the open window, so
+`observations` grows and `backoffs` does not — which is why the claim ("N lanes
+throttled by one limit produce ONE backoff episode") never rested on admission
+control alone. What it costs is the wasted request, and it is not silent: the
+round writes the ordinary `rate_limited` entry with the fleet's own episode and
+observation counts on it.
 
-Both of those bounds are pinned rather than argued — `test_fleet_throttle.py`'s
-last section asserts that a plan taken with an EMPTY queue still carries
-`fleet_throttled` and the shared deadline (so closing this needs nothing from
-the supervisor), and that the audit-shaped observation the fall-through leaks
-leaves the record at one episode and two observations, with the ordinary
-`rate_limited` entry naming both. What is NOT pinned, and cannot be from inside
-these paths, is the fix's own regression: that a throttled fleet with an empty
-queue opens no audit session and logs the hold. That test belongs with the term,
-in `cli.py`.
+All of it is pinned rather than argued, in `test_fleet_throttle.py`'s last
+section: a plan taken with an EMPTY queue still carries `fleet_throttled` and
+the shared deadline (`held == ()` asserted as the distinct fact a `held`-only
+condition misreads); the real `cli._run_continuous` is driven two iterations
+deep with an open window and an empty queue, leaving no session file, no audit
+fingerprint and exactly one `fleet_hold` entry carrying the shared deadline —
+then reaching the selection on the very tick after the window expires, so the
+term is a gate and not a wedge; the same loop over a record nobody can DECODE
+holds and says which of the two it is, since an empty queue leaves `held` empty
+for that reason as well; the same loop over the same record at **one lane**
+reaches the selection on the FIRST iteration and logs no hold at all; and an
+audit-shaped round that does meet the limit leaves the record at one episode and
+two observations.
 
-Gating it inside `Orchestrator.run` instead — the obvious in-scope alternative —
-was considered and rejected: the only hook there is the step loop, `Phase.READY`
-recurs between the turns of a live round (a dozen transitions set it), and a
-gate on it would stall lanes *mid-round*, which is precisely what "a lane
-already mid-round finishes or parks by the existing rules; it is admission that
-stops" rules out.
+Gating it inside `Orchestrator.run` instead — the alternative site, and the only
+one available before the scope adjustment — was considered and rejected: the
+only hook there is the step loop, `Phase.READY` recurs between the turns of a
+live round (a dozen transitions set it), and a gate on it would stall lanes
+*mid-round*, which is precisely what "a lane already mid-round finishes or parks
+by the existing rules; it is admission that stops" rules out.
 
 **And at `lanes = 1` none of this exists.** No record is written, none is read,
 `release_jitter_seconds` returns `0.0`, and `_handle_rate_limited` runs the line
