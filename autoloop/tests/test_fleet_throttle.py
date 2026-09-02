@@ -36,20 +36,22 @@ Six parts, and each section below is one of them:
    text is byte-identical.
 
 Two sections sit outside that six: the setting and what `health` shows, and the
-ONE residual `docs/AUTOLOOP.md` names against requirement 2 — an EMPTY queue,
-where the caller's hold condition has nothing to hold — pinned there as the two
-facts that bound it, since the term that closes it lives in a file outside this
-task's approved paths.
+one shape of requirement 2 that does not arrive through the queue at all — an
+EMPTY queue, where the caller's hold condition has nothing to hold, so the term
+that answers it is the plan's own `fleet_throttled` rather than its `held`.
 
 No git repository, no subprocess and no agent: every claim here is about a
-small JSON file, a registry and a handler. The one place real concurrency is
-needed is section 1's last test, which drives two THREADS through `observe` at
+small JSON file, a registry and a handler. The two places more than that is
+needed are section 1's last test, which drives two THREADS through `observe` at
 once — the read-modify-write there is the whole of the coalescing, and a
-single-threaded test cannot see it lose the race.
+single-threaded test cannot see it lose the race — and the last section, which
+drives the real `cli._run_continuous`, because "no session is opened" is a claim
+about the loop and not about the supervisor it asks.
 """
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import threading
@@ -90,6 +92,7 @@ from autoloop.state import (
 )
 from autoloop.tasks import CO_SCHEDULE_EXEMPT_PATHS, Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
+from autoloop import cli
 from autoloop import health as health_module
 from autoloop import orchestrator as orchestrator_module
 
@@ -1099,34 +1102,48 @@ def test_health_carries_no_fleet_throttle_when_there_is_none(tmp_path):
     assert '"fleet_throttle": null' in verdict.to_json()
 
 
-# ---- the empty queue: the residual, and the bound that survives it -----------
+# ---- the empty queue: the tick with nothing to hold ---------------------------
 #
-# `docs/AUTOLOOP.md` records ONE residual against requirement 2, and it is a
-# residual rather than a defect of anything below: `cli._run_continuous` sleeps
-# on a plan when the fleet is draining, or when the queue has entries and every
-# one of them is held. An EMPTY queue holds nothing, so that condition is False
-# and the iteration falls through to `_select_and_kickoff`, which on a changed
-# repository fingerprint opens an audit session — one request against the
-# allowance the fleet is waiting out. Closing it is one term in that condition
-# (`plan.fleet_throttled`), in a file outside this task's approved paths.
+# Requirement 2 reaches `plan` through the QUEUE — every READY task is held
+# `fleet_rate_limited` while the window is open — and there is one shape of it
+# no queue can carry. `cli._run_continuous` sleeps on a plan when the fleet is
+# draining, or when the queue has entries and every one of them is held; an
+# EMPTY queue holds nothing, so that reads as "no fleet objection" and the
+# iteration falls through to `_select_and_kickoff`, which on a changed
+# repository fingerprint opens an AUDIT session: one request against the
+# allowance the fleet is waiting out, and a silent one, since `_log_fleet_hold`
+# sits on the branch that was skipped.
 #
-# What CAN be pinned here is the pair of facts the residual's size rests on, and
-# both are load-bearing enough that a reader should not have to take the prose's
-# word for them: the supervisor's answer is already complete on exactly that
-# tick, and the leaked round costs an OBSERVATION rather than an EPISODE — so
-# the claim ("N lanes throttled by one limit produce ONE backoff episode, not
-# N") holds while the term is missing.
+# The term that answers it is the plan's own `fleet_throttled`, beside the
+# drain's, and the five tests below are its parts: the supervisor's answer on
+# that tick, the LOOP's use of it — driven through the real `_run_continuous`,
+# because "no session is opened" is a claim about the caller and not about the
+# supervisor it asks — the same loop over a record nobody can READ, where `held`
+# is empty for the second reason and the fall-through would have been the alarm
+# that never fires, the same loop at ONE lane, where the term is never evaluated
+# at all, and the bound that still holds if a round reaches an open window from
+# somewhere this gate cannot see.
+
+
+class StopTheLoop(Exception):
+    """Ends `_run_continuous` from inside a fake sleep or a fake selection —
+    which iteration it is reached on is half of the assertion."""
+
+
+def continuous_args() -> argparse.Namespace:
+    return argparse.Namespace(config=None, continuous=True, null_executor=False)
 
 
 def test_the_plan_reports_the_window_with_nothing_in_the_queue(tmp_path):
-    """The tick the caller falls through on, asked of the supervisor directly.
+    """The tick the caller used to fall through on, asked of the supervisor
+    directly.
 
-    Nothing in `plan` needs to change for the residual to close: `admitted` is
+    Nothing in `plan` had to change for the caller's term to work: `admitted` is
     empty, `held` is empty BECAUSE THERE IS NOTHING TO HOLD — not because
     anything was allowed — and `fleet_throttled` carries the shared deadline on
-    the same tick. An empty `held` is precisely what the caller's condition
-    misreads as "no fleet objection", so it is asserted as the distinct fact it
-    is rather than folded into "nothing was admitted".
+    the same tick. An empty `held` is precisely what a condition reading `held`
+    alone misreads as "no fleet objection", so it is asserted as the distinct
+    fact it is rather than folded into "nothing was admitted".
     """
     config = make_config(tmp_path, lanes=2)
     empty = registry_of()
@@ -1142,22 +1159,166 @@ def test_the_plan_reports_the_window_with_nothing_in_the_queue(tmp_path):
     assert HOLD_RATE_LIMITED in plan.describe(), "a reader is told which it is"
 
 
-def test_the_audit_round_an_empty_queue_leaks_costs_no_extra_episode(tmp_path):
-    """The residual's bound, and the reason THE CLAIM survives it.
+def test_a_throttled_fleet_with_an_empty_queue_opens_no_session(
+    tmp_path, monkeypatch
+):
+    """The LOOP half, driven through the real `cli._run_continuous` — and two
+    iterations, because the second is what makes this a gate rather than a wedge.
 
-    The leaked round is an audit: a fresh session that names no task at all
-    (`_start_new_session` opens on the audit kickoff). Its own first request
-    meets the same account limit, and `_join_fleet_throttle` is keyed on the
-    shared record alone — nothing in it reads the task, or the absence of one —
-    so that observation JOINS the open window like any other lane's.
-    `observations` grows, `backoffs` does not, the shared deadline is not
-    extended, and one limit is still one episode.
+    Iteration 1: the window is open and the queue is EMPTY, so nothing is held
+    and a condition reading `held` alone is False. Reaching `_select_and_kickoff`
+    at all is the failure — it is the only door to `_start_new_session` — so the
+    session file and the audit fingerprint are asserted absent afterwards as the
+    durable half of "no request was made", and the hold is asserted to have been
+    LOGGED, which the skipped branch never did.
 
-    So what the residual costs is the wasted request, never an extra back-off —
-    and not silence either, at the moment it costs anything: the leaked round
-    writes the ordinary `rate_limited` entry with the fleet's own episode and
-    observation counts on it. The tick the fleet held nothing is the part that
-    goes unlogged, and that is the caller's `_log_fleet_hold`, not this record.
+    Iteration 2: the window expires inside the fake poll — the drain test's own
+    device, matched by DURATION so an unrelated internal sleep cannot expire it a
+    step early — and the selection is reached on the very next tick. The poll
+    count is bounded so a gate that never lifts fails this test instead of
+    hanging the suite on a fake sleep that returns instantly.
+    """
+    config = make_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(TaskRegistry())
+    # Seeded rather than driven through a lane, so the fleet is IDLE while the
+    # window is open: `_handle_rate_limited` leaves a busy state file behind it,
+    # and a hold measured with one of those in the fleet could be the cap
+    # wearing the throttle's name.
+    window = seed_episode(config, backoffs=1, opens_in=BASE)
+    events: list[str] = []
+
+    def poll(seconds):
+        if seconds != cli.CONTINUOUS_POLL_SECONDS:
+            return
+        events.append("held")
+        if len(events) > 3:
+            raise StopTheLoop()  # the window never lifted — see the assert below
+        # The window expiring between two iterations, which is the drain test's
+        # own device for changing the fleet inside the fake poll.
+        seed_episode(config, backoffs=1, opens_in=-1.0)
+
+    def select(cfg, store, registry):
+        events.append("session")
+        raise StopTheLoop()
+
+    monkeypatch.setattr(cli.time, "sleep", poll)
+    monkeypatch.setattr(cli, "_select_and_kickoff", select)
+
+    with pytest.raises(StopTheLoop):
+        cli._run_continuous(continuous_args(), config)
+
+    assert events == ["held", "session"], (
+        "a session was opened inside the fleet's own throttle window"
+        if events[:1] == ["session"]
+        else "the hold never lifted after the shared deadline passed"
+    )
+    assert not config.state_file.exists(), "a session was opened while throttled"
+    assert not config.continuous_fingerprint_file.exists(), "an audit was started"
+    logged = entries(config, "fleet_hold")
+    assert len(logged) == 1, "the throttled tick has to be legible, not silent"
+    assert logged[0]["held"] == "" and logged[0]["draining"] is False, (
+        "neither of the reasons that already stopped admission — the shape at issue"
+    )
+    assert HOLD_RATE_LIMITED in logged[0]["detail"], "and it says which it is"
+    assert window.retry_not_before in logged[0]["detail"], "with the shared deadline"
+    assert not config.executions_dir.exists(), "the held tick charged no attempt"
+
+
+def test_a_record_nobody_can_read_holds_the_loop_and_not_only_the_plan(
+    tmp_path, monkeypatch
+):
+    """The same fail-open one level up, and the empty queue is what makes it
+    worth its own test.
+
+    `plan` answers `FLEET_THROTTLE_UNREADABLE` rather than `""` for a record it
+    cannot read, so `fleet_throttled` is TRUE and the loop holds on it exactly as
+    it holds on an open window. With nothing in the queue `held` is empty in BOTH
+    states, so a caller reading `held` alone opens a session precisely when
+    nothing can tell whether the account is throttled — the alarm that never
+    fires. The hold is asserted to name the record as the reason, because "the
+    window is open" and "nobody can tell" are the two answers this record exists
+    to keep apart.
+    """
+    config = make_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(TaskRegistry())
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    fleet_throttle_file(config.state_dir).write_text("{not json", encoding="utf-8")
+
+    def poll(seconds):
+        if seconds == cli.CONTINUOUS_POLL_SECONDS:
+            raise StopTheLoop()  # one tick is the whole claim: it did not admit
+
+    monkeypatch.setattr(cli.time, "sleep", poll)
+    monkeypatch.setattr(
+        cli,
+        "_select_and_kickoff",
+        lambda *a, **k: pytest.fail("an unreadable record is not permission"),
+    )
+
+    with pytest.raises(StopTheLoop):
+        cli._run_continuous(continuous_args(), config)
+
+    logged = entries(config, "fleet_hold")
+    assert len(logged) == 1 and HOLD_RATE_LIMITED in logged[0]["detail"]
+    assert FLEET_THROTTLE_UNREADABLE in logged[0]["detail"], "which of the two it is"
+    assert not config.state_file.exists() and not config.executions_dir.exists()
+
+
+def test_at_one_lane_the_same_record_stops_nothing(tmp_path, monkeypatch):
+    """The single-lane half of the same term, driven through the same loop.
+
+    `cli._fleet_plan` answers `None` below two lanes, so no plan is computed, no
+    `fleet_throttled` is read and the new term is never evaluated: a single-lane
+    deployment reaches `_select_and_kickoff` on the FIRST iteration holding the
+    very record that stops a fleet of two, and its back-off stays entirely
+    `LoopState`'s own two fields. The seeded record and the empty queue are the
+    ones above, so `[concurrency] lanes` is the only difference between the two
+    tests — which is what makes this evidence about the gate rather than about
+    the fixture.
+    """
+    config = make_config(tmp_path, lanes=1)
+    TaskStore(config.tasks_file).save(TaskRegistry())
+    seed_episode(config, backoffs=1, opens_in=BASE)
+    events: list[str] = []
+
+    def poll(seconds):
+        # By duration, so an unrelated internal sleep is not read as a fleet
+        # hold — the same matching rule the two-iteration test above uses.
+        if seconds == cli.CONTINUOUS_POLL_SECONDS:
+            events.append("held")
+
+    def select(cfg, store, registry):
+        events.append("session")
+        raise StopTheLoop()
+
+    monkeypatch.setattr(cli.time, "sleep", poll)
+    monkeypatch.setattr(cli, "_select_and_kickoff", select)
+
+    with pytest.raises(StopTheLoop):
+        cli._run_continuous(continuous_args(), config)
+
+    assert events == ["session"], "a fleet record held a single-lane loop"
+    assert entries(config, "fleet_hold") == [], "and nothing was logged as one"
+
+
+def test_an_audit_round_that_meets_the_limit_joins_the_open_episode(tmp_path):
+    """The bound that holds when a round reaches the limit from somewhere the
+    admission gate cannot see, and the reason THE CLAIM does not rest on that
+    gate alone.
+
+    Admission is refused a tick at a time, so a round can still be in flight
+    inside an open window: a lane admitted in the instant before the window
+    opened, or one an operator's lowered cap cut out of the fleet — which no
+    supervisor sees at all (`HOLD_LANE_RETIRED`). The shape asserted here is the
+    hardest of those, a session that names NO task (`_start_new_session` opens on
+    the audit kickoff), because it is the one a task-keyed rule would miss.
+
+    `_join_fleet_throttle` is keyed on the shared record alone — nothing in it
+    reads the task, or the absence of one — so that observation JOINS the open
+    window like any other lane's. `observations` grows, `backoffs` does not, the
+    shared deadline is not extended, and one limit is still one episode. Nor is
+    it silent: the round writes the ordinary `rate_limited` entry with the
+    fleet's own episode and observation counts on it.
     """
     config = make_config(tmp_path, lanes=2)
     working, _ = build_lane(config, 0)
@@ -1176,11 +1337,11 @@ def test_the_audit_round_an_empty_queue_leaks_costs_no_extra_episode(tmp_path):
 
     record = throttle_store(config).load()
     assert (opened.backoffs, record.backoffs) == (1, 1), "one limit, one episode"
-    assert record.observations == 2, "the leaked round is an observation"
+    assert record.observations == 2, "the in-flight round is an observation"
     assert record.retry_not_before == opened.retry_not_before, "and extends nothing"
     assert audit_lane.state.rate_limit_backoffs == 1
     assert taken and taken[0] == pytest.approx(
         BASE + release_jitter_seconds(1, 2, JITTER), abs=2.0
     ), "it waits out the REMAINDER of the open window, not a fresh copy"
-    leaked = entries(config, "rate_limited")[-1]
-    assert leaked["fleet_episode"] == 1 and leaked["fleet_observations"] == 2
+    joined = entries(config, "rate_limited")[-1]
+    assert joined["fleet_episode"] == 1 and joined["fleet_observations"] == 2

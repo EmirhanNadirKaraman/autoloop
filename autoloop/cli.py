@@ -2024,6 +2024,13 @@ def _log_fleet_hold(config: AutoloopConfig, plan: FleetPlan) -> None:
     verdict and the first few held tasks with their reasons. Capped at five
     because this repeats every poll interval and a transcript is read by
     people.
+
+    `held` is EMPTY on one shape of this and the entry is still worth writing:
+    a fleet inside the account's rate-limit window with nothing in the queue
+    holds no task because there is no task to hold. `detail` is what carries it
+    — `FleetPlan.describe` appends the `fleet_rate_limited` word and the shared
+    deadline — so the tick a throttled fleet dispatched nothing is legible
+    rather than silent.
     """
     TranscriptLogger(config.transcript_file).append(
         "fleet_hold",
@@ -2348,8 +2355,13 @@ def _run_continuous(
             # off declines its sha and the fleet admits again on the next tick.
             _reach_upgrade_boundary(config, lock, args, lane, answered_upgrades)
             continue
-        if plan is not None and (plan.draining or (plan.held and not plan.admitted)):
-            # At the cap, in conflict with a live lane, or draining behind one.
+        if plan is not None and (
+            plan.draining
+            or plan.fleet_throttled
+            or (plan.held and not plan.admitted)
+        ):
+            # At the cap, in conflict with a live lane, draining behind one, or
+            # inside the ACCOUNT's shared rate-limit window (conc-11).
             # Every held task stays `pending`, untouched and charged nothing;
             # the reason is recorded once per tick because a fleet at its cap
             # and a fleet with nothing to do must not read identically.
@@ -2361,6 +2373,18 @@ def _run_continuous(
             # admission a drain exists to stop. A fleet with nothing ready and
             # nothing pending is left alone here and reaches that audit
             # unchanged.
+            #
+            # `plan.fleet_throttled` is that same shape for the throttle, and
+            # the term is separate for the same reason: one allowance backs
+            # every lane, so the audit an empty queue would fall through to is
+            # one more request against an allowance the fleet has already
+            # watched run out — and a silent one, since `_log_fleet_hold` is on
+            # this branch and not on that one. It is the plan's own answer on
+            # exactly this tick, never a second reading of the record, and it is
+            # never set at `lanes = 1` (`_fleet_plan` answers `None` there), so
+            # the single-lane back-off reaches this line unchanged. A lane
+            # already mid-round is untouched by it — it finished or parked
+            # above; what stops here is ADMISSION.
             _log_fleet_hold(config, plan)
             time.sleep(CONTINUOUS_POLL_SECONDS)
             continue
