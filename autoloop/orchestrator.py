@@ -1288,6 +1288,14 @@ HOLD_LANE_UNREADABLE = "lane_unreadable"
 HOLD_AT_CAP = "fleet_at_cap"
 HOLD_SCOPE_CONFLICT = "scope_conflict"
 HOLD_IN_FLIGHT = "already_in_flight"
+#: The one word `FleetSupervisor.plan` never produces, because the condition is
+#: invisible from inside it: THIS LANE is not in the fleet at all — its index is
+#: at or above `[concurrency] lanes`, which is what an operator lowering the cap
+#: under a running fleet leaves behind. `lane_occupants` walks `range(lanes)`,
+#: so such a lane is absent from its own occupant list rather than counted, and
+#: a plan computed for it would see a free slot that does not exist.
+#: `Orchestrator._refused_outside_fleet_admission` answers it before it plans.
+HOLD_LANE_RETIRED = "lane_outside_the_fleet"
 
 #: The verdict code `Orchestrator._refused_outside_fleet_admission` denies a
 #: directive with, so a reader of the transcript — and a test — can tell a fleet
@@ -6576,9 +6584,12 @@ class Orchestrator:
         Fail-open is the whole point of the union, and it is safe HERE because
         the only thing it switches off is a fleet ADMISSION check: a task this
         session already holds was admitted when it started and is not being
-        admitted again. Reading it any other way is the failure conc-06's
-        gate must not have — every `revise` refused, the reviewer re-sending
-        it, and the lane fault-stopping on an exhausted denial budget.
+        admitted again. That covers the retired-lane refusal too — a lane a
+        lowered cap cut out finishes the arc it holds and starts nothing new,
+        which is the same shape as the drain. Reading it any other way is the
+        failure conc-06's gate must not have — every `revise` refused, the
+        reviewer re-sending it, and the lane fault-stopping on an exhausted
+        denial budget.
         """
         found: set[str] = set()
         for record in (self.state.task_execution, self.state.current_task):
@@ -6643,12 +6654,14 @@ class Orchestrator:
 
         Four things it deliberately does not do:
 
-        * **Nothing at `lanes <= 1`.** The first statement, before any file is
-          read: at one lane there is no fleet to schedule, so a single-lane
-          deployment cannot be changed by a scheduling decision — the same
-          structural gate `cli._fleet_plan` applies, at the other call site.
-          A config with no `[concurrency]` section at all (a hand-built one in a
-          test) is one lane by the same rule.
+        * **Nothing at `lanes <= 1`.** Before any file is read: at one lane
+          there is no fleet to schedule, so a single-lane deployment cannot be
+          changed by a scheduling decision — the same structural gate
+          `cli._fleet_plan` applies, at the other call site. A config with no
+          `[concurrency]` section at all (a hand-built one in a test) is one
+          lane by the same rule. The ONE thing checked ahead of it is the
+          retired lane below, because that check reads nothing either and 4 -> 1
+          is the same lowered cap as 4 -> 2.
         * **Nothing about work this lane already owns** (`_session_task_ids`).
           A `revise` continues an arc that was admitted when it started; it is
           never in `ready_in_dispatch_order`, so a membership test against
@@ -6657,7 +6670,10 @@ class Orchestrator:
           up would pass here, which is the in-flight race rather than the
           conflict rule, and it is refused downstream by the worker repo a
           second dispatch cannot create over the first (`worker_repo_is_
-          reusable`) rather than by an efficiency gate.
+          reusable`) rather than by an efficiency gate. Checked ahead of the
+          retired lane below as well: a lane the cap cut out still FINISHES what
+          it holds — that is what every drain in this candidate waits for —
+          and it starts nothing new.
         * **Nothing about a task the supervisor did not schedule.** Only a task
           this plan classified — admitted, or held with a reason — is an
           admission decision at all. A directive naming a task that is not READY
@@ -6666,13 +6682,26 @@ class Orchestrator:
         * **Almost nothing about the CAP.** This lane is excluded from the
           occupants, because the slot it holds is the slot this task would run
           in — so a free lane exists at this call site and the cap is enforced
-          where sessions OPEN, which is where a lane is actually taken. The one
-          exception is the fail-closed direction and is meant: a lane whose index
-          is at or above the current `lanes` is a lane the operator has already
-          cut out of the fleet, nothing excludes it from its own occupant list,
-          and it admits nothing more. The ordinarily reachable reasons are a
-          scope conflict, a drain, an unreadable neighbour and the in-flight
-          race.
+          where sessions OPEN, which is where a lane is actually taken. The
+          ordinarily reachable reasons are a scope conflict, a drain, an
+          unreadable neighbour and the in-flight race.
+
+        THE ONE CAP CASE THIS ANSWERS ITSELF, and it is answered HERE rather
+        than inside `plan` because `plan` cannot see it: an operator who lowers
+        `[concurrency] lanes` under a running fleet leaves lanes at or above the
+        new cap with live sessions in them, and `lane_occupants` walks
+        `range(lanes)` — so such a lane is not in its own occupant list to be
+        excluded from, the exclusion above is a no-op for it, and a plan
+        computed for it counts a free slot that does not exist and ADMITS.
+        `HOLD_LANE_RETIRED` is therefore an explicit refusal taken before
+        anything is planned, and before the `lanes <= 1` return, since 4 -> 1
+        cuts the same lanes out that 4 -> 2 does. It costs one attribute
+        comparison and reads no file, so lane 0 at `lanes = 1` — the only lane a
+        single-lane deployment has — is untouched by it. `lane_occupants` itself
+        is deliberately NOT widened: `cli._fleet_plan` is the supervisor's own
+        view of the fleet it is sizing, it never opens a lane at or above the
+        cap, and a scan that walked further would have to guess how much
+        further.
 
         The gate FAILS CLOSED when it cannot answer: an unreadable neighbour is
         already `HOLD_LANE_UNREADABLE` inside `plan`, and an exception anywhere
@@ -6685,43 +6714,77 @@ class Orchestrator:
         in this loop has.
         """
         lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
-        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes <= 1:
-            return False
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            # A fleet size this build cannot read is ONE lane, not a comparison
+            # against a string: `config.load_config` refuses every such value at
+            # load time, so reaching this is a hand-built config, and the
+            # single-lane reading is the one that changes nothing.
+            lanes = 1
         if task.id in self._session_task_ids():
+            # Ahead of every other check, retired lane included: a lane the
+            # operator has cut out of the fleet still FINISHES the arc it is
+            # holding — that is what the drain does for an upgrade, and
+            # refusing a `revise` mid-round would spend the denial budget
+            # instead of freeing the lane.
             return False
         alternative = ""
-        try:
-            # This lane is not one of its own occupants: it is mid-round by
-            # construction here, so counting the slot it already holds would
-            # make every dispatch above one lane read as a full fleet.
-            occupants = tuple(
-                occupant
-                for occupant in lane_occupants(self._config)
-                if occupant.lane_index != self.lane_index
+        if self.lane_index >= lanes:
+            # THE LOWERED CAP, and it is refused here rather than planned for:
+            # `lane_occupants` walks `range(lanes)`, so this lane is absent from
+            # its own occupant list and the exclusion below would drop nothing
+            # — the plan would count a free slot that no longer exists and admit
+            # into a lane the operator has already cut out of the fleet.
+            reason = (
+                f"{HOLD_LANE_RETIRED}: lane {self.lane_id} is index "
+                f"{self.lane_index} in a fleet of {lanes}"
             )
-            plan = FleetSupervisor(lanes).plan(
-                self._registry,
-                occupants,
-                upgrade_pending=self._fleet_drain_pending(),
-                first=task.id,
+            because = (
+                f"this loop is running {lanes} lanes and this one is no longer "
+                "among them — the cap was lowered while this session was open, "
+                "so this lane finishes what it already holds and starts nothing "
+                "further"
             )
-            admitted_ids = [other.id for other in plan.admitted]
-            if task.id in admitted_ids:
-                return False
-            reason = plan.hold_reason(task.id)
-            if not reason:
-                return False  # not scheduled by this plan at all — see above
-            # An urgent pin makes every other id unsendable (`_refused_ahead_of_
-            # urgent` runs first), so suggesting one would be a correction the
-            # very next directive is refused for.
-            if self._registry.live_urgent_target() is None:
-                alternative = next(iter(admitted_ids), "")
-        except Exception as exc:  # a gate that cannot answer must not pass
-            self._log(
-                "fleet_admission_unreadable",
-                data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
+        elif lanes <= 1:
+            return False
+        else:
+            because = (
+                f"this loop is running {lanes} lanes, and a task that declares "
+                "a path a live lane already declares, or that a pending self-"
+                "upgrade is draining behind, waits for that lane to finish "
+                "rather than starting beside it"
             )
-            reason = f"{HOLD_LANE_UNREADABLE}: the fleet's own state is unreadable"
+            try:
+                # This lane is not one of its own occupants: it is mid-round by
+                # construction here, so counting the slot it already holds would
+                # make every dispatch above one lane read as a full fleet.
+                occupants = tuple(
+                    occupant
+                    for occupant in lane_occupants(self._config)
+                    if occupant.lane_index != self.lane_index
+                )
+                plan = FleetSupervisor(lanes).plan(
+                    self._registry,
+                    occupants,
+                    upgrade_pending=self._fleet_drain_pending(),
+                    first=task.id,
+                )
+                admitted_ids = [other.id for other in plan.admitted]
+                if task.id in admitted_ids:
+                    return False
+                reason = plan.hold_reason(task.id)
+                if not reason:
+                    return False  # not scheduled by this plan at all — see above
+                # An urgent pin makes every other id unsendable (`_refused_ahead_
+                # of_urgent` runs first), so suggesting one would be a correction
+                # the very next directive is refused for.
+                if self._registry.live_urgent_target() is None:
+                    alternative = next(iter(admitted_ids), "")
+            except Exception as exc:  # a gate that cannot answer must not pass
+                self._log(
+                    "fleet_admission_unreadable",
+                    data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
+                )
+                reason = f"{HOLD_LANE_UNREADABLE}: the fleet's own state is unreadable"
         if alternative:
             instead = (
                 f"Send the same decision for '{alternative}' instead — the "
@@ -6737,12 +6800,9 @@ class Orchestrator:
             Verdict.deny(
                 FLEET_HOLD_DENIAL_CODE,
                 f"the fleet supervisor is HOLDING task '{task.id}' rather than "
-                f"admitting it into lane {self.lane_id} ({reason}) — this loop "
-                f"is running {lanes} lanes, and a task that declares a path a "
-                "live lane already declares, or that a pending self-upgrade is "
-                "draining behind, waits for that lane to finish rather than "
-                f"starting beside it. {instead} The task is untouched: it is "
-                "still queued, nothing was executed and no attempt was spent.",
+                f"admitting it into lane {self.lane_id} ({reason}) — {because}. "
+                f"{instead} The task is untouched: it is still queued, nothing "
+                "was executed and no attempt was spent.",
             ),
         )
         return True
