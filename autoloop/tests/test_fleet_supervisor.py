@@ -1514,6 +1514,109 @@ def test_a_stray_directory_beside_the_lanes_is_not_a_lane(tmp_path):
     assert all(o.readable for o in occupants)
 
 
+def test_a_cut_lane_whose_state_cannot_be_read_holds_the_fleet(tmp_path):
+    """The fail-closed rule of section 3, applied to the lane the cap cut out.
+    `test_a_lanes_directory_that_cannot_be_listed_holds_the_fleet` pins the
+    LISTING; this pins the READ one level down, which is the commoner fault and
+    the one the narrow scan cannot reach at all: a cut lane whose state file is
+    corrupt might hold anything, so it costs a slot, stops admission and — the
+    half a drain depends on — keeps the fleet from reading as idle. A scan that
+    passed over what it could not read would raise the effective cap and reach a
+    self-upgrade boundary on exactly the lane that is in trouble."""
+    config = make_config(tmp_path, lanes=2)
+    cut = lane_state_file(config.state_dir, 3)
+    cut.parent.mkdir(parents=True, exist_ok=True)
+    cut.write_text("{ this is not json", encoding="utf-8")
+    registry = registry_of(a_task("t1"))
+
+    assert lane_occupants(config) == (), "the narrow scan never walks that far"
+    occupants = fleet_occupants(config)
+
+    assert [(o.lane_index, o.readable) for o in occupants] == [(3, False)]
+    assert occupants[0].lane_id == lane_id(3)
+    supervisor = FleetSupervisor.from_config(config)
+    plan = supervisor.plan(registry, occupants)
+    assert plan.admitted == ()
+    assert plan.hold_reason("t1") == HOLD_LANE_UNREADABLE
+    assert not plan.fleet_idle
+    draining = supervisor.plan(registry, occupants, upgrade_pending=True)
+    assert draining.upgrade_boundary is False, (
+        "a cut lane nobody can read is not an empty fleet"
+    )
+
+
+def test_the_boundary_arrives_when_the_cut_lane_goes_terminal_and_not_before(
+    tmp_path,
+):
+    """The drain's own sentence, asserted on the PLAN rather than end to end.
+    Section 4's continuous-mode test proves the boundary is REACHED; this proves
+    what it is reached on, over one state directory and two scans of it: with the
+    cut lane mid-round the fleet is not idle and no boundary exists, and the only
+    thing that changes between the two plans is that lane's phase.
+
+    `x` is in the registry so the drain is what holds t1: an id no row describes
+    would hold it `HOLD_LANE_UNREADABLE` instead, which is a different claim."""
+    config = make_config(tmp_path, lanes=2)
+    registry = registry_of(a_task("x"), a_task("t1"))
+    a_busy_lane(config, 3, "x")
+    supervisor = FleetSupervisor.from_config(config)
+
+    draining = supervisor.plan(registry, fleet_occupants(config), upgrade_pending=True)
+
+    assert draining.draining and not draining.fleet_idle
+    assert draining.upgrade_boundary is False, "a cut lane is still mid-round"
+    assert draining.admitted == () and draining.hold_reason("t1") == HOLD_DRAINING
+    assert [task.status for task in registry.all_tasks()] == ["pending"] * 2
+
+    cut = StateStore(lane_state_file(config.state_dir, 3))
+    finished = cut.load()
+    finished.phase = Phase.STOPPED.value
+    cut.save(finished)
+
+    arrived = supervisor.plan(registry, fleet_occupants(config), upgrade_pending=True)
+
+    assert fleet_occupants(config) == (), "a terminal cut lane holds nothing"
+    assert arrived.fleet_idle and arrived.upgrade_boundary is True
+
+
+def test_the_cut_lane_is_counted_without_becoming_a_slot_to_admit_into(tmp_path):
+    """THE SEPARATION, in one test over one state directory — the two halves are
+    pinned apart above and it is holding them at once that is the claim. Lane 3
+    was cut out of a fleet of two and is mid-round, so:
+
+    * to the lanes still inside the cap it is an OCCUPANT — the production
+      scheduler (`cli._fleet_plan`, not a hand-built plan) counts one of the two
+      slots gone and admits exactly one task;
+    * and it is not itself one of the slots that remain — the same session's own
+      dispatch is refused `HOLD_LANE_RETIRED`, with its task left untouched.
+
+    Counting it and admitting into it are opposite answers to one edit, and a
+    round that got either alone would read as correct in the other's test."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config,
+        tasks=[a_task("t1", ["autoloop/a.py"]), a_task("t2", ["autoloop/b.py"])],
+        lane_index=3,
+    )
+    before = config.tasks_file.read_bytes()
+
+    plan = cli._fleet_plan(config, orch._registry, set())
+
+    assert [(o.lane_index, o.task_id) for o in plan.occupants] == [(3, None)]
+    assert plan.free_lanes == 1 and not plan.fleet_idle
+    assert admitted_ids(plan) == ["t1"], "one cut lane costs one of the two slots"
+    assert plan.hold_reason("t2") == HOLD_AT_CAP
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == [], "the free slot is not this lane's to take"
+    assert orch._registry.get("t1").status == "pending"
+    assert config.tasks_file.read_bytes() == before, "the registry was not written"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+    assert HOLD_LANE_RETIRED in (orch.state.outbox or "")
+
+
 def test_at_one_lane_no_scan_walks_past_lane_zero(tmp_path):
     """The acceptance criterion, at the scan this round adds. A single-lane
     deployment consults no scheduler — `_fleet_plan` answers `None` and the
