@@ -159,7 +159,10 @@ from .orchestrator import (
     MAX_REPEATED_STOPS,
     PREEMPTION_STOP_KIND,
     SELF_UPGRADE,
+    FleetPlan,
+    FleetSupervisor,
     Orchestrator,
+    lane_occupants,
     release_task_to_pending,
 )
 from .policy import PolicyConfig, PolicyEngine
@@ -604,6 +607,43 @@ def _build_executor(
     return _DispatchingExecutor(audit_executor, implement_executor)
 
 
+def _round_boundary_may_upgrade(config: AutoloopConfig, args) -> bool:
+    """May ONE round end for a self-upgrade, or does the fleet own that
+    boundary?
+
+    True at `lanes = 1`, which is today's loop exactly: `Orchestrator.run`
+    returns `SELF_UPGRADE` at a READY phase with no packet in flight, and
+    `_run_continuous` replaces the process there.
+
+    FALSE FOR A CONTINUOUS RUN ABOVE ONE LANE, and this is the half conc-06
+    adds. The plan requires the replacement to happen with the WHOLE FLEET idle
+    (`docs/AUTOLOOP.md`, "an interaction the scheduler must answer"), and a
+    boundary that is a property of one round would exec while the neighbouring
+    lanes were mid-round — reaching it by accident rather than by draining,
+    which is the thing the drain exists to make impossible. There the supervisor
+    owns it: it stops admitting, the live lanes finish, and `_run_continuous`
+    reaches the boundary on the tick that finds every lane empty.
+
+    **TRUE FOR THE SINGLE-ROUND PATH WHATEVER THE FLEET SIZE**, and that is not
+    a loose end: `_run_locked` has no supervisor, never calls `_fleet_plan` and
+    can never reach a drain, so switching the boundary off there would leave a
+    merged upgrade with nothing in that path able to act on it — silence, which
+    is the failure the drain exists to end rather than to move. It cannot hand
+    off either, so what it does with the boundary is DEFER it out loud
+    (`_defer_self_upgrade`, `UPGRADE_DEFERRED` and its transcript entry), which
+    is exactly the outcome that must survive.
+
+    `<= 1` rather than `== 1` so a value this build cannot read as a fleet keeps
+    TODAY's behaviour rather than losing the upgrade path altogether — the safe
+    direction for a knob `load_config` has already refused every bad value of.
+    `getattr` for the same reason: an args namespace without `--continuous`
+    (every test, every embedder) is the single-round answer.
+    """
+    if config.concurrency.lanes <= 1:
+        return True
+    return not getattr(args, "continuous", False)
+
+
 def _build_orchestrator(config, args, store, state, task_store, registry) -> Orchestrator:
     """Construct the full produce-then-review collaborator set. After this,
     `run` (continuous or not) has exactly ONE dispatch path for
@@ -701,7 +741,11 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         # same state dir — tests, embedders, and until brw-16 (2026-08-25)
         # `smoke-browser`'s own — sees the pending record and must ignore it
         # rather than fail on an upgrade it cannot perform; see the constructor.
-        self_upgrade_enabled=True,
+        #
+        # AND FOR A CONTINUOUS RUN AT `lanes > 1` NOT EVEN THIS ONE — see
+        # `_round_boundary_may_upgrade`, which owns that rule and says why the
+        # single-round path keeps it.
+        self_upgrade_enabled=_round_boundary_may_upgrade(config, args),
         # esc-02: the loop-owned tree the escape detector watches, and the
         # source every worker repository is seeded from. Always wired here —
         # its default location is derived from the mandatory `workers_root` —
@@ -1849,6 +1893,124 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
 CONTINUOUS_POLL_SECONDS = 30.0
 
 
+def _reach_upgrade_boundary(
+    config: AutoloopConfig,
+    lock: LoopLock | None,
+    args: argparse.Namespace,
+    lane: "_LaneEntry | None",
+    answered_upgrades: set[str],
+) -> None:
+    """Act on a self-upgrade at a boundary, and bound the run against the
+    record it was about. Normally does not return — `os.execv` replaces the
+    process (see `_self_upgrade_at_boundary`).
+
+    TWO SHAS, and they are the same one in every ordinary round: the one this
+    process read on its way in, and the one the decision really acted on. Both
+    are recorded, because a merge landing between the two reads makes them
+    disagree and declining only one leaves the other offered again at the very
+    next round, forever, at the speed of a `continue`.
+
+    `getattr` for the second, because this is the path whose whole job is to
+    keep the process alive past a boundary: a callee that came back a bare slug
+    (a future refactor, a test double) must not end the loop on an
+    `AttributeError` one statement after the carry-on. `""` then falls back on
+    the sha read here, which still bounds the run.
+
+    ONE implementation, two callers — `_run_continuous`'s `SELF_UPGRADE` branch
+    (the single-lane boundary the orchestrator reports) and its fleet DRAIN
+    (the boundary the supervisor reaches by emptying every lane). A second copy
+    of the bound is how one of the two ends up spinning on a record the other
+    one declined.
+    """
+    offered = upgrade_bound_sha(UpgradeStore(config.pending_upgrade_file).load())
+    lane_arg = () if lane is None else (lane,)
+    acted = _self_upgrade_at_boundary(config, lock, args, *lane_arg)
+    for sha in (offered, getattr(acted, "base_sha", "")):
+        if sha:
+            answered_upgrades.add(sha)
+
+
+def _drainable_upgrade_sha(config: AutoloopConfig, answered: set[str]) -> str:
+    """The `base_sha` of a pending self-upgrade this run could still act on, or
+    `""` — the supervisor's `upgrade_pending` input (conc-06).
+
+    THREE ways to answer `""`, and each of them is a spin the drain would
+    otherwise walk into. Draining means "admit nothing until the fleet is
+    empty", so an upgrade nobody can act on would stop the fleet dispatching
+    anything, forever, which is worse than the missed upgrade:
+
+    * no record, or one whose status is not `pending` — nothing to drain for;
+    * a record whose `base_sha` is not a usable key (`upgrade_bound_sha`, the
+      same predicate `_self_upgrade_at_boundary` refuses on) — the boundary
+      would log `self_upgrade_none` and return, and the fleet would drain for
+      it again on the next tick;
+    * a sha this RUN has already answered. The three non-exec outcomes leave
+      the record `pending` ON PURPOSE so a later process can still perform the
+      upgrade (`_carry_on_upgrade`), so without this the fleet would sit
+      drained beside a preflight failure it can never get past. Same set, same
+      argument, as `Orchestrator.decline_self_upgrade`.
+
+    `UpgradeStore.load` answers `None` for an unreadable record rather than
+    raising, which is the safe direction here too: an unreadable marker means
+    "do not stop dispatching", and the merged code is on disk either way.
+    """
+    record = UpgradeStore(config.pending_upgrade_file).load()
+    if record is None or record.status != UPGRADE_PENDING:
+        return ""
+    sha = upgrade_bound_sha(record)
+    return "" if sha in answered else sha
+
+
+def _fleet_plan(
+    config: AutoloopConfig, registry: TaskRegistry, answered_upgrades: set[str]
+) -> FleetPlan | None:
+    """What the fleet supervisor decided this tick, or `None` at `lanes = 1`.
+
+    **`None` at `lanes = 1` is the acceptance criterion made structural**, and
+    it is the same device Decision 2 uses for lane 0's state file: at one lane
+    there is no fleet to schedule, so nothing consults a scheduler and the
+    selection below this call is the one the existing continuous-mode tests
+    pin, byte for byte. `FleetSupervisor.plan` is still TOTAL at one lane — it
+    admits exactly `next_ready()` and holds the rest, which is what the loop
+    does today — and `test_fleet_supervisor.py` pins that; what is gated is the
+    CLI's use of it, so that no single-lane deployment can be changed by a
+    scheduling decision at all.
+
+    Reads three things and writes none: the registry this iteration loaded, the
+    lanes' own state files (`lane_occupants`), and the pending-upgrade record.
+    """
+    if config.concurrency.lanes <= 1:
+        return None
+    return FleetSupervisor.from_config(config).plan(
+        registry,
+        lane_occupants(config),
+        upgrade_pending=bool(_drainable_upgrade_sha(config, answered_upgrades)),
+    )
+
+
+def _log_fleet_hold(config: AutoloopConfig, plan: FleetPlan) -> None:
+    """Record ONCE PER TICK why the fleet dispatched nothing (Decision 4).
+
+    A fleet sitting at its cap and a fleet with nothing to do look identical
+    from outside and must not read identically, so the transcript carries the
+    verdict and the first few held tasks with their reasons. Capped at five
+    because this repeats every poll interval and a transcript is read by
+    people.
+    """
+    TranscriptLogger(config.transcript_file).append(
+        "fleet_hold",
+        data={
+            "lanes": plan.lanes,
+            "busy": len(plan.occupants),
+            "draining": plan.draining,
+            "detail": plan.describe(),
+            "held": "; ".join(
+                f"{task_id}: {reason}" for task_id, reason in plan.held[:5]
+            ),
+        },
+    )
+
+
 def _run_continuous(
     args: argparse.Namespace,
     config: AutoloopConfig,
@@ -2075,28 +2237,19 @@ def _run_continuous(
                 # applies, so a record it rejects is a record the next round
                 # will not offer either. If the file becomes valid again, that
                 # round offers it, this branch reads a real sha and bounds it.
-                offered = UpgradeStore(config.pending_upgrade_file).load()
-                answered = upgrade_bound_sha(offered)
-                # The lane is passed only when there IS one, so a caller that
-                # holds none makes the same three-argument call it always did.
-                # Not a stylistic preference: `_run_continuous(args, config)`
-                # and `(args, config, lock)` are both supported call shapes, a
-                # `None` fourth argument would say nothing the default does not,
-                # and forwarding one would change a signature that several
-                # callers substitute their own function for.
-                lane_arg = () if lane is None else (lane,)
-                acted = _self_upgrade_at_boundary(config, lock, args, *lane_arg)
-                # `getattr` because this is the branch whose whole job is to
-                # keep the process alive past a boundary: a callee that came
-                # back a bare slug (a future refactor, a test double) must not
-                # end the loop on an `AttributeError` one statement after the
-                # carry-on. `""` then falls back on the sha read above, which
-                # still bounds the run — and the swap regression in
-                # `test_self_upgrade.py` fails loudly if the identity ever
-                # stops arriving.
-                for sha in (answered, getattr(acted, "base_sha", "")):
-                    if sha:
-                        answered_upgrades.add(sha)
+                # Both reads, the decision and both bounds live in
+                # `_reach_upgrade_boundary` — including the `getattr` that
+                # keeps a callee returning a bare slug from ending the loop on
+                # an `AttributeError` one statement after the carry-on. The
+                # lane is passed only when there IS one, so a caller that holds
+                # none makes the same three-argument call it always did: not a
+                # stylistic preference, since `_run_continuous(args, config)`
+                # and `(args, config, lock)` are both supported call shapes and
+                # forwarding a `None` would change a signature that several
+                # callers substitute their own function for. The swap
+                # regression in `test_self_upgrade.py` fails loudly if the
+                # identity ever stops arriving.
+                _reach_upgrade_boundary(config, lock, args, lane, answered_upgrades)
                 continue
             if outcome == Phase.NEEDS_USER.value:
                 if _handle_parked_task(config, store, task_store, registry, orchestrator.state) == "task_fatal":
@@ -2148,6 +2301,41 @@ def _run_continuous(
 
         # Clean boundary: no session yet, or the last one ended in a CONTRACT
         # stop — the reviewer's own decision that the round was finished.
+        #
+        # THE FLEET SUPERVISOR gets the first word on it, and only at
+        # `lanes > 1` — `_fleet_plan` answers `None` at one lane, where this
+        # whole block is skipped and the selection below is exactly today's.
+        # This lane is idle HERE by construction (every non-terminal phase
+        # returned or continued above), so a plan taken at this point is a plan
+        # taken with this lane free.
+        plan = _fleet_plan(config, registry, answered_upgrades)
+        if plan is not None and plan.upgrade_boundary:
+            # The drain has arrived: an upgrade is pending and every lane is
+            # empty. REACHED, not waited for — withholding admission alone
+            # would leave the record `pending` while the loop slept beside it
+            # forever, which is the silent-no-outcome failure
+            # `docs/AUTOLOOP.md` says concurrency must not reintroduce. The
+            # same boundary the `SELF_UPGRADE` branch above takes, by the same
+            # call, with the same per-run bound: a boundary that cannot hand
+            # off declines its sha and the fleet admits again on the next tick.
+            _reach_upgrade_boundary(config, lock, args, lane, answered_upgrades)
+            continue
+        if plan is not None and (plan.draining or (plan.held and not plan.admitted)):
+            # At the cap, in conflict with a live lane, or draining behind one.
+            # Every held task stays `pending`, untouched and charged nothing;
+            # the reason is recorded once per tick because a fleet at its cap
+            # and a fleet with nothing to do must not read identically.
+            #
+            # Sleep rather than fall through, and the DRAIN is why the test is
+            # not simply "nothing admitted": with the queue empty there is
+            # nothing to hold, and the selection below would open an AUDIT
+            # session — a round that can dispatch a task, i.e. exactly the
+            # admission a drain exists to stop. A fleet with nothing ready and
+            # nothing pending is left alone here and reaches that audit
+            # unchanged.
+            _log_fleet_hold(config, plan)
+            time.sleep(CONTINUOUS_POLL_SECONDS)
+            continue
         if _select_and_kickoff(config, store, registry):
             continue
         # Already reconciled at the top of this iteration, so what is left here
