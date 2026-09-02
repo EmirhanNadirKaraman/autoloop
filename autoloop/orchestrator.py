@@ -1289,6 +1289,12 @@ HOLD_AT_CAP = "fleet_at_cap"
 HOLD_SCOPE_CONFLICT = "scope_conflict"
 HOLD_IN_FLIGHT = "already_in_flight"
 
+#: The verdict code `Orchestrator._refused_outside_fleet_admission` denies a
+#: directive with, so a reader of the transcript — and a test — can tell a fleet
+#: hold from every other refused directive without matching on prose. The reason
+#: text carries one of the `HOLD_*` words above inside it.
+FLEET_HOLD_DENIAL_CODE = "fleet_admission_held"
+
 
 def session_task_id(state: LoopState) -> str | None:
     """The task a saved session names, or `None` when it names none and when
@@ -1452,11 +1458,17 @@ class FleetSupervisor:
     registry, the busy lanes and whether an upgrade is pending. It never
     mutates the registry, never opens a session and never charges an attempt —
     a task it does not admit stays exactly `pending`, which is the whole of
-    Decision 3's "the task stays queued" promise. The caller (`cli.
-    _run_continuous`) is what turns an admission into a session, and
-    `cli._fleet_plan`'s docstring records exactly how far that goes: the plan
-    gates whether a lane OPENS a session, while which task the session dispatches
-    remains the reviewer's directive.
+    Decision 3's "the task stays queued" promise.
+
+    **TWO callers turn that decision into behaviour, and both are needed.**
+    `cli._run_continuous` gates whether a lane OPENS a session at all — the cap
+    and the drain. `Orchestrator._refused_outside_fleet_admission` gates what an
+    OPEN session may then dispatch, asking this same `plan` about the one task a
+    reviewer's directive names (`first=`). Decision 3's own last paragraph
+    records why the second one is not optional: a lane that opened because
+    something was admissible would otherwise be directed at a task this plan held
+    for a scope conflict, and admission control that only decides which sessions
+    START is not conflict-aware at all.
 
     **The queue is the registry.** No second data structure: the order is
     `TaskRegistry.ready_in_dispatch_order`, which is `next_ready()`'s own
@@ -1491,6 +1503,7 @@ class FleetSupervisor:
         registry: TaskRegistry,
         occupants: "tuple[LaneOccupant, ...] | list[LaneOccupant]" = (),
         upgrade_pending: bool = False,
+        first: str = "",
     ) -> FleetPlan:
         """Which READY tasks may start now, and why each of the others may not.
 
@@ -1513,6 +1526,21 @@ class FleetSupervisor:
            already holds, or that a task admitted earlier this tick declares.
            Checked against BOTH, so one tick cannot co-schedule a conflicting
            pair by admitting them together.
+
+        `first` moves ONE id to the head of the queue, and it exists for one
+        caller: `Orchestrator._refused_outside_fleet_admission`, which asks this
+        about a task a reviewer has already named. Without it the answer would
+        be contaminated by QUEUE POSITION — with one lane free and three
+        non-conflicting tasks ready, the second one is held `HOLD_AT_CAP` purely
+        because the first was admitted ahead of it, and a dispatch gate reading
+        that as a refusal would deny a directive policy authorizes (any READY
+        task, by id) and burn the denial budget on the queue's own ordering. At
+        the head, "admitted" means what the gate needs it to mean: nothing else
+        in this fleet holds it, nothing it shares a path with is running, a lane
+        is free, and no drain is on. `list.sort` is stable, so every other task
+        keeps `ready_in_dispatch_order`'s ordering behind it — the pin included —
+        and an id that is not in the queue moves nothing. Empty (the scheduler's
+        own call) leaves the order exactly as the registry gave it.
         """
         occupants = tuple(occupants)
         unreadable_lane = any(not occupant.readable for occupant in occupants)
@@ -1540,7 +1568,10 @@ class FleetSupervisor:
         free = max(0, self.lanes - len(occupants))
         admitted: list[Task] = []
         held: list[tuple[str, str]] = []
-        for task in registry.ready_in_dispatch_order():
+        queue = registry.ready_in_dispatch_order()
+        if first:
+            queue.sort(key=lambda task: 0 if task.id == first else 1)
+        for task in queue:
             if task.id in held_ids:
                 held.append((task.id, HOLD_IN_FLIGHT))
                 continue
@@ -6532,6 +6563,190 @@ class Orchestrator:
         )
         return True
 
+    def _session_task_ids(self) -> set[str]:
+        """Every task id THIS session already names, by either of its records.
+
+        The UNION, and deliberately not `_active_task_id`'s collapse of the two:
+        that method answers `None` when the records disagree, because the
+        quarantine decision it serves must have exactly one victim. The question
+        here is the opposite one — "is this directive about work this lane
+        already owns" — and two records that disagree name two ids this lane
+        owns, both of which a `revise` may legitimately continue.
+
+        Fail-open is the whole point of the union, and it is safe HERE because
+        the only thing it switches off is a fleet ADMISSION check: a task this
+        session already holds was admitted when it started and is not being
+        admitted again. Reading it any other way is the failure conc-06's
+        gate must not have — every `revise` refused, the reviewer re-sending
+        it, and the lane fault-stopping on an exhausted denial budget.
+        """
+        found: set[str] = set()
+        for record in (self.state.task_execution, self.state.current_task):
+            task_id = self._task_id_in(record)
+            if task_id:
+                found.add(task_id)
+        return found
+
+    def _fleet_drain_pending(self) -> bool:
+        """Is a merged self-upgrade waiting for this fleet to empty?
+
+        `cli._drainable_upgrade_sha`'s question asked from inside a lane, on the
+        same record and with the same two filters — `status == pending`, and a
+        `upgrade_bound_sha` this process has not already answered. The decline
+        set is the shared bound: `cli._run_continuous` re-declines every sha its
+        run has answered onto each rebuilt orchestrator, so a boundary that could
+        not hand off stops draining here exactly as it stops holding there.
+
+        **NOT gated on `self._self_upgrade_enabled`, and that is the fail-open
+        trap in this method.** A continuous run above one lane is built with the
+        per-round boundary OFF (`cli._round_boundary_may_upgrade`), precisely so
+        no lane replaces the process while its neighbours are mid-round — so
+        reading that flag would switch the drain off in the one configuration it
+        exists for.
+
+        An unreadable or absent record answers False, the same direction
+        `_self_upgrade_due` and `cli._drainable_upgrade_sha` take: an unreadable
+        marker means "do not stop dispatching", and the merged code is on disk
+        either way.
+        """
+        try:
+            record = self._upgrades.load()
+        except OSError:
+            return False
+        if record is None or record.status != UPGRADE_PENDING:
+            return False
+        base_sha = upgrade_bound_sha(record)
+        if not base_sha:
+            return False
+        return base_sha not in self._declined_upgrades
+
+    def _refused_outside_fleet_admission(
+        self, directive: Directive, task: Task
+    ) -> bool:
+        """Refuse an executor dispatch the fleet supervisor is not admitting.
+        True when it refused (the caller returns immediately).
+
+        **THE HALF OF ADMISSION CONTROL THAT IS NOT ABOUT SESSIONS.**
+        `cli._fleet_plan` decides whether a lane OPENS a session; this decides
+        what an open session may DISPATCH. Without it a lane that opened because
+        one task was admissible could be directed at a different task the same
+        plan held for a scope conflict — two lanes each authorized to write the
+        file the other is editing, which is exactly the case the gate exists for
+        (`docs/AUTOLOOP.md` Decision 3).
+
+        Refused through `_handle_policy_denial`, the same budget-capped
+        corrective re-prompt `_refused_ahead_of_urgent` above uses, and for the
+        same reason: the reviewer is told what to send instead. Holding costs the
+        held task NOTHING — it is not marked in progress, no decomposition is
+        stored, no worker repo is created and no attempt is charged, because this
+        runs BEFORE every one of those writes.
+
+        Four things it deliberately does not do:
+
+        * **Nothing at `lanes <= 1`.** The first statement, before any file is
+          read: at one lane there is no fleet to schedule, so a single-lane
+          deployment cannot be changed by a scheduling decision — the same
+          structural gate `cli._fleet_plan` applies, at the other call site.
+          A config with no `[concurrency]` section at all (a hand-built one in a
+          test) is one lane by the same rule.
+        * **Nothing about work this lane already owns** (`_session_task_ids`).
+          A `revise` continues an arc that was admitted when it started; it is
+          never in `ready_in_dispatch_order`, so a membership test against
+          `admitted` would refuse every one of them. The residual that carve-out
+          carries: a session still naming a task another lane has since picked
+          up would pass here, which is the in-flight race rather than the
+          conflict rule, and it is refused downstream by the worker repo a
+          second dispatch cannot create over the first (`worker_repo_is_
+          reusable`) rather than by an efficiency gate.
+        * **Nothing about a task the supervisor did not schedule.** Only a task
+          this plan classified — admitted, or held with a reason — is an
+          admission decision at all. A directive naming a task that is not READY
+          is policy's question and `_dispatch_task_postcommit`'s, and an
+          efficiency gate must not become a second, weaker copy of either.
+        * **Almost nothing about the CAP.** This lane is excluded from the
+          occupants, because the slot it holds is the slot this task would run
+          in — so a free lane exists at this call site and the cap is enforced
+          where sessions OPEN, which is where a lane is actually taken. The one
+          exception is the fail-closed direction and is meant: a lane whose index
+          is at or above the current `lanes` is a lane the operator has already
+          cut out of the fleet, nothing excludes it from its own occupant list,
+          and it admits nothing more. The ordinarily reachable reasons are a
+          scope conflict, a drain, an unreadable neighbour and the in-flight
+          race.
+
+        The gate FAILS CLOSED when it cannot answer: an unreadable neighbour is
+        already `HOLD_LANE_UNREADABLE` inside `plan`, and an exception anywhere
+        in the computation refuses too rather than dispatching blind, because a
+        check that passes when what it needs is missing is not a check. The
+        RESIDUAL, stated where the code is: a drain has no admissible
+        alternative to name, so the correction asks for `stop` — a clean round
+        boundary that frees this lane — and a reviewer that ignores it spends the
+        denial budget instead. That bound is the same one every refused directive
+        in this loop has.
+        """
+        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes <= 1:
+            return False
+        if task.id in self._session_task_ids():
+            return False
+        alternative = ""
+        try:
+            # This lane is not one of its own occupants: it is mid-round by
+            # construction here, so counting the slot it already holds would
+            # make every dispatch above one lane read as a full fleet.
+            occupants = tuple(
+                occupant
+                for occupant in lane_occupants(self._config)
+                if occupant.lane_index != self.lane_index
+            )
+            plan = FleetSupervisor(lanes).plan(
+                self._registry,
+                occupants,
+                upgrade_pending=self._fleet_drain_pending(),
+                first=task.id,
+            )
+            admitted_ids = [other.id for other in plan.admitted]
+            if task.id in admitted_ids:
+                return False
+            reason = plan.hold_reason(task.id)
+            if not reason:
+                return False  # not scheduled by this plan at all — see above
+            # An urgent pin makes every other id unsendable (`_refused_ahead_of_
+            # urgent` runs first), so suggesting one would be a correction the
+            # very next directive is refused for.
+            if self._registry.live_urgent_target() is None:
+                alternative = next(iter(admitted_ids), "")
+        except Exception as exc:  # a gate that cannot answer must not pass
+            self._log(
+                "fleet_admission_unreadable",
+                data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            reason = f"{HOLD_LANE_UNREADABLE}: the fleet's own state is unreadable"
+        if alternative:
+            instead = (
+                f"Send the same decision for '{alternative}' instead — the "
+                "supervisor admits that one into this lane right now."
+            )
+        else:
+            instead = (
+                "Nothing else may start in this lane right now: send `stop`, "
+                "which ends this round at a clean boundary and frees the lane."
+            )
+        self._handle_policy_denial(
+            directive,
+            Verdict.deny(
+                FLEET_HOLD_DENIAL_CODE,
+                f"the fleet supervisor is HOLDING task '{task.id}' rather than "
+                f"admitting it into lane {self.lane_id} ({reason}) — this loop "
+                f"is running {lanes} lanes, and a task that declares a path a "
+                "live lane already declares, or that a pending self-upgrade is "
+                "draining behind, waits for that lane to finish rather than "
+                f"starting beside it. {instead} The task is untouched: it is "
+                "still queued, nothing was executed and no attempt was spent.",
+            ),
+        )
+        return True
+
     def _dispatch_executor(self, directive: Directive) -> None:
         """`audit`/`implement`/`revise` all run through the SAME produce-
         then-review commit path (`_dispatch_task_postcommit`) — the legacy
@@ -6543,9 +6758,14 @@ class Orchestrator:
         worker repo, committed automatically, reviewed from the immutable
         commit, never from a pre-commit manifest.
 
-        The one gate in front of all three is `_refused_ahead_of_urgent`: while
-        an operator's urgent pin is live, nothing but that task's own dispatch
-        (and a `revise` continuing an audit arc already in flight) may start.
+        The first gate in front of all three is `_refused_ahead_of_urgent`:
+        while an operator's urgent pin is live, nothing but that task's own
+        dispatch (and a `revise` continuing an audit arc already in flight) may
+        start. The second is `_refused_outside_fleet_admission`, which is inert
+        below two lanes and, above them, refuses a dispatch of a task the fleet
+        supervisor is holding. An audit passes the second one by construction —
+        it takes no task out of the queue, so there is no admission to decide,
+        and the round it does take is what the urgent gate above answers for.
         """
         state = self.state
         is_audit = (
@@ -6555,6 +6775,14 @@ class Orchestrator:
             return
         if not is_audit and directive.decision in TASK_DECISIONS:
             task = self._registry.get(directive.task_id)
+            if self._refused_outside_fleet_admission(directive, task):
+                # THE FLEET GATE, and it is first for the reason the whole of
+                # Decision 3's "the task stays queued" rests on: every write this
+                # method makes is below it, so a held task is not marked in
+                # progress, gets no stored decomposition, no worker repo and no
+                # attempt. Answers False at `lanes <= 1`, where this line changes
+                # nothing at all.
+                return
             if not self._ceiling_reply_ok(directive, task):
                 # This task asked the reviewer to classify it at its attempt
                 # ceiling and the answer was refused or parked. Checked BEFORE

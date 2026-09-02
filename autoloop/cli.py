@@ -1984,14 +1984,17 @@ def _fleet_plan(
     queue every entry of which is held. Which task the session then dispatches is
     still the reviewer's directive against the roadmap (`_start_new_session`
     opens on the audit kickoff, not on a task), so a lane that opens because
-    SOMETHING was admissible can still be directed at a task the plan held for a
-    scope conflict. That is Decision 3's own framing — admission control is an
-    efficiency measure over a merge protocol that owns overlap as correctness,
-    and a held task is never failed, charged or quarantined by being held — and
-    it is the residual to close in the candidate that turns concurrency on with
-    real lanes to observe. The half that is enforced here rather than advised is
-    the CAP: a busy or unreadable lane costs a slot, and no session opens without
-    one free.
+    SOMETHING was admissible can be directed at a task this plan held.
+
+    That gap is closed at the OTHER end rather than here:
+    `Orchestrator._refused_outside_fleet_admission` asks the same
+    `FleetSupervisor.plan` about the one task the directive names, and refuses
+    the dispatch when it is held — so the cap is enforced where sessions open,
+    and the conflict rule is enforced again where a task is actually chosen.
+    Neither is reached at `lanes = 1`. What remains a residual is the ORDER
+    within one lane: a directive may pick any admissible READY task rather than
+    the head of the queue, which is what policy has always authorized and costs
+    a fleet nothing.
     """
     if config.concurrency.lanes <= 1:
         return None
