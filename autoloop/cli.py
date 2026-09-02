@@ -162,7 +162,7 @@ from .orchestrator import (
     FleetPlan,
     FleetSupervisor,
     Orchestrator,
-    lane_occupants,
+    fleet_occupants,
     release_task_to_pending,
 )
 from .policy import PolicyConfig, PolicyEngine
@@ -1977,7 +1977,18 @@ def _fleet_plan(
     scheduling decision at all.
 
     Reads three things and writes none: the registry this iteration loaded, the
-    lanes' own state files (`lane_occupants`), and the pending-upgrade record.
+    lanes' own state files (`fleet_occupants`), and the pending-upgrade record.
+
+    **`fleet_occupants`, not `lane_occupants`, and the DRAIN is why.** The
+    second scan answers "how big is the fleet the config describes"; this needs
+    "which lanes are holding a round", and the two differ for exactly as long as
+    an operator's lowered `[concurrency] lanes` leaves a live session at an
+    index the new cap no longer reaches. Counting only the narrow one would
+    undercount the fleet — `free_lanes` too high, and `fleet_idle` True while a
+    cut lane is mid-round, which reaches `upgrade_boundary` and `os.execv`s the
+    process out from under it. Nothing is admitted INTO a retired lane by
+    counting it: a session opens in the process's own lane, and that lane's own
+    dispatches are refused `HOLD_LANE_RETIRED`.
 
     **WHERE THE PLAN'S AUTHORITY STOPS, stated rather than implied.** What it
     gates is whether THIS lane opens a session at all — the cap, the drain and a
@@ -2000,7 +2011,7 @@ def _fleet_plan(
         return None
     return FleetSupervisor.from_config(config).plan(
         registry,
-        lane_occupants(config),
+        fleet_occupants(config),
         upgrade_pending=bool(_drainable_upgrade_sha(config, answered_upgrades)),
     )
 
