@@ -472,7 +472,12 @@ DOCS_ONLY_SELECTED = 20
 #: 106 -> 107 when conc-05 added `test_lane_state.py` (2026-09-01): it works
 #: on lane paths and lease records under `tmp_path` and reads no tracker, so
 #: the same 20 once more — the DENOMINATOR only.
-SUITE_SIZE = 107
+#: 107 -> 108 when conc-06 added `test_fleet_supervisor.py` (2026-09-02): it
+#: plans against registries built in memory, names its trackers through
+#: `tasks.TRACKER_PATHS` rather than by spelling them, and resolves no
+#: `__file__` — so it reads no document under either half of the rule above and
+#: the same 20 hold. The DENOMINATOR only.
+SUITE_SIZE = 108
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

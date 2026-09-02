@@ -352,7 +352,7 @@ from .blockers import (
     refusal_identity,
 )
 from .changeset_review import ChangesetBinding, build_changeset_packet
-from .config import AutoloopConfig, lane_id
+from .config import LANE_ID_PREFIX, AutoloopConfig, lane_id
 from .context import build_context, render_context
 from .conversation import (
     SendOutcome,
@@ -442,6 +442,7 @@ from .prompts import (
 )
 from .state import (
     EXECUTION_ABORTED,
+    LANES_DIRNAME,
     TERMINAL_PHASES,
     ChunkedDelivery,
     LastResponse,
@@ -453,6 +454,7 @@ from .state import (
     StateStore,
     StopRepetitionStore,
     abort_requested,
+    lane_paths,
     packet_outstanding_reason,
     postcommit_binding_from_record,
     stop_repetition_file,
@@ -465,6 +467,7 @@ from .tasks import (
     TaskRegistry,
     TaskState,
     TaskStore,
+    co_schedule_conflict,
     effective_approved_paths,
     unauthorized_paths,
 )
@@ -1270,6 +1273,508 @@ class RepresentedCandidate:
     #: re-reading git — the same field, on the same rule, as
     #: `_finish_postcommit` sets.
     packet_diff: str
+
+
+#: WHY the fleet supervisor left a READY task in the queue this tick, as values
+#: rather than as prose (conc-06, `docs/AUTOLOOP.md` Decision 4). A fleet
+#: sitting at its cap and a fleet with nothing to do look identical from
+#: outside, so the reason is recorded once per tick and must be a word a reader
+#: can match on rather than a sentence somebody reworded.
+#:
+#: Every one of them means the SAME thing about the task: it stays `pending` in
+#: the registry, untouched, charged no attempt, quarantined by nothing, and
+#: dispatched as soon as the reason goes away (Decision 3's last paragraph).
+HOLD_DRAINING = "draining_for_self_upgrade"
+HOLD_LANE_UNREADABLE = "lane_unreadable"
+HOLD_AT_CAP = "fleet_at_cap"
+HOLD_SCOPE_CONFLICT = "scope_conflict"
+HOLD_IN_FLIGHT = "already_in_flight"
+#: The one word `FleetSupervisor.plan` never produces, because the condition is
+#: invisible from inside it: THIS LANE is not in the fleet at all — its index is
+#: at or above `[concurrency] lanes`, which is what an operator lowering the cap
+#: under a running fleet leaves behind. `lane_occupants` walks `range(lanes)`,
+#: so such a lane is absent from its own occupant list rather than counted, and
+#: a plan computed for it would see a free slot that does not exist.
+#: `Orchestrator._refused_outside_fleet_admission` answers it before it plans.
+#:
+#: That is only half of the lowered cap, and the other half is not a hold at
+#: all: the lanes still INSIDE the cap have to SEE that session, or they count a
+#: free slot the fleet does not have and drain to an upgrade boundary while it
+#: is mid-round. `retired_lane_occupants` is that half — the same lane, read
+#: from outside instead of asked from within.
+HOLD_LANE_RETIRED = "lane_outside_the_fleet"
+
+#: The verdict code `Orchestrator._refused_outside_fleet_admission` denies a
+#: directive with, so a reader of the transcript — and a test — can tell a fleet
+#: hold from every other refused directive without matching on prose. The reason
+#: text carries one of the `HOLD_*` words above inside it.
+FLEET_HOLD_DENIAL_CODE = "fleet_admission_held"
+
+
+def session_task_id(state: LoopState) -> str | None:
+    """The task a saved session names, or `None` when it names none and when
+    its two records disagree.
+
+    `Orchestrator._active_task_id`'s question asked from OUTSIDE the
+    orchestrator — the fleet supervisor reads other lanes' state files and has
+    no instance to ask. It calls that class's own `_task_id_in` rather than
+    re-deriving "which id does this record hold", so the shape-defensiveness
+    (non-dict, missing key, non-string, blank, untrimmed) has exactly one
+    implementation; the class is defined below this function and resolved at
+    call time, which is what lets the helper sit beside its only caller.
+
+    Disagreement answers `None` for the same reason it does there: a session
+    whose execution record and dispatch record name different tasks is one the
+    loop cannot attribute, and picking either would be a guess. The supervisor
+    treats `None` as "this lane holds something it cannot name" — which costs a
+    lane, never a wrong attribution.
+    """
+    recorded = Orchestrator._task_id_in(getattr(state, "task_execution", None))
+    dispatched = Orchestrator._task_id_in(getattr(state, "current_task", None))
+    if recorded is not None and dispatched is not None and recorded != dispatched:
+        return None
+    return recorded if recorded is not None else dispatched
+
+
+@dataclass(frozen=True)
+class LaneOccupant:
+    """One lane the fleet supervisor found BUSY, and what it holds.
+
+    `task_id` is `None` when the lane is mid-round but names no task — a fresh
+    session on the audit kickoff is exactly that, and it is an ordinary state,
+    not a fault. Such a lane costs a slot and constrains nothing else.
+
+    `readable` is False when the lane's state could not be read AT ALL (a
+    corrupt file, an unknown schema version, an unparseable phase, an I/O
+    error). That is the fail-closed case and it is deliberately NOT the same as
+    "names no task": a lane whose state cannot be read might hold anything, so
+    the supervisor admits nothing beside it rather than guessing that it holds
+    nothing. `lane_occupants` counts it as busy for the same reason.
+    """
+
+    lane_index: int
+    lane_id: str
+    task_id: str | None = None
+    readable: bool = True
+
+
+@dataclass(frozen=True)
+class FleetPlan:
+    """What the supervisor decided this tick. A VALUE, and nothing in producing
+    it writes anything: no registry mutation, no state file, no execution
+    record, no attempt. A task this plan does not admit is a task that was
+    never touched.
+    """
+
+    #: The fleet size the plan was computed against (`[concurrency] lanes`).
+    lanes: int
+    #: The READY tasks that may start now, in `ready_in_dispatch_order`, at
+    #: most one per free lane.
+    admitted: tuple[Task, ...]
+    #: `(task_id, reason)` for every READY task that was not admitted, in the
+    #: same order — one of the `HOLD_*` words above, with the shared declared
+    #: entries appended for `HOLD_SCOPE_CONFLICT`.
+    held: tuple[tuple[str, str], ...]
+    #: The busy lanes the plan was computed against.
+    occupants: tuple[LaneOccupant, ...]
+    #: Is a self-upgrade waiting for the fleet to empty (Decision "an
+    #: interaction the scheduler must answer")?
+    draining: bool
+
+    @property
+    def free_lanes(self) -> int:
+        """Lanes with nothing in them. Never negative: more occupants than
+        lanes means the cap was lowered under a running fleet, and the answer
+        to that is "admit nothing", not "admit a negative number"."""
+        return max(0, self.lanes - len(self.occupants))
+
+    @property
+    def fleet_idle(self) -> bool:
+        """No lane is running anything — the state a drain is waiting for."""
+        return not self.occupants
+
+    @property
+    def upgrade_boundary(self) -> bool:
+        """The drain has arrived: an upgrade is pending AND every lane is
+        empty, so the process may replace itself with the whole fleet idle.
+
+        THE POINT OF THE DRAIN, and the half that must not be forgotten:
+        withholding admission alone would leave the record `pending` forever
+        while the loop slept next to it — the silent-no-outcome failure
+        `docs/AUTOLOOP.md` says concurrency must not reintroduce. The caller
+        acts on this by reaching the boundary, not by waiting for one.
+        """
+        return self.draining and self.fleet_idle
+
+    def hold_reason(self, task_id: str) -> str:
+        """Why `task_id` was not admitted, or `""` if it was (or is not READY)."""
+        for held_id, reason in self.held:
+            if held_id == task_id:
+                return reason
+        return ""
+
+    def describe(self) -> str:
+        """One line for the transcript and for an operator reading it."""
+        return (
+            f"{len(self.admitted)} admitted, {len(self.held)} held; "
+            f"{len(self.occupants)}/{self.lanes} lanes busy"
+            + (" (draining for a self-upgrade)" if self.draining else "")
+        )
+
+
+def lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
+    """Which lanes are BUSY right now, read from the lanes' own state files.
+
+    The lane state file is the authority for "is this lane running something",
+    because that is the file the lane's own phase machine writes (conc-05,
+    Decision 2/7: `phase` belongs to a lane). A lane is busy exactly when its
+    state file exists and its phase is not terminal — the same
+    `TERMINAL_PHASES` test `cli._run_continuous` applies to its own session, so
+    a lane the loop would treat as at a clean boundary is a lane this counts as
+    free.
+
+    UNREADABLE IS BUSY, never free. Every failure mode of the read — a corrupt
+    file, a schema version this build does not support, a phase string that is
+    not a `Phase`, an unreadable path — produces an occupant with
+    `readable=False` rather than an absent one. A supervisor that skipped what
+    it could not read would silently RAISE the fleet's effective cap on exactly
+    the lane that is in trouble, which is the fail-open direction.
+
+    Reads only; opens no lease, takes no lock, and writes nothing.
+
+    THE FLEET THE CONFIG DESCRIBES, which is not always the fleet that holds
+    work: a cap the operator LOWERED under a running fleet leaves live sessions
+    at indices this range no longer reaches. Those are `retired_lane_occupants`,
+    and `fleet_occupants` is the union every scheduling decision is taken
+    against. This one stays narrow on purpose — it is what sizes the fleet the
+    config asks for, and a scan that quietly walked further would be answering a
+    different question from the one its name asks.
+    """
+    count = int(config.concurrency.lanes) if lanes is None else int(lanes)
+    found: list[LaneOccupant] = []
+    for index in range(count):
+        occupant = _lane_occupant(config.state_dir, index)
+        if occupant is not None:
+            found.append(occupant)
+    return tuple(found)
+
+
+def _lane_occupant(state_dir, index: int) -> LaneOccupant | None:
+    """One lane, read from its own state file: the occupant it holds, or `None`
+    when that lane is free.
+
+    ONE implementation, two scanners (`lane_occupants` and
+    `retired_lane_occupants`). A lane the cap cut out is judged by exactly the
+    predicate an in-cap lane is judged by — busy is "the state file exists and
+    its phase is not terminal", unreadable is busy — because two spellings of
+    "is this lane running something" are two chances to disagree, and the one
+    that disagrees is the one that lets the fleet exceed its cap.
+    """
+    paths = lane_paths(state_dir, index)
+    try:
+        state = StateStore(paths.state_file).load()
+    except (StateError, OSError, ValueError, TypeError):
+        return LaneOccupant(index, paths.lane_id, None, False)
+    if state is None:
+        return None  # no session in that lane at all
+    try:
+        phase = Phase(state.phase)
+    except ValueError:
+        return LaneOccupant(index, paths.lane_id, None, False)
+    if phase in TERMINAL_PHASES:
+        return None
+    return LaneOccupant(index, paths.lane_id, session_task_id(state))
+
+
+#: The `lane_index` of the one occupant that is not a lane: the fail-closed
+#: stand-in `retired_lane_occupants` returns when it cannot LIST the lanes
+#: directory at all. Negative, so it can never equal a real lane index and can
+#: therefore never be mistaken for "this lane" by
+#: `Orchestrator._refused_outside_fleet_admission`'s own-slot exclusion — an
+#: occupant that excluded itself would be a fail-closed guard that switches
+#: itself off in exactly the lane that asks.
+UNLISTABLE_LANES_INDEX = -1
+
+
+def _lane_index_of(name: str) -> int | None:
+    """The lane index a directory name under `lanes/` denotes, or `None` when
+    the name is not one `config.lane_id` produces.
+
+    ROUND-TRIPPED rather than parsed: `lane_id(index) == name` is what rejects
+    `_lane-03`, `_lane-1x`, a unicode-digit spelling `int()` would happily
+    accept, and anything an operator left beside the lanes. The alternative —
+    treating an unrecognised name as a lane — would invent occupants out of
+    stray directories and hold the whole fleet on one of them.
+    """
+    if not name.startswith(LANE_ID_PREFIX):
+        return None
+    suffix = name.removeprefix(LANE_ID_PREFIX)
+    if not (suffix.isascii() and suffix.isdigit()):
+        return None
+    index = int(suffix)
+    return index if lane_id(index) == name else None
+
+
+def retired_lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
+    """Lanes the operator's LOWERED CAP cut out of the fleet that are still
+    holding a round.
+
+    THE MIRROR OF `HOLD_LANE_RETIRED`, and the half a scheduler cannot see from
+    `range(lanes)`. Lowering `[concurrency] lanes` from 4 to 2 does not end the
+    sessions in lanes 2 and 3; it only stops `lane_occupants` walking that far.
+    Without this scan the supervisor counts two free lanes while four rounds
+    run, and — the sharper failure — reads `fleet_idle` as True and reaches a
+    self-upgrade boundary with two lanes mid-round, which is the one thing the
+    drain exists to prevent.
+
+    Found by LISTING `state_dir/lanes/` rather than by walking a bound, because
+    the bound would have to be guessed: `config.MAX_LANES` is this build's
+    ceiling and a lane opened by a build with a higher one is exactly the state
+    a hardcoded range misses. Lane 0 is never retired — `lanes >= 1` always, so
+    index 0 is always inside the cap — which is why a lanes directory that does
+    not exist at all is `()` and not a fail-closed hold: every lane that could
+    be retired lives under it (`state.lane_paths`).
+
+    FAIL-CLOSED ON THE LISTING ITSELF. A `lanes` path that cannot be listed —
+    permissions, a file where the directory should be — answers one UNREADABLE
+    occupant (`UNLISTABLE_LANES_INDEX`) rather than "no retired lanes", for the
+    reason `lane_occupants` treats an unreadable lane as busy: a scan that
+    reports nothing when it can see nothing raises the effective cap exactly
+    when the state directory is in trouble.
+
+    THE RESIDUAL, stated where the code is: a retired lane whose process DIED
+    leaves a non-terminal state file behind, and this counts it forever — the
+    fleet stops admitting and never reaches an upgrade boundary until an
+    operator removes that lane's directory. That is the same stale-session
+    liveness gap an in-cap lane already has (a round whose process died is
+    conc-08's subject, and the lane LEASE is the evidence it will judge that
+    with); it is inherited here deliberately rather than answered with a second
+    liveness rule that would drift from conc-08's.
+
+    Reads only; opens no lease, takes no lock, and writes nothing.
+    """
+    count = int(config.concurrency.lanes) if lanes is None else int(lanes)
+    root = Path(config.state_dir) / LANES_DIRNAME
+    try:
+        names = sorted(entry.name for entry in root.iterdir())
+    except FileNotFoundError:
+        return ()  # no lane above 0 has ever written state here
+    except OSError:
+        return (LaneOccupant(UNLISTABLE_LANES_INDEX, LANES_DIRNAME, None, False),)
+    found: list[LaneOccupant] = []
+    for name in names:
+        index = _lane_index_of(name)
+        if index is None or index < count:
+            continue  # not a lane, or one `lane_occupants` already walked
+        occupant = _lane_occupant(config.state_dir, index)
+        if occupant is not None:
+            found.append(occupant)
+    return tuple(found)
+
+
+def fleet_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...]:
+    """Every lane that is holding a round — the fleet as it IS, which is what
+    every scheduling decision is taken against.
+
+    `lane_occupants` (the fleet the config describes) plus
+    `retired_lane_occupants` (the lanes a lowered cap cut out and did not stop).
+    Both callers of `FleetSupervisor.plan` in production feed it this rather
+    than the narrow scan: the cap is a cap over the rounds actually running, and
+    the drain waits for the last of them, not for the last one inside the
+    current `[concurrency] lanes`.
+
+    Nothing this adds can widen admission. An occupant only ever removes a free
+    slot, marks an id in flight, contributes a scope to conflict against, or —
+    unreadable — holds everything; and `FleetPlan.fleet_idle` is `not
+    occupants`, so a retired lane can only ever DELAY a boundary, never bring
+    one forward. It cannot reopen admission into a retired lane either: which
+    lane a session opens in is the process's own `lane_index`, and
+    `Orchestrator._refused_outside_fleet_admission` refuses that lane's
+    dispatches outright (`HOLD_LANE_RETIRED`).
+    """
+    return lane_occupants(config, lanes) + retired_lane_occupants(config, lanes)
+
+
+class FleetSupervisor:
+    """Scheduling across N lanes: the cap, the admission rule, and the drain
+    that reaches a self-upgrade boundary (conc-06, `docs/AUTOLOOP.md`
+    Decisions 3 and 4).
+
+    **It decides; it does not dispatch.** `plan()` is a pure function of the
+    registry, the busy lanes and whether an upgrade is pending. It never
+    mutates the registry, never opens a session and never charges an attempt —
+    a task it does not admit stays exactly `pending`, which is the whole of
+    Decision 3's "the task stays queued" promise.
+
+    **TWO callers turn that decision into behaviour, and both are needed.**
+    `cli._run_continuous` gates whether a lane OPENS a session at all — the cap
+    and the drain. `Orchestrator._refused_outside_fleet_admission` gates what an
+    OPEN session may then dispatch, asking this same `plan` about the one task a
+    reviewer's directive names (`first=`). Decision 3's own last paragraph
+    records why the second one is not optional: a lane that opened because
+    something was admissible would otherwise be directed at a task this plan held
+    for a scope conflict, and admission control that only decides which sessions
+    START is not conflict-aware at all.
+
+    **The queue is the registry.** No second data structure: the order is
+    `TaskRegistry.ready_in_dispatch_order`, which is `next_ready()`'s own
+    ordering — the urgent pin, then priority, then id. A supervisor that sorted
+    for itself would be a second implementation of the pin.
+
+    **At `lanes = 1` this is the loop.** `plan()` with one lane, nothing busy
+    and nothing pending admits exactly `next_ready()` and holds the rest, which
+    is what the single-lane loop does today. `cli` does not consult it at
+    `lanes = 1` at all — see `cli._fleet_plan` for why that gate is where the
+    N=1 acceptance criterion is made structural.
+    """
+
+    def __init__(self, lanes: int, trackers: tuple[str, ...] = TRACKER_PATHS):
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            raise ValueError(
+                f"fleet size must be an integer of at least 1, got {lanes!r} — "
+                "`config.load_config` refuses anything else at load time "
+                "(`concurrency.lanes`), and a supervisor built by hand must not "
+                "be the one place a fleet of zero or of `True` lanes exists"
+            )
+        self.lanes = lanes
+        self._trackers = tuple(trackers)
+
+    @classmethod
+    def from_config(cls, config) -> "FleetSupervisor":
+        """The one built from `[concurrency] lanes`."""
+        return cls(config.concurrency.lanes)
+
+    def plan(
+        self,
+        registry: TaskRegistry,
+        occupants: "tuple[LaneOccupant, ...] | list[LaneOccupant]" = (),
+        upgrade_pending: bool = False,
+        first: str = "",
+    ) -> FleetPlan:
+        """Which READY tasks may start now, and why each of the others may not.
+
+        The checks are applied in this order, and the order is what decides
+        which reason is REPORTED for a task several of them would hold:
+
+        1. `HOLD_IN_FLIGHT` — the fleet already holds this id. Belt and braces
+           against the one race the two records make possible: a lane writes
+           its state file and the registry row separately, so for an instant a
+           task can be held by a lane while its row still reads `pending`.
+           Admitting it into a second lane would run one task twice.
+        2. `HOLD_DRAINING` — an upgrade is pending, so nothing new is admitted
+           until the fleet is empty and the boundary is reached.
+        3. `HOLD_LANE_UNREADABLE` — a lane's state, or an occupant's scope,
+           could not be read. The gate needs both to answer, and a gate that
+           passes when what it needs is missing is not a gate.
+        4. `HOLD_AT_CAP` — every lane is busy (or already spoken for by an
+           earlier admission this tick).
+        5. `HOLD_SCOPE_CONFLICT` — this task declares an entry that a lane
+           already holds, or that a task admitted earlier this tick declares.
+           Checked against BOTH, so one tick cannot co-schedule a conflicting
+           pair by admitting them together.
+
+        `first` moves ONE id to the head of the queue, and it exists for one
+        caller: `Orchestrator._refused_outside_fleet_admission`, which asks this
+        about a task a reviewer has already named. Without it the answer would
+        be contaminated by QUEUE POSITION — with one lane free and three
+        non-conflicting tasks ready, the second one is held `HOLD_AT_CAP` purely
+        because the first was admitted ahead of it, and a dispatch gate reading
+        that as a refusal would deny a directive policy authorizes (any READY
+        task, by id) and burn the denial budget on the queue's own ordering. At
+        the head, "admitted" means what the gate needs it to mean: nothing else
+        in this fleet holds it, nothing it shares a path with is running, a lane
+        is free, and no drain is on. `list.sort` is stable, so every other task
+        keeps `ready_in_dispatch_order`'s ordering behind it — the pin included —
+        and an id that is not in the queue moves nothing. Empty (the scheduler's
+        own call) leaves the order exactly as the registry gave it.
+        """
+        occupants = tuple(occupants)
+        unreadable_lane = any(not occupant.readable for occupant in occupants)
+        held_ids = {occupant.task_id for occupant in occupants if occupant.task_id}
+        # The registry's own view of what is in flight, unioned with the lanes'.
+        # NEITHER SOURCE IS SUFFICIENT ALONE: a lane writes its state file and
+        # the registry row at different moments, so a task can be `in_progress`
+        # with no lane naming it (a round whose process died — `conc-08`'s
+        # subject) and can be named by a lane while its row is still `pending`.
+        # Reads the stored status via `in_progress_tasks`, never `state_of`,
+        # which raises on a graph with a dangling `depends_on`.
+        held_ids |= {task.id for task in registry.in_progress_tasks()}
+        # The scopes the fleet is already committed to. An id nothing in the
+        # registry can describe is scope-UNKNOWN, not scope-empty: the gate
+        # cannot prove a conflict does not exist, so it stops admitting rather
+        # than admitting blind.
+        held_scopes: list[tuple[str, tuple[str, ...]]] = []
+        unknown_scope = False
+        for held_id in sorted(held_ids):
+            if registry.has(held_id):
+                held_scopes.append((held_id, registry.get(held_id).approved_paths))
+            else:
+                unknown_scope = True
+
+        free = max(0, self.lanes - len(occupants))
+        admitted: list[Task] = []
+        held: list[tuple[str, str]] = []
+        queue = registry.ready_in_dispatch_order()
+        if first:
+            queue.sort(key=lambda task: 0 if task.id == first else 1)
+        for task in queue:
+            if task.id in held_ids:
+                held.append((task.id, HOLD_IN_FLIGHT))
+                continue
+            if upgrade_pending:
+                held.append((task.id, HOLD_DRAINING))
+                continue
+            if unreadable_lane or unknown_scope:
+                held.append((task.id, HOLD_LANE_UNREADABLE))
+                continue
+            if len(admitted) >= free:
+                held.append((task.id, HOLD_AT_CAP))
+                continue
+            conflict = self._first_conflict(task, held_scopes, admitted)
+            if conflict is not None:
+                other, entries = conflict
+                held.append(
+                    (task.id, f"{HOLD_SCOPE_CONFLICT}: {other} ({', '.join(entries)})")
+                )
+                continue
+            admitted.append(task)
+        return FleetPlan(
+            lanes=self.lanes,
+            admitted=tuple(admitted),
+            held=tuple(held),
+            occupants=occupants,
+            draining=bool(upgrade_pending),
+        )
+
+    def _first_conflict(
+        self,
+        task: Task,
+        held_scopes: list[tuple[str, tuple[str, ...]]],
+        admitted: list[Task],
+    ) -> tuple[str, tuple[str, ...]] | None:
+        """The first task already scheduled that `task` may not run beside, and
+        the declared entries the two share.
+
+        `tasks.co_schedule_conflict` is the whole rule and this adds nothing to
+        it: declared paths only, with the universal trackers and
+        `tasks.CO_SCHEDULE_EXEMPT_PATHS` — the shared test tree — the only
+        entries an overlap in is forgiven. Deterministic — the lanes' scopes are
+        walked in sorted id order and this tick's admissions in admission order
+        — so the reason a task is held does not depend on dict iteration.
+        """
+        for other_id, other_paths in held_scopes:
+            entries = co_schedule_conflict(
+                task.approved_paths, other_paths, self._trackers
+            )
+            if entries:
+                return other_id, entries
+        for other in admitted:
+            entries = co_schedule_conflict(
+                task.approved_paths, other.approved_paths, self._trackers
+            )
+            if entries:
+                return other.id, entries
+        return None
 
 
 class Orchestrator:
@@ -6204,6 +6709,252 @@ class Orchestrator:
         )
         return True
 
+    def _session_task_ids(self) -> set[str]:
+        """Every task id THIS session already names, by either of its records.
+
+        The UNION, and deliberately not `_active_task_id`'s collapse of the two:
+        that method answers `None` when the records disagree, because the
+        quarantine decision it serves must have exactly one victim. The question
+        here is the opposite one — "is this directive about work this lane
+        already owns" — and two records that disagree name two ids this lane
+        owns, both of which a `revise` may legitimately continue.
+
+        Fail-open is the whole point of the union, and it is safe HERE because
+        the only thing it switches off is a fleet ADMISSION check: a task this
+        session already holds was admitted when it started and is not being
+        admitted again. That covers the retired-lane refusal too — a lane a
+        lowered cap cut out finishes the arc it holds and starts nothing new,
+        which is the same shape as the drain. Reading it any other way is the
+        failure conc-06's gate must not have — every `revise` refused, the
+        reviewer re-sending it, and the lane fault-stopping on an exhausted
+        denial budget.
+        """
+        found: set[str] = set()
+        for record in (self.state.task_execution, self.state.current_task):
+            task_id = self._task_id_in(record)
+            if task_id:
+                found.add(task_id)
+        return found
+
+    def _fleet_drain_pending(self) -> bool:
+        """Is a merged self-upgrade waiting for this fleet to empty?
+
+        `cli._drainable_upgrade_sha`'s question asked from inside a lane, on the
+        same record and with the same two filters — `status == pending`, and a
+        `upgrade_bound_sha` this process has not already answered. The decline
+        set is the shared bound: `cli._run_continuous` re-declines every sha its
+        run has answered onto each rebuilt orchestrator, so a boundary that could
+        not hand off stops draining here exactly as it stops holding there.
+
+        **NOT gated on `self._self_upgrade_enabled`, and that is the fail-open
+        trap in this method.** A continuous run above one lane is built with the
+        per-round boundary OFF (`cli._round_boundary_may_upgrade`), precisely so
+        no lane replaces the process while its neighbours are mid-round — so
+        reading that flag would switch the drain off in the one configuration it
+        exists for.
+
+        An unreadable or absent record answers False, the same direction
+        `_self_upgrade_due` and `cli._drainable_upgrade_sha` take: an unreadable
+        marker means "do not stop dispatching", and the merged code is on disk
+        either way.
+        """
+        try:
+            record = self._upgrades.load()
+        except OSError:
+            return False
+        if record is None or record.status != UPGRADE_PENDING:
+            return False
+        base_sha = upgrade_bound_sha(record)
+        if not base_sha:
+            return False
+        return base_sha not in self._declined_upgrades
+
+    def _refused_outside_fleet_admission(
+        self, directive: Directive, task: Task
+    ) -> bool:
+        """Refuse an executor dispatch the fleet supervisor is not admitting.
+        True when it refused (the caller returns immediately).
+
+        **THE HALF OF ADMISSION CONTROL THAT IS NOT ABOUT SESSIONS.**
+        `cli._fleet_plan` decides whether a lane OPENS a session; this decides
+        what an open session may DISPATCH. Without it a lane that opened because
+        one task was admissible could be directed at a different task the same
+        plan held for a scope conflict — two lanes each authorized to write the
+        file the other is editing, which is exactly the case the gate exists for
+        (`docs/AUTOLOOP.md` Decision 3).
+
+        Refused through `_handle_policy_denial`, the same budget-capped
+        corrective re-prompt `_refused_ahead_of_urgent` above uses, and for the
+        same reason: the reviewer is told what to send instead. Holding costs the
+        held task NOTHING — it is not marked in progress, no decomposition is
+        stored, no worker repo is created and no attempt is charged, because this
+        runs BEFORE every one of those writes.
+
+        Four things it deliberately does not do:
+
+        * **Nothing at `lanes <= 1`.** Before any file is read: at one lane
+          there is no fleet to schedule, so a single-lane deployment cannot be
+          changed by a scheduling decision — the same structural gate
+          `cli._fleet_plan` applies, at the other call site. A config with no
+          `[concurrency]` section at all (a hand-built one in a test) is one
+          lane by the same rule. The ONE thing checked ahead of it is the
+          retired lane below, because that check reads nothing either and 4 -> 1
+          is the same lowered cap as 4 -> 2.
+        * **Nothing about work this lane already owns** (`_session_task_ids`).
+          A `revise` continues an arc that was admitted when it started; it is
+          never in `ready_in_dispatch_order`, so a membership test against
+          `admitted` would refuse every one of them. The residual that carve-out
+          carries: a session still naming a task another lane has since picked
+          up would pass here, which is the in-flight race rather than the
+          conflict rule, and it is refused downstream by the worker repo a
+          second dispatch cannot create over the first (`worker_repo_is_
+          reusable`) rather than by an efficiency gate. Checked ahead of the
+          retired lane below as well: a lane the cap cut out still FINISHES what
+          it holds — that is what every drain in this candidate waits for —
+          and it starts nothing new.
+        * **Nothing about a task the supervisor did not schedule.** Only a task
+          this plan classified — admitted, or held with a reason — is an
+          admission decision at all. A directive naming a task that is not READY
+          is policy's question and `_dispatch_task_postcommit`'s, and an
+          efficiency gate must not become a second, weaker copy of either.
+        * **Almost nothing about the CAP.** This lane is excluded from the
+          occupants, because the slot it holds is the slot this task would run
+          in — so a free lane exists at this call site and the cap is enforced
+          where sessions OPEN, which is where a lane is actually taken. The
+          ordinarily reachable reasons are a scope conflict, a drain, an
+          unreadable neighbour and the in-flight race.
+
+        THE ONE CAP CASE THIS ANSWERS ITSELF, and it is answered HERE rather
+        than inside `plan` because `plan` cannot see it: an operator who lowers
+        `[concurrency] lanes` under a running fleet leaves lanes at or above the
+        new cap with live sessions in them, and `lane_occupants` walks
+        `range(lanes)` — so such a lane is not in its own occupant list to be
+        excluded from, the exclusion above is a no-op for it, and a plan
+        computed for it counts a free slot that does not exist and ADMITS.
+        `HOLD_LANE_RETIRED` is therefore an explicit refusal taken before
+        anything is planned, and before the `lanes <= 1` return, since 4 -> 1
+        cuts the same lanes out that 4 -> 2 does. It costs one attribute
+        comparison and reads no file, so lane 0 at `lanes = 1` — the only lane a
+        single-lane deployment has — is untouched by it. `lane_occupants` itself
+        is deliberately NOT widened: it answers "how big is the fleet the config
+        describes", which is the question `cli._fleet_plan` sizes itself with.
+
+        THE MIRROR OF THAT CASE, asked from the lanes still INSIDE the cap, is
+        what `fleet_occupants` answers and why this reads it rather than
+        `lane_occupants`: the lane the operator cut out is still running a
+        round, still holds a task and still holds that task's scope, so a lane
+        that cannot see it would admit a conflicting task beside it and count a
+        free slot the fleet does not have. `retired_lane_occupants` finds it by
+        listing `state_dir/lanes/` — no guess about how far to walk — and
+        counting it can only ever hold MORE, never admit more.
+
+        The gate FAILS CLOSED when it cannot answer: an unreadable neighbour is
+        already `HOLD_LANE_UNREADABLE` inside `plan`, and an exception anywhere
+        in the computation refuses too rather than dispatching blind, because a
+        check that passes when what it needs is missing is not a check. The
+        RESIDUAL, stated where the code is: a drain has no admissible
+        alternative to name, so the correction asks for `stop` — a clean round
+        boundary that frees this lane — and a reviewer that ignores it spends the
+        denial budget instead. That bound is the same one every refused directive
+        in this loop has.
+        """
+        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            # A fleet size this build cannot read is ONE lane, not a comparison
+            # against a string: `config.load_config` refuses every such value at
+            # load time, so reaching this is a hand-built config, and the
+            # single-lane reading is the one that changes nothing.
+            lanes = 1
+        if task.id in self._session_task_ids():
+            # Ahead of every other check, retired lane included: a lane the
+            # operator has cut out of the fleet still FINISHES the arc it is
+            # holding — that is what the drain does for an upgrade, and
+            # refusing a `revise` mid-round would spend the denial budget
+            # instead of freeing the lane.
+            return False
+        alternative = ""
+        if self.lane_index >= lanes:
+            # THE LOWERED CAP, and it is refused here rather than planned for:
+            # `lane_occupants` walks `range(lanes)`, so this lane is absent from
+            # its own occupant list and the exclusion below would drop nothing
+            # — the plan would count a free slot that no longer exists and admit
+            # into a lane the operator has already cut out of the fleet.
+            reason = (
+                f"{HOLD_LANE_RETIRED}: lane {self.lane_id} is index "
+                f"{self.lane_index} in a fleet of {lanes}"
+            )
+            because = (
+                f"this loop is running {lanes} lanes and this one is no longer "
+                "among them — the cap was lowered while this session was open, "
+                "so this lane finishes what it already holds and starts nothing "
+                "further"
+            )
+        elif lanes <= 1:
+            return False
+        else:
+            because = (
+                f"this loop is running {lanes} lanes, and a task that declares "
+                "a path a live lane already declares, or that a pending self-"
+                "upgrade is draining behind, waits for that lane to finish "
+                "rather than starting beside it"
+            )
+            try:
+                # This lane is not one of its own occupants: it is mid-round by
+                # construction here, so counting the slot it already holds would
+                # make every dispatch above one lane read as a full fleet. Every
+                # OTHER lane holding a round is counted, retired ones included —
+                # this lane is inside the cap (the check above returned
+                # otherwise), so the exclusion never drops one of those.
+                occupants = tuple(
+                    occupant
+                    for occupant in fleet_occupants(self._config)
+                    if occupant.lane_index != self.lane_index
+                )
+                plan = FleetSupervisor(lanes).plan(
+                    self._registry,
+                    occupants,
+                    upgrade_pending=self._fleet_drain_pending(),
+                    first=task.id,
+                )
+                admitted_ids = [other.id for other in plan.admitted]
+                if task.id in admitted_ids:
+                    return False
+                reason = plan.hold_reason(task.id)
+                if not reason:
+                    return False  # not scheduled by this plan at all — see above
+                # An urgent pin makes every other id unsendable (`_refused_ahead_
+                # of_urgent` runs first), so suggesting one would be a correction
+                # the very next directive is refused for.
+                if self._registry.live_urgent_target() is None:
+                    alternative = next(iter(admitted_ids), "")
+            except Exception as exc:  # a gate that cannot answer must not pass
+                self._log(
+                    "fleet_admission_unreadable",
+                    data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
+                )
+                reason = f"{HOLD_LANE_UNREADABLE}: the fleet's own state is unreadable"
+        if alternative:
+            instead = (
+                f"Send the same decision for '{alternative}' instead — the "
+                "supervisor admits that one into this lane right now."
+            )
+        else:
+            instead = (
+                "Nothing else may start in this lane right now: send `stop`, "
+                "which ends this round at a clean boundary and frees the lane."
+            )
+        self._handle_policy_denial(
+            directive,
+            Verdict.deny(
+                FLEET_HOLD_DENIAL_CODE,
+                f"the fleet supervisor is HOLDING task '{task.id}' rather than "
+                f"admitting it into lane {self.lane_id} ({reason}) — {because}. "
+                f"{instead} The task is untouched: it is still queued, nothing "
+                "was executed and no attempt was spent.",
+            ),
+        )
+        return True
+
     def _dispatch_executor(self, directive: Directive) -> None:
         """`audit`/`implement`/`revise` all run through the SAME produce-
         then-review commit path (`_dispatch_task_postcommit`) — the legacy
@@ -6215,9 +6966,14 @@ class Orchestrator:
         worker repo, committed automatically, reviewed from the immutable
         commit, never from a pre-commit manifest.
 
-        The one gate in front of all three is `_refused_ahead_of_urgent`: while
-        an operator's urgent pin is live, nothing but that task's own dispatch
-        (and a `revise` continuing an audit arc already in flight) may start.
+        The first gate in front of all three is `_refused_ahead_of_urgent`:
+        while an operator's urgent pin is live, nothing but that task's own
+        dispatch (and a `revise` continuing an audit arc already in flight) may
+        start. The second is `_refused_outside_fleet_admission`, which is inert
+        below two lanes and, above them, refuses a dispatch of a task the fleet
+        supervisor is holding. An audit passes the second one by construction —
+        it takes no task out of the queue, so there is no admission to decide,
+        and the round it does take is what the urgent gate above answers for.
         """
         state = self.state
         is_audit = (
@@ -6227,6 +6983,14 @@ class Orchestrator:
             return
         if not is_audit and directive.decision in TASK_DECISIONS:
             task = self._registry.get(directive.task_id)
+            if self._refused_outside_fleet_admission(directive, task):
+                # THE FLEET GATE, and it is first for the reason the whole of
+                # Decision 3's "the task stays queued" rests on: every write this
+                # method makes is below it, so a held task is not marked in
+                # progress, gets no stored decomposition, no worker repo and no
+                # attempt. Answers False at `lanes <= 1`, where this line changes
+                # nothing at all.
+                return
             if not self._ceiling_reply_ok(directive, task):
                 # This task asked the reviewer to classify it at its attempt
                 # ceiling and the answer was refused or parked. Checked BEFORE

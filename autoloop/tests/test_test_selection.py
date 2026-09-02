@@ -595,7 +595,11 @@ FLOOR_AFTER = 16
 #: DENOMINATOR again: it resolves lane paths and lease records under
 #: `tmp_path`, reads no tracker and spawns nothing, so 20 and 24 are unchanged
 #: once more.
-SUITE_SIZE = 107
+#: 107 -> 108 when conc-06 added `test_fleet_supervisor.py` (2026-09-02), the
+#: DENOMINATOR again: it plans against in-memory registries, reaches its
+#: trackers through `tasks.TRACKER_PATHS` instead of naming one, resolves no
+#: `__file__` and spawns nothing, so 20 and 24 are unchanged once more.
+SUITE_SIZE = 108
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

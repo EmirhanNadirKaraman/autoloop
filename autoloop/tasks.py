@@ -1260,6 +1260,98 @@ def deletable_paths(
     return rest - outside, outside, tracker_refused
 
 
+#: The one declared entry two tasks may SHARE and still be co-scheduled, on top
+#: of the universal `TRACKER_PATHS` (conc-06, `docs/AUTOLOOP.md` Decision 3).
+#:
+#: Nearly every task in this repository declares the test tree, because nearly
+#: every task adds a test; gating on it would serialise the fleet and buy
+#: nothing, since two tasks adding different files under it do not conflict.
+#: That argument is about THIS directory and does not generalise: two tasks that
+#: both declare `autoloop/` or `docs/` are two tasks each authorized to write
+#: every file the other one will touch, which is the case the gate exists for.
+#: So the exemption is an enumerated list of one, not the predicate "ends in a
+#: slash" — the earlier reading, which exempted every directory entry and let
+#: two whole-package scopes co-schedule.
+#:
+#: EXACT ENTRIES, matched by equality and never by prefix. A task declaring
+#: `autoloop/tests/test_docs_merge.py` names one file inside this tree and gates
+#: on it like any other file: the exemption is for the shared directory nobody
+#: can avoid declaring, not for the subtree it covers.
+#:
+#: A fixed constant naming this repository's own layout, for the reason
+#: `TRACKER_PATHS` above is one: `autoloop/` is vendored into the repository it
+#: operates on, so a per-repository list belongs in git-tracked source where
+#: changing it is a reviewed commit, and never in the gitignored config.
+CO_SCHEDULE_EXEMPT_PATHS: tuple[str, ...] = ("autoloop/tests/",)
+
+
+def declared_scope_entries(
+    approved: tuple[str, ...],
+    trackers: tuple[str, ...] = TRACKER_PATHS,
+    exempt: tuple[str, ...] = CO_SCHEDULE_EXEMPT_PATHS,
+) -> frozenset[str]:
+    """The entries of `approved` that GATE co-scheduling — everything the task
+    declared, less the universal trackers and less `CO_SCHEDULE_EXEMPT_PATHS`.
+    The only thing the fleet's admission gate looks at (conc-06,
+    `docs/AUTOLOOP.md` Decision 3).
+
+    DECLARED paths, never `effective_approved_paths`. Every task's effective
+    list carries the six shared trackers, so a gate computed over it would find
+    an overlap between any two tasks in the repository and nothing would ever
+    co-schedule. The trackers are therefore subtracted here rather than left to
+    the caller, so the two halves of the rule ("declared" and "not universally
+    granted") cannot be applied one without the other.
+
+    **A DIRECTORY ENTRY GATES like a file entry**, and this is where the shipped
+    rule is narrower than the one this function was first written to (see
+    `CO_SCHEDULE_EXEMPT_PATHS`): the exemption is the enumerated list, not
+    `is_directory_prefix`. Two tasks that both declare `autoloop/` are each
+    authorized to write every file the other will touch, and dropping both
+    entries because they end in a slash co-scheduled exactly that pair.
+
+    What it still does not answer is CONTAINMENT — `autoloop/` beside
+    `autoloop/cli.py` is not an overlap here, because the entries are compared
+    for equality. That residual is deliberate and is Decision 3's framing: the
+    gate is an efficiency measure over a merge protocol that already handles
+    overlap as correctness, so a rule that made every broad scope conflict with
+    every narrow one would serialise the fleet to buy a cost, not a guarantee.
+
+    An EMPTY `approved` yields an empty set, i.e. "conflicts with nothing".
+    That is deliberate and is NOT a licence to dispatch: a task with no declared
+    scope is refused at dispatch by `effective_approved_paths` returning `()`
+    (docs/SECURITY.md finding #2), which is a different question asked by
+    different code. Admission control is an efficiency measure layered on top of
+    the scope gate, so it must not become a second, weaker copy of it.
+    """
+    ungated = set(trackers) | set(exempt)
+    return frozenset(entry for entry in approved if entry not in ungated)
+
+
+def co_schedule_conflict(
+    a: tuple[str, ...],
+    b: tuple[str, ...],
+    trackers: tuple[str, ...] = TRACKER_PATHS,
+    exempt: tuple[str, ...] = CO_SCHEDULE_EXEMPT_PATHS,
+) -> tuple[str, ...]:
+    """Which declared entries two tasks BOTH name — the whole of the fleet
+    admission gate. Empty means the two may be co-scheduled.
+
+    Returned as the offending entries rather than as a bool because the reason
+    is what the supervisor records in the transcript: "held behind conc-03"
+    is unactionable, "held behind conc-03, both declare autoloop/cli.py" is the
+    sentence an operator can do something about.
+
+    The rule is symmetric, and the entries are sorted, so the answer does not
+    depend on which lane asked.
+    """
+    return tuple(
+        sorted(
+            declared_scope_entries(a, trackers, exempt)
+            & declared_scope_entries(b, trackers, exempt)
+        )
+    )
+
+
 @dataclass(frozen=True)
 class StrandReport:
     """Who a task would leave waiting forever if it reached a terminal
@@ -3313,6 +3405,23 @@ class TaskRegistry:
         task.urgent_reason = reason
         return task
 
+    def ready_in_dispatch_order(self) -> list[Task]:
+        """Every READY task, in the order the loop would dispatch them —
+        `next_ready()`'s answer extended to the whole queue.
+
+        ONE ordering, two callers. `next_ready()` below returns the first
+        element of this list, and the fleet supervisor
+        (`orchestrator.FleetSupervisor`) walks it to fill N lanes. A supervisor
+        that sorted for itself would be a second implementation of the pin, the
+        priority and the id tiebreak, and the one that drifts is the one that
+        quietly stops honouring the URGENT PIN — the exact failure the pin was
+        added for (see `next_ready`).
+        """
+        return sorted(
+            self.ready_tasks(),
+            key=lambda t: (0 if t.urgent_at else 1, t.priority, t.id),
+        )
+
     def next_ready(self) -> Task | None:
         """Highest-priority ready task; ties broken by id — unless one carries
         the URGENT PIN, which outranks both.
@@ -3327,11 +3436,12 @@ class TaskRegistry:
         brw-13 was already P0 — so P0 only TIED, the id tiebreak decided it
         ("brw-13" < "codex-01"), and the urgent task lost silently. A pin no
         other task can hold cannot tie.
+
+        The sort itself lives in `ready_in_dispatch_order` above, which this is
+        the first element of.
         """
-        ready = self.ready_tasks()
-        if not ready:
-            return None
-        return sorted(ready, key=lambda t: (0 if t.urgent_at else 1, t.priority, t.id))[0]
+        ready = self.ready_in_dispatch_order()
+        return ready[0] if ready else None
 
     def summary(self) -> str:
         """One line of roadmap state, rendered into every review request.
