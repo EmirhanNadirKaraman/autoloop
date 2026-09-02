@@ -1010,6 +1010,79 @@ the whole fleet idle. `os.execv` still replaces one process holding one lock, so
 nothing about the handoff, the token, the one-shot marker or the decline set
 changes.
 
+### A second interaction the plan omitted: one account allowance, N lanes
+
+Everything above this line was written without the words *rate limit*, *quota*,
+*throttle* or *backoff* appearing once, and that omission is a scheduling
+decision made by default. The existing back-off was designed for one loop:
+
+```
+browser.rate_limit_backoff_seconds     = 60      first wait
+browser.rate_limit_backoff_max_seconds = 600     ceiling
+policy.max_rate_limit_backoffs         = 6       then it parks
+delay = base * 2^(n-1), capped
+state: LoopState.rate_limit_backoffs, rate_limit_retry_not_before
+```
+
+Decision 2 gives every lane its own state file, so those last two fields become
+N independent counters — against **one** account allowance. `prov-02` measured
+that ceiling rather than assuming it: codex signed in with a ChatGPT account
+(`auth mode: chatgpt`, `stored API key: false`) draws on the same allowance the
+browser provider used, and that limit parked the loop for four hours on
+2026-08-17. At `lanes = 4` the unmodified design gives all four lanes the same
+limit at about the same time, four private records of it, the same deterministic
+60s computed four times, four re-probes on the same instant — and up to
+`4 x 6 = 24` throttled attempts spent discovering one limit a single lane would
+have found in 6. Every one of those extra attempts is a request against an
+allowance already known to be exhausted, which is the exact behaviour
+`_rate_limit_delay`'s own docstring says the escalation exists to prevent:
+"re-probing on a fixed short interval is itself a request stream — a slower
+version of the hammering this exists to stop."
+
+**conc-11's answer: the throttle is scoped to the FLEET.** One shared record,
+`state_dir/fleet_throttle.json`, beside the fleet lock and for the lock's own
+reason — one state directory is one account's fleet, so "this account is
+throttled" is a fact about the directory rather than about a lane. It holds one
+`retry_not_before` and one consecutive-episode counter, and four things follow
+from it:
+
+* **Coalescing.** A lane that meets the limit while the window is open JOINS
+  that episode: the counter does not move, the deadline is not extended, and the
+  lane waits out what remains rather than a fresh copy of it. A lane that meets
+  it after the window closed opens the next episode at `previous + 1`, so the
+  escalation is exactly the single-lane one — 60, 120, 240 — and never a fixed
+  interval. Read, decision and write happen inside one cross-process mutex
+  (`tasks.task_file_mutex`), because "read the record, decide, write it" done
+  outside one is how two lanes both open episode 1.
+* **Admission.** `FleetSupervisor.plan` holds every READY task
+  (`HOLD_RATE_LIMITED`) while the window is open, and holds — never passes — when
+  the record cannot be read. A lane already mid-round finishes or parks by the
+  existing rules; it is admission that stops.
+* **A bounded release.** The shared deadline is one instant; lane *k* adds
+  `k/lanes` of `[concurrency] rate_limit_release_jitter_seconds` (5s by default)
+  before re-probing, so N lanes do not resynchronise on the tick the window
+  expires. Deterministic rather than random: the spread must be small, bounded
+  and *stateable* by an operator reading `health`, and a random draw is none of
+  the three.
+* **One budget for the fleet.** `max_rate_limit_backoffs` is checked against the
+  shared episode number, by a lane that merely joined an episode as much as by
+  the one that opened it. Checking only the opener would park that lane at the
+  sixth episode while the others waited forever on a fleet that had stopped.
+
+The record is not swept by anything, so streak inheritance is bounded: a
+throttle arriving more than one previous delay after the last window closed
+starts a fresh streak. Without that bound a fleet that parked at the sixth
+episode would leave a record making the *next* run's first throttle — hours
+later, about a different limit — open episode 7 and park on the spot. The
+escalation's premise is that the waits are consecutive, and two throttles an
+hour apart are not.
+
+**And at `lanes = 1` none of this exists.** No record is written, none is read,
+`release_jitter_seconds` returns `0.0`, and `_handle_rate_limited` runs the line
+it has always run. The gate is `lanes > 1` in `FleetSupervisor.from_config` and
+in `Orchestrator._fleet_throttle_store`, which is the same structural device
+Decision 2 uses for lane 0's state file.
+
 ### The split, in dependency order
 
 Nine candidates. Each is independently reviewable and each leaves the loop
