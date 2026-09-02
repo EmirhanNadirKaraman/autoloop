@@ -12,11 +12,13 @@ admission rule, and reaches a self-upgrade boundary by draining.**
    `plan()`, not only as a status: attempts live in `executions/<task>.json`
    under that directory, so a snapshot is what can see one being charged, and a
    status equality cannot.
-2. **The admission rule is Decision 3's, exactly.** Declared paths only, file
-   entries only, the six universal trackers excluded — so two tasks sharing
-   `autoloop/tests/` and every tracker co-schedule, and two naming one file do
-   not. The gate is fed `TRACKER_PATHS` itself rather than a copy of the six
-   names, because a copy agrees on the day it is written.
+2. **The admission rule is Decision 3's, exactly.** Declared paths only, with
+   the six universal trackers and `CO_SCHEDULE_EXEMPT_PATHS` — the shared test
+   tree — the only entries an overlap in is forgiven. So two tasks sharing
+   `autoloop/tests/` and every tracker co-schedule, and two naming one file, or
+   one directory that is not that tree, do not. The gate is fed `TRACKER_PATHS`
+   and `CO_SCHEDULE_EXEMPT_PATHS` themselves rather than copies of their
+   entries, because a copy agrees on the day it is written.
 3. **The drain REACHES the boundary.** Withholding admission alone would leave
    the merged upgrade `pending` while the loop slept beside it forever — the
    silent-no-outcome failure the plan says concurrency must not reintroduce —
@@ -71,12 +73,13 @@ from autoloop.state import (
     utcnow_iso,
 )
 from autoloop.tasks import (
+    CO_SCHEDULE_EXEMPT_PATHS,
     TRACKER_PATHS,
     Task,
     TaskRegistry,
     TaskStore,
     co_schedule_conflict,
-    declared_file_entries,
+    declared_scope_entries,
     effective_approved_paths,
 )
 
@@ -108,7 +111,11 @@ def make_config(tmp_path: Path, lanes: int = 2) -> AutoloopConfig:
     )
 
 
-def a_task(task_id: str, paths=("autoloop/tests/",), **overrides) -> Task:
+def a_task(task_id: str, paths=CO_SCHEDULE_EXEMPT_PATHS, **overrides) -> Task:
+    """A task whose default scope is the ONE entry an overlap in is forgiven, so
+    every test about the cap measures the cap and never a scope conflict. Taken
+    from the constant rather than spelled out: the day that list changes, these
+    tests follow it instead of quietly starting to measure the gate."""
     return Task(
         id=task_id,
         title=f"task {task_id}",
@@ -290,21 +297,64 @@ def test_two_tasks_declaring_one_file_are_not_co_scheduled(tmp_path):
     assert registry.state_of("t2").value == "ready", "held, never blocked"
 
 
-def test_a_shared_directory_and_the_trackers_do_not_gate(tmp_path):
+def test_the_shared_test_tree_and_the_trackers_do_not_gate(tmp_path):
     """The other half, and the half that decides whether the fleet moves at all:
     nearly every task declares `autoloop/tests/` and every task is granted the
     six trackers, so gating on either would serialise the fleet and buy
-    nothing."""
+    nothing. THOSE entries, from the constants themselves — not "a directory
+    entry", which is the wider rule the test below pins the refusal of."""
     config = make_config(tmp_path, lanes=2)
     registry = registry_of(
-        a_task("t1", ["autoloop/cli.py", "autoloop/tests/", *TRACKER_PATHS]),
-        a_task("t2", ["autoloop/health.py", "autoloop/tests/", *TRACKER_PATHS]),
+        a_task("t1", ["autoloop/cli.py", *CO_SCHEDULE_EXEMPT_PATHS, *TRACKER_PATHS]),
+        a_task("t2", ["autoloop/health.py", *CO_SCHEDULE_EXEMPT_PATHS, *TRACKER_PATHS]),
     )
 
     plan = FleetSupervisor.from_config(config).plan(registry)
 
     assert admitted_ids(plan) == ["t1", "t2"]
     assert plan.held == ()
+
+
+@pytest.mark.parametrize("shared", ["autoloop/", "docs/", "autoloop/audit/"])
+def test_a_shared_directory_that_is_not_the_test_tree_does_gate(tmp_path, shared):
+    """The correction this candidate's second round exists for. Dropping every
+    entry that ends in a slash co-scheduled two tasks that each declare
+    `autoloop/` — two scopes each authorized to write every file the other one
+    touches, which is the case the gate exists for. The exemption is the
+    enumerated `CO_SCHEDULE_EXEMPT_PATHS`, so a directory outside it gates
+    exactly like a file."""
+    config = make_config(tmp_path, lanes=2)
+    registry = registry_of(
+        a_task("t1", [shared, *CO_SCHEDULE_EXEMPT_PATHS, *TRACKER_PATHS]),
+        a_task("t2", [shared, *CO_SCHEDULE_EXEMPT_PATHS, *TRACKER_PATHS]),
+    )
+
+    plan = FleetSupervisor.from_config(config).plan(registry)
+
+    assert admitted_ids(plan) == ["t1"]
+    assert plan.hold_reason("t2") == f"{HOLD_SCOPE_CONFLICT}: t1 ({shared})"
+    assert registry.state_of("t2").value == "ready", "held, never blocked"
+
+
+def test_a_file_inside_the_exempt_tree_gates_like_any_other_file(tmp_path):
+    """The exemption is an EXACT entry, never a prefix. Two tasks that both name
+    one test file are two tasks that will both edit it, and the reason the tree
+    itself is forgiven — different files under it do not collide — does not
+    reach that case."""
+    config = make_config(tmp_path, lanes=2)
+    # Built from the exempt entry, and deliberately not the name of a file that
+    # exists: what is measured is the string rule, and a real path would tie this
+    # assertion to a test file that may be renamed for reasons of its own.
+    inside = f"{CO_SCHEDULE_EXEMPT_PATHS[0]}test_a_file_this_suite_does_not_have.py"
+    registry = registry_of(
+        a_task("t1", [inside, *CO_SCHEDULE_EXEMPT_PATHS]),
+        a_task("t2", [inside, *CO_SCHEDULE_EXEMPT_PATHS]),
+    )
+
+    plan = FleetSupervisor.from_config(config).plan(registry)
+
+    assert admitted_ids(plan) == ["t1"]
+    assert plan.hold_reason("t2") == f"{HOLD_SCOPE_CONFLICT}: t1 ({inside})"
 
 
 def test_a_conflict_with_a_LIVE_lane_holds_too(tmp_path):
@@ -343,24 +393,48 @@ def test_the_conflict_reason_is_deterministic(tmp_path):
     assert plan.hold_reason("c3") == f"{HOLD_SCOPE_CONFLICT}: a1 (autoloop/cli.py)"
 
 
-def test_the_gate_reads_declared_paths_and_file_entries_only():
-    """The predicate itself, without a supervisor around it. A directory entry
-    is judged by `is_directory_prefix`'s rule (trailing '/'), and a tracker is
-    dropped by identity against `TRACKER_PATHS` rather than by a copy of the
-    six names."""
-    declared = ("autoloop/cli.py", "autoloop/tests/", A_TRACKER)
+def test_the_gate_reads_declared_paths_less_the_ungated_ones():
+    """The predicate itself, without a supervisor around it. An entry is dropped
+    by IDENTITY against `TRACKER_PATHS` and `CO_SCHEDULE_EXEMPT_PATHS` rather
+    than by a copy of their entries or by a shape rule about trailing slashes —
+    every other declared entry, directory or file, gates."""
+    exempt_tree = CO_SCHEDULE_EXEMPT_PATHS[0]
+    declared = ("autoloop/cli.py", exempt_tree, A_TRACKER)
 
-    assert declared_file_entries(declared) == frozenset({"autoloop/cli.py"})
-    # Both sides declare the SAME tracker and the SAME directory, which is the
+    assert declared_scope_entries(declared) == frozenset({"autoloop/cli.py"})
+    assert declared_scope_entries(("autoloop/", "docs/")) == frozenset(
+        {"autoloop/", "docs/"}
+    ), "a directory outside the exempt list is a gating entry"
+    # Both sides declare the SAME tracker and the SAME test tree, which is the
     # shape every pair of tasks in this repository has, and still co-schedule.
-    assert co_schedule_conflict(declared, ("autoloop/tests/", A_TRACKER)) == ()
+    assert co_schedule_conflict(declared, (exempt_tree, A_TRACKER)) == ()
     assert co_schedule_conflict(declared, (ANOTHER_TRACKER,)) == ()
     assert co_schedule_conflict(declared, ("autoloop/cli.py",)) == ("autoloop/cli.py",)
+    assert co_schedule_conflict(("docs/",), ("docs/",)) == ("docs/",)
     # Symmetric, and sorted, so the answer cannot depend on which lane asked.
     assert co_schedule_conflict(("b.py", "a.py"), ("a.py", "b.py")) == ("a.py", "b.py")
     assert co_schedule_conflict(("a.py",), ("b.py", "a.py")) == co_schedule_conflict(
         ("b.py", "a.py"), ("a.py",)
     )
+    # The exempt list is exactly the argument that justifies it: one entry, the
+    # shared test tree, and nothing that is also universally granted.
+    assert CO_SCHEDULE_EXEMPT_PATHS == ("autoloop/tests/",)
+    assert not set(CO_SCHEDULE_EXEMPT_PATHS) & set(TRACKER_PATHS)
+
+
+def test_containment_is_a_stated_residual_the_merge_protocol_owns():
+    """Entries are compared for EQUALITY, so a broad scope and a narrow one
+    inside it are not an overlap here — `autoloop/` beside `autoloop/cli.py`
+    co-schedules, though both lanes may write that file.
+
+    Pinned so it reads as a decision rather than an oversight. Decision 3 owns
+    that overlap where it is owned: the per-diff scope gate, the serialised
+    merge and the re-review obligation, which handle two lanes touching one file
+    as a COST. A containment rule would instead make every whole-package scope
+    conflict with every narrow one and serialise the fleet — buying that cost
+    back at the price of the concurrency the fleet exists for."""
+    assert co_schedule_conflict(("autoloop/",), ("autoloop/cli.py",)) == ()
+    assert co_schedule_conflict(("autoloop/", "docs/"), ("autoloop/",)) == ("autoloop/",)
 
 
 def test_an_unscoped_task_conflicts_with_nothing_and_is_still_refused_at_dispatch(tmp_path):
