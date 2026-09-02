@@ -827,14 +827,19 @@ When the gate fires the task **stays queued** — `pending` in the registry,
 untouched, dispatched as soon as the conflicting lane finishes. It is never
 failed, never charged an attempt, and never quarantined.
 
-One residual of that shape, stated where the rule is rather than discovered
-later: the plan gates whether a lane **opens a session**, and which task the
-session then dispatches is still the reviewer's directive against the roadmap,
-so a lane that opened because something else was admissible can still be
-directed at a held task. It is the same class of residual as the two trackers
-above — a cost the merge protocol already owns, not a correctness hole — and
-the candidate that turns concurrency on is where it is worth closing, with
-real lanes to measure it against.
+The gate therefore has to be applied at BOTH ends, and this is where the plan
+as first written was short. Admission decides whether a lane **opens a
+session** — but which task that session then dispatches is the reviewer's
+directive against the roadmap, so a lane that opened because something else was
+admissible can be directed at a held task. Deferring that to the candidate that
+turns concurrency on would leave "conflict-aware admission" enforced nowhere a
+conflicting pair is actually chosen, so conc-06 closes it: the dispatch site
+asks the same plan about the one task the directive names and refuses it while
+it is held, on the same corrective re-prompt every other refused directive
+takes, and with the task left `pending`, unattempted and untouched. What stays a
+residual is only the ORDER inside one lane — a directive may name any admissible
+READY task rather than the head of the queue — which is what policy has always
+authorized and costs the fleet nothing.
 
 ### Decision 4 — the fleet cap
 

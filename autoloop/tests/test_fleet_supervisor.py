@@ -1,7 +1,7 @@
 """The fleet supervisor — conc-06.
 
 Candidate 5 of the nine in docs/AUTOLOOP.md, "Running several tasks at once —
-the split plan". One claim, in three parts:
+the split plan". One claim, in five parts:
 
 **The supervisor owns scheduling across N lanes, enforces the cap and the
 admission rule, and reaches a self-upgrade boundary by draining.**
@@ -29,11 +29,20 @@ admission rule, and reaches a self-upgrade boundary by draining.**
    `None` there, which is the acceptance criterion made structural; section 5
    drives the same continuous loop at one lane, with a pending upgrade and more
    ready tasks than lanes, and pins that the selection is still reached.
+5. **The plan governs DISPATCH, not only whether a session opens.** Section 6
+   drives `Orchestrator._dispatch_executor` — the site a reviewer's directive
+   becomes a round — and pins that a task the plan held cannot start there while
+   an admitted one can, that the answer is about the fleet rather than about
+   queue position, and that a lane whose fleet state cannot be read refuses
+   instead of dispatching blind.
 
 No git repository, no subprocess and no agent: every claim here is about a
-registry, a small JSON file and a predicate. The one place the real loop is
-needed is the wiring, and section 4 drives it with only the phase machine and
-the replacement itself doubled.
+registry, a small JSON file and a predicate. The two places the real loop is
+needed are the wiring — section 4 drives `cli._run_continuous` with only the
+phase machine and the replacement itself doubled — and the dispatch site, where
+section 6 drives the real `Orchestrator._dispatch_executor` and doubles only
+`_dispatch_task_postcommit`, the produce-then-review path a worker repo, a
+commit and an attempt all come from.
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ from pathlib import Path
 
 import pytest
 
-from autoloop import cli
+from autoloop import cli, orchestrator
 from autoloop.auto_merge import (
     UPGRADE_EXEC_FAILED,
     UPGRADE_PENDING,
@@ -52,7 +61,10 @@ from autoloop.auto_merge import (
     UpgradeStore,
 )
 from autoloop.config import AutoloopConfig, BrowserConfig, ConcurrencyConfig, lane_id
+from autoloop.contract import Decision, Directive
+from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import (
+    FLEET_HOLD_DENIAL_CODE,
     HOLD_AT_CAP,
     HOLD_DRAINING,
     HOLD_IN_FLIGHT,
@@ -60,10 +72,12 @@ from autoloop.orchestrator import (
     HOLD_SCOPE_CONFLICT,
     FleetSupervisor,
     LaneOccupant,
+    Orchestrator,
     lane_occupants,
     session_task_id,
 )
-from autoloop.policy import PolicyConfig
+from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.transcript import TranscriptLogger
 from autoloop.state import (
     LoopState,
     Phase,
@@ -598,6 +612,16 @@ def transcript_types(config: AutoloopConfig) -> list[str]:
     ]
 
 
+def denial_codes(config: AutoloopConfig) -> list[str]:
+    """The verdict code of every refused directive, so a fleet hold is told
+    apart from every other refusal by a value rather than by prose."""
+    path = config.transcript_file
+    if not path.exists():
+        return []
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [r["data"]["code"] for r in rows if r["type"] == "policy_denied"]
+
+
 def fleet_hold_entries(config: AutoloopConfig) -> list[dict]:
     path = config.transcript_file
     if not path.exists():
@@ -821,3 +845,323 @@ def test_one_lane_still_selects_with_an_upgrade_pending_and_a_full_queue(
     assert "fleet_hold" not in transcript_types(config), (
         "a single-lane loop has no fleet to report on"
     )
+
+
+# ---- 6. and the dispatch site is bound to the same plan -----------------------
+#
+# The other end of admission control. `cli._fleet_plan` decides whether a lane
+# OPENS a session; without this half, a lane that opened because SOMETHING was
+# admissible could then be directed at a task the very same plan held for a
+# scope conflict — two lanes each authorized to write the file the other one is
+# editing, which is the case the gate exists for. Everything below drives
+# `Orchestrator._dispatch_executor` itself, because that is where a directive
+# becomes a round.
+
+
+def no_conversation():  # pragma: no cover - reached only by a regression
+    raise AssertionError("an admission decision opens no conversation")
+
+
+def build_lane(
+    config: AutoloopConfig, tasks=(), lane_index: int = 0
+) -> tuple[Orchestrator, list[str]]:
+    """One lane's orchestrator over a real state dir, mid-round, with the
+    produce-then-review path doubled.
+
+    `_dispatch_task_postcommit` is where a worker repo, a commit and an attempt
+    come from, so REACHING it is the whole of "this was dispatched" — and
+    running it would need a git repository, a real executor and an agent, none
+    of which this claim is about. Its state file is written at a non-terminal
+    phase, so this lane reads as BUSY to any supervisor that looks: the gate
+    must exclude the slot this lane already holds, or every dispatch above one
+    lane would read as a full fleet.
+    """
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    store = StateStore(lane_state_file(config.state_dir, lane_index))
+    state = LoopState(session_id=f"lane-{lane_index}", conversation_url=URL)
+    state.phase = Phase.EXECUTING.value
+    store.save(state)
+    registry = registry_of(*tasks)
+    task_store = TaskStore(config.tasks_file)
+    task_store.save(registry)
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=None,
+        executor=None,
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=no_conversation,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=ManifestStore(config.manifests_dir),
+        lane_index=lane_index,
+    )
+    dispatched: list[str] = []
+    orch._dispatch_task_postcommit = lambda d, t, s: dispatched.append(t.id)
+    return orch, dispatched
+
+
+def implement(task_id: str) -> Directive:
+    return Directive(decision=Decision.IMPLEMENT, reason="next", task_id=task_id)
+
+
+def a_busy_lane(config: AutoloopConfig, lane_index: int, task_id: str) -> None:
+    """A neighbour lane mid-round on `task_id`, written as that lane's own state
+    file — the only thing the supervisor reads about a lane it is not in."""
+    state = LoopState(session_id=f"lane-{lane_index}", conversation_url=URL)
+    state.phase = Phase.EXECUTING.value
+    state.current_task = {"task_id": task_id}
+    StateStore(lane_state_file(config.state_dir, lane_index)).save(state)
+
+
+def test_a_lane_may_not_dispatch_the_task_the_plan_held(tmp_path):
+    """THE binding. Lane 1 is running n1, which declares `autoloop/cli.py`; the
+    reviewer directs this lane at t2, which declares the same file. The dispatch
+    is refused and the task is left EXACTLY as it was — pending, unwritten and
+    unattempted — while t3, which the same plan admits, dispatches from the same
+    session one directive later."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config,
+        tasks=[
+            a_task("n1", ["autoloop/cli.py"]),
+            a_task("t2", ["autoloop/cli.py"]),
+            a_task("t3", ["autoloop/health.py"]),
+        ],
+    )
+    orch._registry.mark_in_progress("n1")
+    orch._task_store.save(orch._registry)
+    a_busy_lane(config, 1, "n1")
+    before = config.tasks_file.read_bytes()
+
+    orch._dispatch_executor(implement("t2"))
+
+    assert dispatched == [], "the held task did not start"
+    assert orch._registry.get("t2").status == "pending"
+    assert config.tasks_file.read_bytes() == before, "the registry was not written"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+    assert orch.state.policy_denials == 1
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+    outbox = orch.state.outbox or ""
+    assert HOLD_SCOPE_CONFLICT in outbox and "autoloop/cli.py" in outbox
+    assert "'t3' instead" in outbox, "the correction names a task that CAN start"
+    assert Phase(orch.state.phase) is Phase.READY, "corrected, never parked"
+
+    orch._dispatch_executor(implement("t3"))
+
+    assert dispatched == ["t3"], "an admitted task dispatches from the same session"
+    assert orch._registry.get("t3").status == "in_progress"
+
+
+def test_the_gate_measures_the_fleet_and_not_the_queue_position(tmp_path):
+    """A directive may name any READY task, not only the head of the queue —
+    policy has always authorized that. So the gate asks about the task the
+    directive NAMES (`plan(first=...)`): with one lane free and three tasks
+    ready, the plan's own scheduling answer for t2 is `HOLD_AT_CAP`, because t1
+    was admitted into the last slot ahead of it. Reading that as a refusal would
+    deny a legal directive and spend the denial budget on the queue's ordering.
+    """
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config,
+        tasks=[
+            a_task("n1", ["autoloop/n.py"]),
+            a_task("t1", ["autoloop/a.py"]),
+            a_task("t2", ["autoloop/b.py"]),
+            a_task("t3", ["autoloop/c.py"]),
+        ],
+    )
+    orch._registry.mark_in_progress("n1")
+    orch._task_store.save(orch._registry)
+    a_busy_lane(config, 1, "n1")
+    scheduled = FleetSupervisor(2).plan(orch._registry, [busy(1, "n1")])
+    assert admitted_ids(scheduled) == ["t1"] and scheduled.hold_reason("t2") == HOLD_AT_CAP
+
+    orch._dispatch_executor(implement("t2"))
+
+    assert dispatched == ["t2"], "held by position is not held by the fleet"
+    assert orch.state.policy_denials == 0
+
+
+def test_a_revise_of_the_arc_this_lane_already_owns_is_not_an_admission(tmp_path):
+    """The failure a membership test against `admitted` alone would ship. A
+    `revise` continues work this lane was already admitted for, and the ONE
+    instant it is not covered by "in progress, therefore not in the queue" is
+    the race the plan documents: the session names the task while its registry
+    row still reads `pending`. Refusing there would refuse every revise in that
+    window, the reviewer would re-send it, and the lane would fault-stop on an
+    exhausted denial budget — with a conflicting neighbour, which is when it
+    happens, the refusal would be permanent."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config,
+        tasks=[a_task("n1", ["autoloop/cli.py"]), a_task("t1", ["autoloop/cli.py"])],
+    )
+    orch._registry.mark_in_progress("n1")
+    orch._task_store.save(orch._registry)
+    a_busy_lane(config, 1, "n1")
+    # The session owns t1; the registry row has not caught up yet.
+    orch.state.current_task = {"task_id": "t1", "decision": "implement"}
+    assert orch._registry.get("t1").status == "pending"
+
+    orch._dispatch_executor(
+        Directive(
+            decision=Decision.REVISE,
+            reason="tighten the claim",
+            task_id="t1",
+            feedback="one test is asserting the fixture",
+        )
+    )
+
+    assert dispatched == ["t1"], "the arc this lane owns continues"
+    assert orch.state.policy_denials == 0
+
+
+def test_at_one_lane_the_dispatch_site_consults_no_fleet_at_all(tmp_path, monkeypatch):
+    """The acceptance criterion, at the second call site. At `lanes = 1` the gate
+    returns before it reads anything — no lane state file, no upgrade record —
+    so the dispatch sequence is the one the existing tests pin, and a fleet the
+    gate could not have read cannot change it."""
+    config = make_config(tmp_path, lanes=1)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1", ["autoloop/cli.py"])])
+    monkeypatch.setattr(
+        orchestrator,
+        "lane_occupants",
+        lambda *a, **k: pytest.fail("a single-lane loop asked the fleet a question"),
+    )
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"]
+    assert orch.state.policy_denials == 0
+
+
+def test_a_fleet_the_gate_cannot_read_refuses_rather_than_dispatching(
+    tmp_path, monkeypatch
+):
+    """FAIL-CLOSED, the direction this whole candidate is graded on. An
+    unreadable neighbour is already a hold inside `plan`; this is the outer
+    version — the computation itself raising — and it must refuse rather than
+    dispatch blind, because a check that passes when what it needs is missing is
+    not a check. The failure is named in the transcript, so a fleet that starts
+    refusing everything says why."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1", ["autoloop/cli.py"])])
+
+    def unreadable(*_args, **_kwargs):
+        raise OSError("the state directory went away")
+
+    monkeypatch.setattr(orchestrator, "lane_occupants", unreadable)
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == []
+    assert orch._registry.get("t1").status == "pending"
+    assert orch.state.policy_denials == 1
+    assert HOLD_LANE_UNREADABLE in (orch.state.outbox or "")
+    assert "fleet_admission_unreadable" in transcript_types(config)
+
+
+def test_a_drain_stops_a_dispatch_an_open_session_could_otherwise_start(tmp_path):
+    """The drain, at the site `cli._fleet_plan` cannot reach: a session that was
+    already open when the upgrade landed. Nothing new starts in it, and the
+    correction asks for the one answer that helps — `stop` frees this lane, and
+    an empty fleet is what the boundary is waiting for.
+
+    The second half is the bound: a sha this run has already answered stops
+    draining, exactly as it does in `cli._drainable_upgrade_sha`, so a boundary
+    that could not hand off does not wedge the fleet shut."""
+    config = upgrade_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1", ["autoloop/cli.py"])])
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == []
+    assert orch._registry.get("t1").status == "pending"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+    outbox = orch.state.outbox or ""
+    assert HOLD_DRAINING in outbox
+    assert "Nothing else may start in this lane" in outbox
+
+    assert orch.decline_self_upgrade("b" * 40) is True
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"], "an answered upgrade stops draining the fleet"
+
+
+def test_a_corrupt_upgrade_record_does_not_wedge_every_dispatch(tmp_path):
+    """TWO fail directions, held at once on two different files, and getting
+    them the same way round would be the bug. An unreadable FLEET refuses,
+    because a lane that might hold anything cannot be admitted beside. An
+    unreadable UPGRADE marker does NOT: `UpgradeStore.load` answers `None` for
+    it — the direction `cli._drainable_upgrade_sha` and `_self_upgrade_due` both
+    take, since the merged code is on disk either way — so a corrupt bookkeeping
+    file cannot hold every lane's dispatch shut."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1", ["autoloop/cli.py"])])
+    config.pending_upgrade_file.write_text("{ not json", encoding="utf-8")
+
+    assert orch._fleet_drain_pending() is False
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"]
+    assert orch.state.policy_denials == 0
+
+
+def test_the_correction_names_no_alternative_the_urgent_pin_would_refuse(tmp_path):
+    """Two gates, one directive, and they must not send the reviewer in a
+    circle. While an operator's pin is live, `_refused_ahead_of_urgent` refuses
+    every id but that one — so a fleet hold on the pinned task must not answer
+    "send t3 instead", which the gate above would refuse in the very next
+    round."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config,
+        tasks=[
+            a_task("n1", ["autoloop/cli.py"]),
+            a_task("t2", ["autoloop/cli.py"]),
+            a_task("t3", ["autoloop/health.py"]),
+        ],
+    )
+    orch._registry.mark_in_progress("n1")
+    orch._task_store.save(orch._registry)
+    a_busy_lane(config, 1, "n1")
+    orch._registry.request_urgent("t2", "production is down")
+
+    orch._dispatch_executor(implement("t2"))
+
+    assert dispatched == [], "the pin does not overrule the conflict"
+    outbox = orch.state.outbox or ""
+    assert "Nothing else may start in this lane" in outbox
+    assert "t3" not in outbox, "a correction the urgent gate refuses is not offered"
+
+
+def test_a_directive_naming_a_task_the_plan_never_scheduled_is_left_to_policy(
+    tmp_path,
+):
+    """The gate answers about ADMISSIONS and about nothing else. A task that is
+    not READY was never scheduled by this plan — it has no hold reason — so the
+    refusal belongs to `policy._check_task_reference` and to
+    `_dispatch_task_postcommit`, which answer it for reasons of their own. An
+    efficiency gate that invented a second, weaker copy of a correctness check
+    would be the worse of the two answers."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config, tasks=[a_task("n1", ["autoloop/cli.py"]), a_task("t1", ["autoloop/cli.py"])]
+    )
+    orch._registry.mark_in_progress("n1")
+    orch._registry.mark_in_progress("t1")
+    orch._task_store.save(orch._registry)
+    a_busy_lane(config, 1, "n1")
+
+    plan = FleetSupervisor(2).plan(orch._registry, [busy(1, "n1")], first="t1")
+    assert plan.hold_reason("t1") == "", "an in-progress task is not in the queue"
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"]
+    assert orch.state.policy_denials == 0
