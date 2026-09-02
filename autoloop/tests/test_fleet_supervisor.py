@@ -33,8 +33,10 @@ admission rule, and reaches a self-upgrade boundary by draining.**
    drives `Orchestrator._dispatch_executor` — the site a reviewer's directive
    becomes a round — and pins that a task the plan held cannot start there while
    an admitted one can, that the answer is about the fleet rather than about
-   queue position, and that a lane whose fleet state cannot be read refuses
-   instead of dispatching blind.
+   queue position, that a lane whose fleet state cannot be read refuses instead
+   of dispatching blind, and that a lane the operator's LOWERED CAP removed from
+   the fleet — the one hold `plan` cannot see, because `lane_occupants` never
+   walks that far — dispatches nothing at any cap.
 
 No git repository, no subprocess and no agent: every claim here is about a
 registry, a small JSON file and a predicate. The two places the real loop is
@@ -68,6 +70,7 @@ from autoloop.orchestrator import (
     HOLD_AT_CAP,
     HOLD_DRAINING,
     HOLD_IN_FLIGHT,
+    HOLD_LANE_RETIRED,
     HOLD_LANE_UNREADABLE,
     HOLD_SCOPE_CONFLICT,
     FleetSupervisor,
@@ -1164,4 +1167,70 @@ def test_a_directive_naming_a_task_the_plan_never_scheduled_is_left_to_policy(
     orch._dispatch_executor(implement("t1"))
 
     assert dispatched == ["t1"]
+    assert orch.state.policy_denials == 0
+
+
+@pytest.mark.parametrize("lanes", [2, 1])
+def test_a_lane_the_lowered_cap_removed_dispatches_nothing(tmp_path, lanes):
+    """THE CAP, ASKED FROM INSIDE THE LANE IT CUT — the one hold `plan` cannot
+    answer. An operator who lowers `[concurrency] lanes` under a running fleet
+    leaves a session open in a lane at or above the new cap, and
+    `lane_occupants` walks `range(lanes)`: that lane is not an occupant to be
+    excluded, the fleet reads as having a free slot, and the plan admits into a
+    slot that no longer exists. The two `assert`s before the dispatch are what
+    keep this test from measuring the ordinary cap instead — nothing here marks
+    a lane busy, so the plan the gate would otherwise compute admits t1.
+
+    Run at BOTH caps, because 4 -> 1 cuts the same lanes out that 4 -> 2 does
+    and the `lanes <= 1` return would let the second one through. It costs the
+    single-lane deployment nothing: lane 0 is the only lane `lanes = 1` has, and
+    `0 >= 1` is false.
+    """
+    config = make_config(tmp_path, lanes=lanes)
+    orch, dispatched = build_lane(
+        config, tasks=[a_task("t1", ["autoloop/cli.py"])], lane_index=3
+    )
+    before = config.tasks_file.read_bytes()
+    assert lane_occupants(config) == (), "the cut lane is invisible to the scan"
+    assert admitted_ids(FleetSupervisor(lanes).plan(orch._registry)) == ["t1"]
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == [], "a lane outside the fleet starts nothing"
+    assert orch._registry.get("t1").status == "pending"
+    assert config.tasks_file.read_bytes() == before, "the registry was not written"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+    assert orch.state.policy_denials == 1
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+    outbox = orch.state.outbox or ""
+    assert HOLD_LANE_RETIRED in outbox and lane_id(3) in outbox
+    assert "Nothing else may start in this lane" in outbox, (
+        "a cut lane has no admissible alternative to offer"
+    )
+    assert Phase(orch.state.phase) is Phase.READY, "corrected, never parked"
+
+
+def test_a_cut_lane_still_finishes_the_arc_it_already_holds(tmp_path):
+    """Where that guard sits, asserted as behaviour rather than as an ordering.
+    A lane the lowered cap removed starts nothing NEW — but the round already in
+    it is exactly what a drain waits for everywhere else in this candidate, so a
+    `revise` of the arc this session owns is not an admission and is not
+    refused. Refusing it would strand the round mid-arc and spend the denial
+    budget on a lane that only needs to reach a boundary and free itself."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(
+        config, tasks=[a_task("t1", ["autoloop/cli.py"])], lane_index=3
+    )
+    orch.state.current_task = {"task_id": "t1", "decision": "implement"}
+
+    orch._dispatch_executor(
+        Directive(
+            decision=Decision.REVISE,
+            reason="tighten the claim",
+            task_id="t1",
+            feedback="one test is asserting the fixture",
+        )
+    )
+
+    assert dispatched == ["t1"], "the arc this lane owns still finishes"
     assert orch.state.policy_denials == 0
