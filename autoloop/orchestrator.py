@@ -1351,7 +1351,7 @@ class FleetPlan:
     #: most one per free lane.
     admitted: tuple[Task, ...]
     #: `(task_id, reason)` for every READY task that was not admitted, in the
-    #: same order — one of the `HOLD_*` words above, with the conflicting file
+    #: same order — one of the `HOLD_*` words above, with the shared declared
     #: entries appended for `HOLD_SCOPE_CONFLICT`.
     held: tuple[tuple[str, str], ...]
     #: The busy lanes the plan was computed against.
@@ -1453,7 +1453,10 @@ class FleetSupervisor:
     mutates the registry, never opens a session and never charges an attempt —
     a task it does not admit stays exactly `pending`, which is the whole of
     Decision 3's "the task stays queued" promise. The caller (`cli.
-    _run_continuous`) is what turns an admission into a session.
+    _run_continuous`) is what turns an admission into a session, and
+    `cli._fleet_plan`'s docstring records exactly how far that goes: the plan
+    gates whether a lane OPENS a session, while which task the session dispatches
+    remains the reviewer's directive.
 
     **The queue is the registry.** No second data structure: the order is
     `TaskRegistry.ready_in_dispatch_order`, which is `next_ready()`'s own
@@ -1506,7 +1509,7 @@ class FleetSupervisor:
            passes when what it needs is missing is not a gate.
         4. `HOLD_AT_CAP` — every lane is busy (or already spoken for by an
            earlier admission this tick).
-        5. `HOLD_SCOPE_CONFLICT` — this task declares a file entry that a lane
+        5. `HOLD_SCOPE_CONFLICT` — this task declares an entry that a lane
            already holds, or that a task admitted earlier this tick declares.
            Checked against BOTH, so one tick cannot co-schedule a conflicting
            pair by admitting them together.
@@ -1573,13 +1576,14 @@ class FleetSupervisor:
         admitted: list[Task],
     ) -> tuple[str, tuple[str, ...]] | None:
         """The first task already scheduled that `task` may not run beside, and
-        the file entries the two share.
+        the declared entries the two share.
 
         `tasks.co_schedule_conflict` is the whole rule and this adds nothing to
-        it: declared paths only, file entries only, universal trackers
-        excluded. Deterministic — the lanes' scopes are walked in sorted id
-        order and this tick's admissions in admission order — so the reason a
-        task is held does not depend on dict iteration.
+        it: declared paths only, with the universal trackers and
+        `tasks.CO_SCHEDULE_EXEMPT_PATHS` — the shared test tree — the only
+        entries an overlap in is forgiven. Deterministic — the lanes' scopes are
+        walked in sorted id order and this tick's admissions in admission order
+        — so the reason a task is held does not depend on dict iteration.
         """
         for other_id, other_paths in held_scopes:
             entries = co_schedule_conflict(

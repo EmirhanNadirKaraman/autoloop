@@ -785,12 +785,18 @@ survive the universal tracker grant.** Every task's `effective_approved_paths`
 is its declared list UNION the six shared documentation trackers, so an overlap
 gate computed over the effective list would find an overlap between any two
 tasks and nothing would ever co-schedule. The gate is therefore computed over
-**declared** `approved_paths` only, and only at **file granularity**:
+**declared** `approved_paths` only, less an enumerated set of entries every
+task shares:
 
-* **Gates.** Two co-scheduled tasks must not both declare the same *file* entry
-  (an entry not ending in `/`) outside the six universal trackers. A same-file
-  declaration is the strongest advance signal that both lanes will edit the same
-  file, which is the case no resolver handles.
+* **Gates.** Two co-scheduled tasks must not both declare the same entry —
+  a file such as `autoloop/cli.py`, or a directory such as `autoloop/` — outside
+  the exempt entries the bullets below list. A same-entry declaration is the
+  strongest advance signal that both lanes will edit the same file, which is the
+  case no resolver handles. Entries are compared for EQUALITY, so a broad scope
+  and a narrow one inside it (`autoloop/` beside `autoloop/cli.py`) are not an
+  overlap here; that residual is deliberate, and steps 1–4 above are what
+  answers it — a containment rule would make every whole-package scope
+  serialise the fleet to buy a cost rather than a guarantee.
 * **Does not gate: the four append-only trackers** (`docs/SUMMARY.md`,
   `docs/TESTS.md`, `docs/SECURITY.md`, `docs/COMMON_ERRORS.md`). Every task
   appends to them by construction, and `note_merge.py` exists to resolve exactly
@@ -799,13 +805,19 @@ tasks and nothing would ever co-schedule. The gate is therefore computed over
   `note_merge.MAX_NOTE_LINE_CHARS`. The resolver switches itself off silently
   when that discipline is broken, so concurrency raises the price of breaking
   it, and the enabling candidate must say so in the operator docs.
-* **Does not gate: a shared directory entry** such as `autoloop/tests/`, which
-  nearly every task declares. Gating on it would serialise the fleet and buy
-  nothing; two tasks adding different files under it do not conflict.
+* **Does not gate: `autoloop/tests/`**, which nearly every task declares because
+  nearly every task adds a test. Gating on it would serialise the fleet and buy
+  nothing; two tasks adding different files under it do not conflict. That
+  argument is about THAT directory and does not generalise to directory entries
+  as a shape: two tasks both declaring `autoloop/` are two scopes each
+  authorized to write every file the other one touches, which is the case the
+  gate exists for. So the exemption is an enumerated list — one entry today,
+  matched exactly, never by prefix, so a task naming one file *inside* the tree
+  gates on it like any other file.
 * **Does not gate, and is a stated residual: `CLAUDE.md` and `docs/SCHEMA.md`.**
   They are universally granted, they have no resolver, and a conflict in either
   deliberately stops a merge because they carry claims that need a human. A task
-  that *declares* one of them explicitly gates like any other file entry; a task
+  that *declares* one of them explicitly gates like any other entry; a task
   that writes one it never declared is the residual. Its cost is bounded: the
   serialised merge finds the conflict, the second candidate parks, and a human
   reads two files. That is the designed behaviour of those two trackers, not a
@@ -814,6 +826,15 @@ tasks and nothing would ever co-schedule. The gate is therefore computed over
 When the gate fires the task **stays queued** — `pending` in the registry,
 untouched, dispatched as soon as the conflicting lane finishes. It is never
 failed, never charged an attempt, and never quarantined.
+
+One residual of that shape, stated where the rule is rather than discovered
+later: the plan gates whether a lane **opens a session**, and which task the
+session then dispatches is still the reviewer's directive against the roadmap,
+so a lane that opened because something else was admissible can still be
+directed at a held task. It is the same class of residual as the two trackers
+above — a cost the merge protocol already owns, not a correctness hole — and
+the candidate that turns concurrency on is where it is worth closing, with
+real lanes to measure it against.
 
 ### Decision 4 — the fleet cap
 

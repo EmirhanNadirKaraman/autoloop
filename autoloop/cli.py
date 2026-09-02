@@ -1978,6 +1978,20 @@ def _fleet_plan(
 
     Reads three things and writes none: the registry this iteration loaded, the
     lanes' own state files (`lane_occupants`), and the pending-upgrade record.
+
+    **WHERE THE PLAN'S AUTHORITY STOPS, stated rather than implied.** What it
+    gates is whether THIS lane opens a session at all — the cap, the drain and a
+    queue every entry of which is held. Which task the session then dispatches is
+    still the reviewer's directive against the roadmap (`_start_new_session`
+    opens on the audit kickoff, not on a task), so a lane that opens because
+    SOMETHING was admissible can still be directed at a task the plan held for a
+    scope conflict. That is Decision 3's own framing — admission control is an
+    efficiency measure over a merge protocol that owns overlap as correctness,
+    and a held task is never failed, charged or quarantined by being held — and
+    it is the residual to close in the candidate that turns concurrency on with
+    real lanes to observe. The half that is enforced here rather than advised is
+    the CAP: a busy or unreadable lane costs a slot, and no session opens without
+    one free.
     """
     if config.concurrency.lanes <= 1:
         return None
