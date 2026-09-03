@@ -887,6 +887,20 @@ The direction of the default does not change: an unrecognised or absent kind is
 **`fleet_fatal`**. Which existing codes move to `lane_fatal` is enumerated by the
 candidate that does the work, against the actual call sites, not guessed here.
 
+**conc-07 landed that enumeration in `blockers.LANE_FATAL_CODES` /
+`FLEET_FATAL_CODES`, read through `blockers.fatal_scope`, and it rides a
+SEPARATE AXIS from `kind` rather than replacing it** — that is what keeps the
+acceptance criterion: no park site's `kind` changed, `state.park_kind` still
+carries literally `loop_fatal`, and the new question is answered from the CODE.
+Thirteen codes are lane-fatal (the lane's own session, conversation, request,
+candidate, execution record or observed clone); the rest are fleet-fatal, in
+four families — the account, the shared tree and its remote, the shared records
+under the state directory, and the hard halts. `orchestrator.fleet_stop` is how a
+lane learns a sibling reached a fleet-fatal terminal: it reads the lanes' own
+state files rather than the blocker set, so it is a question about a live park
+and not about history, and `cli._run_continuous` asks it once per outer
+iteration — the "next safe phase" — and only at `lanes > 1`.
+
 **`checkout_escape_detected` stays `fleet_fatal`, deliberately.** It is
 tempting to make it lane-fatal now that the boundary is per-lane and the
 violation is attributable — and that is the wrong direction. The evidence an
