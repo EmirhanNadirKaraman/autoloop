@@ -145,6 +145,7 @@ from .auto_merge import (
     UPGRADE_PREFLIGHT_FAILED,
     UPGRADE_UNAPPLICABLE,
     MergeDeferralStore,
+    MergeObligation,
     PendingUpgrade,
     UpgradeStore,
     upgrade_bound_sha,
@@ -6825,7 +6826,9 @@ def _candidate_base_ancestry(config, record, git=None) -> tuple[str, str]:
     )
 
 
-def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list[str]]:
+def _merge_window_blockers(
+    config, seen=None, git=None, *, obligations: list | None = None
+) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
     the window is open.
@@ -6908,6 +6911,42 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
       merge-forward or a recut before it can be reviewed again, and dropping it
       from the blockers must not drop it from the operator's view. Reported, not
       hidden; visible, not blocking.
+
+    **AT `lanes > 1` THE BOUND-CANDIDATE BLOCKER BECOMES AN OBLIGATION**, and
+    nothing else about this predicate moves (conc-03, docs/AUTOLOOP.md
+    "Decision 6 — merging is serialised and rebase-aware"). The blanket block
+    above is a fleet-wide mutual exclusion: with N lanes, N−1 of them hold
+    exactly the record it names, so the window as written would essentially
+    never open. The document's replacement is a per-candidate obligation —
+
+        the window may open while candidates are bound to the head, provided
+        every such candidate is carried forward and RE-REVIEWED before it can
+        be pushed
+
+    — so at `lanes > 1` a `BASE_AT_HEAD` record is reported as a NOTE and, when
+    the caller passed a list, appended to `obligations` as a `MergeObligation`.
+    The caller that MERGES (`auto_merge.AutoMerger.attempt`) is the one that
+    passes the list, and it is what discharges them: it marks each record
+    `rereview_owed_base` BEFORE the head moves and carries each one forward
+    after. A caller that passes nothing (the operator's `merge-window`, the
+    sweep's own gate call) still sees the note, and still sees every blocker.
+
+    Three things are deliberately NOT relaxed at any lane count:
+
+    * `BASE_UNVERIFIED` stays a BLOCKER. "Cannot be shown to be bound to the
+      head" is not "is bound to the head, and carriable": nothing can be
+      carried forward past a base git will not place, so the fail-closed arm
+      keeps failing closed.
+    * The EXECUTING-phase reason below is untouched. A lane mid-write is not
+      a candidate obligation and has no carry-forward to owe.
+    * Every exemption above (terminal state, published, retired, orphaned,
+      already-behind) is evaluated first and unchanged, so a record that never
+      reached the bound-candidate arm cannot become an obligation.
+
+    At `lanes = 1` — the shipped default, and the acceptance criterion every
+    candidate in that plan carries — `obligations` is never appended to and the
+    reason string below is the one this function has always produced, byte for
+    byte.
 
     Nothing here changes the ALL-OR-NOTHING sweep. `merge_sweep` checks this
     predicate once for the whole backlog and merges every branch or none; this
@@ -7040,6 +7079,28 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
                 "window; it will need a merge-forward or a recut before it can "
                 "be reviewed again (its next dispatch attempts the merge-forward "
                 "and parks on task_base_behind_head if that refuses)"
+            )
+            continue
+        # THE OBLIGATION ARM, and the only lane-dependent line in this function.
+        # `BASE_AT_HEAD` only — an unverifiable base is not a carriable one, so
+        # it falls through to the blocker below at every lane count.
+        if verdict == BASE_AT_HEAD and config.concurrency.lanes > 1:
+            if obligations is not None:
+                obligations.append(
+                    MergeObligation(
+                        task_id=task_id,
+                        candidate_sha=str(record.get("candidate_sha") or ""),
+                        base_sha=str(record.get("task_base_sha") or ""),
+                        worktree_path=str(record.get("worktree_path") or ""),
+                    )
+                )
+            notes.append(
+                f"task {task_id}: candidate {candidate} is bound to base "
+                f"{base}, {detail} — at {config.concurrency.lanes} lanes this "
+                "OWES A RE-REVIEW rather than holding the window: it is "
+                "recorded as owing one before the head moves, carried forward "
+                "onto the new head afterwards, and cannot be pushed on its "
+                "current approval until a new review has been asked for"
             )
             continue
         reasons.append(
