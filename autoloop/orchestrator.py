@@ -335,6 +335,7 @@ import hashlib
 import json
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import tempfile
@@ -412,10 +413,12 @@ from .errors import (
     EnvironmentDriftError,
     GitCommandError,
     GitError,
+    LockHeldError,
     LoginExpiredError,
     QuotaExhaustedError,
     RateLimitedError,
     ResponseTimeoutError,
+    StaleLockError,
     StateCorruptError,
     StateError,
     TaskGraphError,
@@ -433,11 +436,15 @@ from .execution_records import (
 from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
 from .health import (
+    DeadLane,
     StrandedRound,
     current_round_age_seconds,
+    dead_lane_survey,
     round_ceiling_for,
     stranded_fault_rounds,
 )
+from .lock import LaneLease
+from .merge_sweep import MergeToken
 from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import (
@@ -453,6 +460,7 @@ from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
 from .worker_env import (
     ObservedCheckout,
+    WorkerRepoManager,
     validate_lane_checkout_distinctness,
     verify_worker_isolation,
     worker_env,
@@ -1928,6 +1936,413 @@ def fleet_stop(config, blockers=None, lanes=None, exclude=None) -> FleetStop | N
     return None
 
 
+# ---- lane death and recovery (conc-08, 2026-09-03) --------------------------
+#
+# Decision 8 of the split plan, and most of it already existed per TASK:
+# `worker_repo_is_reusable` decides whether a worker can be resumed as it
+# stands, `WorkerRepoManager.quarantine` moves a failed attempt aside without
+# deleting evidence, execution records are per-task files that survive any
+# process, and `health.dead_lane_survey` (conc-08's own addition, beside
+# `stranded_fault_rounds` for its reason) is the predicate that says which lane
+# a death left behind. What is added here is the ACTING half, and its whole
+# claim is the scope of what it touches: a recovered lane's own state file, its
+# own lease and its own worker repository, and nothing else. No other lane names
+# any of those, which is why the recovery cannot reach one.
+#
+# WHO MAY CALL IT: the holder of the FLEET LOCK, and that is a real
+# precondition rather than a note. Every decision here is a check-then-act on a
+# shared file — read the lease, judge it dead, unlink it — and `lock.LaneLease`
+# refuses to do that for itself precisely because two processes racing on it
+# both enter one lane. `LoopLock` is single-holder-per-state-dir, so today the
+# process running a round IS that holder and the ordering is free; a future
+# arrangement that runs lanes in separate processes inherits the obligation,
+# which is stated here rather than discovered by conc-10.
+
+
+#: The lane may be re-entered exactly as it stands: its dead lease is gone and
+#: the next tick resumes the saved phase through the ordinary `Orchestrator.run`
+#: path, which is what a killed-and-restarted `run --continuous` has always done.
+RECOVERY_RESUMED = "resumed"
+#: Its worker repository failed `worker_repo_is_reusable`, so that repository was
+#: MOVED ASIDE (never deleted) before the lease was released. The next dispatch
+#: creates a fresh one from the recorded base.
+RECOVERY_QUARANTINED = "quarantined"
+#: A dead lease with nothing mid-round behind it — the lease is removed and no
+#: round is resumed, because there is none.
+RECOVERY_RELEASED = "released"
+#: NOTHING WAS TOUCHED. The evidence needed to decide was unreadable, so the
+#: lease stays exactly where it is and the lane stays closed. This is the
+#: fail-closed direction and it is the one an operator has to act on.
+RECOVERY_REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class LaneRecovery:
+    """What the recovery did about ONE lane, and why.
+
+    A record of an action, unlike `FleetPlan` and `FleetStop`, which are values
+    produced by reading. It is returned so the caller can write it to the
+    transcript: a lane recovered silently is a round that vanished, and the
+    quarantine in particular moves a directory an operator may go looking for.
+    """
+
+    lane_index: int
+    lane_id: str
+    #: One of the four `RECOVERY_*` words above.
+    action: str
+    #: The task that lane's session named, `""` when it named none.
+    task_id: str = ""
+    #: Why this action and not another, in a sentence.
+    detail: str = ""
+    #: Where a quarantined worker repository was moved to. Set on a refusal too
+    #: when the move had already happened — the evidence exists either way and
+    #: the report must not lose it.
+    quarantined_at: str = ""
+
+    def describe(self) -> str:
+        line = f"lane {self.lane_id}: {self.action}"
+        if self.task_id:
+            line += f" ({self.task_id})"
+        if self.detail:
+            line += f" — {self.detail}"
+        if self.quarantined_at:
+            line += f"; worker moved to {self.quarantined_at}"
+        return line
+
+
+@dataclass(frozen=True)
+class FleetRecovery:
+    """Everything one recovery pass did, across the lanes and the merge token."""
+
+    lanes: tuple[LaneRecovery, ...] = ()
+    #: `RECOVERY_RELEASED` when a dead lane's merge token was released,
+    #: `RECOVERY_REFUSED` when there is one this pass could not read or remove,
+    #: and `""` — the ordinary state — when there was nothing to do.
+    merge_token: str = ""
+    #: The dead holder, described, or the reason the token could not be judged.
+    merge_token_detail: str = ""
+    #: Set when the pass itself could not be completed. Reported rather than
+    #: raised: a recovery that stopped a round would be a worse failure than the
+    #: one it exists to fix.
+    detail: str = ""
+
+    def describe(self) -> str:
+        parts = [entry.describe() for entry in self.lanes]
+        if self.merge_token:
+            parts.append(f"merge token {self.merge_token}: {self.merge_token_detail}")
+        if self.detail:
+            parts.append(self.detail)
+        return "; ".join(parts) if parts else "no lane needed recovering"
+
+
+def recover_dead_lanes(
+    config,
+    *,
+    exclude=None,
+    worker_repos=None,
+    execution_store=None,
+    lanes: int | None = None,
+) -> FleetRecovery:
+    """Recover every lane a dead process left behind, and release the fleet's
+    merge token if its holder is one of them. Never raises.
+
+    ONE LANE AT A TIME AND NOTHING SHARED. Each recovery reads and writes only
+    `state.lane_paths(state_dir, index)`'s own files and the worker repository
+    that lane's own execution record names; no other lane's state file, lease,
+    clone or worker is opened, which is the whole of "recovered without touching
+    the others". The merge token is the one deliberate exception and it is not a
+    lane's: it is the fleet's, and a dead holder of it strands every lane.
+
+    THE TOKEN IS JUDGED ON ITS OWN RECORD, not on the holder's lease. A lease
+    that cannot be read refuses that LANE — correctly — and if the token
+    depended on it, one corrupt file would stop the whole fleet merging until a
+    person arrived. The two questions are separate and are answered separately.
+
+    `exclude` is the caller's own lane index, which is alive by construction.
+    `worker_repos` and `execution_store` are the caller's own collaborators when
+    it has them; both are derived from `config` when it does not, so a caller
+    with neither still recovers (see `_recover_lane_worker`, which refuses only
+    when a quarantine is actually required and no manager can be built).
+    """
+    detail = ""
+    try:
+        dead = dead_lane_survey(config, lanes=lanes, exclude=exclude)
+    except Exception as exc:      # noqa: BLE001 - a recovery must not stop a round
+        dead, detail = (), (
+            f"the lanes could not be surveyed ({type(exc).__name__}: {exc})"
+        )
+    recovered: list[LaneRecovery] = []
+    for entry in dead:
+        try:
+            recovered.append(
+                _recover_one_lane(entry, config, worker_repos, execution_store)
+            )
+        except Exception as exc:  # noqa: BLE001 - one lane must not stop the pass
+            recovered.append(
+                LaneRecovery(
+                    entry.lane_index,
+                    entry.lane_id,
+                    RECOVERY_REFUSED,
+                    task_id=entry.task_id,
+                    detail=(
+                        f"recovering it raised {type(exc).__name__}: {exc}, so "
+                        "nothing about it was changed"
+                    ),
+                )
+            )
+    try:
+        action, described = _release_dead_merge_token(config)
+    except Exception as exc:      # noqa: BLE001 - the docstring's promise
+        action, described = (
+            RECOVERY_REFUSED,
+            f"the merge token could not be judged ({type(exc).__name__}: {exc})",
+        )
+    return FleetRecovery(
+        lanes=tuple(recovered),
+        merge_token=action,
+        merge_token_detail=described,
+        detail=detail,
+    )
+
+
+def _recover_one_lane(
+    dead: DeadLane, config, worker_repos, execution_store
+) -> LaneRecovery:
+    """Recover the one lane `dead` describes.
+
+    THE REFUSAL COMES FIRST, before a path is even built: a `DeadLane` carrying
+    `unreadable` is the survey saying it could not establish what that lane
+    holds — including the one entry that is not a lane at all, the unlistable
+    `lanes/` directory, whose index is negative and would raise if it reached
+    `lane_paths`. Nothing is touched, the lease stays where it is, and the lane
+    stays closed until a person looks.
+
+    THE WORKER IS DEALT WITH BEFORE THE LEASE, and the order is the safety
+    property: releasing the lease is what lets the next tick into the lane, so a
+    quarantine that failed must leave the lane shut rather than open onto a
+    worker nobody could make safe.
+
+    AND NOTHING CAN ENTER THE LANE IN BETWEEN, which is what makes acting on the
+    survey's older judgement safe rather than a race. A dead lease REFUSES
+    `LaneLease.acquire` (`StaleLockError` — leases are never stolen), so the only
+    way into that lane is the removal below, and only the fleet-lock holder
+    performs it. `break_stale` re-reads and re-judges anyway before it unlinks,
+    so a lease that has somehow become live or unreadable in the interval refuses
+    there too and the lane keeps it.
+    """
+    if dead.unreadable:
+        return LaneRecovery(
+            dead.lane_index,
+            dead.lane_id,
+            RECOVERY_REFUSED,
+            task_id=dead.task_id,
+            detail=dead.unreadable,
+        )
+    lease = LaneLease(config.state_dir, dead.lane_index)
+    action, detail, quarantined_at = RECOVERY_RELEASED, "", ""
+    if _lane_is_mid_round(dead):
+        action, detail, quarantined_at = _recover_lane_worker(
+            dead, config, worker_repos, execution_store
+        )
+    else:
+        detail = (
+            "its lease is dead and its session is at "
+            f"{dead.phase or 'no phase at all'}, so there is no round to resume"
+        )
+    if action == RECOVERY_REFUSED:
+        return LaneRecovery(
+            dead.lane_index,
+            dead.lane_id,
+            action,
+            task_id=dead.task_id,
+            detail=detail,
+            quarantined_at=quarantined_at,
+        )
+    try:
+        lease.break_stale()
+    except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
+        # `break_stale` re-reads and re-judges before it unlinks, so a lease
+        # that has become LIVE (a process entered the lane between the survey
+        # and here) or unreadable in the interval refuses — which is the whole
+        # reason the removal is not `unlink()`. The lane keeps its lease.
+        return LaneRecovery(
+            dead.lane_index,
+            dead.lane_id,
+            RECOVERY_REFUSED,
+            task_id=dead.task_id,
+            detail=f"its lease could not be released ({exc})",
+            quarantined_at=quarantined_at,
+        )
+    return LaneRecovery(
+        dead.lane_index,
+        dead.lane_id,
+        action,
+        task_id=dead.task_id,
+        detail=detail,
+        quarantined_at=quarantined_at,
+    )
+
+
+def _lane_is_mid_round(dead: DeadLane) -> bool:
+    """Was the lane holding a round when its process died?
+
+    The same test `_lane_occupant` applies to decide whether a lane is BUSY —
+    the state file exists and its phase is not terminal — asked of the phase the
+    survey already read. Two spellings of "is this lane running something" is
+    how a recovery comes to quarantine a worker for a lane that had cleanly
+    finished.
+    """
+    if not dead.phase:
+        return False
+    try:
+        return Phase(dead.phase) not in TERMINAL_PHASES
+    except (ValueError, TypeError):      # pragma: no cover - the survey refuses these
+        return False
+
+
+def _recover_lane_worker(
+    dead: DeadLane, config, worker_repos, execution_store
+) -> tuple[str, str, str]:
+    """`(action, detail, quarantined_at)` for the worker repository the dead
+    lane's round was using — Decision 8's "resumed or quarantined".
+
+    RESUMED is the answer whenever there is nothing to make safe, and the three
+    ways that happens are kept apart deliberately, because `worker_repo_is_
+    reusable` answers False to all of them and only one is a broken worker:
+
+      * the session names no task, or has no execution record — there is no
+        worker to judge;
+      * the record names no worker path, or the path is GONE — the next
+        dispatch creates one from the recorded base, which is exactly what a
+        resumed round already does today;
+      * the recorded worker still passes the probe — a git repository at the
+        recorded path, checked out on the recorded branch — which is the wrk-01
+        resume, and quarantining it would discard the interrupted round's own
+        partial work.
+
+    QUARANTINED is the remaining case and the one the claim is about: a worker
+    that is there and is NOT what the record says it is. It is moved aside by
+    `WorkerRepoManager.quarantine` — never deleted, so the evidence survives —
+    and the label carries the lane, the instant and a random suffix, because
+    that method refuses a colliding destination by design and two recoveries of
+    one task in the same second must not be one of them.
+
+    REFUSED is for the evidence, not for the worker: an execution record that
+    cannot be read, and a quarantine that is required but cannot be performed.
+    Both leave the lane shut.
+    """
+    if not dead.task_id:
+        return (
+            RECOVERY_RESUMED,
+            "its session names no task, so it holds no worker to judge",
+            "",
+        )
+    store = execution_store
+    if store is None:
+        try:
+            store = TaskExecutionStore(config.executions_dir)
+        except (AttributeError, TypeError, OSError) as exc:
+            return (
+                RECOVERY_REFUSED,
+                f"its execution records could not be located ({exc})",
+                "",
+            )
+    try:
+        execution = store.load(dead.task_id)
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        return (
+            RECOVERY_REFUSED,
+            f"the execution record for {dead.task_id} could not be read ({exc})",
+            "",
+        )
+    if execution is None:
+        return (
+            RECOVERY_RESUMED,
+            f"{dead.task_id} has no execution record, so it holds no worker",
+            "",
+        )
+    recorded = (getattr(execution, "worktree_path", "") or "").strip()
+    branch = getattr(execution, "task_branch", "") or ""
+    if not recorded:
+        return (
+            RECOVERY_RESUMED,
+            "its execution record names no worker repository",
+            "",
+        )
+    path = Path(recorded)
+    if worker_repo_is_reusable(path, branch):
+        return (
+            RECOVERY_RESUMED,
+            f"its worker {path} is still a git repository on {branch}",
+            "",
+        )
+    if not path.exists():
+        return (
+            RECOVERY_RESUMED,
+            f"its worker {path} is gone, so the next dispatch creates one",
+            "",
+        )
+    manager = worker_repos
+    if manager is None:
+        try:
+            manager = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+        except (AttributeError, TypeError, OSError) as exc:
+            return (
+                RECOVERY_REFUSED,
+                f"its worker {path} does not pass the reuse probe and no worker "
+                f"manager could be built to quarantine it ({exc})",
+                "",
+            )
+    label = f"lanedeath-{dead.lane_id}-{utcnow_iso().replace(':', '')}-{uuid.uuid4().hex[:8]}"
+    try:
+        moved = manager.quarantine(dead.task_id, label)
+    except Exception as exc:  # noqa: BLE001 - any failure leaves the lane shut
+        return (
+            RECOVERY_REFUSED,
+            f"its worker {path} does not pass the reuse probe and could not be "
+            f"quarantined ({type(exc).__name__}: {exc})",
+            "",
+        )
+    return (
+        RECOVERY_QUARANTINED,
+        f"its worker {path} is not a git repository checked out on "
+        f"{branch or '(no branch recorded)'}",
+        str(moved),
+    )
+
+
+def _release_dead_merge_token(config) -> tuple[str, str]:
+    """`(action, detail)` for the fleet's merge token — Decision 8's "a dead
+    lane holding the merge token releases it".
+
+    `("", "")` when there is nothing to do, which is every ordinary state: one
+    lane, no token file, or a token a LIVE lane is merging under. A live token
+    is never removed — `MergeToken.break_stale` refuses one, and the refusal is
+    the point: the alternative is two lanes merging into one base.
+
+    An unreadable token is `RECOVERY_REFUSED` rather than removed, for the
+    reason `LaneLease.read` gives about its own refusal: "remove what you cannot
+    read" is how a resource with a live holder gets handed to somebody else.
+    That leaves the fleet unable to merge until a person looks, which is the
+    direction this whole module fails in.
+    """
+    lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes <= 1:
+        return "", ""
+    token = MergeToken(config.state_dir)
+    try:
+        info = token.read()
+    except (StateCorruptError, OSError) as exc:
+        return RECOVERY_REFUSED, f"the merge token could not be read ({exc})"
+    if info is None or MergeToken.is_live(info):
+        return "", ""
+    try:
+        removed = token.break_stale()
+    except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
+        return RECOVERY_REFUSED, f"the merge token could not be released ({exc})"
+    return RECOVERY_RELEASED, removed.describe()
+
+
 class FleetSupervisor:
     """Scheduling across N lanes: the cap, the admission rule, and the drain
     that reaches a self-upgrade boundary (conc-06, `docs/AUTOLOOP.md`
@@ -2545,6 +2960,12 @@ class Orchestrator:
         # `is_dir()` when no split has ever been accepted, which is the ordinary
         # case, and never raises.
         self._reconcile_split_acceptance()
+        # AND THE LANES A DEATH LEFT BEHIND (conc-08), at the same boundary and
+        # for the same reason: a lane whose process was killed mid-round leaves
+        # a dead lease that nothing else removes, and until it is removed no
+        # process may enter that lane. A no-op at `lanes = 1`, where it reads
+        # nothing; never raises.
+        self._recover_dead_lanes()
         steps = 0
         while True:
             # BOTH locations: the flag moved outside the checkout (see
@@ -4043,6 +4464,69 @@ class Orchestrator:
         if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
             return 1
         return lanes
+
+    def _recover_dead_lanes(self) -> None:
+        """Recover the lanes a dead process left behind, once per tick, before
+        this lane takes a step (conc-08, Decision 8).
+
+        NOTHING AT ALL AT `lanes = 1`, and structurally rather than by a flag:
+        `_fleet_lanes` answers 1 for every single-lane deployment and every
+        hand-built config in the suite, so no lease is read, no survey runs and
+        no file is touched. That is the acceptance criterion this candidate
+        carries, in the one place a per-tick hook could otherwise break it.
+
+        HERE, at the top of `run`, for `_reconcile_split_acceptance`'s reason
+        one line up: it is the moment before anything else reads the state
+        directory, it recurs every tick a lane takes, and the process is holding
+        the fleet lock — which is what makes the check-then-act inside
+        `LaneLease.break_stale` safe (see `recover_dead_lanes`). THIS lane is
+        excluded by index: it is alive by construction, and a process offered
+        its own lane to recover would be recovering itself.
+
+        NEVER RAISES, and every outcome is written to the transcript, including
+        the refusals. A recovery that stopped a round would be a worse failure
+        than the death it exists to repair; a recovery that fixed a lane
+        silently would be a round that vanished, and one that REFUSED a lane
+        silently would be the fail-open shape this whole candidate is written
+        against — the lane stays shut and nothing says why.
+        """
+        if self._fleet_lanes() <= 1:
+            return
+        try:
+            recovery = recover_dead_lanes(
+                self._config,
+                exclude=self.lane_index,
+                worker_repos=self._worker_repos,
+                execution_store=self._execution_store,
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self._log(
+                "lane_recovery_error",
+                data={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            return
+        for entry in recovery.lanes:
+            self._log(
+                "lane_recovered",
+                data={
+                    "lane_id": entry.lane_id,
+                    "lane_index": entry.lane_index,
+                    "action": entry.action,
+                    "task_id": entry.task_id,
+                    "detail": entry.detail,
+                    "quarantined_at": entry.quarantined_at,
+                },
+            )
+        if recovery.merge_token:
+            self._log(
+                "merge_token_recovered",
+                data={
+                    "action": recovery.merge_token,
+                    "detail": recovery.merge_token_detail,
+                },
+            )
+        if recovery.detail:
+            self._log("lane_recovery_error", data={"error": recovery.detail})
 
     def _fleet_throttle_store(self) -> FleetThrottleStore | None:
         """The fleet's shared throttle record, or `None` at one lane.

@@ -1010,6 +1010,24 @@ What the fleet adds:
   that refusal is a lane-fatal park naming that lane's directory, and the other
   lanes keep running.
 
+**conc-08 landed that as `orchestrator.recover_dead_lanes`, called from
+`Orchestrator.run`'s startup block once per tick and only at `lanes > 1`.** The
+dead LEASE is the evidence, never the state file: a mid-round session with no
+lease beside it is what an ordinary `run` leaves between rounds. `health.
+dead_lane_survey` is the predicate, beside `stranded_fault_rounds` and for its
+reason — one implementation, one reader that reports and one that acts. The
+merge slot is `merge_sweep.MergeToken`, a lease with `LoopLock.is_live`'s own
+rule, taken by `BacklogSweeper.sweep` around the merges and released in a
+`finally`; a token a live lane holds defers the sweep and is never stolen, and a
+dead holder's is released by the recovery on the TOKEN's own evidence rather than
+on any lane's lease, so one corrupt lease cannot stop the fleet merging. Every
+absence — an unreadable lease, state, phase or execution record, an unlistable
+`lanes/`, a quarantine that fails — refuses and leaves the lease in place, so
+nothing enters that lane. The recovery is only safe from the holder of the FLEET
+LOCK, which is what makes `LaneLease.break_stale`'s check-then-act sound; one
+process holds it today, and an arrangement that runs lanes in separate processes
+inherits that obligation.
+
 ### An interaction the scheduler must answer: self-upgrade boundaries
 
 `_self_upgrade_due` offers a replacement only at a `READY` phase with no packet
