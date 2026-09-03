@@ -48,17 +48,22 @@ from autoloop.config import (
     lane_observed_checkout,
     load_config,
 )
+from autoloop.contract import Decision, Directive
+from autoloop.executor import ExecutionOutcome
+from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
-from autoloop.state import LoopState, StateStore
-from autoloop.tasks import TaskRegistry, TaskStore
+from autoloop.state import LoopState, Phase, StateStore
+from autoloop.tasks import Task, TaskRegistry, TaskStore, mutation_ledger_for
 from autoloop.transcript import TranscriptLogger
 from autoloop.worker_env import (
     ObservedCheckout,
     WorkerRepoManager,
+    validate_lane_checkout_distinctness,
     validate_observed_checkout,
 )
+from autoloop.worktask import IntentStore, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/conc-04-one-checkout-per-lane"
 
@@ -488,3 +493,293 @@ def test_a_deployment_with_no_clone_wired_is_untouched_by_the_lane_rule(tmp_path
     orch = build_orchestrator(tmp_path, lanes=2, lane_index=1, observed=None)
 
     assert orch._observed is None
+    assert orch._lane_isolation_violations() == [], "nothing to isolate from"
+
+
+# =============================================================================
+# 5. The rule asked where it can still stop something — and the symlink that
+#    makes the derivation alone insufficient
+# =============================================================================
+#
+# `config.lane_observed_checkout` makes two lanes' NAMES distinct. A symlink
+# makes two distinct names one directory, and a lane set that resolves onto one
+# tree is exactly the arrangement Decision 1 removes — so the rule has to be
+# asked about RESOLVED paths, by the round, before the tree is written to. These
+# are the tests for that caller: the previous section pins the rule, this one
+# pins that production reaches it.
+
+
+class _CountingExecutor:
+    """Runs nothing. What is under test is whether it is called at all."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, directive, task):
+        self.calls += 1
+        return ExecutionOutcome(
+            status="ok", summary="did it", validation="ok", changed_paths=()
+        )
+
+
+class _RecordingWorkerRepos(WorkerRepoManager):
+    """Records the fetch source every worker repository is seeded from — the
+    second thing that must not happen when a lane's clone is refused."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sources: list[Path] = []
+
+    def create(self, task_id, source_repo_path, base_sha, branch=None):
+        self.sources.append(Path(source_repo_path).resolve())
+        return super().create(task_id, source_repo_path, base_sha, branch=branch)
+
+
+def ok_validation(argv, **kwargs):
+    class Proc:
+        returncode = 0
+        stdout = "All checks passed!\n"
+        stderr = ""
+
+    return Proc()
+
+
+def implement(task_id="t1") -> Directive:
+    return Directive(decision=Decision.IMPLEMENT, reason="go", task_id=task_id)
+
+
+def a_task(task_id="t1") -> Task:
+    return Task(id=task_id, title="T", description="d", approved_paths=("feature.py",))
+
+
+def lane_layout(tmp_path):
+    """A primary checkout and ONE real clone, at lane 1's derived path. Lane 0's
+    directory is left free for whatever each test below plants there."""
+    primary = make_repo_from_template(tmp_path / "repo")
+    root = tmp_path / "observed"
+    root.mkdir(parents=True)
+    head = head_of(primary)
+    lane_b = ObservedCheckout(lane_observed_checkout(root, 1, 2))
+    assert lane_b.synchronize(primary, [head]) == []
+    return primary, root, lane_b, head
+
+
+def dispatching_orchestrator(tmp_path, root, primary, *, lanes, lane_index):
+    """A lane's orchestrator wired the way a real round is — a primary checkout,
+    a worker-repo manager, an executor — so a refusal can be asked the only
+    question that matters about it: did anything run?"""
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=PolicyConfig(implement_enabled=True),
+        state_dir=tmp_path / ".al",
+        workers_root=tmp_path / "workers_root",
+        observed_checkout=root,
+        concurrency=ConcurrencyConfig(lanes=lanes),
+    )
+    store = StateStore(config.state_file)
+    state = LoopState.new(URL)
+    store.save(state)
+    registry = TaskRegistry([a_task()])
+    task_store = TaskStore(
+        config.tasks_file,
+        ledger=mutation_ledger_for(config.workers_root, config.state_dir),
+    )
+    task_store.save(registry)
+    executor = _CountingExecutor()
+    repos = _RecordingWorkerRepos(config.workers_root, tmp_path / "worker-hooks")
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=GitGateway(primary, PolicyEngine(config.policy)),
+        executor=executor,
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=lambda: None,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=ManifestStore(config.manifests_dir),
+        worker_repos=repos,
+        execution_store=TaskExecutionStore(tmp_path / "executions"),
+        intent_store=IntentStore(tmp_path / "intents"),
+        validation_runner=ok_validation,
+        observed_checkout=ObservedCheckout(root),
+        lane_index=lane_index,
+    )
+    return orch, executor, repos
+
+
+def test_two_lanes_symlinked_onto_one_tree_park_before_the_clone_is_touched(tmp_path):
+    """The layout the derivation cannot rule out: `_lane-0` is a symlink to
+    `_lane-1`, so two lexically distinct lane paths are ONE working tree and
+    lane 0 would bracket a tree lane 1 synchronises. The round refuses, and it
+    refuses BEFORE the clone is written to — which is the only refusal worth
+    having, because a `synchronize` that had already run would have rewritten
+    the sibling's tree inside the sibling's window."""
+    primary, root, lane_b, head = lane_layout(tmp_path)
+    (root / lane_id(0)).symlink_to(lane_b.path, target_is_directory=True)
+    orch, executor, repos = dispatching_orchestrator(
+        tmp_path, root, primary, lanes=2, lane_index=0
+    )
+    assert orch._observed.path == lane_b.path, "not vacuous: it really is one tree"
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert executor.calls == 0, "no agent may run in a tree another lane watches"
+    assert repos.sources == [], "and no worker repository may be seeded from one"
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    question = orch.state.question or ""
+    assert "IS another lane's observed checkout" in question, question
+    # BEFORE, not after: lane 1's tree is byte for byte what it was, so nothing
+    # was fetched into it, checked out in it, or left behind in it.
+    assert lane_b.head_sha() == head
+    assert lane_b.residue() == []
+
+
+def test_a_lane_symlinked_inside_a_sibling_is_refused_from_both_sides(tmp_path):
+    """The nested spelling of the same defeat, and both directions of it —
+    either lane may be the one that reaches its boundary first, and a rule that
+    only looked downwards would let the containing lane carry on bracketing a
+    tree its sibling writes to."""
+    primary, root, lane_b, head = lane_layout(tmp_path)
+    inner = lane_b.path / "inner"
+    inner.mkdir()
+    (root / lane_id(0)).symlink_to(inner, target_is_directory=True)
+
+    lane_a_orch, executor_a, repos_a = dispatching_orchestrator(
+        tmp_path, root, primary, lanes=2, lane_index=0
+    )
+    lane_b_orch, _executor_b, _repos_b = dispatching_orchestrator(
+        tmp_path, root, primary, lanes=2, lane_index=1
+    )
+    assert lane_a_orch._observed.path == inner.resolve(), "one tree inside another"
+
+    a_violations = lane_a_orch._lane_isolation_violations()
+    assert a_violations, "a lane inside a sibling's clone is refused"
+    assert "is nested beneath another lane's observed checkout" in a_violations[0]
+    b_violations = lane_b_orch._lane_isolation_violations()
+    assert b_violations, "and so is the sibling that contains it"
+    assert "is nested beneath observed_checkout" in b_violations[0]
+
+    lane_a_orch._dispatch_executor(implement("t1"))
+
+    assert executor_a.calls == 0
+    assert repos_a.sources == []
+    assert lane_a_orch.state.park_kind == "loop_fatal"
+    assert lane_b.head_sha() == head, "the sibling's tree was never established"
+
+
+def test_at_one_lane_the_check_compares_nothing_and_the_round_carries_on(tmp_path):
+    """The acceptance criterion at the new caller. One lane has no siblings, so
+    the comparison is over an empty set, no branch it could park on is reachable,
+    and the boundary does exactly what it did before this existed: it
+    synchronises the configured tree and returns True."""
+    primary = make_repo_from_template(tmp_path / "repo")
+    observed = tmp_path / "observed"
+    orch, _executor, _repos = dispatching_orchestrator(
+        tmp_path, observed, primary, lanes=1, lane_index=0
+    )
+
+    assert orch._observed.path == observed.resolve(), "exactly the configured path"
+    assert orch._lane_isolation_violations() == []
+    assert orch._synchronise_observed_checkout(a_task()) is True
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert ObservedCheckout(observed).head_sha() == head_of(primary)
+
+
+def test_a_retired_lane_at_one_lane_is_still_compared_against_lane_zero(tmp_path):
+    """Where "at one lane nothing is compared" stops being the whole truth,
+    stated rather than left to be found. Lowering `[concurrency] lanes` to 1 does
+    not end the session in lane 1, and lane 0 then resolves to the root that
+    CONTAINS lane 1's clone — two trees that nest, with no attribution between
+    them. Lane 0's own round already refuses that root from the other side
+    (`synchronize`: not the top level of a git repository); this is the same
+    refusal asked by the lane inside it. The acceptance criterion sits in the
+    same test, one line up: the only lane a single-lane deployment HAS compares
+    nothing."""
+    observed = tmp_path / "observed"
+
+    lane_zero = build_orchestrator(tmp_path, lanes=1, lane_index=0, observed=observed)
+    assert lane_zero._lane_isolation_violations() == []
+
+    retired = build_orchestrator(tmp_path, lanes=1, lane_index=1, observed=observed)
+    violations = retired._lane_isolation_violations()
+    assert violations, "a lane whose clone sits inside lane 0's tree is refused"
+    assert "nested beneath another lane's observed checkout" in violations[0]
+
+
+def test_an_isolation_check_that_cannot_answer_refuses_rather_than_passing(tmp_path):
+    """The fail-open this guard is shaped against. "I could not work out whether
+    two lanes share a tree" must never be reported as "they do not" — the alarm
+    that silently switches itself off when its input is unreadable. Provoked
+    through the fleet size the sibling set is derived from, because that is the
+    one input to the derivation this process cannot re-read or repair."""
+    primary, root, lane_b, head = lane_layout(tmp_path)
+    orch, executor, repos = dispatching_orchestrator(
+        tmp_path, root, primary, lanes=2, lane_index=1
+    )
+    assert orch._lane_isolation_violations() == [], (
+        "not vacuous: this layout is the isolated one, and it answers cleanly"
+    )
+
+    orch._observed_lanes = "2"      # a fleet size no derivation can read
+
+    violations = orch._lane_isolation_violations()
+    assert violations and "could not be determined" in violations[0], violations
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert executor.calls == 0, "an unanswerable check runs nothing"
+    assert repos.sources == []
+    assert orch.state.park_kind == "loop_fatal"
+    assert lane_b.head_sha() == head
+
+
+def test_an_orchestrator_assembled_without_init_presents_as_one_lane(tmp_path):
+    """`Orchestrator.__new__` plus a handful of attributes is how several tests
+    in this suite build the carry-forward path, and such an object records
+    neither a fleet size nor the deployment path a fleet's lanes derive from. It
+    is lane 0 of a fleet of one: it compares nothing, which is the answer the
+    single-lane loop gives, rather than raising on an attribute it never set.
+    The one incoherent pair is still refused — a fleet of more than one with
+    nothing to derive its lanes from cannot be answered, and is not passed."""
+    orch = Orchestrator.__new__(Orchestrator)
+    orch._observed = ObservedCheckout(tmp_path / "observed")
+
+    assert orch._lane_isolation_violations() == []
+
+    orch._observed_lanes = 2
+
+    violations = orch._lane_isolation_violations()
+    assert violations, "a fleet with nothing to derive its lanes from is refused"
+    assert "cannot be answered" in violations[0], violations
+
+
+def test_the_sibling_rule_is_one_rule_asked_from_two_places(tmp_path):
+    """The extracted function and the validator's sibling half are the same
+    code, not two copies that agree today — asserted as an equality over every
+    arrangement the rule distinguishes, so a future edit to either has to move
+    both or fail here."""
+    root = tmp_path / "observed"
+    lane_a = lane_observed_checkout(root, 0, 2)
+    repo, state, workers = tmp_path / "repo", tmp_path / ".al", tmp_path / "workers_root"
+
+    for observed, others in (
+        (lane_a, [lane_observed_checkout(root, 1, 2)]),   # isolated
+        (lane_a, [lane_a]),                               # the same tree
+        (lane_a, [root]),                                 # inside a sibling
+        (root, [lane_a]),                                 # containing one
+        (lane_a, [Path("observed/_lane-1")]),             # a relative sibling
+    ):
+        assert validate_observed_checkout(observed, repo, state, workers, others) == (
+            validate_lane_checkout_distinctness(observed, others)
+        ), (observed, others)
+
+    # And the inputs that reach no comparison at all: the two the validator
+    # refuses BEFORE this rule (so it never answers them in a second voice), a
+    # sibling lane that watches nothing, and no siblings at all.
+    assert validate_lane_checkout_distinctness(None, [lane_a]) == []
+    assert validate_lane_checkout_distinctness(Path("relative"), [lane_a]) == []
+    assert validate_lane_checkout_distinctness(lane_a, [None]) == []
+    assert validate_lane_checkout_distinctness(lane_a) == []
