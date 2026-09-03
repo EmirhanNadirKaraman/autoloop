@@ -886,6 +886,74 @@ def resolve_observed_checkout(configured, workers_root) -> Path:
     return observed
 
 
+def lane_observed_checkout(observed, lane_index: int, lanes: int = 1):
+    """WHICH TREE LANE `lane_index` WATCHES, in a fleet of `lanes` (conc-04,
+    docs/AUTOLOOP.md "Decision 1 — the isolation boundary is one observed
+    checkout per lane"). `None` in, `None` out; a `Path` otherwise.
+
+    `resolve_observed_checkout` above answers "where does this DEPLOYMENT keep
+    its observed checkout"; this answers "which of them is THIS LANE's", and the
+    two are the same path in exactly one case:
+
+      * **`lane_index == 0` and `lanes <= 1`** -> `observed` itself, byte for
+        byte, expanded and absolute exactly as it was resolved. That is the
+        acceptance criterion the whole split carries, made structural: at one
+        lane no clone moves, no new directory exists, and every existing reader
+        of `[paths].observed_checkout` is looking at the tree the loop watches.
+      * **anything else** -> `observed/<lane_id(lane_index)>`, siblings under
+        the configured path.
+
+    THE ASYMMETRY IS ON THE FLEET SIZE, NOT ON THE INDEX, and that is the one
+    place this deliberately departs from `state.lane_paths` (which keeps lane 0
+    at `state_dir` and nests lanes *k>0* under `state_dir/lanes/`). A state file
+    beside a `lanes/` directory is two files; a CLONE containing another lane's
+    CLONE is one tree inside another, so lane 1's whole working tree would show
+    up in lane 0's `residue()` and in lane 0's escape-detector window — the
+    misattribution this candidate exists to remove, rebuilt inside its own fix,
+    and refused outright by `worker_env.validate_observed_checkout`'s
+    `other_lane_checkouts` rule. So above one lane EVERY lane nests, lane 0
+    included, and no lane is ever the parent of another.
+
+    A LANE OUTSIDE THE CAP STILL GETS ITS OWN TREE. The condition is `lane_index
+    == 0 and lanes <= 1`, not `lane_index >= lanes`, so lane 3 of a fleet an
+    operator has cut to 1 resolves to `observed/_lane-3` and never collapses onto
+    lane 0's tree. Two live lanes sharing one clone is the exact fail-open here
+    (a `retired_lane_occupants` session is precisely the lane that would still be
+    running while the cap says it does not exist), and it is worth one derived
+    directory that nobody is watching to make it unreachable.
+
+    TWO TRANSITION RESIDUALS, stated rather than solved, because both are inert
+    or fail-closed and neither is this candidate's to fix:
+
+      * raising `lanes` 1 -> N leaves the old single-lane clone AT the configured
+        path, no longer watched by anything, with the new per-lane clones created
+        inside it. Nothing observes the parent, so nothing is misattributed; it
+        is disk an operator can remove.
+      * lowering N -> 1 points lane 0 back at the configured path, which by then
+        holds the `_lane-*` directories. `ObservedCheckout.synchronize` refuses
+        it (`is_repo` is False, and residue is refused before anything is fetched
+        or checked out) and the round parks rather than observing it.
+
+    `lane_index` is validated by `lane_id` FIRST, unconditionally, for the reason
+    `state.lane_paths` gives: a bool or a float would otherwise be a second
+    spelling of an existing lane's directory. `lanes` is held to the same
+    standard — a bool, a non-integer or a value below one is refused rather than
+    read as "one lane", since "one lane" is the single reading under which lane 0
+    keeps the shared path.
+    """
+    name = lane_id(lane_index)
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+        raise ValueError(
+            f"the fleet size must be an integer of at least 1, got {lanes!r}"
+        )
+    if observed is None:
+        return None
+    observed = Path(observed)
+    if lane_index == 0 and lanes <= 1:
+        return observed
+    return observed / name
+
+
 def workers_root_from(raw) -> Path:
     """`[paths].workers_root` as a validated absolute `Path`.
 
@@ -1087,6 +1155,13 @@ class AutoloopConfig:
     #: before, unchanged. `load_config` always resolves a real one (the default
     #: is derived from `workers_root`, which is mandatory), so every deployment
     #: that goes through the CLI gets the dedicated tree.
+    #:
+    #: THE DEPLOYMENT's tree, which above one lane is the parent of the lanes'
+    #: own clones rather than a clone itself — `lane_observed_checkout` turns
+    #: this value into the one a given lane watches, and at `lanes = 1` the two
+    #: are the same path. Every reader that means "the tree THIS lane observes"
+    #: has to go through that function; this field alone is the configured
+    #: location and nothing more.
     #:
     #: Appended AFTER `migration_notices` on purpose, despite that field's own
     #: "last field" comment: adding a field anywhere earlier would shift the

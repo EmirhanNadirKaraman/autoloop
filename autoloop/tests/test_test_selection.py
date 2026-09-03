@@ -609,7 +609,12 @@ FLOOR_AFTER = 16
 #: `run_git` hands an unreadable argv to `subprocess.run` with no interpreter
 #: literal anywhere in the file — so neither term of the opacity rule above
 #: holds and 20 and 24 are unchanged once more.
-SUITE_SIZE = 110
+#: 110 -> 111 when conc-04b added `test_lane_observed_checkout.py` (2026-09-03),
+#: the DENOMINATOR again: it names `docs/AUTOLOOP.md`, which is not one of the
+#: change-note trackers a docs-only round changes, resolves no `__file__`, and
+#: borrows `gitrepo.run_git` without an interpreter literal of its own — so 20
+#: and 24 are unchanged once more.
+SUITE_SIZE = 111
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
