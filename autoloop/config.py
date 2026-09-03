@@ -703,6 +703,41 @@ class ConcurrencyConfig:
     rate_limit_release_jitter_seconds: float = 5.0
 
 
+#: The default `[context] max_records`, and the number a deployment that never
+#: writes the section runs with.
+#:
+#: HOW IT WAS CHOSEN, because a budget nobody can justify is a number that gets
+#: raised the first time it binds. A selection begins with the ids a task names
+#: explicitly and expands only along relations somebody wrote down, so the
+#: ordinary shape is a handful of seeds and their immediate neighbourhood.
+#: Twenty-five is comfortably above that and small enough that binding is an
+#: event a reviewer notices in the report rather than a routine truncation —
+#: which is the whole point of the setting, since the failure it prevents is
+#: silent truncation and not a large selection.
+DEFAULT_CONTEXT_MAX_RECORDS = 25
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    """`[context]` — how much context one selection may carry (ctx-03).
+
+    ONE key, and deliberately one: the resolver
+    (`context_resolver.resolve_context`) is pure given its inputs and takes its
+    record directory, its seed list and its revision as ARGUMENTS. Adding a
+    `records_dir` here would put half the resolver's inputs in a config file
+    and half in a call, and the wiring that decides where records live is
+    ctx-04's.
+    """
+
+    #: The most records one resolution may return. When it binds, the resolver
+    #: drops by a stated rule — (depth from seed, kind, id) — and reports every
+    #: dropped record, its rank and that rule. Values below 1 are REFUSED at
+    #: load rather than clamped: a budget of zero returns nothing while reading
+    #: as configured, which is exactly the silent truncation the reporting
+    #: exists to prevent.
+    max_records: int = DEFAULT_CONTEXT_MAX_RECORDS
+
+
 #: The longest `[notify].timeout_seconds` this loop will accept. The round pays
 #: this wait whenever the SMTP server stops answering, so it is bounded here
 #: rather than left to an operator's typo: a notification is an accessory and
@@ -1196,6 +1231,12 @@ class AutoloopConfig:
     #: `notify` for the reason `observed_checkout`'s own comment gives: the
     #: positional meaning of every field before it must not move.
     concurrency: ConcurrencyConfig = ConcurrencyConfig()
+    #: `[context]` — the context-selection budget (ctx-03, 2026-09-03).
+    #: Defaulted, and appended AFTER `concurrency` for the reason
+    #: `observed_checkout`'s own comment gives: the positional meaning of every
+    #: field before it must not move, because the direct `AutoloopConfig(...)`
+    #: sites across the suite are not all keyword-only.
+    context: ContextConfig = ContextConfig()
 
     @property
     def state_file(self) -> Path:
@@ -1416,7 +1457,7 @@ class AutoloopConfig:
 
 _SECTIONS = {
     "browser", "policy", "paths", "conversation", "codex", "executor", "audit",
-    "repo", "autonomy", "projects", "notify", "concurrency",
+    "repo", "autonomy", "projects", "notify", "concurrency", "context",
 }
 
 
@@ -2107,6 +2148,52 @@ def _load_release_jitter(raw: dict) -> float:
     return float(value)
 
 
+def _load_context_section(data: dict) -> ContextConfig:
+    """`[context]`, validated. Absent means `ContextConfig()` — the default
+    budget, which is every config file written before this section existed.
+
+    Shape first, exactly as `_load_concurrency_section` does it: `context = 5`
+    written as a bare key gets this loader's own error naming the section
+    rather than `_check_keys` reporting the digits as unknown keys. Nothing is
+    clamped — a budget the loop would not run is refused, so a typo can never
+    read as configured while a different number binds.
+    """
+    raw = data.get("context", {})
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[context] must be a table, got {raw!r} — write it as a section "
+            "header (`[context]` followed by `max_records = "
+            f"{DEFAULT_CONTEXT_MAX_RECORDS}`), not as a bare key"
+        )
+    _check_keys("context", raw, {f.name for f in dataclasses.fields(ContextConfig)})
+    if "max_records" not in raw:
+        return ContextConfig()
+    value = raw["max_records"]
+    # `bool` BEFORE `int`, exactly as `concurrency.lanes` orders it and for the
+    # same reason: `True` IS an int and is `>= 1`, so an unguarded check would
+    # accept `max_records = true` as a budget of one record.
+    if isinstance(value, bool) or not isinstance(value, int):
+        extra = (
+            " A boolean is refused rather than read as its integer value: this "
+            "is a COUNT of records, not a switch."
+            if isinstance(value, bool)
+            else ""
+        )
+        raise ConfigError(
+            f"context.max_records must be an integer number of records, got "
+            f"{value!r}." + extra + " Delete the key entirely for the default of "
+            f"{DEFAULT_CONTEXT_MAX_RECORDS}."
+        )
+    if value < 1:
+        raise ConfigError(
+            f"context.max_records must be at least 1, got {value!r} — there is "
+            "no 'unlimited' value and no 'off' value here. A budget of zero "
+            "would return no context at all while reading as configured, which "
+            "is the silent truncation this setting exists to make impossible."
+        )
+    return ContextConfig(max_records=value)
+
+
 def load_config(path: Path) -> AutoloopConfig:
     path = Path(path)
     if not path.exists():
@@ -2343,6 +2430,7 @@ def load_config(path: Path) -> AutoloopConfig:
     projects = _load_projects_section(data)
     notify = _load_notify_section(data)
     concurrency = _load_concurrency_section(data)
+    context = _load_context_section(data)
 
     return AutoloopConfig(
         browser=browser,
@@ -2362,4 +2450,5 @@ def load_config(path: Path) -> AutoloopConfig:
         projects=projects,
         notify=notify,
         concurrency=concurrency,
+        context=context,
     )
