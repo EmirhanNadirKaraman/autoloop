@@ -278,6 +278,7 @@ def validate_observed_checkout(
     repo_root: Path,
     state_dir: Path,
     workers_root: Path | None,
+    other_lane_checkouts=(),
 ) -> list[str]:
     """Human-readable violations in `observed` as the LOOP-OWNED tree the
     escape detector watches (esc-02). Empty means it is safe to use.
@@ -303,6 +304,30 @@ def validate_observed_checkout(
         an observed checkout with `workers_root` (or the state dir) inside it
         would put every worker repo and every loop state write back inside the
         snapshot, i.e. re-create port-01's bug on the new tree.
+
+    `other_lane_checkouts` — ANY OTHER LANE'S OBSERVED CHECKOUT (conc-04,
+    docs/AUTOLOOP.md "Decision 1"), and the rule is the whole of that decision:
+    a lane's clone must not BE, must not be nested beneath, and must not
+    CONTAIN another lane's. It is the same `_is_nested` test in both directions
+    the boundaries above already get, extended to siblings, and it fails the
+    same way — a violation, never a repair. Two lanes sharing (or nesting) one
+    tree means lane B's `synchronize` rewrites the working tree lane A is
+    bracketing, which `escape_detector` reports truthfully as every path in the
+    repository and attributes to A: the loop-fatal misattribution per-lane
+    isolation exists to remove.
+
+    EMPTY BY DEFAULT, and at `lanes = 1` that is the only value there is: one
+    lane has no siblings, so every existing caller passes four arguments and
+    gets today's answer. Above one lane it is NOT merely a restatement of
+    `config.lane_observed_checkout`'s derivation, and the reason is on
+    `validate_lane_checkout_distinctness` below, which is this rule extracted so
+    that `orchestrator._lane_isolation_violations` can ask it once per round
+    before anything is synchronised: the derivation makes two lanes' NAMES
+    distinct, and a symlink makes two distinct names one directory. It also
+    refuses a lane set assembled some other way — the fleet supervisor's, an
+    operator's hand-written layout, or a future candidate's. A path that is not
+    absolute is refused rather than resolved against the caller's cwd, for the
+    reason `observed` itself is.
     """
     if observed is None:
         return []
@@ -365,6 +390,93 @@ def validate_observed_checkout(
                 f"({resolved}) — anything written there would land inside the "
                 "tree the escape detector snapshots, which is exactly the "
                 "confusion the dedicated checkout exists to remove"
+            )
+
+    violations.extend(
+        validate_lane_checkout_distinctness(observed, other_lane_checkouts)
+    )
+    return violations
+
+
+def validate_lane_checkout_distinctness(
+    observed: Path | None, other_lane_checkouts=()
+) -> list[str]:
+    """THE SIBLING HALF of `validate_observed_checkout` above, on its own so a
+    caller that already knows the deployment-wide boundaries are satisfied can
+    ask only the question that is per-lane: is THIS lane's clone a tree no other
+    lane also watches?
+
+    One PRODUCTION caller — `orchestrator._lane_isolation_violations`, which runs
+    on every round before the clone is synchronised or an agent is started — plus
+    `validate_observed_checkout` above, which delegates its sibling branch here
+    so there is one implementation of the rule rather than two that agree today.
+
+    It asks the sibling question ALONE, and deliberately: the boundary rules
+    above are already enforced at the one place that builds a dispatching
+    orchestrator (`cli._build_orchestrator`), and every lane path is a CHILD of
+    the path checked there, so re-asking them from the round would repeat an
+    answer already given — while requiring a `repo_root` the round would have to
+    supply a stand-in for, manufacturing a boundary violation out of the stand-in.
+    What is NOT asked anywhere else in production is this rule, and a rule with no
+    production caller is a rule that never fires.
+
+    RESOLVED ON BOTH SIDES, which is the whole reason this compares paths rather
+    than trusting `config.lane_observed_checkout`'s derivation. Two lexically
+    distinct siblings can be one tree: `_lane-0` may be a symlink to `_lane-1`,
+    or to something inside it, and a derivation is a statement about names while
+    isolation is a claim about directories. `Path.resolve` collapses both, so the
+    equal case and both nesting directions are caught on the paths git will
+    actually write to.
+
+    A sibling that is `None` is skipped (a lane that watches nothing shares no
+    tree); one that is not absolute is a VIOLATION rather than something to
+    resolve against this process's cwd, for the reason `observed` itself is held
+    to. `observed` being `None` or relative yields `[]` here — not because either
+    is acceptable, but because `validate_observed_checkout` refuses both before
+    it ever reaches this rule, and answering them twice in two different voices
+    is how two checks come to disagree.
+    """
+    if observed is None:
+        return []
+    observed = Path(observed)
+    if not observed.is_absolute():
+        return []
+    resolved = observed.resolve()
+
+    violations: list[str] = []
+    for other in other_lane_checkouts or ():
+        if other is None:
+            continue
+        other_path = Path(other)
+        if not other_path.is_absolute():
+            violations.append(
+                f"another lane's observed_checkout ({other_path}) is not an "
+                "absolute path, so whether it is the same tree as "
+                f"{resolved} depends on the cwd of whoever asks — refusing "
+                "rather than resolving it against this process's own"
+            )
+            continue
+        other_resolved = other_path.resolve()
+        if other_resolved == resolved:
+            violations.append(
+                f"observed_checkout ({resolved}) IS another lane's observed "
+                "checkout — two lanes sharing one clone means each lane's "
+                "synchronisation rewrites the tree the other one is watching, "
+                "and every path in it is then reported against the wrong lane"
+            )
+        elif _is_nested(resolved, other_resolved):
+            violations.append(
+                f"observed_checkout ({resolved}) is nested beneath another "
+                f"lane's observed checkout ({other_resolved}) — everything this "
+                "lane writes lands inside the tree that lane's escape detector "
+                "brackets, which attributes this lane's work to that one"
+            )
+        elif _is_nested(other_resolved, resolved):
+            violations.append(
+                f"another lane's observed checkout ({other_resolved}) is nested "
+                f"beneath observed_checkout ({resolved}) — everything that lane "
+                "writes lands inside the tree this lane's escape detector "
+                "brackets, which attributes that lane's work to this one"
             )
     return violations
 
@@ -615,6 +727,21 @@ class ObservedCheckout:
     fetch source recorded in `.git/FETCH_HEAD`, and after this it names this
     clone. An agent that follows it lands somewhere watched.
 
+    ONE PER LANE, NOT ONE PER LOOP (conc-04, docs/AUTOLOOP.md "Decision 1").
+    Above one lane every lane holds its OWN instance of this class, at its own
+    directory (`for_lane` below, over `config.lane_observed_checkout`'s rule),
+    and the three things esc-02 moved onto this tree move onto THAT lane's copy
+    of it: the snapshots that bracket its agent, its clean-baseline precondition,
+    and the fetch source of the worker repositories it creates. Nothing in this
+    class changed to make that true — every method already works on `self.path`
+    and names no deployment-wide location — and nothing about a single lane
+    changed either, because at `lanes = 1` `for_lane` hands back this very
+    object. What it buys is the attribution: `synchronize` rewrites a whole
+    working tree, so two lanes on one clone would put lane B's checkout inside
+    lane A's snapshot window, and the FETCH_HEAD argument above becomes per-lane
+    in the same step — an agent following the only absolute path it was handed
+    lands in ITS OWN lane's watched tree.
+
     SYNCHRONISATION IS THE HARD PART, and every answer is fail-safe — this
     class never returns "fine" for a tree it could not establish:
 
@@ -655,6 +782,30 @@ class ObservedCheckout:
         # directory, and as a `git fetch` source spelled to another repo.
         self.path = Path(path).resolve()
         self._runner = runner or subprocess.run
+
+    def for_lane(self, lane_index: int, lanes: int = 1) -> "ObservedCheckout":
+        """This deployment's observed checkout AS LANE `lane_index` sees it, in
+        a fleet of `lanes` — the path rule is `config.lane_observed_checkout`'s
+        and is argued there.
+
+        `self` itself, the same object, whenever the lane's path is this one:
+        lane 0 at `lanes <= 1`, which is every deployment today. That is not an
+        optimisation — a new instance would drop `runner`, and a caller that
+        injected one to make a git failure testable would silently get the real
+        `subprocess.run` back, which is the shape of a guard switching itself
+        off. For the same reason the derived instance carries `runner` forward.
+
+        `config` is imported HERE rather than at module level, the way
+        `state.lane_paths` imports `config.lane_id`: this module is deliberately
+        importable on its own, and the lane vocabulary is the only thing it needs
+        from the config layer.
+        """
+        from .config import lane_observed_checkout
+
+        path = lane_observed_checkout(self.path, lane_index, lanes)
+        if Path(path) == self.path:
+            return self
+        return ObservedCheckout(path, runner=self._runner)
 
     # ---- primitives ---------------------------------------------------------
 

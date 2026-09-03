@@ -352,7 +352,12 @@ from .blockers import (
     refusal_identity,
 )
 from .changeset_review import ChangesetBinding, build_changeset_packet
-from .config import LANE_ID_PREFIX, AutoloopConfig, lane_id
+from .config import (
+    LANE_ID_PREFIX,
+    AutoloopConfig,
+    lane_id,
+    lane_observed_checkout,
+)
 from .context import build_context, render_context
 from .conversation import (
     SendOutcome,
@@ -427,6 +432,7 @@ from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
 from .worker_env import (
     ObservedCheckout,
+    validate_lane_checkout_distinctness,
     verify_worker_isolation,
     worker_env,
     worker_repo_is_reusable,
@@ -2144,6 +2150,10 @@ class Orchestrator:
         #: `cli._build_orchestrator` always wires one (the default location is
         #: derived from the mandatory `workers_root`), so production is always
         #: on the dedicated tree.
+        #:
+        #: NARROWED TO THIS LANE'S OWN CLONE further down, once `lane_index` has
+        #: been validated — see that block. What is stored here is what the
+        #: caller passed; what the round uses is the lane's.
         self._observed = observed_checkout
         #: Built once, lazily, by `_observation_git` — a `GitGateway` rooted at
         #: the clone. Cached because `enumerate_checkout_paths` runs twice per
@@ -2241,6 +2251,43 @@ class Orchestrator:
         #: lanes. The path belongs to whoever built the store.
         self.lane_index = lane_index
         self.lane_id = lane_id(lane_index)
+        #: AND THE TREE THIS LANE WATCHES (conc-04, docs/AUTOLOOP.md "Decision 1
+        #: — the isolation boundary is one observed checkout per lane"). Derived
+        #: HERE, after `lane_id` above has refused a bool/float/negative index,
+        #: because a lane whose id is `_lane-True` would otherwise name a
+        #: directory beside a real lane's clone.
+        #:
+        #: The caller hands over the DEPLOYMENT's observed checkout — the one
+        #: `[paths].observed_checkout` resolves to — and this narrows it to the
+        #: lane's own (`ObservedCheckout.for_lane`). At lane 0 with `lanes <= 1`
+        #: it is the very object that was passed, unchanged and with the caller's
+        #: `runner` intact, so today's single-lane deployment and every
+        #: hand-built Orchestrator in the suite watch exactly the tree they were
+        #: given. Above one lane every lane gets its own sibling clone, and the
+        #: three things that follow `self._observed` — the snapshots in
+        #: `_execute_with_escape_detection`, the baseline in
+        #: `_prepare_write_capable_worker`, and `_worker_fetch_root` — follow it
+        #: there together, which is what stops one lane's sync landing inside
+        #: another's window.
+        #:
+        #: ONCE, at construction, rather than per call: this is the identity of
+        #: a tree on disk, and a lane that changed which clone it watched
+        #: mid-round would compare a "before" snapshot of one repository against
+        #: an "after" of another. The fleet size is read through `_fleet_lanes`,
+        #: the same defensive reading every other fleet-aware site here uses, so
+        #: a hand-built config with no `[concurrency]` section is one lane.
+        #:
+        #: THE DEPLOYMENT's path and the fleet size are KEPT, both read exactly
+        #: once and here, because `_lane_isolation_violations` has to derive the
+        #: OTHER lanes' clones from the same two values this lane's own path came
+        #: from. A second `_fleet_lanes()` read at sync time would let a config
+        #: that changed underneath this process compare a lane path derived from
+        #: one fleet size against siblings derived from another — a check that
+        #: answers about a layout neither lane is in.
+        self._observed_root = self._observed.path if self._observed is not None else None
+        self._observed_lanes = self._fleet_lanes()
+        if self._observed is not None:
+            self._observed = self._observed.for_lane(lane_index, self._observed_lanes)
         #: Phase steps this orchestrator has actually taken, across every call
         #: to `run`. Public, and read by `cli._remaining_steps`.
         self.steps_taken = 0
@@ -9395,14 +9442,16 @@ class Orchestrator:
     def _worker_fetch_root(self) -> Path:
         """Where a worker repository's content is fetched FROM.
 
-        The observed clone once one is wired, and this is load-bearing rather
-        than tidy. A worker repo records its fetch source in `.git/FETCH_HEAD`,
-        so it is the one absolute path to a non-worker tree that an agent
-        inside a worker can read off disk. Pointing it at the clone means the
-        tree an agent can most easily find its way back to is the tree the
-        detector is watching — without which "a genuine escape is still
-        reported" would be a hope about paths nobody handed out rather than a
-        property of the arrangement.
+        The observed clone once one is wired — THIS LANE's clone since conc-04
+        (`__init__`'s `for_lane`) — and this is load-bearing rather than tidy. A
+        worker repo records its fetch source in `.git/FETCH_HEAD`, so it is the
+        one absolute path to a non-worker tree that an agent inside a worker can
+        read off disk. Pointing it at the clone means the tree an agent can most
+        easily find its way back to is the tree the detector is watching — and,
+        above one lane, the tree ITS OWN lane's detector is watching, so a
+        worker's own provenance never names a sibling lane. Without it "a genuine
+        escape is still reported" would be a hope about paths nobody handed out
+        rather than a property of the arrangement.
 
         Only ever consulted AFTER `_synchronise_observed_checkout` has
         succeeded for this round, which is what guarantees the commit being
@@ -9427,6 +9476,93 @@ class Orchestrator:
             return self._observed_synced_sha
         return self._git.head_sha()
 
+    def _lane_isolation_violations(self) -> list[str]:
+        """Is the tree this lane is about to synchronise and bracket a tree only
+        THIS lane writes to? Human-readable violations; empty means yes.
+
+        THE PRODUCTION CALLER of `worker_env.validate_lane_checkout_distinctness`
+        — the rule Decision 1 states as the whole claim, asked where it can still
+        stop something: `_synchronise_observed_checkout` runs it before the clone
+        is fetched into, checked out, or bracketed, and a violation parks the
+        round with nothing executed. A rule only a validator function knows is a
+        rule that never fires.
+
+        The siblings are DERIVED, from the two values `__init__` recorded — the
+        deployment's configured checkout and the fleet size this lane's own path
+        was derived against — so the set asked about is exactly the set of trees
+        the other lanes of this fleet resolve to. Every lane index in the fleet
+        except this one; a lane whose index is at or above the cap (an operator
+        lowered `[concurrency] lanes` and the sessions above it did not stop —
+        `retired_lane_occupants`) still asks about every in-cap lane, because
+        `range` is over the fleet rather than over this index.
+
+        EMPTY FOR LANE 0 AT ONE LANE, structurally: `range(1)` minus lane 0 is
+        no siblings at all, so the single-lane loop — whose only lane is lane 0 —
+        makes no comparison, reaches no new branch, and cannot park for a reason
+        that did not exist before. That is the acceptance criterion the whole
+        split carries, and it is why this is a `for` over a derived range rather
+        than a special case for `lanes == 1`.
+
+        THE ONE PLACE THAT IS NOT THE WHOLE FLEET, stated because it is the case
+        a reader will look for: a RETIRED lane (index at or above the cap, its
+        session still running because lowering the cap does not end one) is
+        compared against the in-cap lanes, and at `lanes = 1` lane 0 resolves to
+        the very root its clone sits inside — so it refuses. That is the answer
+        this rule is for rather than an accident of it: lane 0's round refuses
+        the same layout from the other side already (`ObservedCheckout.
+        synchronize` on a root full of `_lane-*` directories is not a repository),
+        and two lanes whose trees nest have no attribution between them whichever
+        of the two asks first.
+
+        FAIL-CLOSED ON ITS OWN FAILURE. Anything the derivation or the resolution
+        raises — a `resolve()` that meets a symlink loop, a lane id a future
+        build refuses, an `OSError` off a vanished parent — becomes a violation
+        naming the exception. "I could not tell whether two lanes share a tree"
+        must not be read as "they do not", which is the shape of every guard in
+        this file that switches itself off when its input is unavailable.
+
+        THE THREE INPUTS ARE READ THROUGH `getattr`, and the defaults are the
+        SINGLE-LANE LOOP rather than a shrug. An orchestrator assembled with
+        `Orchestrator.__new__` and a handful of attributes — which is how several
+        tests build the carry-forward path — has no fleet and no deployment path
+        recorded, so it presents as lane 0 of a fleet of one and compares
+        nothing, which is the answer the real single-lane loop gives. What is NOT
+        forgiven is the incoherent pair: an object claiming a fleet of more than
+        one while carrying no path to derive that fleet's lanes from cannot be
+        answered at all, and is refused rather than passed.
+        """
+        observed = self._observed
+        if observed is None:
+            return []
+        lanes = getattr(self, "_observed_lanes", 1)
+        root = getattr(self, "_observed_root", None)
+        this_lane = getattr(self, "lane_index", 0)
+        if root is None:
+            if lanes == 1:
+                return []       # one lane has no siblings, derived or otherwise
+            return [
+                f"this lane is one of {lanes!r} but carries no configured "
+                "observed checkout to derive the other lanes' clones from, so "
+                "whether it watches a tree of its own cannot be answered — "
+                "refusing rather than assuming it does"
+            ]
+        try:
+            others = [
+                lane_observed_checkout(root, index, lanes)
+                for index in range(lanes)
+                if index != this_lane
+            ]
+            if not others:
+                return []
+            return validate_lane_checkout_distinctness(observed.path, others)
+        except Exception as exc:  # noqa: BLE001 - any failure here is a refusal
+            return [
+                "whether this lane's observed checkout is a tree only this lane "
+                f"watches could not be determined ({exc!r}), so it is refused: a "
+                "lane isolation check that cannot answer must not be read as "
+                "'the lanes are isolated'"
+            ]
+
     def _synchronise_observed_checkout(self, task: Task, *shas: str) -> bool:
         """Bring the loop-owned clone to the primary checkout's current head
         (plus any extra `shas` a resumed round still needs present), at the
@@ -9443,6 +9579,15 @@ class Orchestrator:
         A no-op returning True when no clone is wired. That is the pre-esc-02
         deployment, which observes the primary checkout and has nothing to
         synchronise — not a failure to fall back from.
+
+        AND THE PLACE THE PER-LANE RULE IS ASKED (conc-04, Decision 1), before
+        the synchronisation rather than beside it: `_lane_isolation_violations`
+        refuses a clone another lane also watches, and it refuses it here because
+        this is the last moment at which nothing has been written to that tree
+        yet. Its violations take the same park as every other one below — same
+        `loop_fatal` kind, same `observed_checkout_unusable` code — because they
+        are the same fact about the same round: the tree this loop was going to
+        bracket is not one it can attribute writes in.
         """
         # Cleared FIRST, unconditionally: a value left over from an earlier
         # dispatch would let `_observed_base_sha` hand this round a commit the
@@ -9451,15 +9596,26 @@ class Orchestrator:
         if self._observed is None:
             return True
         head = ""
-        try:
-            head = self._git.head_sha()
-        except (GitError, OSError) as exc:
-            violations = [
-                "the primary checkout's head could not be read, so there is no "
-                f"commit to synchronise the observed checkout to: {exc}"
-            ]
-        else:
-            violations = self._observed.synchronize(self._git.repo_root, [head, *shas])
+        # LANE ISOLATION FIRST, and structurally first rather than by comment:
+        # `synchronize` below rewrites a whole working tree, so a clone another
+        # lane also watches must be refused BEFORE a byte of it is fetched or
+        # checked out — after that the sibling's window has already been
+        # contaminated and nothing can un-report it. Nothing here is compared at
+        # one lane (`_lane_isolation_violations` derives no siblings), so this
+        # branch is unreachable in today's single-lane loop.
+        violations = self._lane_isolation_violations()
+        if not violations:
+            try:
+                head = self._git.head_sha()
+            except (GitError, OSError) as exc:
+                violations = [
+                    "the primary checkout's head could not be read, so there is "
+                    f"no commit to synchronise the observed checkout to: {exc}"
+                ]
+            else:
+                violations = self._observed.synchronize(
+                    self._git.repo_root, [head, *shas]
+                )
         if not violations:
             self._observed_synced_sha = head
             return True
@@ -9486,8 +9642,9 @@ class Orchestrator:
         checkout taken immediately before and immediately after the call,
         nothing wider.
 
-        "Observed" is the loop-owned clone since esc-02 (2026-08-26), and the
-        primary checkout only for a deployment that wires none — see
+        "Observed" is the loop-owned clone since esc-02 (2026-08-26) — THIS
+        LANE's clone since conc-04, which is the same tree at one lane — and the
+        primary checkout only for a deployment that wires none; see
         `_observation_git`, `_synchronise_observed_checkout` and
         `worker_env.ObservedCheckout`. The change is not to WHAT is watched
         (tracked + untracked + ignored, unchanged and deliberately not
