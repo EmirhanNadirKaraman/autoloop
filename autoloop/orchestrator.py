@@ -2342,6 +2342,12 @@ def _lane_clone_violations(dead: DeadLane, config, observed, lanes) -> tuple[lis
     Reading either as a fault would park every lane whose clone a death
     interrupted before it existed.
 
+    THE DISTINCTNESS QUESTION IS ASKED BEFORE EVERY OTHER ONE, of every lane
+    this deployment holds state for rather than of the lanes the cap describes —
+    `_sibling_lane_checkouts`, which unions the retired indices in, because the
+    lane being recovered is frequently one of them and so is the lane its clone
+    can alias.
+
     `for_lane` derives the lane's own tree rather than a hand-built
     `ObservedCheckout`, for the reason that method's docstring gives: a new
     instance drops an injected `runner`, and a guard that silently gets the real
@@ -2359,16 +2365,20 @@ def _lane_clone_violations(dead: DeadLane, config, observed, lanes) -> tuple[lis
         # this claim's own failure, committed by the code that exists to protect
         # it. `_lane-0` symlinked onto `_lane-1` is exactly the layout, and it is
         # a REFUSAL rather than a park: nothing is established, so nothing is
-        # touched, and the fault is not lost — `_lane_isolation_violations` parks
-        # on it, lane-fatally, at the next dispatch into either lane.
-        problems = validate_lane_checkout_distinctness(
-            path,
-            [
-                lane_observed_checkout(observed.path, index, lanes)
-                for index in range(lanes)
-                if index != dead.lane_index
-            ],
+        # touched, and the fault is named every tick, by lane and by directory,
+        # in the `lane_recovered` entry this refusal becomes. It is NOT left to
+        # the next dispatch to catch — `_lane_isolation_violations` compares
+        # against the IN-CAP lanes only, and a lane above the cap never
+        # dispatches at all (`HOLD_LANE_RETIRED`) — so for two RETIRED lanes
+        # sharing one tree this refusal is the whole of the answer, which is
+        # why `_sibling_lane_checkouts` asks about every lane that EXISTS
+        # rather than every lane the cap describes.
+        others, unlistable = _sibling_lane_checkouts(
+            observed.path, dead, config, lanes
         )
+        if unlistable:
+            return [], unlistable
+        problems = validate_lane_checkout_distinctness(path, others)
         if problems:
             return [], (
                 f"lane {dead.lane_id}'s observed checkout is not a tree only "
@@ -2413,6 +2423,54 @@ def _lane_clone_violations(dead: DeadLane, config, observed, lanes) -> tuple[lis
             "the clone."
         ], ""
     return [], ""
+
+
+def _sibling_lane_checkouts(root, dead: DeadLane, config, lanes: int):
+    """`(others, refusal)` — the observed clone of every lane that is NOT `dead`,
+    for the distinctness question `_lane_clone_violations` asks before it reads a
+    dead lane's tree at all.
+
+    EVERY LANE THAT EXISTS, NOT EVERY LANE THE CAP DESCRIBES, and that is the
+    whole reason this is a function rather than a `range`. The recovery walks
+    `dead_lane_survey`'s own order — the lanes inside the cap, then the lanes a
+    LOWERED cap cut out of the fleet — so the lane being recovered can itself be
+    a retired one, and so can the lane its clone turns out to alias. Deriving the
+    siblings from `range(lanes)` alone compares a retired lane against the in-cap
+    lanes and against nothing else, so two RETIRED clones that resolve to one
+    tree pass the check: `residue()` then runs `git status` inside the OTHER
+    retired lane's repository and refreshes its `.git/index` — one lane's
+    recovery writing into another, committed by the guard written to prevent it.
+    The two sources are disjoint by construction, because `_retired_lane_indices`
+    drops every index the same `lanes` `range` already covers.
+
+    FAIL-CLOSED ON THE LISTING, as `fleet_stop` and `dead_lane_survey` are with
+    the identical scan: a `lanes/` directory that cannot be listed means which
+    other lanes exist is UNKNOWN, which is not "there are none". The caller then
+    touches that lane in no way whatsoever — no git runs, no park is written, the
+    lease stays — and says so every tick.
+
+    THE RESIDUAL, stated where the code is: the set is derived from the STATE
+    directory, so a clone at `<root>/_lane-7` with no `lanes/_lane-7/` behind it
+    — a lane whose state an operator removed and whose tree they did not — is not
+    in it, and a dead lane aliased onto that tree would still be read. Listing
+    the observed ROOT instead would close that class and is deliberately not done
+    here: it answers a question about lanes with a listing of a tree whose layout
+    the loop does not own, and it needs an unlistable-root refusal of its own.
+    Every lane this deployment holds state for is covered.
+    """
+    retired = _retired_lane_indices(config.state_dir, lanes)
+    if retired is None:
+        return [], (
+            f"whether lane {dead.lane_id}'s observed checkout is a tree only "
+            f"that lane watches could not be established — {LANES_DIRNAME}/ "
+            "could not be listed, so which other lanes exist is unknown — and "
+            "nothing about that lane was read or changed"
+        )
+    return [
+        lane_observed_checkout(root, index, lanes)
+        for index in (*range(lanes), *retired)
+        if index != dead.lane_index
+    ], ""
 
 
 def _park_dead_lane(dead: DeadLane, config, violations, blockers) -> tuple[str, str]:

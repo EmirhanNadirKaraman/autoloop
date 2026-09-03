@@ -1024,7 +1024,13 @@ on any lane's lease, so one corrupt lease cannot stop the fleet merging. The
 CLONE is asked before either, by `_lane_clone_violations`, and only of a lane the
 recovery is about to reopen a round in: the read-only half of `synchronize`'s
 refusals — present but not a repository, and residue, including residue nobody
-could read — over that lane's own tree via `ObservedCheckout.for_lane`. A
+could read — over that lane's own tree via `ObservedCheckout.for_lane`. That
+tree is asked to be that lane's ALONE before any of it, against every lane this
+deployment holds state for — the in-cap lanes and the retired ones both
+(`_sibling_lane_checkouts`), because the dead lane is frequently itself retired
+and so is the lane its clone can alias; an alias, or a `lanes/` nobody can list,
+refuses that lane with nothing read, since `git status` in a tree two lanes share
+would write into the other one. A
 violation writes the same park a live lane writes (`needs_user`, `loop_fatal`,
 `observed_checkout_unusable`, a blocker record naming the lane), so conc-07's
 table keeps it lane-fatal and the fleet runs on; nothing there is fetched, reset

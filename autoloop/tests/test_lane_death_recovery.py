@@ -1073,6 +1073,68 @@ def test_a_clone_that_is_another_lanes_tree_is_read_by_nothing_here(
     assert BlockerStore(config.blockers_dir).open_blockers() == []
 
 
+def test_two_retired_lanes_sharing_one_tree_are_read_by_nothing_here(
+    tmp_path, monkeypatch
+):
+    """The same failure one cap-lowering later, and the one a sibling set built
+    from `range(lanes)` cannot see. BOTH lanes here are above the cap — an
+    operator cut `[concurrency] lanes` to 2 and the sessions in lanes 3 and 4 did
+    not stop, which is exactly why the survey walks them — so comparing lane 3
+    against lanes 0 and 1 and against nothing else would pass, and `residue()`
+    would then run `git status` inside lane 4's repository and refresh its
+    `.git/index`: one lane's recovery writing into another. The set is every lane
+    this deployment holds state for, so the alias is refused before a single git
+    command runs."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-cut", real_repo=True)
+    seed_lane(config, 3, execution=execution)
+    write_lease(config, 3, alive=False, boot=boot)
+    seed_lane(config, 4, execution=execution)     # retired too, and NOT dead
+    sibling = seed_clone_repo(config, 4, stray="the other cut lane's work\n")
+    root = Path(config.state_dir).parent / "observed"
+    Path(lane_observed_checkout(root, 3, 2)).symlink_to(sibling, target_is_directory=True)
+    before_sibling = lane_snapshot(config, 4)
+
+    assert [e.lane_index for e in dead_lane_survey(config, exclude=0)] == [3]
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [(e.lane_id, e.action) for e in recovery.lanes] == [
+        (lane_id(3), RECOVERY_REFUSED)
+    ]
+    assert "only that lane watches" in recovery.lanes[0].detail
+    assert lane_snapshot(config, 4) == before_sibling  # not even an index refresh
+    assert digest(sibling) == before_sibling["clone"]
+    assert lane_paths(config.state_dir, 3).lease_file.exists()
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
+
+
+def test_a_lanes_directory_nobody_can_list_stops_the_clone_being_read(
+    tmp_path, monkeypatch
+):
+    """Which OTHER lanes exist is part of the distinctness question, so a
+    `lanes/` directory that cannot be listed leaves it unanswered — and unknown
+    is not "there are none". The lane is refused with nothing read: its clone,
+    dirty enough to have parked it, is not even opened, and its lease stays."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 0, execution=execution)
+    write_lease(config, 0, alive=False, boot=boot)
+    clone = seed_clone_repo(config, 0, stray="something else wrote here\n")
+    before_clone = digest(clone)
+    (config.state_dir / LANES_DIRNAME).write_text("a file where the lanes go\n")
+
+    recovery = recover_dead_lanes(config, exclude=1)
+
+    lane = next(e for e in recovery.lanes if e.lane_index == 0)
+    assert lane.action == RECOVERY_REFUSED
+    assert f"{LANES_DIRNAME}/ could not be listed" in lane.detail
+    assert digest(clone) == before_clone              # not even an index refresh
+    assert lane_paths(config.state_dir, 0).lease_file.exists()
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
+
+
 def test_a_park_whose_blocker_cannot_be_written_refuses_and_keeps_the_lease(
     tmp_path, monkeypatch
 ):
