@@ -1040,15 +1040,28 @@ execution record NAMES, through `WorkerRepoManager.quarantine_recorded`, and not
 by task id: `quarantine(task_id, …)` moves `<workers_root>/<task_id>` as the
 manager stands today, so a deployment whose `workers_root` moved would leave the
 broken worker in place and carry a healthy namesake off instead — the wrong
-directory moved, on evidence gathered about another. A recorded path that cannot
-be placed is refused rather than moved: `orchestrator._recorded_worker_refusal`
-keeps it out of the state directory and the observed-checkout root (a worker
+directory moved, on evidence gathered about another. **And it is quarantined
+only where the record and today's `workers_root` name ONE directory**, which
+`orchestrator._recreated_worker_refusal` establishes BEFORE anything moves: a
+worker that fails the reuse probe is RECREATED by the next dispatch, which
+builds at `path_for(task_id)` and then works in `execution.worktree_path`
+without writing the record back, so where those differ the dispatch either
+refuses (the namesake is already there) or fills a directory the round never
+opens. Both are a lane re-entered with no worker at all, so the mismatch is a
+REFUSAL — nothing moved, the lease kept, both directories named every tick —
+rather than a quarantine that reports success and strands the lane. Re-pointing
+the record instead is the other answer this allows and is deliberately not
+taken: it would re-aim a durable record at a directory no operator named, on a
+deployment change nothing here can verify was intended. A recorded path that
+cannot be placed is refused too: `orchestrator._recorded_worker_refusal` keeps it
+out of the state directory and the observed-checkout root (a worker
 "quarantined" from under `observed/_lane-N` would be this claim inverted), and
 the manager itself requires a real directory, never a symlink, named for the task
 and holding none of its own roots. Every absence — an unreadable lease, state,
 phase or execution record, an unlistable `lanes/`, a quarantine that fails or a
-recorded worker that cannot be placed, a clone that could not be established at
-all — refuses and leaves the lease in place, so nothing enters that lane. The recovery is only safe from the holder of the FLEET
+recorded worker that cannot be placed or that names a directory this deployment
+would not recreate, a clone that could not be established at all — refuses and
+leaves the lease in place, so nothing enters that lane. The recovery is only safe from the holder of the FLEET
 LOCK, which is what makes `LaneLease.break_stale`'s check-then-act sound; one
 process holds it today, and an arrangement that runs lanes in separate processes
 inherits that obligation.

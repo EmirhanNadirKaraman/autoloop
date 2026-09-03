@@ -14,8 +14,13 @@ Five sections, and the first is the claim itself:
    assertion trivially, so each of these tests carries a positive control — the
    dead lane's lease really is gone, its worker really did move — beside the
    equality. The directory that moves is the one the RECORD names, never the one
-   the task id resolves to under today's `workers_root`; where those differ, only
-   the recorded worker moves and its healthy namesake is byte-identical too.
+   the task id resolves to under today's `workers_root` — and it moves only
+   where those two are ONE directory, because that is the directory the next
+   dispatch recreates in. Where they differ nothing moves at all: the lane is
+   refused, keeps its lease, and the broken worker and its healthy namesake are
+   both byte-identical afterwards. Both answers are carried through to the
+   dispatch that follows them — `create` succeeding into the freed path on the
+   one side, and refusing at the namesake on the other.
 2. **The merge token.** A live lane's sweep DEFERS while a dead lane holds it
    (it is never stolen), the recovery releases it, and the same sweep then
    merges. At `lanes = 1` no token exists and no file is created.
@@ -74,7 +79,7 @@ from autoloop.config import (
     lane_id,
     lane_observed_checkout,
 )
-from autoloop.errors import GitCommandError
+from autoloop.errors import GitCommandError, StaleLockError
 from autoloop.git_gateway import GitGateway
 from autoloop.health import check as health_check
 from autoloop.health import dead_lane_survey, dead_lane_view
@@ -116,7 +121,7 @@ from autoloop.worker_env import (
     worker_repo_is_reusable,
 )
 from autoloop.worktask import TaskExecution, TaskExecutionStore
-from gitrepo import make_repo_from_template
+from gitrepo import make_repo_from_template, run_git
 
 URL = "https://chatgpt.com/c/lane-death-recovery"
 
@@ -512,23 +517,29 @@ def test_a_dead_lane_whose_worker_fails_the_reuse_probe_is_quarantined(
     assert lane_snapshot(config, 2, live_worker) == before_live
 
 
-def test_the_quarantine_moves_the_recorded_worker_and_not_the_one_named_by_id(
+def test_a_record_a_moved_workers_root_and_a_healthy_namesake_refuses(
     tmp_path, monkeypatch
 ):
-    """THE DIRECTORY THAT MOVES IS THE ONE THAT WAS JUDGED.
+    """A RECORD AND A `workers_root` THAT DISAGREE ARE A REFUSAL, NOT A
+    QUARANTINE — carried through to the dispatch that would have followed it.
 
     Everything the recovery decides is decided about `execution.worktree_path`
-    as the record wrote it; `WorkerRepoManager.quarantine(task_id, ...)` moves
-    `<workers_root>/<task_id>` as the manager is configured NOW. A deployment
-    whose `workers_root` moved between the two makes those different
+    as the record wrote it; a dispatch that has to RECREATE a worker builds at
+    `<workers_root>/<task_id>` as the manager is configured NOW and then works
+    in the recorded path, because `create` never writes the record back. A
+    deployment whose `workers_root` moved between the two makes those different
     directories, and this is that deployment: the broken worker the dead round
     left behind sits under the OLD root and is what the record names, while the
     new root holds a healthy repository for the same task id.
 
-    Quarantining by id would leave the broken one exactly where it is and carry
-    the healthy one off instead — the wrong repository moved, on evidence
-    gathered about another. Both halves are asserted, so both flip if that
-    returns.
+    There is no dispatch that survives that, and the test says so rather than
+    asserting it: `create` for this task id is asked here and REFUSES, because
+    the namesake is already at the path it builds. So quarantining the recorded
+    worker would have reported a recovery, released the lease and left the lane
+    to fail on its next dispatch with its evidence already carried off. Nothing
+    moves instead, the lease stays — which is what keeps every later tick out,
+    asserted through `acquire` itself — and the refusal names BOTH directories,
+    every tick, because it stands until a person reconciles them.
     """
     boot = pin_boot(monkeypatch)
     config = make_config(tmp_path, lanes=3)
@@ -545,15 +556,15 @@ def test_the_quarantine_moves_the_recorded_worker_and_not_the_one_named_by_id(
         task_base_sha="0" * 40,
     )
     TaskExecutionStore(config.executions_dir).save(execution)
+    before_broken = digest(broken)
 
     # ...and a healthy repository at the path the task id resolves to today
-    decoy = WorkerRepoManager(
-        config.workers_root, config.worker_hooks_dir
-    ).path_for("t-broken")
+    manager = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    namesake = manager.path_for("t-broken")
     make_repo_from_template(
-        decoy, branch="autoloop/t-broken", files=(("work.txt", "not this one\n"),)
+        namesake, branch="autoloop/t-broken", files=(("work.txt", "not this one\n"),)
     )
-    before_decoy = digest(decoy)
+    before_namesake = digest(namesake)
 
     seed_lane(config, 1, execution=execution)
     write_lease(config, 1, alive=False, boot=boot)
@@ -568,17 +579,116 @@ def test_the_quarantine_moves_the_recorded_worker_and_not_the_one_named_by_id(
     recovery = recover_dead_lanes(config, exclude=0)
 
     entry = recovery.lanes[0]
-    assert entry.action == RECOVERY_QUARANTINED and entry.task_id == "t-broken"
-    # the recorded worker moved, with its evidence...
-    moved = Path(entry.quarantined_at)
-    assert moved.is_dir() and "quarantine" in moved.parts
-    assert (moved / "half-written.txt").read_text() == "what the dead round wrote\n"
-    assert not broken.exists()
-    # ...and the repository that merely shares its task id did not
-    assert digest(decoy) == before_decoy
-    assert worker_repo_is_reusable(decoy, "autoloop/t-broken")
-    assert not lane_paths(config.state_dir, 1).lease_file.exists()
+    assert entry.action == RECOVERY_REFUSED and entry.task_id == "t-broken"
+    assert entry.quarantined_at == ""
+    # the remedy is the sentence, so it names both directories
+    assert str(broken) in entry.detail and str(namesake) in entry.detail
+    # nothing moved: neither the worker that was judged...
+    assert digest(broken) == before_broken
+    assert not (config.workers_root.parent / "quarantine").exists()
+    # ...nor the repository that merely shares its task id
+    assert digest(namesake) == before_namesake
+    assert worker_repo_is_reusable(namesake, "autoloop/t-broken")
+    # the lane stays shut, which is the whole of "not opened onto a broken round"
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    with pytest.raises(StaleLockError):
+        LaneLease(config.state_dir, 1).acquire()
+    # ...and the dispatch it was kept out of is the one that could not have run
+    with pytest.raises(GitCommandError, match="already exists"):
+        manager.create("t-broken", tmp_path / "source", "0" * 40)
     assert lane_snapshot(config, 2, live_worker) == before_live
+
+    # every tick says so, in the transcript, with both directories in it
+    orch, _blockers = build_orchestrator(config, lane_index=0)
+    orch._recover_dead_lanes()
+    logged = [
+        row
+        for row in transcript_entries(config, "lane_recovered")
+        if row.get("lane_id") == lane_id(1)
+    ]
+    assert [row["action"] for row in logged] == [RECOVERY_REFUSED]
+    assert str(broken) in logged[0]["detail"] and str(namesake) in logged[0]["detail"]
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+
+
+def test_a_worker_missing_from_a_moved_workers_root_is_refused_too(
+    tmp_path, monkeypatch
+):
+    """The same disagreement without the namesake, which is the half that looks
+    harmless and is not.
+
+    The recorded worker is not merely broken here, it is GONE, and the path this
+    deployment would create at is free — so `create` would succeed, and the
+    round would then be pointed at the directory the record still names, which is
+    nowhere at all. "It is gone, so the next dispatch creates one" is only true
+    when the next dispatch creates it THERE, so this is refused for the same
+    reason and leaves the same lane shut.
+    """
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2)
+    gone = tmp_path / "old-workers" / "t-gone"
+    execution = TaskExecution(
+        task_id="t-gone",
+        task_branch="autoloop/t-gone",
+        worktree_path=str(gone),
+        task_base_sha="0" * 40,
+    )
+    TaskExecutionStore(config.executions_dir).save(execution)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    entry = recovery.lanes[0]
+    assert entry.action == RECOVERY_REFUSED and entry.task_id == "t-gone"
+    target = WorkerRepoManager(
+        config.workers_root, config.worker_hooks_dir
+    ).path_for("t-gone")
+    assert str(gone) in entry.detail and str(target) in entry.detail
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    # nothing was created, moved or invented anywhere
+    assert not gone.exists() and not target.exists()
+    assert not (config.workers_root.parent / "quarantine").exists()
+
+
+def test_the_recovery_leaves_a_record_the_next_dispatch_can_create_into(
+    tmp_path, monkeypatch
+):
+    """The positive control for the two refusals above, and the other half of
+    "resumed or quarantined": on an ordinary deployment — the record and
+    `workers_root` naming ONE directory — the quarantine frees exactly the path
+    the next dispatch fills, so the round really does continue.
+
+    Asserted through the dispatch's OWN calls rather than by inspection, because
+    that is where the previous cut of this recovery failed: the record still
+    names `path_for(task_id)` afterwards, `WorkerRepoManager.create` for that id
+    succeeds (it refuses a path that is not free, so succeeding IS the
+    assertion), and the worker the record names then passes
+    `worker_repo_is_reusable` — which is the exact question
+    `_dispatch_task_postcommit` asks of it before it works there.
+    """
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2)
+    manager = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    broken, execution = seed_worker(config, "t-broken", real_repo=False)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert recovery.lanes[0].action == RECOVERY_QUARANTINED
+    assert not lane_paths(config.state_dir, 1).lease_file.exists()
+    # the record is untouched, and it names the directory the create will fill
+    record = TaskExecutionStore(config.executions_dir).load("t-broken")
+    assert record.worktree_path == str(broken) == str(manager.path_for("t-broken"))
+    assert not broken.exists()
+
+    source = make_repo_from_template(tmp_path / "source")
+    base_sha = run_git(source, "rev-parse", "HEAD").strip()
+    repo = manager.create("t-broken", source, base_sha, branch=record.task_branch)
+
+    assert str(repo.path) == record.worktree_path
+    assert worker_repo_is_reusable(Path(record.worktree_path), record.task_branch)
 
 
 def test_the_orchestrator_recovers_on_its_next_tick_and_records_what_it_did(
