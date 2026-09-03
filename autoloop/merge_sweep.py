@@ -399,17 +399,22 @@ run from starting, so every failure swallows to a transcript entry.
 from __future__ import annotations
 
 import json
+import os
 import re
-from dataclasses import dataclass, field
+import socket
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import auto_merge
 from .auto_merge import AutoMerger
-from .config import AutoloopConfig
-from .errors import GitError, StateCorruptError
+from .config import AutoloopConfig, lane_id
+from .errors import GitError, LockHeldError, StaleLockError, StateCorruptError
 from .git_gateway import GitGateway
+from .lock import LockInfo, LoopLock
 from .policy import PolicyEngine
+from .state import utcnow_iso
 from .tasks import TaskState
 from .transcript import TranscriptLogger
 from .worktask import TaskExecutionStore
@@ -489,6 +494,279 @@ SWEEP_RECOVERED_EVENT = "merge_sweep_candidate_recovered"
 #: merging an earlier branch can carry a later one in with it, which is exactly
 #: what building on it means.
 _CONTINUE_ON = (auto_merge.MERGED, auto_merge.ALREADY_INTEGRATED)
+
+
+# ---- the merge token (conc-08) ----------------------------------------------
+#
+# "Merging is serialised" (Decision 6) is a property of the FLEET, not of one
+# process: at `lanes > 1` several lanes each hold their own state machine and
+# each reach a point where they would sweep the backlog, and two sweeps
+# interleaving is two merges moving one base under each other's verification.
+# The token is what makes "one at a time" a fact rather than an arrangement.
+#
+# It is a LEASE, with the lane lease's own liveness rule, and Decision 8 says
+# why in one sentence: a merge slot held by a dead process is the one shared
+# resource a lane death can strand. Nothing here steals a dead token — see
+# `acquire` — because "read the record, decide it is dead, overwrite it" is a
+# check-then-act on a shared file and two lanes doing it both merge. Releasing a
+# dead one belongs to `orchestrator.recover_dead_lanes`, which runs from the
+# holder of the FLEET LOCK, where the check-then-act is safe.
+
+
+#: The token's file, beside `lock.LOCK_FILENAME` and `state.
+#: FLEET_THROTTLE_FILENAME` and for their reason: one state directory is one
+#: fleet, so "who is merging" belongs to the directory rather than to a lane.
+#:
+#: WRITTEN ONLY AT `lanes > 1` (`BacklogSweeper._take_merge_token`). At one lane
+#: there is one process, one sweep and nothing to serialise, so no new file
+#: appears under the state dir — the same structural spelling of the acceptance
+#: criterion `state.lane_paths` uses for lane 0's state file.
+MERGE_TOKEN_FILENAME = "merge_token.json"
+
+
+def _fleet_lanes(config) -> int:
+    """`[concurrency] lanes`, read defensively — `orchestrator._fleet_lanes`'
+    reading, borrowed rather than rewritten. A config with no `[concurrency]`
+    section (a hand-built one in a test, and every `AutoloopConfig` predating
+    conc-02) or a value this build cannot read is ONE lane, which is the answer
+    that changes nothing."""
+    lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+        return 1
+    return lanes
+
+
+def merge_token_file(state_dir) -> Path:
+    """Where the fleet's one merge token lives."""
+    return Path(state_dir) / MERGE_TOKEN_FILENAME
+
+
+@dataclass(frozen=True)
+class MergeTokenInfo:
+    """Who is merging, as it is written to disk.
+
+    The four facts `lock.LockInfo` carries — pid, hostname, `started_at`, run id
+    — plus WHICH LANE, and nothing else. Deliberately not a subclass of either
+    that or `LaneLeaseInfo`: a token is not adoptable across `os.execv` and has
+    no `exec_handoff`, and inheriting one would serialise that field into every
+    token file and invite a reader into believing otherwise.
+    """
+
+    pid: int
+    hostname: str
+    started_at: str
+    run_id: str
+    #: The lane that took it, for a transcript reader and for the recovery
+    #: entry that names whose token was released. `""` for a caller that has no
+    #: lane (a `merge-backlog` command run by hand).
+    lane_id: str
+    #: The state directory it was taken in, recorded for `LockInfo.state_dir`'s
+    #: diagnostic reason.
+    state_dir: str
+
+    def describe(self) -> str:
+        return (
+            f"lane={self.lane_id or '(none)'} pid={self.pid} host={self.hostname} "
+            f"started={self.started_at} run_id={self.run_id}"
+        )
+
+
+class MergeToken:
+    """Exclusive right to move the base — one per state directory.
+
+    Modelled on `lock.LaneLease` line for line, and the three properties that
+    matter are its:
+
+    * **Acquisition is `O_CREAT|O_EXCL` and nothing else**, which is atomic on
+      POSIX and is the whole of the mutual exclusion.
+    * **A DEAD token is refused, not taken over.** `orchestrator.
+      recover_dead_lanes` is what releases one, holding the fleet lock.
+    * **An unreadable token is refused rather than read as free** — a sweep that
+      merged on the strength of bytes nobody could parse is exactly the
+      fail-open shape the rest of this module is written against.
+
+    NEVER TAKEN AT `lanes = 1`: the only caller gates on the fleet size, so at
+    one lane the file is never created and the sweep is byte-identical to
+    today's.
+    """
+
+    def __init__(self, state_dir, lane_id: str = ""):
+        self.state_dir = Path(state_dir)
+        self.lane_id = lane_id or ""
+        self.path = merge_token_file(state_dir)
+        self.run_id = uuid.uuid4().hex
+        self._owned = False
+
+    # ---- inspection ---------------------------------------------------------
+
+    def read(self) -> "MergeTokenInfo | None":
+        """The token record, `None` when there is none, and `StateCorruptError`
+        when there is one this cannot be trusted to read.
+
+        Every refusal here is `LaneLease.read`'s and is argued there: the empty
+        file a process killed between `O_CREAT` and the write leaves behind, the
+        `TypeError` an unknown key raises because the record is built with
+        `MergeTokenInfo(**data)` rather than by picking fields out one at a time,
+        the `bool`-is-an-`int` pid check, and the pid below 1 that would send
+        `os.kill` at the caller's own process group. A file that vanishes
+        between the `exists()` and the read is `None` — that is a release racing
+        this read, and the token really is free.
+        """
+        if not self.path.exists():
+            return None
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None  # released between the check and the read
+        except OSError as exc:
+            raise StateCorruptError(
+                f"merge token {self.path} cannot be read: {exc}. Until it can be, "
+                "nothing may merge."
+            ) from exc
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise TypeError(f"expected a JSON object, got {type(data).__name__}")
+            info = MergeTokenInfo(**data)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise StateCorruptError(
+                f"merge token {self.path} is unreadable: {exc}. A token that cannot "
+                "be read is NOT a free one — refusing to merge."
+            ) from exc
+        if isinstance(info.pid, bool) or not isinstance(info.pid, int):
+            raise StateCorruptError(
+                f"merge token {self.path} has a non-integer pid {info.pid!r}"
+            )
+        if info.pid < 1:
+            raise StateCorruptError(
+                f"merge token {self.path} has pid {info.pid}, which no writer produces"
+            )
+        for name in ("hostname", "started_at", "run_id", "lane_id", "state_dir"):
+            if not isinstance(getattr(info, name), str):
+                raise StateCorruptError(
+                    f"merge token {self.path} has a non-string {name}"
+                )
+        return info
+
+    @staticmethod
+    def is_live(info: MergeTokenInfo) -> bool:
+        """Exactly `LoopLock.is_live`, asked about a token — borrowed for
+        `LaneLease.is_live`'s reason: the boot-before-probe ordering, the
+        foreign-host fail-closed rule and the clock slack come with it and
+        cannot drift, because there is no second copy."""
+        return LoopLock.is_live(
+            LockInfo(
+                pid=info.pid,
+                hostname=info.hostname,
+                started_at=info.started_at,
+                run_id=info.run_id,
+                state_dir=info.state_dir,
+            )
+        )
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def acquire(self) -> "MergeToken":
+        """Take the token, or raise: `LockHeldError` when a live lane holds it,
+        `StaleLockError` when its holder is provably dead, `StateCorruptError`
+        when it cannot be read.
+
+        The write is `LaneLease.acquire`'s, including the short-write loop and
+        the removal of this call's OWN failed acquisition — a token that was
+        created and never written in full would refuse every sweep forever.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        info = MergeTokenInfo(
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            started_at=utcnow_iso(),
+            run_id=self.run_id,
+            lane_id=self.lane_id,
+            state_dir=str(self.state_dir),
+        )
+        payload = json.dumps(asdict(info), indent=2).encode("utf-8")
+        try:
+            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            existing = self.read()
+            if existing is None:  # raced with a release; one retry
+                return self.acquire()
+            if self.is_live(existing):
+                raise LockHeldError(
+                    f"another lane holds the merge token ({existing.describe()}) — "
+                    f"{self.path}. Merging is serialised; this sweep defers."
+                ) from None
+            raise StaleLockError(
+                f"the merge token at {self.path} is held by a lane that is gone "
+                f"({existing.describe()}). It is released by the fleet's own lane "
+                "recovery, which holds the fleet lock — never stolen here."
+            ) from None
+        try:
+            try:
+                written = 0
+                while written < len(payload):
+                    count = os.write(fd, payload[written:])
+                    if count <= 0:
+                        raise OSError(
+                            f"merge token {self.path}: wrote {written} of "
+                            f"{len(payload)} bytes and then made no progress"
+                        )
+                    written += count
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            raise
+        self._owned = True
+        return self
+
+    def release(self) -> None:
+        """Give the token back, removing it only while it is still ours — the
+        run-id check `LoopLock.release` and `LaneLease.release` both make, for
+        their reason: a token somebody else has since recovered and retaken must
+        not be deleted by the process that used to hold it."""
+        if not self._owned:
+            return
+        try:
+            current = self.read()
+        except StateCorruptError:
+            current = None
+        if current is not None and current.run_id == self.run_id:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        self._owned = False
+
+    def __enter__(self) -> "MergeToken":
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    def break_stale(self) -> MergeTokenInfo:
+        """Remove a verifiably-dead token. Refuses a live one, and refuses one
+        it cannot read.
+
+        `LaneLease.break_stale`'s counterpart, and the primitive
+        `orchestrator.recover_dead_lanes` calls from inside the fleet lock —
+        which is what makes the check-then-act safe there, and why `acquire`
+        will not do it for itself.
+        """
+        info = self.read()
+        if info is None:
+            raise StaleLockError(f"no merge token at {self.path} — nothing to release")
+        if self.is_live(info):
+            raise LockHeldError(
+                f"refusing to remove a LIVE merge token ({info.describe()}). "
+                "Wait for that lane's sweep to finish."
+            )
+        self.path.unlink()
+        return info
 
 
 @dataclass(frozen=True)
@@ -613,6 +891,7 @@ class BacklogSweeper:
         log,
         merger=None,
         carry_forward=None,
+        lane_index: int = 0,
     ):
         self._config = config
         self._git = git
@@ -620,6 +899,11 @@ class BacklogSweeper:
         self._execution_store = execution_store
         self._registry = registry
         self._log = log
+        #: WHICH LANE is sweeping, for the merge token's record only (conc-08).
+        #: Last in the signature and defaulted, so no existing construction site
+        #: moves, and `0` is what both of today's callers are: one process, one
+        #: lane, and at `lanes = 1` no token is taken at all.
+        self._lane_index = lane_index
         #: Read once per sweeper, and only when a candidate this checkout does
         #: not hold actually needs them. `()` is "not looked at yet" and
         #: `(value,)` is "looked at, and this is the answer" — a one-cell tuple
@@ -760,59 +1044,119 @@ class BacklogSweeper:
             )
             return result
 
-        for index, candidate in enumerate(candidates):
-            # Probed per BRANCH rather than once for the sweep, because the
-            # branches that already landed moved HEAD legitimately: each was
-            # verified and pushed before the next was attempted. The only head
-            # move in question is the one the STOPPING attempt made, so the
-            # baseline has to be where that attempt found the checkout.
-            before_attempt = _probe(self._git)
-            outcome = self._attempt(candidate, seen)
-            if outcome not in _CONTINUE_ON:
-                # Read from the checkout, never inferred from `outcome`. A
-                # refused push returns `auto_merge.DEFERRED` — the slug that
-                # otherwise means "a precondition failed, nothing was touched"
-                # — over a base that has already moved locally. See the module
-                # docstring's "a stop is not automatically a restoration".
-                after_attempt = _probe(self._git)
-                result.outcome = STOPPED
-                result.stopped_on = candidate.task_id
-                result.stopped_outcome = outcome
-                result.pending = [c.task_id for c in candidates[index:]]
-                result.base_after = after_attempt.head
-                result.unreconciled = _unreconciled(before_attempt, after_attempt)
-                self._log(
-                    SWEEP_STOPPED_EVENT,
-                    data={
-                        "task_id": candidate.task_id,
-                        "outcome": outcome,
-                        "merged": list(result.merged),
-                        "remaining": list(result.pending),
-                        "base_sha_at_start": result.base_before,
-                        "base_sha_before_attempt": before_attempt.head,
-                        "base_sha_after_attempt": after_attempt.head,
-                        "unreconciled": result.unreconciled,
-                    },
-                )
-                return result
-            result.merged.append(candidate.task_id)
+        # AND THE FLEET'S OWN GATE, after the window's and immediately before
+        # the first merge (conc-08). The window says whether the BACKLOG may
+        # move; this says whether THIS lane is the one moving it. Taken here
+        # rather than at the top so a sweep that was never going to merge —
+        # disabled, nothing to do, held, deferred — takes nothing and can
+        # neither block a lane that would merge nor strand a token if it dies.
+        # `None` at `lanes = 1`, where no file is created and this is a `<= 1`
+        # comparison and nothing else.
+        token, refusal = self._take_merge_token()
+        if refusal:
+            result.outcome = DEFERRED
+            result.reasons = [refusal]
+            self._log(
+                SWEEP_DEFERRED_EVENT,
+                data={"reasons": [refusal], "pending": list(result.pending)},
+            )
+            return result
 
-        result.outcome = SWEPT
-        result.pending = []
-        # Every branch here returned `merged` (verified AND pushed) or
-        # `already_integrated` (the remote base already carried it), so the head
-        # moved only into states `AutoMerger` confirmed. Recorded for the report,
-        # not questioned.
-        result.base_after = _probe(self._git).head
-        self._log(
-            SWEEP_COMPLETED_EVENT,
-            data={
-                "merged": list(result.merged),
-                "base_sha_before": result.base_before,
-                "base_sha_after": result.base_after,
-            },
-        )
-        return result
+        try:
+            for index, candidate in enumerate(candidates):
+                # Probed per BRANCH rather than once for the sweep, because the
+                # branches that already landed moved HEAD legitimately: each was
+                # verified and pushed before the next was attempted. The only head
+                # move in question is the one the STOPPING attempt made, so the
+                # baseline has to be where that attempt found the checkout.
+                before_attempt = _probe(self._git)
+                outcome = self._attempt(candidate, seen)
+                if outcome not in _CONTINUE_ON:
+                    # Read from the checkout, never inferred from `outcome`. A
+                    # refused push returns `auto_merge.DEFERRED` — the slug that
+                    # otherwise means "a precondition failed, nothing was touched"
+                    # — over a base that has already moved locally. See the module
+                    # docstring's "a stop is not automatically a restoration".
+                    after_attempt = _probe(self._git)
+                    result.outcome = STOPPED
+                    result.stopped_on = candidate.task_id
+                    result.stopped_outcome = outcome
+                    result.pending = [c.task_id for c in candidates[index:]]
+                    result.base_after = after_attempt.head
+                    result.unreconciled = _unreconciled(before_attempt, after_attempt)
+                    self._log(
+                        SWEEP_STOPPED_EVENT,
+                        data={
+                            "task_id": candidate.task_id,
+                            "outcome": outcome,
+                            "merged": list(result.merged),
+                            "remaining": list(result.pending),
+                            "base_sha_at_start": result.base_before,
+                            "base_sha_before_attempt": before_attempt.head,
+                            "base_sha_after_attempt": after_attempt.head,
+                            "unreconciled": result.unreconciled,
+                        },
+                    )
+                    return result
+                result.merged.append(candidate.task_id)
+
+            result.outcome = SWEPT
+            result.pending = []
+            # Every branch here returned `merged` (verified AND pushed) or
+            # `already_integrated` (the remote base already carried it), so the head
+            # moved only into states `AutoMerger` confirmed. Recorded for the report,
+            # not questioned.
+            result.base_after = _probe(self._git).head
+            self._log(
+                SWEEP_COMPLETED_EVENT,
+                data={
+                    "merged": list(result.merged),
+                    "base_sha_before": result.base_before,
+                    "base_sha_after": result.base_after,
+                },
+            )
+            return result
+        finally:
+            # EVERY exit, including the one that raises. A sweep that returned
+            # its token only on the paths somebody remembered would leave the
+            # fleet unable to merge until a lane died and was recovered, which is
+            # a worse failure than the one the token prevents. `release` removes
+            # it only while it is still ours.
+            if token is not None:
+                token.release()
+
+    def _take_merge_token(self) -> tuple["MergeToken | None", str]:
+        """`(token, refusal)` — the fleet's merge token, or the reason this
+        sweep must not merge (conc-08, Decision 6/8).
+
+        `(None, "")` AT ONE LANE, and that is the acceptance criterion made
+        structural rather than asserted: no token object is built, no path is
+        constructed and no file appears under the state dir, so a single-lane
+        sweep is byte-identical to today's.
+
+        Every failure is a DEFERRAL and never an exception: `sweep` is
+        documented never to raise, a deferral is the outcome that mutates
+        nothing, and `SWEEP_DEFERRED_EVENT` is already in
+        `SWEEP_CLEARED_EVENTS`, so deferring here cannot be misread by
+        `health.held_merge_sweep` as a backlog nobody can judge.
+
+        A token held by a DEAD lane defers too, rather than being taken. That is
+        `MergeToken.acquire`'s discipline and it is not a wasted round: the fleet
+        recovery releases it from the fleet-lock holder, and this sweep merges on
+        the next tick. Stealing it here would be a check-then-act on a shared
+        file, which is two lanes merging at once — the one thing this token
+        exists to prevent.
+        """
+        if _fleet_lanes(self._config) <= 1:
+            return None, ""
+        try:
+            token = MergeToken(self._config.state_dir, lane_id(self._lane_index))
+        except (ValueError, TypeError, AttributeError, OSError) as exc:
+            return None, f"the merge token could not be resolved: {exc}"
+        try:
+            return token.acquire(), ""
+        except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
+            return None, f"the merge token was not free: {exc}"
 
     def _attempt(self, candidate: SweepCandidate, seen: set) -> str:
         """One branch, through the shared merge machinery, on publication
