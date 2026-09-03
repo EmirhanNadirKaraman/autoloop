@@ -493,7 +493,13 @@ DOCS_ONLY_SELECTED = 20
 #: tracker, it resolves no `__file__`, and it borrows `gitrepo.run_git` with no
 #: interpreter literal of its own — so the same 20 once more. The DENOMINATOR
 #: only.
-SUITE_SIZE = 111
+#: 111 -> 112 when ctx-03 added `test_context_resolver.py` (2026-09-03): it does
+#: resolve its own `__file__`, and the one document it names is
+#: `autoloop/config.example.toml` — not a change-note tracker, so a docs-only
+#: round still reaches it through neither half of the rule — and its
+#: `CountingRunner` hands `subprocess.run` an unreadable argv with no interpreter
+#: literal in the file. The same 20 once more; the DENOMINATOR only.
+SUITE_SIZE = 112
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

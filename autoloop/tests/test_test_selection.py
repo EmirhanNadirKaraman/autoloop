@@ -614,7 +614,14 @@ FLOOR_AFTER = 16
 #: change-note trackers a docs-only round changes, resolves no `__file__`, and
 #: borrows `gitrepo.run_git` without an interpreter literal of its own — so 20
 #: and 24 are unchanged once more.
-SUITE_SIZE = 111
+#: 111 -> 112 when ctx-03 added `test_context_resolver.py` (2026-09-03), the
+#: DENOMINATOR again: the one document it names is `autoloop/config.example.toml`
+#: (through its own `__file__`, exactly as `test_config_concurrency.py` does),
+#: which is not one of the change-note trackers a docs-only round changes, and
+#: its `CountingRunner` hands `subprocess.run` an argv this cannot read with no
+#: interpreter literal anywhere in the file — so 20 and 24 are unchanged once
+#: more.
+SUITE_SIZE = 112
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
