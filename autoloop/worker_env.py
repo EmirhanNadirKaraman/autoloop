@@ -673,6 +673,103 @@ class WorkerRepoManager:
         shutil.rmtree(self.hooks_dir_for(task_id), ignore_errors=True)
         return dest
 
+    def quarantine_recorded(self, task_id: str, label: str, source: Path) -> Path:
+        """MOVE (never delete) the EXACT directory `source` aside — the worker
+        an execution RECORD names — rather than whatever `path_for(task_id)`
+        resolves to under this manager's `root_dir` today. Returns the
+        destination, exactly like `quarantine`.
+
+        WHY A SECOND DOOR. `quarantine` above takes a task id and can therefore
+        only ever move `root_dir/<task_id>`; that is safe precisely because the
+        path is CONSTRUCTED here. A caller that has already read a worker path
+        out of a stored record and judged THAT path broken cannot use it: if
+        `root_dir` has changed since the record was written, `path_for(task_id)`
+        names a different directory, and moving it would leave the broken worker
+        in place while carrying a healthy one off to quarantine — the wrong
+        directory, silently, on evidence gathered about another. So the path is
+        passed in and this method is the one that decides whether moving it is
+        safe.
+
+        THE STRUCTURAL GUARANTEE IS GONE AND IS REPLACED BY CHECKS, which is the
+        whole of this method. `shutil.move` here targets a string that came out
+        of a JSON file, so:
+
+          * a `source` that already IS `path_for(task_id)` is handed straight to
+            `quarantine`, unchanged — the ordinary case stays one implementation,
+            including its hooks-directory cleanup;
+          * anything else must LOOK like a worker repository directory: present,
+            a real directory (never a symlink — moving the link would report a
+            quarantine while leaving the tree it points at exactly where it is),
+            and named for the task, which is the shape every worker this class
+            has ever created has (`root_dir/<task_id>`);
+          * and it must not CONTAIN this manager's own `root_dir`,
+            `hooks_root_dir` or quarantine directory, because moving a directory
+            that holds one of those would carry every OTHER task's worker, or
+            every earlier quarantined attempt, along with it.
+
+        Each refusal raises `GitCommandError` and moves nothing. Callers that
+        cannot establish the wider context of a recorded path — that it is not
+        inside a tree some other part of the deployment owns — must refuse
+        BEFORE calling this; nothing here knows about state directories or
+        observed checkouts (see `orchestrator._recorded_worker_refusal`).
+
+        The hooks directory is NOT touched on the foreign-path branch:
+        `hooks_dir_for(task_id)` belongs to the worker at `path_for(task_id)`,
+        which is by definition not the directory being moved.
+        """
+        validate_task_id(task_id)
+        source = Path(source)
+        try:
+            resolved = source.resolve()
+            expected = self.path_for(task_id).resolve()
+        except OSError as exc:
+            raise GitCommandError(
+                f"quarantine refused: the recorded worker path {source} for task "
+                f"{task_id!r} could not be resolved ({exc}), so nothing was moved"
+            ) from exc
+        if resolved == expected:
+            return self.quarantine(task_id, label)
+        if source.is_symlink():
+            raise GitCommandError(
+                f"quarantine refused: the recorded worker path {source} for task "
+                f"{task_id!r} is a symbolic link — moving it would report a "
+                "quarantine while leaving the tree it points at in place"
+            )
+        if not source.is_dir():
+            raise GitCommandError(
+                f"quarantine refused: the recorded worker path {source} for task "
+                f"{task_id!r} is not a directory, so it is not a worker "
+                "repository this can move aside"
+            )
+        if source.name != task_id:
+            raise GitCommandError(
+                f"quarantine refused: the recorded worker path {source} is not "
+                f"named for task {task_id!r} (every worker this creates is "
+                "<workers_root>/<task_id>), so what it holds could not be "
+                "established and it was left where it is"
+            )
+        quarantine_root = self.root_dir.parent / "quarantine"
+        for boundary, what in (
+            (self.root_dir, "the workers root"),
+            (self.hooks_root_dir, "the worker hooks root"),
+            (quarantine_root, "the quarantine directory"),
+        ):
+            if _is_nested(boundary.resolve(), resolved):
+                raise GitCommandError(
+                    f"quarantine refused: the recorded worker path {source} for "
+                    f"task {task_id!r} contains {what} ({boundary}), so moving "
+                    "it would carry other tasks' work with it"
+                )
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        dest = quarantine_root / f"{task_id}-{label}"
+        if dest.exists():
+            raise GitCommandError(
+                f"quarantine destination {dest} already exists — 'label' must "
+                "be unique per call"
+            )
+        shutil.move(str(source), str(dest))
+        return dest
+
 
 #: A commit id the observed checkout will accept as a synchronisation target.
 #: Literal 40-hex only, for `push_exact`'s reason one level down: a branch name

@@ -1035,10 +1035,20 @@ unresolvable code is fleet-fatal, so a park with no record behind it would stop
 every lane over one lane's dirty clone. AHEAD/DIVERGED is left to
 `_synchronise_observed_checkout` at the next dispatch, which refuses it with the
 identical park: what the earlier answer buys is that nothing re-enters a lane
-whose tree is visibly not the loop's. Every absence — an unreadable lease, state,
-phase or execution record, an unlistable `lanes/`, a quarantine that fails, a
-clone that could not be established at all — refuses and leaves the lease in
-place, so nothing enters that lane. The recovery is only safe from the holder of the FLEET
+whose tree is visibly not the loop's. The WORKER is quarantined by the path the
+execution record NAMES, through `WorkerRepoManager.quarantine_recorded`, and not
+by task id: `quarantine(task_id, …)` moves `<workers_root>/<task_id>` as the
+manager stands today, so a deployment whose `workers_root` moved would leave the
+broken worker in place and carry a healthy namesake off instead — the wrong
+directory moved, on evidence gathered about another. A recorded path that cannot
+be placed is refused rather than moved: `orchestrator._recorded_worker_refusal`
+keeps it out of the state directory and the observed-checkout root (a worker
+"quarantined" from under `observed/_lane-N` would be this claim inverted), and
+the manager itself requires a real directory, never a symlink, named for the task
+and holding none of its own roots. Every absence — an unreadable lease, state,
+phase or execution record, an unlistable `lanes/`, a quarantine that fails or a
+recorded worker that cannot be placed, a clone that could not be established at
+all — refuses and leaves the lease in place, so nothing enters that lane. The recovery is only safe from the holder of the FLEET
 LOCK, which is what makes `LaneLease.break_stale`'s check-then-act sound; one
 process holds it today, and an arrangement that runs lanes in separate processes
 inherits that obligation.

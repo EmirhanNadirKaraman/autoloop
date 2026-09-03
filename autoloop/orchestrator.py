@@ -466,6 +466,7 @@ from .worker_env import (
     worker_env,
     worker_repo_is_reusable,
 )
+from .worker_env import _is_nested as _path_is_nested  # one containment predicate
 from .prompts import (
     TEMPLATES,
     build_prompt,
@@ -2542,14 +2543,28 @@ def _recover_lane_worker(
 
     QUARANTINED is the remaining case and the one the claim is about: a worker
     that is there and is NOT what the record says it is. It is moved aside by
-    `WorkerRepoManager.quarantine` — never deleted, so the evidence survives —
-    and the label carries the lane, the instant and a random suffix, because
-    that method refuses a colliding destination by design and two recoveries of
-    one task in the same second must not be one of them.
+    `WorkerRepoManager.quarantine_recorded` — never deleted, so the evidence
+    survives — and the label carries the lane, the instant and a random suffix,
+    because that method refuses a colliding destination by design and two
+    recoveries of one task in the same second must not be one of them.
+
+    THE DIRECTORY THAT MOVES IS THE ONE THAT WAS JUDGED, and that is why the
+    RECORDED path is passed down rather than the task id. `quarantine(task_id,
+    label)` moves `path_for(task_id)` — `<workers_root>/<task_id>` as the
+    manager is configured NOW — while every judgement above was made about
+    `execution.worktree_path` as it was written. A deployment whose
+    `workers_root` moved between the two makes those different directories, and
+    quarantining by id would then leave the broken worker exactly where it is
+    and carry a healthy one off instead: the wrong repository moved, on evidence
+    gathered about another, which is precisely the "touching something this lane
+    does not own" the claim forbids. `_recorded_worker_refusal` asks first
+    whether the recorded path can be moved at all, and a path it cannot place
+    fails CLOSED — nothing moves, the lane keeps its lease.
 
     REFUSED is for the evidence, not for the worker: an execution record that
-    cannot be read, and a quarantine that is required but cannot be performed.
-    Both leave the lane shut.
+    cannot be read, a recorded path that cannot be safely mapped, and a
+    quarantine that is required but cannot be performed. All three leave the
+    lane shut.
     """
     if not dead.task_id:
         return (
@@ -2613,9 +2628,16 @@ def _recover_lane_worker(
                 f"manager could be built to quarantine it ({exc})",
                 "",
             )
+    refusal = _recorded_worker_refusal(path, config)
+    if refusal:
+        return (
+            RECOVERY_REFUSED,
+            f"its worker {path} does not pass the reuse probe and {refusal}",
+            "",
+        )
     label = f"lanedeath-{dead.lane_id}-{utcnow_iso().replace(':', '')}-{uuid.uuid4().hex[:8]}"
     try:
-        moved = manager.quarantine(dead.task_id, label)
+        moved = manager.quarantine_recorded(dead.task_id, label, path)
     except Exception as exc:  # noqa: BLE001 - any failure leaves the lane shut
         return (
             RECOVERY_REFUSED,
@@ -2629,6 +2651,80 @@ def _recover_lane_worker(
         f"{branch or '(no branch recorded)'}",
         str(moved),
     )
+
+
+def _recorded_worker_refusal(path: Path, config) -> str:
+    """Why the worker recorded at `path` must NOT be moved aside, in a clause a
+    `RECOVERY_REFUSED` detail can carry, or `""` when moving it is safe.
+
+    THE HALF OF THE QUESTION `WorkerRepoManager` CANNOT ANSWER. That class
+    checks its own invariants — the path is a real directory named for the task
+    and does not contain the workers root, the hooks root or the quarantine
+    directory — and it deliberately knows nothing about the rest of the
+    deployment. This asks the other half, from the one place that has the
+    config: is the recorded path somewhere ANOTHER part of this deployment owns?
+
+    Two boundaries, and both are this candidate's own claim rather than general
+    tidiness:
+
+      * the STATE DIRECTORY — every lane's state file, lease and the fleet's
+        merge token live under it, so a record naming a path there would have a
+        recovery move the very files it recovers lanes THROUGH;
+      * the OBSERVED CHECKOUT ROOT — every lane's clone is `<root>/_lane-N`
+        (`lane_observed_checkout`), so a path under it is another lane's watched
+        tree, and moving it would be "touching the others" performed by the code
+        written to prove the opposite.
+
+    Asked in BOTH directions, like `validate_lane_checkout_distinctness`: a
+    recorded path INSIDE a boundary is a directory that belongs to something
+    else, and one that CONTAINS a boundary would carry that whole thing away
+    with it.
+
+    FAIL CLOSED ON NOT KNOWING. A path or a configured boundary that cannot be
+    resolved is a refusal, not a pass: this exists to answer "may this directory
+    be moved", and a check that cannot see where the directory is has not
+    answered it. Refusing costs a lane its recovery for one tick and says so;
+    passing costs whatever the move takes with it.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, ValueError, TypeError) as exc:
+        return (
+            f"where it sits could not be established ({type(exc).__name__}: "
+            f"{exc}), so it was left exactly where it is"
+        )
+    boundaries: list[tuple[str, Path]] = []
+    for what, configured in (
+        ("the loop's state directory", getattr(config, "state_dir", None)),
+        ("the observed checkout root", getattr(config, "observed_checkout", None)),
+    ):
+        if not configured:
+            # An unset `observed_checkout` is the pre-esc-02 deployment and has
+            # no boundary to violate. `state_dir` is never unset on a real
+            # config — a hand-built one without it simply has no such boundary
+            # either, and the manager's own checks still apply.
+            continue
+        try:
+            boundaries.append((what, Path(configured).resolve()))
+        except (OSError, ValueError, TypeError) as exc:
+            return (
+                f"{what} could not be resolved to compare it against "
+                f"({type(exc).__name__}: {exc}), so it was left exactly where "
+                "it is"
+            )
+    for what, boundary in boundaries:
+        if _path_is_nested(resolved, boundary):
+            return (
+                f"it sits inside {what} ({boundary}), which this deployment "
+                "owns and no worker repository belongs in, so it was left "
+                "exactly where it is"
+            )
+        if _path_is_nested(boundary, resolved):
+            return (
+                f"it contains {what} ({boundary}), so moving it would carry "
+                "that away too, and it was left exactly where it is"
+            )
+    return ""
 
 
 def _release_dead_merge_token(config) -> tuple[str, str]:
