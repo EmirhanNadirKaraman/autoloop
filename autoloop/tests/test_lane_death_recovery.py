@@ -13,7 +13,9 @@ Five sections, and the first is the claim itself:
    half is why: a recovery that did NOTHING would pass a byte-identical
    assertion trivially, so each of these tests carries a positive control — the
    dead lane's lease really is gone, its worker really did move — beside the
-   equality.
+   equality. The directory that moves is the one the RECORD names, never the one
+   the task id resolves to under today's `workers_root`; where those differ, only
+   the recorded worker moves and its healthy namesake is byte-identical too.
 2. **The merge token.** A live lane's sweep DEFERS while a dead lane holds it
    (it is never stolen), the recovery releases it, and the same sweep then
    merges. At `lanes = 1` no token exists and no file is created.
@@ -60,6 +62,8 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from autoloop import auto_merge, cli
 from autoloop import lock as lock_module
 from autoloop.blockers import FLEET_FATAL, LANE_FATAL, BlockerStore, fatal_scope
@@ -70,6 +74,7 @@ from autoloop.config import (
     lane_id,
     lane_observed_checkout,
 )
+from autoloop.errors import GitCommandError
 from autoloop.git_gateway import GitGateway
 from autoloop.health import check as health_check
 from autoloop.health import dead_lane_survey, dead_lane_view
@@ -90,6 +95,7 @@ from autoloop.orchestrator import (
     RECOVERY_RELEASED,
     RECOVERY_RESUMED,
     Orchestrator,
+    _recorded_worker_refusal,
     fleet_stop,
     recover_dead_lanes,
 )
@@ -502,6 +508,75 @@ def test_a_dead_lane_whose_worker_fails_the_reuse_probe_is_quarantined(
     assert moved.is_dir() and "quarantine" in moved.parts
     assert (moved / "half-written.txt").read_text() == "what the dead round wrote\n"
     assert not broken.exists()          # a later create() for t-broken is free
+    assert not lane_paths(config.state_dir, 1).lease_file.exists()
+    assert lane_snapshot(config, 2, live_worker) == before_live
+
+
+def test_the_quarantine_moves_the_recorded_worker_and_not_the_one_named_by_id(
+    tmp_path, monkeypatch
+):
+    """THE DIRECTORY THAT MOVES IS THE ONE THAT WAS JUDGED.
+
+    Everything the recovery decides is decided about `execution.worktree_path`
+    as the record wrote it; `WorkerRepoManager.quarantine(task_id, ...)` moves
+    `<workers_root>/<task_id>` as the manager is configured NOW. A deployment
+    whose `workers_root` moved between the two makes those different
+    directories, and this is that deployment: the broken worker the dead round
+    left behind sits under the OLD root and is what the record names, while the
+    new root holds a healthy repository for the same task id.
+
+    Quarantining by id would leave the broken one exactly where it is and carry
+    the healthy one off instead — the wrong repository moved, on evidence
+    gathered about another. Both halves are asserted, so both flip if that
+    returns.
+    """
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=3)
+
+    # the worker the record names, under the root the record was written against
+    broken = tmp_path / "old-workers" / "t-broken"
+    broken.mkdir(parents=True)
+    (broken / "half-written.txt").write_text("what the dead round wrote\n")
+    assert not worker_repo_is_reusable(broken, "autoloop/t-broken")
+    execution = TaskExecution(
+        task_id="t-broken",
+        task_branch="autoloop/t-broken",
+        worktree_path=str(broken),
+        task_base_sha="0" * 40,
+    )
+    TaskExecutionStore(config.executions_dir).save(execution)
+
+    # ...and a healthy repository at the path the task id resolves to today
+    decoy = WorkerRepoManager(
+        config.workers_root, config.worker_hooks_dir
+    ).path_for("t-broken")
+    make_repo_from_template(
+        decoy, branch="autoloop/t-broken", files=(("work.txt", "not this one\n"),)
+    )
+    before_decoy = digest(decoy)
+
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone(config, 1)
+
+    live_worker, live_exec = seed_worker(config, "t-live", real_repo=True)
+    seed_lane(config, 2, execution=live_exec)
+    write_lease(config, 2, alive=True, boot=boot)
+    seed_clone(config, 2)
+    before_live = lane_snapshot(config, 2, live_worker)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    entry = recovery.lanes[0]
+    assert entry.action == RECOVERY_QUARANTINED and entry.task_id == "t-broken"
+    # the recorded worker moved, with its evidence...
+    moved = Path(entry.quarantined_at)
+    assert moved.is_dir() and "quarantine" in moved.parts
+    assert (moved / "half-written.txt").read_text() == "what the dead round wrote\n"
+    assert not broken.exists()
+    # ...and the repository that merely shares its task id did not
+    assert digest(decoy) == before_decoy
+    assert worker_repo_is_reusable(decoy, "autoloop/t-broken")
     assert not lane_paths(config.state_dir, 1).lease_file.exists()
     assert lane_snapshot(config, 2, live_worker) == before_live
 
@@ -1184,6 +1259,107 @@ def test_a_quarantine_that_fails_leaves_the_lane_shut(tmp_path, monkeypatch):
     assert [e.action for e in recovery.lanes] == [RECOVERY_REFUSED]
     assert lane_paths(config.state_dir, 1).lease_file.exists()
     assert worker.exists()
+
+
+def test_a_recorded_worker_inside_another_lanes_clone_is_refused_not_moved(
+    tmp_path, monkeypatch
+):
+    """The fail-closed half of "quarantine the recorded path": a path that
+    cannot be safely placed is not moved at all.
+
+    The record here names a directory inside the observed checkout root, which
+    is where every lane's clone lives — lane 2's, in fact. It fails the reuse
+    probe (it is a repository, on the wrong branch), so without this refusal the
+    recovery would move ANOTHER LANE'S WATCHED TREE aside, which is this
+    candidate's own claim inverted by the code written to prove it. Nothing
+    moves, the dead lane keeps its lease, and the detail says why.
+    """
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=3, observed=True)
+    seed_clone_repo(config, 1)              # this lane's own tree is clean
+    sibling_clone = seed_clone_repo(config, 2)
+    assert not worker_repo_is_reusable(sibling_clone, "autoloop/t-broken")
+    execution = TaskExecution(
+        task_id="t-broken",
+        task_branch="autoloop/t-broken",
+        worktree_path=str(sibling_clone),
+        task_base_sha="0" * 40,
+    )
+    TaskExecutionStore(config.executions_dir).save(execution)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_lane(config, 2)
+    write_lease(config, 2, alive=True, boot=boot)
+    before_live = lane_snapshot(config, 2)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    entry = recovery.lanes[0]
+    assert entry.action == RECOVERY_REFUSED and entry.quarantined_at == ""
+    assert "observed checkout root" in entry.detail
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    assert lane_snapshot(config, 2) == before_live
+    # the guard's other boundary, asked directly rather than through a second
+    # fixture: the state directory, where every lane's own files live
+    assert "state directory" in _recorded_worker_refusal(
+        lane_paths(config.state_dir, 2).state_dir, config
+    )
+
+
+def test_quarantine_recorded_refuses_a_path_it_cannot_place(tmp_path):
+    """`WorkerRepoManager`'s own half of the same guard, asked directly.
+
+    `quarantine(task_id, label)` can only ever move a path this class
+    constructed; `quarantine_recorded` moves a string that came out of a JSON
+    file, so the structural guarantee is replaced by these checks. Each one
+    raises and moves nothing.
+    """
+    manager = WorkerRepoManager(tmp_path / "workers", tmp_path / "worker-hooks")
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "t-broken").mkdir(parents=True)
+    (elsewhere / "t-broken" / "evidence.txt").write_text("half a round\n")
+    before = digest(elsewhere)
+
+    # a symlink: moving it would report a quarantine and leave the tree in place
+    link = tmp_path / "links" / "t-broken"
+    link.parent.mkdir()
+    link.symlink_to(elsewhere / "t-broken", target_is_directory=True)
+    with pytest.raises(GitCommandError, match="symbolic link"):
+        manager.quarantine_recorded("t-broken", "label-1", link)
+
+    # a directory that is not named for the task: what it holds is unknown
+    with pytest.raises(GitCommandError, match="not named for task"):
+        manager.quarantine_recorded("t-broken", "label-2", elsewhere)
+
+    # ...including when it is the workers root's own parent, which would carry
+    # every other task's worker with it
+    with pytest.raises(GitCommandError, match="not named for task"):
+        manager.quarantine_recorded("t-broken", "label-3", tmp_path)
+
+    # a file, not a directory
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    (loose / "t-broken").write_text("not a worker\n")
+    with pytest.raises(GitCommandError, match="not a directory"):
+        manager.quarantine_recorded("t-broken", "label-4", loose / "t-broken")
+
+    # a directory that is named for the task AND holds the workers root: moving
+    # it would carry every other task's worker along
+    (tmp_path / "t-broken").mkdir()
+    nested = WorkerRepoManager(
+        tmp_path / "t-broken" / "workers", tmp_path / "t-broken" / "hooks"
+    )
+    with pytest.raises(GitCommandError, match="contains the workers root"):
+        nested.quarantine_recorded("t-broken", "label-5", tmp_path / "t-broken")
+
+    assert digest(elsewhere) == before
+    assert link.is_symlink() and not (tmp_path / "quarantine").exists()
+
+    # and the path it CAN place moves, so the refusals above are the guard
+    # firing rather than the method never working
+    dest = manager.quarantine_recorded("t-broken", "label-6", elsewhere / "t-broken")
+    assert (dest / "evidence.txt").read_text() == "half a round\n"
+    assert not (elsewhere / "t-broken").exists()
 
 
 def test_a_dead_lease_with_nothing_mid_round_is_simply_released(
