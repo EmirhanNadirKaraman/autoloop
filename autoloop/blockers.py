@@ -89,6 +89,15 @@ costs one of `MAX_TASK_ATTEMPTS` and one of `policy.max_review_rounds` exactly
 as a reviewer's does — and both ceilings are themselves set-aside codes in
 `EXHAUSTED_BUDGET_RECOVERIES`. A task whose refusals never repeat therefore
 ends at `attempt_count_ceiling`, quarantined, rather than looping.
+
+conc-07 (2026-09-03) adds the FAULT-ISOLATION table — `LANE_FATAL_CODES`,
+`FLEET_FATAL_CODES` and `fatal_scope` — for the same two reasons the recovery
+tables are here rather than in `orchestrator.py`: it is data ABOUT blocker
+codes, and a table of code strings in the orchestrator's source is
+indistinguishable from an emitter to `test_transport_recovery.py`'s retired-code
+walk. It answers one question and changes no vocabulary: given a `loop_fatal`
+park, does stopping the lane that raised it answer the fault, or does every lane
+have to stop? `Blocker.lane_id` is the other half — the record says which lane.
 """
 
 from __future__ import annotations
@@ -946,6 +955,174 @@ AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
 }
 
 
+# ---- fault isolation: how far one park reaches (conc-07, 2026-09-03) --------
+#
+# Candidate 6 of docs/AUTOLOOP.md's split plan, Decision 5. A `loop_fatal` park
+# stops "the loop"; with N lanes there are N loops, so the word has to be split
+# in two — and the split rides a SEPARATE AXIS from `kind`, which is what keeps
+# `lanes = 1` byte-identical. Nothing here renames a kind: `_to_needs_user` goes
+# on writing literally `"loop_fatal"` into `state.park_kind` and into every
+# blocker record, every existing assertion about that string still holds, and
+# what these tables answer is the NEW question a fleet asks of an old park —
+# does stopping this lane answer it, or does every lane have to stop?
+#
+#   * `LANE_FATAL` — this lane stops and parks; the fleet keeps running.
+#   * `FLEET_FATAL` — every lane stops at its next safe phase.
+#
+# THE RULE THE ENUMERATION BELOW APPLIES, stated once rather than re-argued per
+# entry: a code is lane-fatal when the thing that failed is ONE LANE'S OWN — its
+# session bookkeeping, its conversation, its request, its candidate, its
+# execution record, its observed clone — so a sibling lane running the identical
+# code is unaffected by it. Everything else is fleet-fatal: the ACCOUNT (one
+# allowance, one login, one browser), the SHARED REPOSITORY and its remote, the
+# SHARED records under the state directory, and every hard halt.
+#
+# THE DEFAULT DIRECTION DOES NOT CHANGE, which is Decision 5's own sentence: an
+# absent, empty or unrecognised code is `FLEET_FATAL`. `fatal_scope` is a
+# function rather than a dict lookup for exactly the reason `autonomous_recovery`
+# is: neither that default nor the hard-halt refusal below can then be forgotten
+# by a caller that only remembers the table.
+
+
+#: This lane stops; the other lanes keep working.
+LANE_FATAL = "lane_fatal"
+
+#: Every lane stops at its next safe phase.
+FLEET_FATAL = "fleet_fatal"
+
+#: The `loop_fatal` codes whose fault belongs to ONE LANE. Enumerated against
+#: the real park sites in `orchestrator.py` rather than guessed, which is the
+#: work Decision 5 delegates to this candidate; `test_fault_isolation.py` walks
+#: those sites and fails when one of them emits a code neither this set nor
+#: `FLEET_FATAL_CODES` names.
+#:
+#: Two entries are settled by the DOCUMENT and not by the rule above:
+#: `observed_checkout_unusable` is lane-fatal because Decision 8 says so in
+#: those words ("that refusal is a lane-fatal park naming that lane's directory,
+#: and the other lanes keep running"), and `checkout_escape_detected` is absent
+#: here because Decision 5 keeps it fleet-fatal deliberately — an agent that has
+#: demonstrated it writes outside its boundary is not one to keep three
+#: neighbours running alongside.
+LANE_FATAL_CODES = frozenset({
+    # The lane's OWN session bookkeeping: `LoopState`, one per lane (Decision 2).
+    "state_inconsistent",
+    # `policy.max_iterations` against `state.iteration` — the lane's own count.
+    "iteration_budget_exhausted",
+    # `state.parse_retries`: consecutive malformed replies in this lane's turn.
+    "parse_budget_exhausted",
+    # One request in this lane's outbox whose acceptance is unknown.
+    "submission_ambiguous",
+    # This lane's own request, refused twice by its own transport turn.
+    "send_rejected_twice",
+    # This lane's conversation. Every codex turn is its own subprocess, so a
+    # conversation is per lane by construction and no sibling shares one.
+    "conversation_unusable",
+    # Decision 8, verbatim: an unclean or diverged clone parks THAT lane.
+    "observed_checkout_unusable",
+    # `state.current_task` pointing at an audit unit nobody minted — a pointer
+    # that exists only inside this lane's session.
+    "audit_revise_no_record",
+    # This lane's own outbox cannot carry the four identifiers an approval binds
+    # by, so no round IT spends could publish. A sibling's outbox is untouched.
+    "changeset_binding_missing",
+    # The four push refusals: each is about ONE candidate and the binding,
+    # ancestry or tree of that one candidate, held in one lane's round.
+    "push_candidate_stale",
+    "push_candidate_unresolvable",
+    "push_not_descendant",
+    "push_tree_mismatch",
+})
+
+#: The `loop_fatal` codes that stop EVERY lane. Enumerated rather than left as
+#: "whatever is not lane-fatal", so that the classification of a park site is a
+#: thing somebody wrote down and a reviewer can read — the fail-closed default
+#: in `fatal_scope` covers a code nobody classified, and this set is what says
+#: the ones below were classified on purpose.
+#:
+#: Four families, and the family is the whole argument for the member:
+#:
+#:   * THE ACCOUNT — one allowance, one login, one browser profile behind every
+#:     lane (`login_expired`, `rate_limited`, `quota_exhausted`,
+#:     `provider_switch_budget`, `browser_unattachable`,
+#:     `browser_restart_cooldown_blocked`, `transport_failure_budget_exhausted`).
+#:     conc-11 already scopes the throttle to the fleet for this reason.
+#:   * THE SHARED TREE AND ITS REMOTE — the operator's checkout, the git
+#:     environment every worker inherits, the publisher and what it will accept
+#:     (`primary_checkout_dirty`, `worker_environment_drift`,
+#:     `publisher_url_drift`, `changeset_publisher_required`, `push_refused`,
+#:     `push_refused_protected`, `git_unavailable_in_ready`,
+#:     `git_unavailable_in_delivering`, `git_failure_budget_exhausted`,
+#:     `review_mismatch_budget_exhausted`).
+#:   * SHARED RECORDS AND SHARED ARTEFACTS — the fleet throttle record, the stop
+#:     ledger, the roadmap a plan is rejected against (`fleet_throttle_unreadable`,
+#:     `stop_repetition_ledger_unusable`, `stop_livelock`,
+#:     `plan_denial_budget_exhausted`, `policy_denial_budget_exhausted`).
+#:   * THE HARD HALTS — an agent that wrote where it may not, or a checkout that
+#:     is not what the loop believes it to be (`HARD_HALT_CODES`).
+#:
+#: `unclassified` is `_to_needs_user`'s own default `code`, i.e. the literal "a
+#: park nobody classified", and it is named here so the fail-closed answer is
+#: visible in the table and not only in the function.
+FLEET_FATAL_CODES = frozenset({
+    "login_expired",
+    "rate_limited",
+    "quota_exhausted",
+    "provider_switch_budget",
+    "browser_unattachable",
+    "browser_restart_cooldown_blocked",
+    "transport_failure_budget_exhausted",
+    "primary_checkout_dirty",
+    "worker_environment_drift",
+    "publisher_url_drift",
+    "changeset_publisher_required",
+    "push_refused",
+    "push_refused_protected",
+    "git_unavailable_in_ready",
+    "git_unavailable_in_delivering",
+    "git_failure_budget_exhausted",
+    "review_mismatch_budget_exhausted",
+    "fleet_throttle_unreadable",
+    "stop_repetition_ledger_unusable",
+    "stop_livelock",
+    "plan_denial_budget_exhausted",
+    "policy_denial_budget_exhausted",
+    "unclassified",
+    *HARD_HALT_CODES,
+})
+
+
+def fatal_scope(code) -> str:
+    """How far a `loop_fatal` park with this `code` reaches — `LANE_FATAL` or
+    `FLEET_FATAL`.
+
+    `FLEET_FATAL` for everything the table does not name a lane fault, which
+    covers the four shapes that matter and is the direction Decision 5 fixes:
+    an EMPTY code, a code this build has never heard of, a code from a FUTURE
+    build, and a value that is not a string at all (a hand-edited record, a
+    `None` read off a field nobody set). A park whose reach cannot be read stops
+    everything, exactly as an unrecognised `kind` already does in
+    `cli._handle_parked_task` and as an unrecognised kind already ranks in
+    `_KIND_RANK`.
+
+    A HARD HALT IS REFUSED BEFORE THE TABLE IS CONSULTED, which is the second,
+    redundant lock `autonomous_recovery` uses for the same set and for the same
+    reason: `checkout_escape_detected` staying fleet-fatal is a decision the
+    document makes, and adding it to `LANE_FATAL_CODES` by hand must not be
+    enough to move it. A test asserts the two sets are disjoint, so that edit is
+    a failing test rather than a silent one.
+
+    Says nothing about `task_fatal`, deliberately. A task_fatal park is NARROWER
+    than either word here — one task is set aside and the lane itself keeps
+    working — so "how far does this stop reach" is not a question about it, and
+    the one caller (`orchestrator.fleet_stop`) answers it a step earlier.
+    """
+    if not isinstance(code, str):
+        return FLEET_FATAL
+    if code in HARD_HALT_CODES:
+        return FLEET_FATAL
+    return LANE_FATAL if code in LANE_FATAL_CODES else FLEET_FATAL
+
+
 def refusal_identity(code: str, question: str, detail: str) -> str:
     """A stable digest of ONE refusal — the thing the repeat guard compares
     (halt-04).
@@ -1042,6 +1219,18 @@ class Blocker:
     #: autonomous mode does not answer with a revise, which `load` supplies by
     #: default and `refusal_revises` reads as "nothing spent here".
     revised_refusals: list[str] = field(default_factory=list)
+    #: WHICH LANE parked this (conc-07) — `config.lane_id(index)`, e.g.
+    #: `_lane-0`. Decision 5's "its blocker record names the lane", and the
+    #: reason it is on the record rather than derived: a fleet-fatal park stops
+    #: every lane, so the operator reading `blockers` afterwards is looking at a
+    #: list in which the lane that raised each question is the first thing they
+    #: need and the one thing no other field carries.
+    #:
+    #: Descriptive metadata only. Nothing branches on it — `fatal_scope` reads
+    #: the CODE, and `orchestrator.fleet_stop` reads the lanes' own state files —
+    #: so a record written before this field existed, or by a caller that passes
+    #: none, is `""` and is still classified exactly as one that names a lane.
+    lane_id: str = ""
 
 
 #: Severity rank for primary selection — LOWER is more urgent. `loop_fatal`
@@ -1190,9 +1379,17 @@ class BlockerStore:
         return None
 
     def record(self, *, task_id, kind, code, question, detail, phase, now,
-               session_id: str = "") -> "Blocker":
+               session_id: str = "", lane_id: str = "") -> "Blocker":
         """Idempotent upsert. Returns the existing open blocker for this
         condition with its recurrence count bumped, or a new one.
+
+        `lane_id` (conc-07) NEVER BLANKS what a record already carries: a bump
+        keeps the existing lane when the caller supplies none, because "no lane
+        was passed" is an absence of information and overwriting a named lane
+        with it would lose the only field that says where the fault was raised.
+        A bump that DOES name a lane wins, so a condition that re-parks in a
+        different lane names the lane it was last seen in — the same rule
+        `question` and `detail` already follow.
 
         Deliberately does NOT touch `revised_refusals`: this method records that
         a fault was SEEN, and the repeat guard meters what the loop DID about it
@@ -1216,13 +1413,14 @@ class BlockerStore:
                 last_seen_at=now,
                 question=question,
                 detail=detail,
+                lane_id=lane_id or existing.lane_id,
             )
             self.save(bumped)
             return bumped
         fresh = Blocker(
             id=self.next_id(task_id), task_id=task_id, kind=kind, code=code,
             question=question, detail=detail, phase=phase, created_at=now,
-            last_seen_at=now, session_id=session_id,
+            last_seen_at=now, session_id=session_id, lane_id=lane_id,
         )
         self.save(fresh)
         return fresh
