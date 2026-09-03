@@ -2144,6 +2144,10 @@ class Orchestrator:
         #: `cli._build_orchestrator` always wires one (the default location is
         #: derived from the mandatory `workers_root`), so production is always
         #: on the dedicated tree.
+        #:
+        #: NARROWED TO THIS LANE'S OWN CLONE further down, once `lane_index` has
+        #: been validated — see that block. What is stored here is what the
+        #: caller passed; what the round uses is the lane's.
         self._observed = observed_checkout
         #: Built once, lazily, by `_observation_git` — a `GitGateway` rooted at
         #: the clone. Cached because `enumerate_checkout_paths` runs twice per
@@ -2241,6 +2245,33 @@ class Orchestrator:
         #: lanes. The path belongs to whoever built the store.
         self.lane_index = lane_index
         self.lane_id = lane_id(lane_index)
+        #: AND THE TREE THIS LANE WATCHES (conc-04, docs/AUTOLOOP.md "Decision 1
+        #: — the isolation boundary is one observed checkout per lane"). Derived
+        #: HERE, after `lane_id` above has refused a bool/float/negative index,
+        #: because a lane whose id is `_lane-True` would otherwise name a
+        #: directory beside a real lane's clone.
+        #:
+        #: The caller hands over the DEPLOYMENT's observed checkout — the one
+        #: `[paths].observed_checkout` resolves to — and this narrows it to the
+        #: lane's own (`ObservedCheckout.for_lane`). At lane 0 with `lanes <= 1`
+        #: it is the very object that was passed, unchanged and with the caller's
+        #: `runner` intact, so today's single-lane deployment and every
+        #: hand-built Orchestrator in the suite watch exactly the tree they were
+        #: given. Above one lane every lane gets its own sibling clone, and the
+        #: three things that follow `self._observed` — the snapshots in
+        #: `_execute_with_escape_detection`, the baseline in
+        #: `_prepare_write_capable_worker`, and `_worker_fetch_root` — follow it
+        #: there together, which is what stops one lane's sync landing inside
+        #: another's window.
+        #:
+        #: ONCE, at construction, rather than per call: this is the identity of
+        #: a tree on disk, and a lane that changed which clone it watched
+        #: mid-round would compare a "before" snapshot of one repository against
+        #: an "after" of another. The fleet size is read through `_fleet_lanes`,
+        #: the same defensive reading every other fleet-aware site here uses, so
+        #: a hand-built config with no `[concurrency]` section is one lane.
+        if self._observed is not None:
+            self._observed = self._observed.for_lane(lane_index, self._fleet_lanes())
         #: Phase steps this orchestrator has actually taken, across every call
         #: to `run`. Public, and read by `cli._remaining_steps`.
         self.steps_taken = 0
@@ -9395,14 +9426,16 @@ class Orchestrator:
     def _worker_fetch_root(self) -> Path:
         """Where a worker repository's content is fetched FROM.
 
-        The observed clone once one is wired, and this is load-bearing rather
-        than tidy. A worker repo records its fetch source in `.git/FETCH_HEAD`,
-        so it is the one absolute path to a non-worker tree that an agent
-        inside a worker can read off disk. Pointing it at the clone means the
-        tree an agent can most easily find its way back to is the tree the
-        detector is watching — without which "a genuine escape is still
-        reported" would be a hope about paths nobody handed out rather than a
-        property of the arrangement.
+        The observed clone once one is wired — THIS LANE's clone since conc-04
+        (`__init__`'s `for_lane`) — and this is load-bearing rather than tidy. A
+        worker repo records its fetch source in `.git/FETCH_HEAD`, so it is the
+        one absolute path to a non-worker tree that an agent inside a worker can
+        read off disk. Pointing it at the clone means the tree an agent can most
+        easily find its way back to is the tree the detector is watching — and,
+        above one lane, the tree ITS OWN lane's detector is watching, so a
+        worker's own provenance never names a sibling lane. Without it "a genuine
+        escape is still reported" would be a hope about paths nobody handed out
+        rather than a property of the arrangement.
 
         Only ever consulted AFTER `_synchronise_observed_checkout` has
         succeeded for this round, which is what guarantees the commit being
@@ -9486,8 +9519,9 @@ class Orchestrator:
         checkout taken immediately before and immediately after the call,
         nothing wider.
 
-        "Observed" is the loop-owned clone since esc-02 (2026-08-26), and the
-        primary checkout only for a deployment that wires none — see
+        "Observed" is the loop-owned clone since esc-02 (2026-08-26) — THIS
+        LANE's clone since conc-04, which is the same tree at one lane — and the
+        primary checkout only for a deployment that wires none; see
         `_observation_git`, `_synchronise_observed_checkout` and
         `worker_env.ObservedCheckout`. The change is not to WHAT is watched
         (tracked + untracked + ignored, unchanged and deliberately not
