@@ -161,9 +161,11 @@ from .orchestrator import (
     PREEMPTION_STOP_KIND,
     SELF_UPGRADE,
     FleetPlan,
+    FleetStop,
     FleetSupervisor,
     Orchestrator,
     fleet_occupants,
+    fleet_stop,
     release_task_to_pending,
 )
 from .policy import PolicyConfig, PolicyEngine
@@ -2017,6 +2019,36 @@ def _fleet_plan(
     )
 
 
+def _fleet_stop_reached(
+    config: AutoloopConfig,
+    blocker_store: BlockerStore,
+    lane: "_LaneEntry | None",
+) -> FleetStop | None:
+    """Has some OTHER lane reached a fleet-fatal terminal, or `None` when this
+    lane may keep working (conc-07)?
+
+    **`None` at `lanes = 1` is the acceptance criterion made structural**, the
+    same device `_fleet_plan` uses one function above: at one lane there are no
+    siblings to stop for, so nothing is read, no path is stat'ed, and a
+    single-lane deployment cannot be changed by this at all. That gate is the
+    reason a `lanes/` directory left behind by an experiment cannot stop a loop
+    that has since been turned back down to one.
+
+    `lane.lane_index` — 0 for the call shapes that pass no lane, which is what
+    `_cmd_run` opens today — is excluded from the walk. THIS lane's own park is
+    reported by `_handle_parked_task` with today's wording and today's exit
+    code; describing it a second time, in the fleet's vocabulary, would tell an
+    operator about one park as though it were two.
+    """
+    if config.concurrency.lanes <= 1:
+        return None
+    return fleet_stop(
+        config,
+        blocker_store,
+        exclude=lane.lane_index if lane is not None else 0,
+    )
+
+
 def _log_fleet_hold(config: AutoloopConfig, plan: FleetPlan) -> None:
     """Record ONCE PER TICK why the fleet dispatched nothing (Decision 4).
 
@@ -2043,6 +2075,31 @@ def _log_fleet_hold(config: AutoloopConfig, plan: FleetPlan) -> None:
             "held": "; ".join(
                 f"{task_id}: {reason}" for task_id, reason in plan.held[:5]
             ),
+        },
+    )
+
+
+def _log_fleet_stop(config: AutoloopConfig, stop: FleetStop) -> None:
+    """Record that THIS lane stopped for somebody else's fault (conc-07).
+
+    `_log_fleet_hold`'s sibling, and for its reason: a lane that exits 2 having
+    printed one line to a terminal nobody is watching has left no record that it
+    stopped, or of which lane it stopped for — and the durable evidence
+    (`blockers/`) belongs to the lane that parked, not to this one. The entry is
+    written once, on the tick this lane gives up, and carries the lane, the code
+    and the blocker id so the transcript answers "why did lane 0 stop" without a
+    second file being opened.
+    """
+    TranscriptLogger(config.transcript_file).append(
+        "fleet_stop",
+        data={
+            "lane_id": stop.lane_id,
+            "lane_index": stop.lane_index,
+            "code": stop.code,
+            "kind": stop.kind,
+            "blocker_id": stop.blocker_id,
+            "readable": stop.readable,
+            "detail": stop.describe(),
         },
     )
 
@@ -2075,6 +2132,16 @@ def _run_continuous(
     separate phase, never routed through `_to_needs_user`, so never
     classified) always stops the loop too — resolve either with a plain
     `run --retry`/`--answer` (WITHOUT `--continuous`), then restart.
+
+    **AT `lanes > 1` A `loop_fatal` PARK REACHES FURTHER THAN THIS PROCESS**
+    (conc-07). The classification above decides what happens in the lane that
+    parked; `blockers.fatal_scope` decides what happens in the OTHERS. A
+    lane-fatal code stops that one lane and nothing else — the fleet keeps
+    working, which is the whole of Decision 5 — while a fleet-fatal one, an
+    unrecognised one and an absent one stop every lane at the top of its next
+    iteration (`_fleet_stop_reached`, the check beside `pause`/`abort` above).
+    At `lanes = 1` that check answers `None` without reading anything, so this
+    paragraph describes nothing a single-lane deployment can reach.
 
     **A `stopped` session is split too**, and this is the one place the split
     matters most: `stop_kind="contract"` (the reviewer decided the round was
@@ -2157,6 +2224,35 @@ def _run_continuous(
         if abort_requested(config):
             print("aborted — `resume` clears the flag and starts working again")
             return 0
+        # THE FLEET-FATAL TERMINAL SOME OTHER LANE REACHED (conc-07). Here, at
+        # the top of an outer iteration, because this is the "next safe phase"
+        # Decision 5 asks for and the only boundary that is one: a round in
+        # flight has already returned or continued by the time control is back
+        # here, and a gate inside `Orchestrator.run`'s step loop would stall a
+        # lane MID-ROUND — the same site conc-11 considered and rejected for the
+        # throttle, for the same reason.
+        #
+        # AFTER `pause`/`abort`, so an operator's own two verbs still answer
+        # first and still answer 0; a fleet stop is a fault and exits 2 like
+        # every other loop-fatal terminal. `None` at `lanes = 1`, where nothing
+        # is read at all.
+        fleet_fault = _fleet_stop_reached(config, blocker_store, lane)
+        if fleet_fault is not None:
+            # No `_summary`: this lane's own session is not the thing that went
+            # wrong, and printing its phase here would put a healthy lane's
+            # bookkeeping under a headline about somebody else's fault. The
+            # transcript entry is what makes the stop durable HERE — the blocker
+            # record belongs to the lane that parked.
+            _log_fleet_stop(config, fleet_fault)
+            print(
+                f"continuous mode stopped: {fleet_fault.describe()}\n"
+                "Every lane stops for a fleet-fatal fault. It clears when THAT "
+                "lane's own session leaves `needs_user` — `run --retry` / "
+                "`--answer` (WITHOUT --continuous) in that lane, or `reset` — "
+                "and answering the blocker record alone does not move it. Then "
+                "restart this lane."
+            )
+            return 2
         # One completed iteration is what retires a self-upgrade's one-shot
         # marker (`_confirm_self_upgrade`). Checked at the TOP of the second
         # iteration rather than at the bottom of the first: every branch below
