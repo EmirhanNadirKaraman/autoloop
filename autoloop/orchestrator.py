@@ -10736,12 +10736,13 @@ class Orchestrator:
         """Is the tree this lane is about to synchronise and bracket a tree only
         THIS lane writes to? Human-readable violations; empty means yes.
 
-        THE PRODUCTION CALLER of `worker_env.validate_lane_checkout_distinctness`
+        THE ROUND'S CALLER of `worker_env.validate_lane_checkout_distinctness`
         — the rule Decision 1 states as the whole claim, asked where it can still
         stop something: `_synchronise_observed_checkout` runs it before the clone
         is fetched into, checked out, or bracketed, and a violation parks the
         round with nothing executed. A rule only a validator function knows is a
-        rule that never fires.
+        rule that never fires. `_lane_clone_violations` (conc-08) is the other
+        caller, asking it of a DEAD lane's clone before that tree is read.
 
         The siblings are DERIVED, from the two values `__init__` recorded — the
         deployment's configured checkout and the fleet size this lane's own path

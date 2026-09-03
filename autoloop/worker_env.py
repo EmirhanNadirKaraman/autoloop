@@ -406,8 +406,10 @@ def validate_lane_checkout_distinctness(
     ask only the question that is per-lane: is THIS lane's clone a tree no other
     lane also watches?
 
-    One PRODUCTION caller — `orchestrator._lane_isolation_violations`, which runs
-    on every round before the clone is synchronised or an agent is started — plus
+    Two PRODUCTION callers, both asking it before anything touches a tree —
+    `orchestrator._lane_isolation_violations`, on every round before the clone is
+    synchronised or an agent is started, and `orchestrator._lane_clone_violations`
+    (conc-08), before a dead lane's own clone is read at all — plus
     `validate_observed_checkout` above, which delegates its sibling branch here
     so there is one implementation of the rule rather than two that agree today.
 
