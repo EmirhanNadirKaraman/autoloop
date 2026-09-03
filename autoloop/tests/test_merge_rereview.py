@@ -16,6 +16,15 @@ test writes directly — the plan says so itself ("it needs two execution
 carry-forward is a claim about GIT, so it gets real repositories, real
 worktrees, a real remote and the real orchestrator.
 
+The third claim, and the one the carry-forward would be useless without: a
+carried candidate does not wait for a human to notice it. The lane holding the
+now-invalid approval sends a FRESH packet for it and can publish only the
+binding that packet produces — asserted end to end, through `_step_ready`,
+rather than by writing the record a discharge would have left. Five states in
+which the loop must NOT ask (a carry that refused, an outstanding stat-only
+split ask, a spent round budget, a task the registry lost, a worker that cannot
+be read) each keep the park, with the reason they did not ask in the transcript.
+
 `lanes = 1` is the acceptance criterion every candidate in that plan carries,
 and it is asserted here rather than assumed: the reason string, the merge
 outcome and the untouched record are pinned at one lane in the same file that
@@ -52,9 +61,14 @@ from autoloop.state import (
     PostcommitBinding,
     StateStore,
 )
-from autoloop.tasks import Task, TaskRegistry, TaskStore
+from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
-from autoloop.worktask import IntentStore, TaskExecutionStore
+from autoloop.worktask import (
+    ATTEMPT_TASK,
+    IntentStore,
+    TaskExecutionStore,
+    format_attempt,
+)
 from autoloop.worktree import WorktreeManager
 
 URL = "https://chatgpt.com/c/conc-03"
@@ -533,6 +547,16 @@ def approve(h, binding):
     )
 
 
+def queued_review_packet(h) -> str:
+    """The produce-then-review packet waiting to be sent, or `""`.
+
+    Not `state.outbox is None`: the push that moved the head leaves its own
+    `git_report` there, so "no packet was queued" and "the outbox is empty" are
+    different claims and only the first one is being made anywhere below."""
+    outbox = h.orch.state.outbox or ""
+    return outbox if "POST-COMMIT REVIEW PACKET" in outbox else ""
+
+
 def test_a_merge_at_two_lanes_carries_the_bound_candidate_onto_the_new_head(tmp_path):
     """The claim, in one test. Another task merges, the head moves, and the
     reviewed candidate is not stranded — it is carried onto the new head, its
@@ -567,8 +591,12 @@ def test_a_merge_at_two_lanes_carries_the_bound_candidate_onto_the_new_head(tmp_
 
 def test_the_old_approval_is_refused_after_the_carry_forward(tmp_path):
     """"Never pushed on its old approval." The reviewer approved a candidate
-    against a base that has since moved; the binding still names it, and the
-    push is refused rather than published."""
+    against a base that has since moved; the binding still names it, and
+    `_dispatch_task_push` publishes nothing.
+
+    What it does INSTEAD of parking is the other half of Decision 6 — the round
+    was reset "so the loop asks for the new review instead of parking" — so the
+    refusal is asserted here together with the ask that replaces the park."""
     h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
     nine = bound_candidate(h, "t9", "nine.py", "nine\n")
     stale = binding_for(nine, Path(nine.worktree_path))
@@ -576,12 +604,19 @@ def test_the_old_approval_is_refused_after_the_carry_forward(tmp_path):
     h.push("t1")
     approve(h, stale)
 
-    assert [b.code for b in h.blockers("t9")] == ["push_rereview_owed"]
-    assert h.orch.state.park_kind == "task_fatal", "one task waits; the fleet runs"
+    # REFUSED, which is the graded sentence: nothing reached the remote, the
+    # record records no publication, and the task did not complete.
     assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == "", (
         "nothing was published on the stale approval"
     )
     assert h.execution_store.load("t9").published_sha == ""
+    assert h.orch._registry.state_of("t9") is not TaskState.COMPLETED
+    # ASKED, not parked: no blocker for t9, and a packet naming the carried
+    # candidate is queued for the reviewer.
+    assert h.blockers("t9") == []
+    assert h.orch.state.phase == Phase.READY.value
+    carried = h.execution_store.load("t9")
+    assert carried.candidate_sha in queued_review_packet(h)
 
 
 def test_a_carry_forward_that_conflicts_parks_and_destroys_nothing(tmp_path):
@@ -618,7 +653,13 @@ def test_a_failed_carry_forward_still_refuses_the_old_approval(tmp_path):
 
     The carry-forward refused, so `candidate_sha` and its tree are untouched
     and every push-time check would pass. Only the marker stands between an
-    approval taken against a base that has since moved and a publish."""
+    approval taken against a base that has since moved and a publish.
+
+    It is also the one owed re-review the loop must NOT ask for: no carried
+    candidate exists, the record is still on a base the head has moved past,
+    and asking a reviewer to look again at a commit a human has to unstick
+    would spend a round on the wrong question. So this one PARKS, exactly as it
+    always did, and says why it did not ask."""
     h = build(tmp_path, per_task={"t1": {"shared.py": "one\n"}}, lanes=2)
     before = h.head()
     nine = bound_candidate(h, "t9", "shared.py", "nine\n")
@@ -631,32 +672,176 @@ def test_a_failed_carry_forward_still_refuses_the_old_approval(tmp_path):
         "the precondition of this test: every OTHER check would let this through"
     )
     assert kept.rereview_owed_base == before
+    assert kept.rereview_candidate_sha == "", "nothing was carried, so nothing is named"
 
     approve(h, stale)
 
     assert "push_rereview_owed" in [b.code for b in h.blockers("t9")]
     assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert queued_review_packet(h) == "", "no packet: there is nothing new to review"
+    refused = h.entries("postcommit_rereview_not_requested")
+    assert [e["data"]["task_id"] for e in refused] == ["t9"]
+    assert "carried-forward candidate" in refused[0]["data"]["reason"]
+    assert h.execution_store.load("t9").rereview_owed_base == before, (
+        "and the obligation is still owed, so the approval stays refused"
+    )
 
 
 def test_the_obligation_is_discharged_by_the_re_review_not_by_the_carry(tmp_path):
     """The marker survives a SUCCESSFUL carry-forward and is cleared where a
-    new review packet is actually sent. A candidate carried onto a new head
-    that nobody has looked at again is precisely what must stay unpushable."""
+    new review packet is actually SENT — end to end, through the real loop
+    rather than by writing the record a discharge would leave behind.
+
+    A candidate carried onto a new head that nobody has looked at again is
+    precisely what must stay unpushable, and the way it stops being that is a
+    review the loop asks for itself: the approval taken against the old base
+    publishes nothing and queues a fresh packet, that packet goes out bound to
+    the CARRIED candidate, and only that new binding publishes it."""
     h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
-    bound_candidate(h, "t9", "nine.py", "nine\n")
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    stale = binding_for(nine, Path(nine.worktree_path))
 
     h.push("t1")
 
     carried = h.execution_store.load("t9")
     assert carried.rereview_owed_base, "still owed after the carry"
+    assert carried.rereview_candidate_sha == carried.candidate_sha, (
+        "and the carry NAMES what it produced, rather than leaving it to be inferred"
+    )
 
-    # What `_dispatch_task_postcommit` does at the one line a packet becomes
-    # `outbox`: the round is charged and the obligation is discharged together.
-    carried.review_round += 1
-    carried.rereview_owed_base = ""
+    approve(h, stale)
+
+    asked = h.execution_store.load("t9")
+    assert asked.rereview_owed_base == "", "discharged where the packet was sent"
+    assert asked.rereview_candidate_sha == ""
+    assert asked.review_round == 1, "and that packet charged its own review round"
+    assert [
+        e["data"]["task_id"] for e in h.entries("postcommit_rereview_requested")
+    ] == ["t9"]
+
+    # The packet really goes out, and it binds to the CARRIED candidate: a
+    # packet nothing could bind would spend the review and leave the approval
+    # unable to publish anything.
+    h.orch._step_ready()
+    fresh = h.orch.state.pending_request.postcommit
+    assert fresh is not None, "the re-review packet carries a binding"
+    assert fresh.candidate_sha == carried.candidate_sha
+    assert fresh.candidate_sha != stale.candidate_sha
+    assert fresh.base_sha == h.head(), "reviewed against the base the merge left"
+
+    # ONLY the new binding can publish. The old approval is still refused —
+    # by `push_candidate_stale` now, since the obligation it named is
+    # discharged — and publishes nothing.
+    approve(h, stale)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert [b.code for b in h.blockers("t9")] == ["push_candidate_stale"]
+
+    approve(h, fresh)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == carried.candidate_sha
+    assert h.execution_store.load("t9").published_sha == carried.candidate_sha
+
+
+def test_the_ask_never_outruns_the_review_round_cap(tmp_path):
+    """The re-review is a review round like any other, so it is refused by the
+    SAME cap that refuses a revision round — `_review_rounds_exhausted`, asked
+    at both sites. A carry-forward moves its rounds to `carried_review_rounds`
+    rather than discarding them precisely so this stays reachable: without that,
+    a moved base would hand every task a fresh budget and the ask would be the
+    one round that walks past a cap the rest of the loop enforces."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, max_review_rounds=1
+    )
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    stale = binding_for(nine, Path(nine.worktree_path))
+
+    h.push("t1")
+    carried = h.execution_store.load("t9")
+    assert (carried.review_round, carried.carried_review_rounds) == (0, 1)
+
+    approve(h, stale)
+
+    assert [b.code for b in h.blockers("t9")] == ["push_rereview_owed"]
+    assert queued_review_packet(h) == "", "no packet was sent past the cap"
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    refused = h.entries("postcommit_rereview_not_requested")
+    assert "no review rounds left" in refused[0]["data"]["reason"]
+    assert h.execution_store.load("t9").rereview_owed_base, "still owed, still refused"
+
+
+def test_a_candidate_under_a_split_ask_is_not_re_reviewed_over_the_top(tmp_path):
+    """A packet nothing can bind is worse than a park: the review round is
+    spent and the approval that comes back publishes nothing (the prof-01
+    shape). `_current_pending_postcommit` refuses to bind a record holding a
+    stat-only SPLIT ask, so this refuses to SEND one — the two halves of the
+    same gate, met from opposite sides."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    stale = binding_for(nine, Path(nine.worktree_path))
+
+    h.push("t1")
+    carried = h.execution_store.load("t9")
+    carried.attempt_ledger = (format_attempt(1, ATTEMPT_TASK, "sent_for_split_review"),)
     h.execution_store.save(carried)
 
-    assert h.execution_store.load("t9").rereview_owed_base == ""
+    approve(h, stale)
+
+    assert [b.code for b in h.blockers("t9")] == ["push_rereview_owed"]
+    assert queued_review_packet(h) == ""
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    refused = h.entries("postcommit_rereview_not_requested")
+    assert "SPLIT ask" in refused[0]["data"]["reason"]
+
+
+def test_a_task_the_registry_lost_parks_rather_than_asking(tmp_path):
+    """The packet names the task and quotes its title, so a record whose task
+    is gone cannot be asked about. Park, loudly — a silent fall-through here
+    would be indistinguishable from the ask being switched off."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    stale = binding_for(nine, Path(nine.worktree_path))
+
+    h.push("t1")
+    # The task leaves the registry AFTER the carry — an operator archiving a
+    # row, or a registry file rewritten under a running fleet.
+    h.orch._registry = TaskRegistry(
+        [t for t in h.orch._registry.all_tasks() if t.id != "t9"]
+    )
+
+    approve(h, stale)
+
+    assert [b.code for b in h.blockers("t9")] == ["push_rereview_owed"]
+    assert queued_review_packet(h) == ""
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    refused = h.entries("postcommit_rereview_not_requested")
+    assert "registry has no task" in refused[0]["data"]["reason"]
+
+
+def test_an_unreadable_worker_parks_with_gits_own_words(tmp_path):
+    """The packet is rendered from the worker repository, and a repository that
+    cannot be read produces no packet. The refusal is BROAD on purpose — the
+    park carries whatever git said rather than a guess at which failure it
+    was — and it is still a refusal, so the old approval publishes nothing."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    stale = binding_for(nine, Path(nine.worktree_path))
+
+    h.push("t1")
+    carried = h.execution_store.load("t9")
+    # The record still names its carried candidate; the repository it lives in
+    # is what has gone.
+    gone = tmp_path / "not-a-repo"
+    gone.mkdir()
+    carried.worktree_path = str(gone)
+    h.execution_store.save(carried)
+
+    approve(h, stale)
+
+    assert [b.code for b in h.blockers("t9")] == ["push_rereview_owed"]
+    assert queued_review_packet(h) == ""
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    refused = h.entries("postcommit_rereview_not_requested")
+    assert "review packet could not be built" in refused[0]["data"]["reason"]
+    assert h.execution_store.load("t9").rereview_owed_base, "still owed, still refused"
 
 
 def test_at_one_lane_nothing_is_marked_and_the_merge_defers(tmp_path):
