@@ -853,3 +853,24 @@ lanes = 1
 # coalescing is the record's job, not the jitter's), values above 60 are
 # refused, and at lanes = 1 it is exactly 0 and no fleet record is ever written.
 rate_limit_release_jitter_seconds = 5.0
+
+[context]
+# The most context records ONE selection may return (ctx-03).
+#
+# A selection starts from the record ids a task names explicitly and expands
+# only along relations somebody wrote down — no similarity search, no
+# embeddings — so the ordinary result is a handful of seeds and their immediate
+# neighbourhood, well under this. The budget is here for the case that is not
+# ordinary.
+#
+# WHEN IT BINDS IT SAYS SO. The resolver drops by a stated rule — (depth from
+# the seed, then kind, then id), so a record the seed list named explicitly is
+# never dropped in favour of one three relations away — and reports EVERY
+# dropped record with its rank and that rule. Silent truncation is the failure
+# this setting exists to prevent, not an acceptable degradation, so there is no
+# value here that means "drop quietly".
+#
+# Values below 1 are REFUSED at load rather than clamped, and there is no
+# "unlimited": a budget of zero would return no context while reading as
+# configured. `true` is refused too — this is a count, not a switch.
+max_records = 25
