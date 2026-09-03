@@ -482,7 +482,13 @@ DOCS_ONLY_SELECTED = 20
 #: trackers not at all, resolves no `__file__`, and its only concurrency is
 #: `threading` — which is not a spawn under the opacity rule — so the same 20
 #: once more. The DENOMINATOR only.
-SUITE_SIZE = 109
+#: 109 -> 110 when conc-03b added `test_merge_rereview.py` (2026-09-03): it
+#: names no tracker, resolves no `__file__`, and its `run_git` hands an argv
+#: this cannot read to `subprocess.run` WITHOUT any interpreter literal in the
+#: file — `opaque` is `starts_an_interpreter or (interpreter_seen and
+#: unreadable)`, and both terms are False — so the same 20 once more. The
+#: DENOMINATOR only.
+SUITE_SIZE = 110
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
