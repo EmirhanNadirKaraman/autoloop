@@ -148,3 +148,43 @@ window shut, exactly as a live, worker-backed or published one does.
 Nothing archives an orphaned record automatically. `release` and `discard` both
 require a task id the registry knows, so retiring one is still a move into
 `executions/archive/` by hand.
+
+## Context record
+
+One JSON object per file, `*.json`, in a directory the CALLER names — ctx-03
+fixes the SHAPE and deliberately not the location: `context_resolver.
+resolve_context` is pure given its inputs the way `context.build_context` is,
+and wiring a directory (and `Task.context_ids`) into the loop is ctx-04's.
+Read by `context_records.load_records`, indexed by `context_index.load_index`.
+
+`id` (required, unique across the directory, compared verbatim — a padded value
+is refused rather than stripped), `kind` (required; `decision` | `feature` |
+`incident` | `lesson`, and no fifth), `title`, `invariant`, `source_paths`,
+`related_ids`, `last_verified_commit`, `superseded_by`. Unknown keys are refused
+at parse time, in `load_config`'s style: a typo'd `source_path` would otherwise
+load as a record asserting nothing about no files, which can never be found
+stale, missing or contradictory.
+
+A record is a claim about `source_paths` AT `last_verified_commit`. That pairing
+is what makes staleness a question about TREES: the resolver compares
+`tree_of(last_verified_commit)` with the tree of the checkout it was resolved
+against (`GitGateway.changed_paths`, one `diff-tree` per DISTINCT commit) and
+marks the record stale only when its own paths are among the changed ones. HEAD
+advancing over other files leaves it fresh, and a change made and then reverted
+leaves it fresh too — which is the correct answer, and the reason no history
+walk is used. Nothing here widens `policy._ALLOWED_GIT`.
+
+`superseded_by` NON-EMPTY IS THE WHOLE ASSERTION: such a record is never
+returned as active and is never expanded through, whether or not the successor
+id resolves — an unresolvable successor is reported as its own finding and does
+not restore the record. `related_ids` is the ONLY edge the resolver follows, and
+it is directed as written. `invariant` is what two active records can disagree
+about over one source path; a conflict is RECORDED, with both sides, and no
+winner is picked.
+
+Two files declaring one `id` is a DUPLICATE: neither is indexed, under any
+lookup, and the id is reported naming both files. A file that will not parse is
+reported by name rather than dropped. Staleness is a TRI-STATE — `fresh`,
+`stale`, `unknown` — because a record whose commit no longer resolves has not
+been shown to be fine, and reporting it as fresh is the one answer that would
+make the alarm silent.
