@@ -1579,8 +1579,8 @@ def _with_dead_lanes(config, verdict: Health, exclude=None) -> Health:
     one case that genuinely needs a person — a lease, a state file or a lanes
     directory nothing can read — is fail-CLOSED in behaviour rather than silent:
     recovery refuses such a lane, so nothing enters it, `DeadLaneView.refused`
-    names it here, and the refusal is a durable `lane_recovery` transcript
-    entry. Which VERDICT WORD a fleet reports per lane is Decision 7's question
+    names it here, and the refusal is a durable `lane_recovered` transcript
+    entry carrying `action="refused"`. Which VERDICT WORD a fleet reports per lane is Decision 7's question
     and belongs to conc-09, whose scope is exactly that; inventing a code for it
     here would be a second vocabulary for the fleet to report itself in.
     """

@@ -1941,13 +1941,27 @@ def fleet_stop(config, blockers=None, lanes=None, exclude=None) -> FleetStop | N
 # Decision 8 of the split plan, and most of it already existed per TASK:
 # `worker_repo_is_reusable` decides whether a worker can be resumed as it
 # stands, `WorkerRepoManager.quarantine` moves a failed attempt aside without
-# deleting evidence, execution records are per-task files that survive any
-# process, and `health.dead_lane_survey` (conc-08's own addition, beside
-# `stranded_fault_rounds` for its reason) is the predicate that says which lane
-# a death left behind. What is added here is the ACTING half, and its whole
-# claim is the scope of what it touches: a recovered lane's own state file, its
-# own lease and its own worker repository, and nothing else. No other lane names
-# any of those, which is why the recovery cannot reach one.
+# deleting evidence, `ObservedCheckout` already refuses a clone that is not a
+# tree only the loop has written to, execution records are per-task files that
+# survive any process, and `health.dead_lane_survey` (conc-08's own addition,
+# beside `stranded_fault_rounds` for its reason) is the predicate that says
+# which lane a death left behind. What is added here is the ACTING half, and its
+# whole claim is the scope of what it touches: a recovered lane's own state
+# file, its own lease, its own observed clone and its own worker repository, and
+# nothing else. No other lane names any of those, which is why the recovery
+# cannot reach one.
+#
+# THE THREE THINGS A DEATH CAN LEAVE, and Decision 8 answers them in this order
+# because the order is what keeps the lane shut while any of them is unresolved:
+#
+#   1. an observed CLONE that is not the loop's tree any more — the lane is
+#      parked, `loop_fatal`/`observed_checkout_unusable`, which conc-07 already
+#      classifies LANE-fatal, so the fleet keeps running. Nothing is rebuilt,
+#      reset or deleted: `_lane_clone_violations` only READS.
+#   2. a WORKER repository that is not what its record says — quarantined, never
+#      deleted.
+#   3. the LEASE, released last of the three and only once the other two are
+#      settled, because releasing it is what lets the next tick in.
 #
 # WHO MAY CALL IT: the holder of the FLEET LOCK, and that is a real
 # precondition rather than a note. Every decision here is a check-then-act on a
@@ -1970,6 +1984,12 @@ RECOVERY_QUARANTINED = "quarantined"
 #: A dead lease with nothing mid-round behind it — the lease is removed and no
 #: round is resumed, because there is none.
 RECOVERY_RELEASED = "released"
+#: Its observed clone is not a tree only the loop has written to, so that LANE
+#: was parked — `loop_fatal`/`observed_checkout_unusable`, which conc-07
+#: classifies LANE-fatal — instead of being opened again. Nothing in the clone
+#: was reset, rebuilt or deleted; the park names the directory and waits for a
+#: person, and every other lane keeps running.
+RECOVERY_PARKED = "parked"
 #: NOTHING WAS TOUCHED. The evidence needed to decide was unreadable, so the
 #: lease stays exactly where it is and the lane stays closed. This is the
 #: fail-closed direction and it is the one an operator has to act on.
@@ -1988,7 +2008,7 @@ class LaneRecovery:
 
     lane_index: int
     lane_id: str
-    #: One of the four `RECOVERY_*` words above.
+    #: One of the five `RECOVERY_*` words above.
     action: str
     #: The task that lane's session named, `""` when it named none.
     task_id: str = ""
@@ -2042,12 +2062,15 @@ def recover_dead_lanes(
     worker_repos=None,
     execution_store=None,
     lanes: int | None = None,
+    blockers=None,
+    observed=None,
 ) -> FleetRecovery:
     """Recover every lane a dead process left behind, and release the fleet's
     merge token if its holder is one of them. Never raises.
 
     ONE LANE AT A TIME AND NOTHING SHARED. Each recovery reads and writes only
-    `state.lane_paths(state_dir, index)`'s own files and the worker repository
+    `state.lane_paths(state_dir, index)`'s own files, the observed clone
+    `config.lane_observed_checkout` gives THAT lane, and the worker repository
     that lane's own execution record names; no other lane's state file, lease,
     clone or worker is opened, which is the whole of "recovered without touching
     the others". The merge token is the one deliberate exception and it is not a
@@ -2059,10 +2082,14 @@ def recover_dead_lanes(
     person arrived. The two questions are separate and are answered separately.
 
     `exclude` is the caller's own lane index, which is alive by construction.
-    `worker_repos` and `execution_store` are the caller's own collaborators when
-    it has them; both are derived from `config` when it does not, so a caller
-    with neither still recovers (see `_recover_lane_worker`, which refuses only
-    when a quarantine is actually required and no manager can be built).
+    `worker_repos`, `execution_store`, `blockers` and `observed` are the caller's
+    own collaborators when it has them; all four are derived from `config` when
+    it does not, so a caller with none still recovers (see `_recover_lane_worker`
+    and `_park_dead_lane`, which refuse only when the thing they would have to
+    WRITE cannot be reached). `observed` is the DEPLOYMENT's checkout, never a
+    lane's: `ObservedCheckout.for_lane` derives the lane's own from it, which is
+    also what carries an injected `runner` forward instead of silently restoring
+    the real `subprocess.run`.
     """
     detail = ""
     try:
@@ -2071,11 +2098,22 @@ def recover_dead_lanes(
         dead, detail = (), (
             f"the lanes could not be surveyed ({type(exc).__name__}: {exc})"
         )
+    count = _recovery_lane_count(config, lanes)
+    if observed is None:
+        observed = _deployment_observed_checkout(config)
     recovered: list[LaneRecovery] = []
     for entry in dead:
         try:
             recovered.append(
-                _recover_one_lane(entry, config, worker_repos, execution_store)
+                _recover_one_lane(
+                    entry,
+                    config,
+                    worker_repos,
+                    execution_store,
+                    blockers,
+                    observed,
+                    count,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - one lane must not stop the pass
             recovered.append(
@@ -2105,8 +2143,51 @@ def recover_dead_lanes(
     )
 
 
+def _recovery_lane_count(config, lanes: int | None) -> int:
+    """The fleet size the clone paths are derived against.
+
+    THE SAME DEFENSIVE READING every fleet-aware site here uses
+    (`Orchestrator._fleet_lanes`, `health._fleet_lanes`): a hand-built config
+    with no `[concurrency]` section, a bool, a float or a value below one is ONE
+    lane. It matters here rather than being a formality, because
+    `lane_observed_checkout`'s asymmetry is on the fleet SIZE — at one lane, lane
+    0's clone is the configured path itself, and deriving `observed/_lane-0` for
+    it would have the recovery inspect a tree the deployment does not watch.
+    """
+    if lanes is None:
+        lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+        return 1
+    return lanes
+
+
+def _deployment_observed_checkout(config) -> "ObservedCheckout | None":
+    """The DEPLOYMENT's observed checkout, or `None` when this deployment wires
+    none — the pre-esc-02 arrangement, which observes the primary checkout and
+    has no loop-owned clone for a recovery to judge.
+
+    `None` on any failure to build one, deliberately, and it is not a fail-open:
+    the caller then inspects no clone and takes the path it took before this
+    existed, while the clone a round actually runs against is still established
+    by `_synchronise_observed_checkout` at the next dispatch — which refuses,
+    lane-fatally, exactly the trees this inspection refuses. Nothing is rebuilt
+    silently either way; what is lost is only the EARLIER refusal.
+    """
+    try:
+        configured = getattr(config, "observed_checkout", None)
+        return ObservedCheckout(configured) if configured else None
+    except Exception:  # noqa: BLE001 - `recover_dead_lanes` promises never to
+        # raise, and this is the one thing it does OUTSIDE the per-lane `try` —
+        # so an escaping error here skips `_release_dead_merge_token` too, and
+        # one unbuildable path would leave the whole FLEET unable to merge.
+        # That is exactly the coupling Decision 8 says the token must not have,
+        # and it is why the catch is broad rather than a tuple of the errors
+        # `Path(...).resolve()` happens to raise on this build.
+        return None
+
+
 def _recover_one_lane(
-    dead: DeadLane, config, worker_repos, execution_store
+    dead: DeadLane, config, worker_repos, execution_store, blockers, observed, lanes
 ) -> LaneRecovery:
     """Recover the one lane `dead` describes.
 
@@ -2117,10 +2198,16 @@ def _recover_one_lane(
     `lane_paths`. Nothing is touched, the lease stays where it is, and the lane
     stays closed until a person looks.
 
-    THE WORKER IS DEALT WITH BEFORE THE LEASE, and the order is the safety
-    property: releasing the lease is what lets the next tick into the lane, so a
-    quarantine that failed must leave the lane shut rather than open onto a
-    worker nobody could make safe.
+    THE CLONE IS DEALT WITH BEFORE THE WORKER, AND BOTH BEFORE THE LEASE, and
+    that order is the safety property: releasing the lease is what lets the next
+    tick into the lane, so a quarantine that failed — or a clone that is no
+    longer a tree only the loop has written to — must leave the lane shut rather
+    than open onto something nobody could make safe. The clone comes first
+    because its answer is a PARK: a lane whose watched tree cannot be
+    established has no round to resume into, so judging its worker would be
+    deciding what to do with a repository nobody is going to use, and
+    quarantining one would move evidence out from under the person the park is
+    summoning.
 
     AND NOTHING CAN ENTER THE LANE IN BETWEEN, which is what makes acting on the
     survey's older judgement safe rather than a race. A dead lease REFUSES
@@ -2141,9 +2228,21 @@ def _recover_one_lane(
     lease = LaneLease(config.state_dir, dead.lane_index)
     action, detail, quarantined_at = RECOVERY_RELEASED, "", ""
     if _lane_is_mid_round(dead):
-        action, detail, quarantined_at = _recover_lane_worker(
-            dead, config, worker_repos, execution_store
-        )
+        violations, refusal = _lane_clone_violations(dead, config, observed, lanes)
+        if refusal:
+            return LaneRecovery(
+                dead.lane_index,
+                dead.lane_id,
+                RECOVERY_REFUSED,
+                task_id=dead.task_id,
+                detail=refusal,
+            )
+        if violations:
+            action, detail = _park_dead_lane(dead, config, violations, blockers)
+        else:
+            action, detail, quarantined_at = _recover_lane_worker(
+                dead, config, worker_repos, execution_store
+            )
     else:
         detail = (
             "its lease is dead and its session is at "
@@ -2165,12 +2264,20 @@ def _recover_one_lane(
         # that has become LIVE (a process entered the lane between the survey
         # and here) or unreadable in the interval refuses — which is the whole
         # reason the removal is not `unlink()`. The lane keeps its lease.
+        #
+        # WHATEVER WAS ALREADY DONE IS STILL REPORTED. A park or a quarantine
+        # that happened before this point is durable, and a refusal that dropped
+        # the sentence saying so would send an operator looking for a worker, or
+        # for a park, that the transcript never mentioned.
         return LaneRecovery(
             dead.lane_index,
             dead.lane_id,
             RECOVERY_REFUSED,
             task_id=dead.task_id,
-            detail=f"its lease could not be released ({exc})",
+            detail=(
+                f"its lease could not be released ({exc})"
+                + (f", after {action}: {detail}" if detail else "")
+            ),
             quarantined_at=quarantined_at,
         )
     return LaneRecovery(
@@ -2198,6 +2305,219 @@ def _lane_is_mid_round(dead: DeadLane) -> bool:
         return Phase(dead.phase) not in TERMINAL_PHASES
     except (ValueError, TypeError):      # pragma: no cover - the survey refuses these
         return False
+
+
+def _lane_clone_violations(dead: DeadLane, config, observed, lanes) -> tuple[list[str], str]:
+    """`(violations, refusal)` for the observed clone of the ONE lane `dead`
+    describes — Decision 8's "a lane whose observed clone is unclean or diverged
+    is not silently rebuilt".
+
+    `([], "")` is "there is nothing here to refuse". Non-empty `violations` is a
+    tree the loop may not observe, and the caller PARKS that lane on them.
+    Non-empty `refusal` is this function saying it established nothing at all,
+    and the caller then touches the lane in no way whatsoever.
+
+    THE READ-ONLY HALF OF `ObservedCheckout.synchronize`, in its own order and in
+    its own words, and nothing else: exists-and-not-a-directory, present-but-not
+    -a-repository, and residue. Nothing here fetches, checks out, creates or
+    deletes anything — a recovery that reset a lane's clone would destroy the one
+    piece of evidence the park exists to preserve, which is that tree's own
+    contents. The two halves this deliberately does NOT ask are the ones that
+    need a commit to compare against: AHEAD/DIVERGED, and "is the clone at the
+    sha the round wanted". Neither is lost, and neither can be silently rebuilt
+    past — `_synchronise_observed_checkout` asks both at the next dispatch,
+    against the primary checkout's head, and refuses with the same `loop_fatal`/
+    `observed_checkout_unusable` park this one writes. What the earlier answer
+    buys is that a lane whose tree is visibly not the loop's is parked BEFORE
+    anything re-enters it.
+
+    ABSENT AND EMPTY ARE NOT VIOLATIONS, exactly as `synchronize` treats them: a
+    clone that is not there is one the next dispatch creates, and an empty
+    directory is an ordinary `mkdir -p` on the way to looking at something.
+    Reading either as a fault would park every lane whose clone a death
+    interrupted before it existed.
+
+    `for_lane` derives the lane's own tree rather than a hand-built
+    `ObservedCheckout`, for the reason that method's docstring gives: a new
+    instance drops an injected `runner`, and a guard that silently gets the real
+    `subprocess.run` back is one that stops testing what it claims to test.
+    """
+    if observed is None:
+        return [], ""
+    try:
+        clone = observed.for_lane(dead.lane_index, lanes)
+        path = clone.path
+        # ISOLATION BEFORE ANYTHING ELSE, and before a single git command, for
+        # `_synchronise_observed_checkout`'s reason one level up: `git status`
+        # refreshes `.git/index`, so asking a tree ANOTHER lane also watches
+        # would write into that lane while proving nothing about this one —
+        # this claim's own failure, committed by the code that exists to protect
+        # it. `_lane-0` symlinked onto `_lane-1` is exactly the layout, and it is
+        # a REFUSAL rather than a park: nothing is established, so nothing is
+        # touched, and the fault is not lost — `_lane_isolation_violations` parks
+        # on it, lane-fatally, at the next dispatch into either lane.
+        problems = validate_lane_checkout_distinctness(
+            path,
+            [
+                lane_observed_checkout(observed.path, index, lanes)
+                for index in range(lanes)
+                if index != dead.lane_index
+            ],
+        )
+        if problems:
+            return [], (
+                f"lane {dead.lane_id}'s observed checkout is not a tree only "
+                "that lane watches, so nothing about it was read or changed: "
+                + "; ".join(problems)
+            )
+        if not path.exists():
+            return [], ""
+        if not path.is_dir():
+            return [
+                f"the observed checkout path {path} exists and is not a "
+                "directory — nothing here deletes it; move it aside by hand"
+            ], ""
+        if not any(path.iterdir()):
+            return [], ""
+        if not clone.is_repo():
+            return [
+                f"the observed checkout path {path} exists but is not the top "
+                "level of a git repository. Nothing here deletes it: inspect it, "
+                "then remove it and the loop will rebuild the clone on the next "
+                "round."
+            ], ""
+        dirt = clone.residue()
+    except Exception as exc:  # noqa: BLE001 - established nothing; touch nothing
+        return [], (
+            f"whether lane {dead.lane_id}'s observed checkout is still a tree "
+            f"only the loop has written to could not be established "
+            f"({type(exc).__name__}: {exc}), so nothing about that lane was "
+            "changed"
+        )
+    if dirt:
+        # `residue()` answers its own "I could not look" as a violation string
+        # rather than as an empty list, and that string is treated here exactly
+        # as dirt is — a park — because that is what `_synchronise_observed_
+        # checkout` does with the identical string on a live lane. A guard that
+        # could not read the tree must not resume a round into it.
+        return [
+            f"the observed checkout {path} is not clean, so it is not a tree "
+            "only the loop has written to: "
+            + "; ".join(sorted(dirt)[:20])
+            + ". Inspect it, then remove the directory and the loop will rebuild "
+            "the clone."
+        ], ""
+    return [], ""
+
+
+def _park_dead_lane(dead: DeadLane, config, violations, blockers) -> tuple[str, str]:
+    """Park the dead lane `dead` on its own unusable clone — `(action, detail)`,
+    either `RECOVERY_PARKED` or `RECOVERY_REFUSED`.
+
+    THE SAME PARK A LIVE LANE WRITES, field for field: `needs_user`, `park_kind`
+    literally `"loop_fatal"`, and a blocker record carrying
+    `observed_checkout_unusable` and THIS lane's id. That is not imitation for
+    tidiness — it is what makes the outcome one the rest of the system already
+    understands. `blockers.fatal_scope` classifies that code LANE-fatal (conc-07,
+    on Decision 8's own sentence), so `fleet_stop` walks past it and the other
+    lanes keep running; `cli` handles the park exactly as it handles the one
+    `_synchronise_observed_checkout` writes; and an operator sees one vocabulary
+    for one fault rather than a second one invented here.
+
+    THE BLOCKER RECORD IS WRITTEN FIRST, AND THE PARK IS ABANDONED IF IT CANNOT
+    BE — the single ordering in this function that can invert the claim.
+    `_lane_fleet_stop` reads the park's KIND from the state file and its CODE
+    from the record `park_blocker_id` names, and `_blocker_code` answers `None`
+    for a record that is missing or unreadable, which `fatal_scope` reads as
+    FLEET-fatal. So a park written with no record behind it would stop every lane
+    over one lane's dirty clone — the exact opposite of this candidate's claim,
+    arrived at through a guard that looks like it fired.
+
+    A LANE WITH NO SESSION TO PARK IS REFUSED, not invented. Only a mid-round
+    lane reaches here, so this is the state file that was read by the survey and
+    is gone by the time the park is written — an operator's `reset` between the
+    two. There is then no round for a park to be about, and writing one would
+    manufacture a session nobody opened. Refusing leaves that lane's lease in
+    place, which keeps the lane shut just as durably, and says so every tick.
+    """
+    paths = lane_paths(config.state_dir, dead.lane_index)
+    detail = "; ".join(violations)
+    store = blockers
+    try:
+        if store is None:
+            store = BlockerStore(config.blockers_dir)
+        state = StateStore(paths.state_file).load()
+    except (StateError, OSError, ValueError, TypeError, AttributeError) as exc:
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the park that "
+            f"would stop this lane could not be prepared ({exc})"
+        )
+    if state is None:
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and it holds no "
+            "session to park, so its lease is left in place and the lane stays "
+            "shut"
+        )
+    question = (
+        f"lane {dead.lane_id} died mid-round and its loop-owned observed "
+        f"checkout could not be established — {detail}. This is LANE-FATAL: that "
+        "clone is the ONLY tree the escape detector watches for this lane, so "
+        "re-entering it would mean running a write-capable agent with no escape "
+        "detection at all. Nothing in it was reset, rebuilt or deleted, and no "
+        "other lane is affected."
+    )
+    try:
+        blocker = store.record(
+            task_id=dead.task_id or NO_TASK,
+            kind="loop_fatal",
+            code="observed_checkout_unusable",
+            question=question,
+            detail=detail,
+            phase=dead.phase or "",
+            now=utcnow_iso(),
+            session_id=getattr(state, "session_id", "") or "",
+            lane_id=dead.lane_id,
+        )
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the blocker record "
+            f"that classifies the park could not be written ({exc}), so it was "
+            "not parked and its lease is left in place"
+        )
+    blocker_id = getattr(blocker, "id", "")
+    if not isinstance(blocker_id, str) or not blocker_id:
+        # The same inversion as an unwritable record, one step later and easier
+        # to miss: `_blocker_code` needs an id to look the code up with, and a
+        # park carrying none is classified FLEET-fatal. A store that recorded
+        # something this cannot name is a store this must not park behind.
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the blocker record "
+            "that classifies the park carries no id, so the park could not be "
+            "read as this lane's own and was not written"
+        )
+    state.question = question
+    state.resume_phase = None
+    state.phase = Phase.NEEDS_USER.value
+    state.stop_kind = ""
+    state.park_kind = "loop_fatal"
+    state.park_task_id = dead.task_id or None
+    state.park_blocker_id = blocker_id
+    try:
+        StateStore(paths.state_file).save(state)
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        # The record above is now open with no park behind it, which stops
+        # nothing: `_lane_fleet_stop` reads the STATE file and treats a record
+        # without one as history (its own docstring's argument). So this is a
+        # refusal in the ordinary direction — the lease stays, nothing enters
+        # the lane, and an operator has the record naming what is wrong with it.
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the park could not "
+            f"be written to its state file ({exc}), so its lease is left in place"
+        )
+    return RECOVERY_PARKED, (
+        f"its observed checkout is unusable, so this lane is parked "
+        f"lane-fatally rather than re-entered: {detail}"
+    )
 
 
 def _recover_lane_worker(
@@ -2325,6 +2645,15 @@ def _release_dead_merge_token(config) -> tuple[str, str]:
     read" is how a resource with a live holder gets handed to somebody else.
     That leaves the fleet unable to merge until a person looks, which is the
     direction this whole module fails in.
+
+    THE FLEET SIZE IS READ FROM THE CONFIG, deliberately, and NOT from
+    `recover_dead_lanes`' `lanes=` argument — which exists so a caller can
+    survey a different number of LANES, a question about `lanes/` and nothing
+    else. The token is written by exactly one site (`BacklogSweeper.
+    _take_merge_token`) under exactly this test, so reading it here keeps the
+    writer and the releaser asking one question. A deployment lowered back to
+    one lane strands nothing by it: at one lane the sweep never looks at the
+    file, so a token left over from a larger fleet is inert rather than held.
     """
     lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
     if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes <= 1:
@@ -4489,6 +4818,15 @@ class Orchestrator:
         silently would be a round that vanished, and one that REFUSED a lane
         silently would be the fail-open shape this whole candidate is written
         against — the lane stays shut and nothing says why.
+
+        THE BLOCKER STORE IS THIS LANE'S, and the observed checkout is
+        deliberately NOT: a dead lane's park is filed in the one store the whole
+        deployment shares (`config.blockers_dir`, which is also where
+        `fleet_stop` looks the code up), while `self._observed` has already been
+        narrowed to THIS lane's clone by `for_lane` — deriving another lane's
+        tree from it would name a directory inside this one. `recover_dead_lanes`
+        therefore re-derives the deployment's checkout from `config`, which is
+        the same value `cli` built this lane's from.
         """
         if self._fleet_lanes() <= 1:
             return
@@ -4498,6 +4836,7 @@ class Orchestrator:
                 exclude=self.lane_index,
                 worker_repos=self._worker_repos,
                 execution_store=self._execution_store,
+                blockers=self._blocker_store,
             )
         except Exception as exc:  # noqa: BLE001 - see the docstring
             self._log(

@@ -17,10 +17,13 @@ Five sections, and the first is the claim itself:
 2. **The merge token.** A live lane's sweep DEFERS while a dead lane holds it
    (it is never stolen), the recovery releases it, and the same sweep then
    merges. At `lanes = 1` no token exists and no file is created.
-3. **An unclean clone parks that lane and no other**, through the park that
-   already exists (`observed_checkout_unusable`, lane-fatal since conc-07) —
-   with the lane's own clone directory named in the question, and `fleet_stop`
-   answering `None` for the sibling.
+3. **An unclean clone parks that lane and no other**, in both halves. A LIVE
+   lane parks through the path that already exists
+   (`_synchronise_observed_checkout`); a DEAD lane is parked by the recovery
+   itself, before anything re-enters it, with the same
+   `observed_checkout_unusable` record (lane-fatal since conc-07), the lane's
+   own clone directory named in the question, `fleet_stop` answering `None` for
+   the sibling — and nothing in that clone reset, rebuilt or deleted.
 4. **Everything the recovery REFUSES to touch.** A lease nobody can read, a
    state file nobody can read, an execution record nobody can read, a lanes
    directory nobody can list, a live lease, a quarantine that fails — every one
@@ -32,10 +35,18 @@ Five sections, and the first is the claim itself:
 
 Real git repositories are used where the claim is about git — a worker repo that
 passes `worker_repo_is_reusable`, one that does not, and an observed clone with
-residue in it — and nowhere else. The other lanes' CLONES are plain directories:
-the recovery runs no git in a tree it does not own, so what is being asserted
-about them is that their bytes do not move, which a directory shows as well as a
-repository and 12ms cheaper.
+residue in it — and nowhere else.
+
+THE SIBLING'S CLONE IS A REPOSITORY IN EVERY TEST WHERE GIT ACTUALLY RUNS, and
+that is not a detail: a plain directory shows that bytes did not move, but a
+`git status` aimed at one fails harmlessly and leaves no trace, so a directory
+cannot tell "nothing ran here" from "something ran and found nothing". A
+repository can — `status` refreshes `.git/index`, which `digest` walks — so
+where the recovery reaches the clone check (the dead-lane park), the LIVE lane
+beside it is `seed_clone_repo`, and the equality then reads "not even an index
+refresh". Where the recovery inspects no clone at all (a deployment wiring
+none), a plain `seed_clone` directory is what the sibling needs to be and is
+12ms cheaper.
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,6 +84,7 @@ from autoloop.merge_sweep import (
     merge_token_file,
 )
 from autoloop.orchestrator import (
+    RECOVERY_PARKED,
     RECOVERY_QUARANTINED,
     RECOVERY_REFUSED,
     RECOVERY_RELEASED,
@@ -107,12 +120,23 @@ URL = "https://chatgpt.com/c/lane-death-recovery"
 # =============================================================================
 
 
-def make_config(tmp_path: Path, lanes: int = 3, auto_merge_enabled: bool = False):
+def make_config(
+    tmp_path: Path,
+    lanes: int = 3,
+    auto_merge_enabled: bool = False,
+    observed: bool = False,
+):
+    """`observed=True` wires `[paths].observed_checkout` at the root
+    `seed_clone`/`lane_snapshot` already derive every lane's clone from, which is
+    what makes the recovery inspect one at all. Off by default, because a
+    deployment that wires no clone is the pre-esc-02 arrangement and the recovery
+    must go on behaving exactly as it did for it."""
     return AutoloopConfig(
         browser=BrowserConfig(conversation_url=URL),
         policy=PolicyConfig(auto_merge_enabled=auto_merge_enabled),
         state_dir=tmp_path / ".al",
         workers_root=tmp_path / "workers",
+        observed_checkout=(tmp_path / "observed") if observed else None,
         concurrency=ConcurrencyConfig(lanes=lanes),
     )
 
@@ -228,6 +252,42 @@ def seed_clone(config, index: int) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     (path / "clone.txt").write_text(f"lane {index}'s tree\n")
     return path
+
+
+def seed_clone_repo(config, index: int, *, stray: str = "") -> Path:
+    """A REAL git repository at exactly the path lane `index`'s observed clone
+    resolves to — the fixture the dead-lane clone tests need, because what is
+    under test there is `ObservedCheckout`'s own reading of a tree.
+
+    `stray` writes one file the loop never checked out, which is the whole of
+    "this is not a tree only the loop has written to".
+    """
+    root = Path(config.state_dir).parent / "observed"
+    path = Path(lane_observed_checkout(root, index, config.concurrency.lanes))
+    make_repo_from_template(
+        path, branch="main", files=(("watched.txt", "the loop checked this out\n"),)
+    )
+    if stray:
+        (path / "stray.txt").write_text(stray, encoding="utf-8")
+    return path
+
+
+class HalfBrokenGit:
+    """git that answers `rev-parse --show-toplevel` and fails everything else:
+    the clone IS a repository and whether it is clean cannot be read.
+
+    Injected through `ObservedCheckout(root, runner=...)`, which `for_lane`
+    carries forward to the lane's own clone — the property that method's
+    docstring exists to protect, and the reason this fixture works at all.
+    """
+
+    def __init__(self, toplevel: Path):
+        self.toplevel = str(toplevel)
+
+    def __call__(self, args, **kwargs):
+        if list(args[1:3]) == ["rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(args, 0, f"{self.toplevel}\n", "")
+        return subprocess.CompletedProcess(args, 128, "", "fatal: unable to read the index")
 
 
 def digest(path: Path) -> str:
@@ -588,15 +648,17 @@ def test_the_token_is_taken_around_the_merges_and_given_back_after_them(
 # =============================================================================
 
 
-def test_an_unclean_clone_parks_that_lane_and_no_other(tmp_path):
-    """Decision 8's third bullet. `ObservedCheckout.synchronize` already refuses
-    a clone that is not a tree only the loop has written to; under the fleet
-    that refusal is a LANE-fatal park naming that lane's own directory, and the
-    other lanes keep running.
+def test_an_unclean_clone_parks_a_live_lane_and_no_other(tmp_path):
+    """Decision 8's third bullet in its LIVE-lane half.
+    `ObservedCheckout.synchronize` already refuses a clone that is not a tree
+    only the loop has written to; under the fleet that refusal is a LANE-fatal
+    park naming that lane's own directory, and the other lanes keep running.
 
     Nothing here is new code — that is the point of the test. What it pins is
     that the refusal, the park's code and conc-07's classification still line up,
-    so a clone one lane over cannot stop the fleet.
+    so a clone one lane over cannot stop the fleet. The DEAD-lane half, where the
+    recovery has to reach that same conclusion for a lane no live round is about
+    to enter, is the test below.
     """
     config = make_config(tmp_path, lanes=2)
     primary = make_repo_from_template(tmp_path / "primary", branch="main")
@@ -627,6 +689,359 @@ def test_an_unclean_clone_parks_that_lane_and_no_other(tmp_path):
     assert fleet_stop(config, blockers, exclude=0) is None
     # the sibling's own clone was never even created, let alone written to
     assert not Path(lane_observed_checkout(observed_root, 0, 2)).exists()
+
+
+def test_a_dead_lanes_unclean_clone_parks_that_lane_and_no_other(
+    tmp_path, monkeypatch
+):
+    """Decision 8's third bullet in its DEAD-lane half, which is what the
+    recovery owes: lane 1 died mid-executing and its clone is no longer a tree
+    only the loop has written to, so the recovery PARKS that lane — lane-fatally,
+    on the code conc-07 classifies — instead of opening it again.
+
+    Four positive controls, because a recovery that did nothing would satisfy
+    every "unchanged" assertion here:
+
+      * its worker passes `worker_repo_is_reusable`, so without the clone check
+        this lane would have been RESUMED. The action is what the clone decided.
+      * the park is the one the rest of the system already reads: `needs_user`,
+        `park_kind` literally `loop_fatal`, and a blocker record carrying
+        `observed_checkout_unusable` AND this lane's id — which is what
+        `fleet_stop` resolves the scope from, so it answers `None` and the fleet
+        keeps running.
+      * NOTHING IN THE CLONE MOVED. The stray file is still there and the
+        checked-out file is unchanged: the evidence the park summons a person to
+        look at is exactly what a rebuild would have destroyed.
+      * the sibling lane is byte-identical across all four of the things a lane
+        owns, and its lease is still live. Its clone is a REAL repository here,
+        which is what makes that equality mean anything on this path: git runs
+        against the dead lane's tree in this test, and a `status` that had
+        wandered into the live lane's would have refreshed its `.git/index` —
+        a move a plain directory could never have shown.
+    """
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=3, observed=True)
+    workers = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+
+    dead_worker, dead_exec = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=dead_exec)
+    write_lease(config, 1, alive=False, boot=boot)
+    dead_clone = seed_clone_repo(config, 1, stray="something else wrote here\n")
+
+    live_worker, live_exec = seed_worker(config, "t-live", real_repo=True)
+    seed_lane(config, 2, execution=live_exec)
+    write_lease(config, 2, alive=True, boot=boot)
+    # A REAL repository, unlike the siblings in the tests where no clone is
+    # inspected at all: this is the one path on which the recovery runs git, so
+    # the sibling has to be a tree an accidental `status` would leave a mark in.
+    seed_clone_repo(config, 2, stray="the live lane's own work\n")
+    before_live = lane_snapshot(config, 2, live_worker)
+    before_dead_worker = digest(dead_worker)
+
+    recovery = recover_dead_lanes(config, exclude=0, worker_repos=workers)
+
+    entry = recovery.lanes[0]
+    assert [(e.lane_id, e.action) for e in recovery.lanes] == [
+        (lane_id(1), RECOVERY_PARKED)
+    ]
+    assert entry.task_id == "t-dead" and str(dead_clone) in entry.detail
+    # the park, as the rest of the system reads it
+    parked = StateStore(lane_paths(config.state_dir, 1).state_file).load()
+    assert parked.phase == Phase.NEEDS_USER.value
+    assert parked.park_kind == "loop_fatal"
+    assert str(dead_clone) in parked.question and "stray.txt" in parked.question
+    blockers = BlockerStore(config.blockers_dir)
+    open_records = blockers.open_blockers()
+    assert [b.code for b in open_records] == ["observed_checkout_unusable"]
+    assert [b.lane_id for b in open_records] == [lane_id(1)]
+    assert parked.park_blocker_id == open_records[0].id
+    # ...which is a LANE-fatal stop: the fleet keeps running
+    assert fatal_scope("observed_checkout_unusable") == LANE_FATAL
+    assert fleet_stop(config, blockers, exclude=0) is None
+    # ...the park is durable rather than held open by a lease nobody can clear:
+    # the state file is what keeps this lane shut from here, as it does for a
+    # lane that parked while alive.
+    assert not lane_paths(config.state_dir, 1).lease_file.exists()
+    # ...nothing in the clone was reset, rebuilt or deleted
+    assert (dead_clone / "stray.txt").read_text() == "something else wrote here\n"
+    assert (dead_clone / "watched.txt").read_text() == "the loop checked this out\n"
+    # ...its worker was left where it is rather than quarantined
+    assert digest(dead_worker) == before_dead_worker
+    # ...and the live lane cost nothing at all — its clone is a repository, so
+    # this is "not even an index refresh" rather than "no visible bytes moved"
+    assert lane_snapshot(config, 2, live_worker) == before_live
+    assert LaneLease(config.state_dir, 2).read() is not None
+    # LAST, because it runs git: the worker was reusable all along, so the clone
+    # is what decided this action rather than anything about the worker.
+    assert worker_repo_is_reusable(dead_worker, "autoloop/t-dead")
+
+
+def test_a_dead_lanes_clone_that_is_not_a_repository_parks_that_lane(
+    tmp_path, monkeypatch
+):
+    """The other tree `synchronize` refuses without touching: a directory with
+    something in it that is not the top level of a git repository. Nothing here
+    deletes it either — the park names it and stops the lane."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    clone = seed_clone(config, 1)          # a plain directory, not a repository
+    before_clone = digest(clone)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_PARKED]
+    assert "not the top level of a git repository" in recovery.lanes[0].detail
+    assert digest(clone) == before_clone
+    assert (
+        StateStore(lane_paths(config.state_dir, 1).state_file).load().phase
+        == Phase.NEEDS_USER.value
+    )
+
+
+def test_a_dead_lane_with_a_clean_clone_is_resumed_and_never_parked(
+    tmp_path, monkeypatch
+):
+    """The control the park test needs. The identical fixture minus the stray
+    file resumes: the clone check refuses a tree that is not the loop's, and a
+    tree that IS the loop's is not an excuse to stop a lane. A guard that parked
+    either way would pass the test above and be worthless."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone_repo(config, 1)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_RESUMED]
+    assert not lane_paths(config.state_dir, 1).lease_file.exists()
+    assert (
+        StateStore(lane_paths(config.state_dir, 1).state_file).load().phase
+        == Phase.EXECUTING.value
+    )
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
+
+
+def test_a_clone_whose_cleanliness_cannot_be_read_parks_rather_than_resuming(
+    tmp_path, monkeypatch
+):
+    """The fail-open shape this whole candidate is written against: git answers
+    that the clone IS a repository and then fails on the status read.
+    "I could not look" is not "there is nothing there", so the lane parks on the
+    refusal rather than resuming a round into a tree nobody could read.
+
+    The runner is injected on the DEPLOYMENT's checkout and reaches the lane's
+    through `for_lane`, which is the only reason this test can exist.
+    """
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    clone = seed_clone_repo(config, 1)
+
+    recovery = recover_dead_lanes(
+        config,
+        exclude=0,
+        observed=ObservedCheckout(tmp_path / "observed", runner=HalfBrokenGit(clone)),
+    )
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_PARKED]
+    assert "could not be read" in recovery.lanes[0].detail
+    parked = StateStore(lane_paths(config.state_dir, 1).state_file).load()
+    assert parked.phase == Phase.NEEDS_USER.value
+    assert [b.code for b in BlockerStore(config.blockers_dir).open_blockers()] == [
+        "observed_checkout_unusable"
+    ]
+
+
+def test_a_clone_that_is_another_lanes_tree_is_read_by_nothing_here(
+    tmp_path, monkeypatch
+):
+    """The one way this recovery could commit the failure it exists to prevent.
+    `git status` refreshes `.git/index`, so probing a clone that is really
+    ANOTHER lane's tree — `_lane-1` symlinked onto `_lane-2`, the layout conc-04
+    already refuses at dispatch — would write into a live lane while proving
+    nothing about the dead one. Distinctness is asked before any git runs, and a
+    layout that fails it is refused rather than parked: nothing is read, nothing
+    is written, and the lease stays."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=3, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    sibling = seed_clone_repo(config, 2, stray="the live lane's own work\n")
+    root = Path(config.state_dir).parent / "observed"
+    Path(lane_observed_checkout(root, 1, 3)).symlink_to(sibling, target_is_directory=True)
+    before_sibling = digest(sibling)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_REFUSED]
+    assert "only that lane watches" in recovery.lanes[0].detail
+    assert digest(sibling) == before_sibling         # not even an index refresh
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
+
+
+def test_a_park_whose_blocker_cannot_be_written_refuses_and_keeps_the_lease(
+    tmp_path, monkeypatch
+):
+    """THE ordering that can invert the claim. `_lane_fleet_stop` reads the
+    park's kind from the state file and its CODE from the record
+    `park_blocker_id` names, and an unresolvable code is FLEET-fatal — so a park
+    written with no record behind it would stop every lane over one lane's dirty
+    clone. The record therefore comes first, and a park that cannot be classified
+    is not written at all: the lease stays, the state file does not move, and
+    nothing enters the lane."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone_repo(config, 1, stray="something else wrote here\n")
+    before_state = digest(lane_paths(config.state_dir, 1).state_file)
+
+    class RefusingBlockers(BlockerStore):
+        def record(self, **kwargs):
+            raise OSError("the blockers directory is not writable")
+
+    recovery = recover_dead_lanes(
+        config, exclude=0, blockers=RefusingBlockers(config.blockers_dir)
+    )
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_REFUSED]
+    assert "could not be written" in recovery.lanes[0].detail
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    assert digest(lane_paths(config.state_dir, 1).state_file) == before_state
+    assert fleet_stop(config, BlockerStore(config.blockers_dir), exclude=0) is None
+
+
+def test_a_park_whose_blocker_carries_no_id_is_refused_too(tmp_path, monkeypatch):
+    """The same inversion one step later, and the easier one to miss: a store
+    that RECORDS something the park cannot name leaves `park_blocker_id` empty,
+    `_blocker_code` cannot resolve a code from it, and `fatal_scope` reads the
+    park as fleet-fatal. Refusing keeps that unclassifiable park off disk."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone_repo(config, 1, stray="something else wrote here\n")
+    before_state = digest(lane_paths(config.state_dir, 1).state_file)
+
+    class NamelessBlockers(BlockerStore):
+        def record(self, **kwargs):
+            return None
+
+    recovery = recover_dead_lanes(
+        config, exclude=0, blockers=NamelessBlockers(config.blockers_dir)
+    )
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_REFUSED]
+    assert "carries no id" in recovery.lanes[0].detail
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    assert digest(lane_paths(config.state_dir, 1).state_file) == before_state
+
+
+def test_a_clean_clone_and_a_failing_quarantine_still_leaves_the_lane_shut(
+    tmp_path, monkeypatch
+):
+    """The clone check runs BEFORE the worker check, so the fail-closed
+    quarantine has to survive the new ordering: a lane whose clone is fine and
+    whose worker cannot be made safe is still left shut, with its lease and its
+    worker exactly where they were."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    worker, execution = seed_worker(config, "t-broken", real_repo=False)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone_repo(config, 1)
+
+    class RefusingManager(WorkerRepoManager):
+        def quarantine(self, task_id, label):
+            raise OSError("the quarantine destination is not writable")
+
+    manager = RefusingManager(config.workers_root, config.worker_hooks_dir)
+    recovery = recover_dead_lanes(config, exclude=0, worker_repos=manager)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_REFUSED]
+    assert lane_paths(config.state_dir, 1).lease_file.exists()
+    assert worker.exists()
+    assert (
+        StateStore(lane_paths(config.state_dir, 1).state_file).load().phase
+        == Phase.EXECUTING.value
+    )
+
+
+def test_a_dead_lane_whose_clone_was_never_created_is_not_parked_for_it(
+    tmp_path, monkeypatch
+):
+    """Absent is not unclean. A death that interrupted a round before its clone
+    existed leaves no tree to refuse, and the next dispatch creates one at the
+    controlled boundary — parking on the absence would stop a lane for the
+    ordinary case."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_RESUMED]
+    assert not lane_paths(config.state_dir, 1).lease_file.exists()
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
+
+
+def test_a_dead_lane_at_a_terminal_phase_is_not_judged_on_its_clone(
+    tmp_path, monkeypatch
+):
+    """The recovery inspects the clone of a lane it is about to REOPEN a round
+    in, which a terminal session is not. The clone of a lane holding no round is
+    still refused — by `_synchronise_observed_checkout`, at the next dispatch,
+    with the same lane-fatal park — so nothing is rebuilt silently either way,
+    and no terminal state file is rewritten by a recovery."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2, observed=True)
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, phase=Phase.STOPPED, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone_repo(config, 1, stray="something else wrote here\n")
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_RELEASED]
+    assert (
+        StateStore(lane_paths(config.state_dir, 1).state_file).load().phase
+        == Phase.STOPPED.value
+    )
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
+
+
+def test_a_deployment_with_no_observed_checkout_recovers_exactly_as_before(
+    tmp_path, monkeypatch
+):
+    """The pre-esc-02 arrangement, which wires no loop-owned clone at all. There
+    is no tree for the recovery to judge, and the lane is resumed on the evidence
+    that already decided it — a deployment that configures nothing must not be
+    parked on a directory nobody watches."""
+    boot = pin_boot(monkeypatch)
+    config = make_config(tmp_path, lanes=2)
+    assert config.observed_checkout is None
+    _worker, execution = seed_worker(config, "t-dead", real_repo=True)
+    seed_lane(config, 1, execution=execution)
+    write_lease(config, 1, alive=False, boot=boot)
+    seed_clone(config, 1)                  # residue nobody is watching
+
+    recovery = recover_dead_lanes(config, exclude=0)
+
+    assert [e.action for e in recovery.lanes] == [RECOVERY_RESUMED]
+    assert BlockerStore(config.blockers_dir).open_blockers() == []
 
 
 def test_a_fleet_fatal_park_in_the_same_place_still_stops_everything(tmp_path):

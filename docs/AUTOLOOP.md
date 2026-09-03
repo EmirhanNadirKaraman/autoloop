@@ -1020,10 +1020,25 @@ merge slot is `merge_sweep.MergeToken`, a lease with `LoopLock.is_live`'s own
 rule, taken by `BacklogSweeper.sweep` around the merges and released in a
 `finally`; a token a live lane holds defers the sweep and is never stolen, and a
 dead holder's is released by the recovery on the TOKEN's own evidence rather than
-on any lane's lease, so one corrupt lease cannot stop the fleet merging. Every
-absence — an unreadable lease, state, phase or execution record, an unlistable
-`lanes/`, a quarantine that fails — refuses and leaves the lease in place, so
-nothing enters that lane. The recovery is only safe from the holder of the FLEET
+on any lane's lease, so one corrupt lease cannot stop the fleet merging. The
+CLONE is asked before either, by `_lane_clone_violations`, and only of a lane the
+recovery is about to reopen a round in: the read-only half of `synchronize`'s
+refusals — present but not a repository, and residue, including residue nobody
+could read — over that lane's own tree via `ObservedCheckout.for_lane`. A
+violation writes the same park a live lane writes (`needs_user`, `loop_fatal`,
+`observed_checkout_unusable`, a blocker record naming the lane), so conc-07's
+table keeps it lane-fatal and the fleet runs on; nothing there is fetched, reset
+or deleted, because the tree IS the evidence the park summons a person to. The
+record is written before the state park and the park abandoned if it cannot be —
+`_lane_fleet_stop` resolves a park's scope THROUGH that record, and an
+unresolvable code is fleet-fatal, so a park with no record behind it would stop
+every lane over one lane's dirty clone. AHEAD/DIVERGED is left to
+`_synchronise_observed_checkout` at the next dispatch, which refuses it with the
+identical park: what the earlier answer buys is that nothing re-enters a lane
+whose tree is visibly not the loop's. Every absence — an unreadable lease, state,
+phase or execution record, an unlistable `lanes/`, a quarantine that fails, a
+clone that could not be established at all — refuses and leaves the lease in
+place, so nothing enters that lane. The recovery is only safe from the holder of the FLEET
 LOCK, which is what makes `LaneLease.break_stale`'s check-then-act sound; one
 process holds it today, and an arrangement that runs lanes in separate processes
 inherits that obligation.
