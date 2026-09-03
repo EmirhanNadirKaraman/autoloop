@@ -62,7 +62,11 @@ other:
 3. **Carry forward, after the merge** (`_discharge_rereview`, through the
    injected callable): the head is merged INTO each task's own branch and its
    record is advanced onto the new candidate, so the approval that was taken
-   against the old one no longer matches and `_dispatch_task_push` refuses it.
+   against the old one no longer matches and `_dispatch_task_push` refuses it —
+   and then ASKS for the re-review that record owes
+   (`orchestrator._ask_for_the_owed_rereview`) rather than parking, which is
+   what the reset review round in step 3 is for. The mark is what the owning
+   lane, in another process, reads to know it owes one.
 
 Step 1 exists for step 3's failure path. A conflict, a dirty worker, a missing
 worker repo or a process that dies between 2 and 3 all leave a reviewed
@@ -1010,6 +1014,12 @@ class AutoMerger:
         moved usually belongs to another lane entirely. What stops that
         candidate being published is `rereview_owed_base`, which is still set:
         the park is how an operator finds out, not how the refusal is enforced.
+
+        And the owning lane PARKS on that marker rather than asking for a new
+        review, which is the one place the two outcomes of a carry-forward
+        diverge: no `rereview_candidate_sha` was written here, because no new
+        candidate exists to show anyone — the record is still on a base the head
+        has moved past, which is a human's problem and not a reviewer's.
 
         Swallowed like every other failure here, for the same reason: the merge
         has already landed.

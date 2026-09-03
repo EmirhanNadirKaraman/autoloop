@@ -135,16 +135,42 @@ class TaskExecution:
     #: then publish — the one thing "never merged or pushed on its old approval"
     #: forbids, reachable only on the error path.
     #:
-    #: Cleared at exactly one site: `_dispatch_task_postcommit` where
-    #: `review_round` is incremented, i.e. where a NEW review packet is actually
-    #: sent. The obligation is discharged by the re-review happening, not by the
-    #: carry-forward succeeding — a carried-forward candidate nobody has looked
-    #: at again is precisely what must not be pushed.
+    #: Cleared where a NEW review packet is actually sent, and nowhere else:
+    #: `_dispatch_task_postcommit` where `review_round` is incremented, and
+    #: `_ask_for_the_owed_rereview`, which is that same discharge reached from
+    #: an approval instead of from a round. The obligation is discharged by the
+    #: re-review happening, not by the carry-forward succeeding — a
+    #: carried-forward candidate nobody has looked at again is precisely what
+    #: must not be pushed.
     #:
     #: EMPTY AT `lanes = 1`, always: the merge window is shut whenever a
     #: candidate is bound to the head there, so nothing ever moves the head past
     #: one and no site ever writes this.
     rereview_owed_base: str = ""
+    #: The candidate commit a SUCCESSFUL carry-forward produced, while it still
+    #: owes its re-review (conc-03). Written by
+    #: `_carry_candidate_past_for_merge` at the same moment it advances
+    #: `candidate_sha`, and cleared beside `rereview_owed_base` at the two sites
+    #: that actually send a packet.
+    #:
+    #: It exists because `rereview_owed_base` alone cannot tell the two shapes
+    #: of an owed re-review apart, and they need opposite answers: a carry that
+    #: SUCCEEDED has a new candidate on the new base and can simply be reviewed
+    #: again, while a carry that REFUSED left the record on a base the head has
+    #: moved past, which is a park for a human. `rereview_candidate_sha ==
+    #: candidate_sha` is the positive statement "this record's current candidate
+    #: is the one the carry-forward made", and `_dispatch_task_push` asks for the
+    #: re-review only on it.
+    #:
+    #: Deliberately NOT inferred at push time from "the base moved and the
+    #: approval names a different sha": those two are also true of an approval
+    #: that is stale for an unrelated reason, and inferring would route it to a
+    #: re-review request instead of the `push_candidate_stale` refusal it has
+    #: always taken — a `loop_fatal` guard switched off by a sibling feature.
+    #:
+    #: Empty at `lanes = 1` and on every record written before this field
+    #: existed, and empty is the fail-closed value: it licenses no ask.
+    rereview_candidate_sha: str = ""
     #: Review rounds this record earned BEFORE a carry-forward reset
     #: `review_round` (conc-03). docs/AUTOLOOP.md Decision 6 requires the round
     #: to be reset so the loop asks for the new review; this field is what keeps
