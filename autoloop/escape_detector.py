@@ -21,6 +21,21 @@ the scope did not. This is the same argument port-01 (2026-08-23) made when it
 moved the loop's writable STATE out of the observed tree, applied one level up
 to the tree itself.
 
+AND ONE SUCH TREE PER LANE (conc-04, docs/AUTOLOOP.md "Decision 1"). Nothing in
+this module changed for it, which is the point: no function here names a
+repository, so "the observed checkout" is whichever root the caller brackets,
+and above one lane that root is the calling LANE's own clone
+(`config.lane_observed_checkout`, `worker_env.ObservedCheckout.for_lane`). The
+exclusion list stays empty for the same measured reason as before — a lane's
+own bookkeeping is outside its tree since port-01, and no OTHER lane writes into
+it, because no two lanes share one. What that buys is attribution rather than
+scope: a `synchronize` rewrites an entire working tree, so on a shared clone one
+lane's routine synchronisation, landing inside another's window, would be
+reported here truthfully as every path in the repository and read as that lane's
+escape. The residual it leaves is stated with the rest below: a write by one
+lane INTO another lane's tree is still detected, and still attributed to the
+lane whose window brackets it.
+
 READ THIS BEFORE TRUSTING IT. This module is an ESCAPE DETECTOR, not an OS
 security sandbox. It does not stop a write-capable agent from touching
 anything on disk — nothing here has that power, because the agent runs as an
@@ -156,9 +171,13 @@ path to a non-worker tree that leaks into it is the fetch source recorded in
 creation and the carry-forward merge that fetches a moved head into an existing
 worker, since either alone would leave the claim false for half the tasks that
 run. An agent that goes looking for "the repo"
-therefore finds a watched tree. An agent that already knows the operator's
-absolute path from somewhere else does not, and never did in any way this
-module could have proven — see docs/SECURITY.md.
+therefore finds a watched tree — its OWN lane's watched tree above one lane,
+since that is the clone its worker was seeded from. An agent that already knows
+the operator's absolute path from somewhere else does not, and never did in any
+way this module could have proven — see docs/SECURITY.md. A SIBLING LANE's
+absolute path is the same case one lane over and is the one residual concurrency
+adds: such a write IS detected, by the lane whose window brackets that tree, and
+is attributed to that lane rather than to the one that made it.
 
 SCOPE: the checkout's WORKING TREE, not `.git/` internals. "Tracked,
 untracked and ignored" is exactly the three categories `git status`

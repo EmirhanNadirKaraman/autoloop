@@ -488,7 +488,12 @@ DOCS_ONLY_SELECTED = 20
 #: file — `opaque` is `starts_an_interpreter or (interpreter_seen and
 #: unreadable)`, and both terms are False — so the same 20 once more. The
 #: DENOMINATOR only.
-SUITE_SIZE = 110
+#: 110 -> 111 when conc-04b added `test_lane_observed_checkout.py` (2026-09-03):
+#: the one document it names is `docs/AUTOLOOP.md`, which is not a change-note
+#: tracker, it resolves no `__file__`, and it borrows `gitrepo.run_git` with no
+#: interpreter literal of its own — so the same 20 once more. The DENOMINATOR
+#: only.
+SUITE_SIZE = 111
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
