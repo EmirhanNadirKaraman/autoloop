@@ -239,6 +239,25 @@ section for the full table):
   change what happens next; use `_to_needs_user` wherever a human doing
   something makes the SAME session resumable.
 
+Fault isolation across lanes (conc-07, 2026-09-03):
+
+* `loop_fatal` says "the loop stops", and with N lanes there are N loops. The
+  fleet splits that reach in two — `blockers.LANE_FATAL` (this lane stops, the
+  others keep working) and `blockers.FLEET_FATAL` (every lane stops at its next
+  safe phase) — on a SEPARATE AXIS from `kind`. No park site's `kind` changes,
+  `state.park_kind` still carries literally `"loop_fatal"`, and every existing
+  assertion about that string still holds; the new question is answered from the
+  CODE, by `blockers.fatal_scope`, against the enumeration in
+  `blockers.LANE_FATAL_CODES` / `FLEET_FATAL_CODES`.
+* An absent, empty or unrecognised code is `FLEET_FATAL` — the same fail-closed
+  direction `_to_needs_user`'s `kind="loop_fatal"` default already takes — and
+  `checkout_escape_detected` is fleet-fatal by a second, redundant lock
+  (`blockers.HARD_HALT_CODES`, refused before the table is consulted).
+* `fleet_stop` is how a lane LEARNS that a sibling reached a fleet-fatal
+  terminal: it reads the lanes' own state files, never the blocker set, so it is
+  a question about a live park rather than about history. `cli._run_continuous`
+  asks it once per outer iteration, and only at `lanes > 1`.
+
 Autonomous recovery (halt-02, 2026-08-25):
 
 * A CONFIG FLAG, DEFAULT OFF (`config.AutonomyConfig`). With it off — every
@@ -335,6 +354,7 @@ from .auto_merge import (
     upgrade_bound_sha,
 )
 from .blockers import (
+    FLEET_FATAL,
     NO_TASK,
     RECOVER_BY_REBUILDING_AT_HEAD,
     RECOVER_BY_RESUBMITTING,
@@ -349,6 +369,7 @@ from .blockers import (
     STRANDED_AFTER_FAULT,
     BlockerStore,
     autonomous_recovery,
+    fatal_scope,
     refusal_identity,
 )
 from .changeset_review import ChangesetBinding, build_changeset_packet
@@ -1647,21 +1668,48 @@ def retired_lane_occupants(config, lanes: int | None = None) -> tuple[LaneOccupa
     Reads only; opens no lease, takes no lock, and writes nothing.
     """
     count = int(config.concurrency.lanes) if lanes is None else int(lanes)
-    root = Path(config.state_dir) / LANES_DIRNAME
+    indices = _retired_lane_indices(config.state_dir, count)
+    if indices is None:
+        return (LaneOccupant(UNLISTABLE_LANES_INDEX, LANES_DIRNAME, None, False),)
+    found: list[LaneOccupant] = []
+    for index in indices:
+        occupant = _lane_occupant(config.state_dir, index)
+        if occupant is not None:
+            found.append(occupant)
+    return tuple(found)
+
+
+def _retired_lane_indices(state_dir, count: int) -> tuple[int, ...] | None:
+    """WHICH lane indices a lowered cap left outside the fleet, in the listing's
+    own order, or `None` when `lanes/` cannot be listed at all.
+
+    Extracted from `retired_lane_occupants` when `fleet_stop` needed the same
+    walk (conc-07): both have to reach a lane the operator's cap no longer
+    covers, and two spellings of "which directories under `lanes/` are lanes
+    this build did not walk" are two chances to disagree about the one lane that
+    is in trouble. The `None` answer is deliberately not an empty tuple — an
+    unlistable directory and an empty one are the two answers each caller has to
+    tell apart for itself, and each fails closed in its own vocabulary.
+
+    ORDERED BY DIRECTORY NAME, which is what `retired_lane_occupants` returned
+    before the extraction and therefore what its existing tuple equalities are
+    written against. A second ordering rule (by integer, say) would agree with
+    it for every fleet this build can configure and diverge at `_lane-10` — a
+    difference nobody would notice until `MAX_LANES` moved.
+    """
+    root = Path(state_dir) / LANES_DIRNAME
     try:
         names = sorted(entry.name for entry in root.iterdir())
     except FileNotFoundError:
         return ()  # no lane above 0 has ever written state here
     except OSError:
-        return (LaneOccupant(UNLISTABLE_LANES_INDEX, LANES_DIRNAME, None, False),)
-    found: list[LaneOccupant] = []
+        return None
+    found: list[int] = []
     for name in names:
         index = _lane_index_of(name)
         if index is None or index < count:
             continue  # not a lane, or one `lane_occupants` already walked
-        occupant = _lane_occupant(config.state_dir, index)
-        if occupant is not None:
-            found.append(occupant)
+        found.append(index)
     return tuple(found)
 
 
@@ -1686,6 +1734,198 @@ def fleet_occupants(config, lanes: int | None = None) -> tuple[LaneOccupant, ...
     dispatches outright (`HOLD_LANE_RETIRED`).
     """
     return lane_occupants(config, lanes) + retired_lane_occupants(config, lanes)
+
+
+# ---- fault isolation: what stops the FLEET (conc-07, 2026-09-03) -------------
+
+
+@dataclass(frozen=True)
+class FleetStop:
+    """One lane's terminal that every OTHER lane has to stop for — Decision 5's
+    `fleet_fatal`.
+
+    A VALUE, like `FleetPlan`: producing it writes nothing, takes no lock and
+    opens no lease. It says which lane stopped, under what classification, and
+    with which durable record, so the lane that reads it can tell an operator
+    where to look instead of exiting silently.
+
+    `readable` is False for the one case that is not a classified park at all —
+    a lane whose state file, or whose lanes directory, could not be read. That
+    is a fleet stop on the same fail-closed reading Decision 5 fixes for an
+    absent kind: a park this build cannot read is not a park it may assume is
+    harmless. `code` and `kind` are then empty, because nothing was read to put
+    in them.
+    """
+
+    lane_index: int
+    lane_id: str
+    kind: str = ""
+    code: str = ""
+    blocker_id: str = ""
+    question: str = ""
+    readable: bool = True
+
+    def describe(self) -> str:
+        """One line for an operator's terminal and for the transcript."""
+        if self.lane_index == UNLISTABLE_LANES_INDEX:
+            return (
+                f"{self.lane_id}/ could not be listed, so whether any lane parked "
+                "fleet-fatally cannot be decided"
+            )
+        if not self.readable:
+            return (
+                f"lane {self.lane_id}: its state could not be read, so whether it "
+                "parked fleet-fatally cannot be decided"
+            )
+        where = f"lane {self.lane_id} stopped {FLEET_FATAL} ({self.code or 'no code'}"
+        if self.kind:
+            where += f", {self.kind}"
+        where += ")"
+        if self.blocker_id:
+            where += f" — blocker {self.blocker_id}"
+        if self.question:
+            where += f": {self.question}"
+        return where
+
+
+def _blocker_code(blockers, blocker_id) -> str | None:
+    """The `code` of the blocker a lane's terminal names, or `None` when it
+    cannot be read.
+
+    `None` is the fail-closed answer and every road to it is one: no store, no
+    id on the record, an id naming a record that is gone, and a record that will
+    not decode. `fatal_scope(None)` is `FLEET_FATAL`, so a terminal whose code
+    cannot be established stops the fleet rather than being classified as one
+    lane's business on the strength of evidence nobody could read.
+    """
+    if blockers is None or not isinstance(blocker_id, str) or not blocker_id:
+        return None
+    try:
+        record = blockers.load(blocker_id)
+    except (StateError, OSError, ValueError, TypeError):
+        return None
+    return None if record is None else record.code
+
+
+def _lane_fleet_stop(state_dir, index: int, blockers) -> FleetStop | None:
+    """Whether lane `index` has reached a terminal the whole fleet must stop
+    for, read from that lane's OWN state file.
+
+    THE STATE FILE IS THE SIGNAL, and the blocker record is only a lookup for
+    the code. That order is what keeps this a question about a PARK rather than
+    about history: `_to_needs_user` writes its blocker record BEFORE it decides
+    whether to park, so a fault autonomous mode went on to recover from leaves
+    an open `loop_fatal` record behind and no park at all — and a fleet stop
+    derived from the record set would stop four lanes over a fault the loop
+    handled. It also self-clears through the remedy the operator already has:
+    `run --retry` / `--answer` moves the lane out of `needs_user`, and nothing
+    has to remember to clear a second flag.
+
+    Two terminals count, and they are the two that stop something today:
+    a `needs_user` park, and a `stopped` session with `stop_kind="fault"`
+    (`_to_fault_stop`, which records the same `loop_fatal` blocker without
+    parking). A `task_fatal` park is NEITHER — it is narrower than lane-fatal,
+    one task is set aside and that lane goes on working — so it is skipped
+    before any code is looked up.
+
+    **THE KIND IS ASKED FIRST AND THE CODE ONLY AFTER IT.** Only a park this
+    build can read as `loop_fatal` is classified by its code; an ABSENT or
+    UNRECOGNISED kind is fleet-fatal whatever its code says, which is Decision
+    5's own default and the direction `cli._handle_parked_task` already takes.
+    Consulting the code first would invert exactly that: a state file written
+    before `park_kind` existed, hand-edited, or written by a build that knows a
+    word this one does not, would be classified on a code the loop has no reason
+    to believe describes it — and a lane-fatal code there would let the fleet
+    walk past a park nobody could read.
+
+    Everything else in this lane is `None`: no session, a terminal phase that is
+    an ordinary boundary, a lane still mid-round. A lane mid-round is not a stop
+    and must not be one — "every lane is stopped at its next safe phase" is the
+    caller's boundary, never an interruption of a round in flight.
+    """
+    paths = lane_paths(state_dir, index)
+    unreadable = FleetStop(index, paths.lane_id, readable=False)
+    try:
+        state = StateStore(paths.state_file).load()
+    except (StateError, OSError, ValueError, TypeError):
+        return unreadable
+    if state is None:
+        return None  # no session in that lane at all
+    try:
+        phase = Phase(state.phase)
+    except (ValueError, TypeError):
+        return unreadable
+    if phase is Phase.NEEDS_USER:
+        kind = getattr(state, "park_kind", None)
+        if kind == "task_fatal":
+            return None
+        blocker_id = getattr(state, "park_blocker_id", None)
+    elif phase is Phase.STOPPED and getattr(state, "stop_kind", "") == "fault":
+        # `_to_fault_stop` classifies its record `loop_fatal` unconditionally,
+        # so the kind is read off the terminal rather than off a field it never
+        # writes into the state.
+        kind = "loop_fatal"
+        blocker_id = getattr(state, "stop_blocker_id", None)
+    else:
+        return None
+    code = _blocker_code(blockers, blocker_id)
+    if kind == "loop_fatal" and fatal_scope(code) != FLEET_FATAL:
+        return None
+    return FleetStop(
+        index,
+        paths.lane_id,
+        kind=kind if isinstance(kind, str) else "",
+        code=code or "",
+        blocker_id=blocker_id if isinstance(blocker_id, str) else "",
+        question=getattr(state, "question", None) or "",
+    )
+
+
+def fleet_stop(config, blockers=None, lanes=None, exclude=None) -> FleetStop | None:
+    """The fleet-fatal terminal some OTHER lane has reached, or `None` when the
+    fleet may keep working — Decision 5, the half a lane-fatal park does not
+    have.
+
+    Every lane the fleet actually has is walked, in one deterministic order: the
+    lanes inside the cap ascending, then the lanes a LOWERED cap cut out of it
+    in `_retired_lane_indices`' own listing order. A cut lane is included for the
+    reason
+    `fleet_occupants` includes it — the operator's edit did not end the session
+    in it, and a fleet-fatal park there is one nothing else would ever see.
+
+    `exclude` is the caller's OWN lane index. Its own park is reported by its
+    own handler with its own wording (`cli._handle_parked_task`), and reporting
+    it twice, in two vocabularies, would be the loop telling an operator about
+    one park as if it were two.
+
+    FAIL-CLOSED IN THREE PLACES, each of which is an absence of evidence rather
+    than evidence of health: a lane state that cannot be read, a `lanes/`
+    directory that cannot be listed, and a park whose kind or code cannot be
+    established (`_blocker_code` → `fatal_scope`). Every one of them answers
+    "the fleet stops", which is the direction Decision 5 fixes for an absent or
+    unrecognised kind and the direction `lane_occupants` already takes for an
+    unreadable lane — where the answer is milder (busy, so admission holds)
+    because that scan is sizing a fleet and this one is deciding whether a fleet
+    that may be compromised keeps running.
+
+    Reads only; opens no lease, takes no lock, and writes nothing. NEVER CALLED
+    AT `lanes = 1`, where its caller answers `None` without walking anything
+    (`cli._fleet_stop_reached`) — at one lane there is no sibling to stop for,
+    and the acceptance criterion is structural rather than asserted.
+    """
+    count = int(config.concurrency.lanes) if lanes is None else int(lanes)
+    if blockers is None:
+        blockers = BlockerStore(config.blockers_dir)
+    retired = _retired_lane_indices(config.state_dir, count)
+    if retired is None:
+        return FleetStop(UNLISTABLE_LANES_INDEX, LANES_DIRNAME, readable=False)
+    for index in (*range(count), *retired):
+        if index == exclude:
+            continue
+        stop = _lane_fleet_stop(config.state_dir, index, blockers)
+        if stop is not None:
+            return stop
+    return None
 
 
 class FleetSupervisor:
@@ -13847,6 +14087,12 @@ class Orchestrator:
                 # Attribution, so a later run can tell a live blocker from one
                 # abandoned by a session that has since been reset.
                 session_id=state.session_id or "",
+                # WHICH LANE parked (conc-07). Decision 5's "its blocker record
+                # names the lane", and written for every park rather than only
+                # for a lane-fatal one: an operator reading `blockers` after a
+                # fleet-fatal stop is looking at records from several lanes, and
+                # a field that only some parks carry is one nobody can sort by.
+                lane_id=self.lane_id,
             )
             if plan is not None and self._autonomous_retry(
                 plan, blocker, code=code, resume_phase=resume_phase,
@@ -16027,6 +16273,10 @@ class Orchestrator:
                 phase=originating_phase,
                 now=utcnow_iso(),
                 session_id=state.session_id or "",
+                # The same lane attribution a park gets (conc-07). A fault stop
+                # is not a park, but it is a `loop_fatal` record an operator
+                # reads out of the same list.
+                lane_id=self.lane_id,
             )
             state.stop_blocker_id = blocker.id
         self._store.save(state)

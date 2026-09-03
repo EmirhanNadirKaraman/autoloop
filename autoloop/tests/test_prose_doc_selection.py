@@ -499,7 +499,12 @@ DOCS_ONLY_SELECTED = 20
 #: round still reaches it through neither half of the rule — and its
 #: `CountingRunner` hands `subprocess.run` an unreadable argv with no interpreter
 #: literal in the file. The same 20 once more; the DENOMINATOR only.
-SUITE_SIZE = 112
+#: 112 -> 113 when conc-07 added `test_fault_isolation.py` (2026-09-03): the one
+#: document it names is `docs/AUTOLOOP.md`, which is not a change-note tracker,
+#: it resolves no `__file__`, and it spawns nothing at all — so it reads no
+#: document under either half of the rule and the same 20 hold. The DENOMINATOR
+#: only.
+SUITE_SIZE = 113
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

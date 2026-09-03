@@ -69,7 +69,7 @@ Status is one of `pending`, `in_progress`, `blocked`, `completed`, `retired`,
 filename order is chronological within a task). `id`, `task_id`, `kind`
 (`task_fatal` | `loop_fatal`), `code`, `question`, `detail`, `phase`,
 `created_at`, `resolved_at`, `answer`, `recurrences`, `last_seen_at`,
-`session_id`, `archived_reason`, `revised_refusals`.
+`session_id`, `archived_reason`, `revised_refusals`, `lane_id`.
 
 `task_id` is `(loop)` for a blocker tied to no registry task; task ids cannot
 contain parentheses, so the two never collide. `answer` means an operator
@@ -91,6 +91,15 @@ every record written before it existed and on every code autonomous mode does no
 answer with a revise. A value that is not a list of strings is treated as a
 corrupt record and RAISES, because "we cannot read the meter" must not read as
 "nothing was spent".
+
+`lane_id` is WHICH LANE parked this (`_lane-0`, `_lane-1`, …) — descriptive
+metadata, so an operator reading `blockers` after a fleet-fatal stop can tell
+records from several lanes apart. Nothing branches on it: how far a park reaches
+is decided from `code` (`blockers.fatal_scope`), and which lane has actually
+stopped is read from the lanes' own state files. Empty on a record written
+before it existed and on one recorded by a caller that names no lane; a bump
+that names none keeps the lane the record already carries, because an absence of
+information must not overwrite one.
 
 Readers are tolerant of missing keys (each has a default) and INTOLERANT of
 unreadable ones: a record that fails to decode raises rather than reading as

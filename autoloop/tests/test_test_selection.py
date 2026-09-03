@@ -621,7 +621,12 @@ FLOOR_AFTER = 16
 #: its `CountingRunner` hands `subprocess.run` an argv this cannot read with no
 #: interpreter literal anywhere in the file — so 20 and 24 are unchanged once
 #: more.
-SUITE_SIZE = 112
+#: 112 -> 113 when conc-07 added `test_fault_isolation.py` (2026-09-03), the
+#: DENOMINATOR again: the one document it names is `docs/AUTOLOOP.md`, which is
+#: not one of the change-note trackers a docs-only round changes, it resolves no
+#: `__file__`, and it spawns no process at all — so 20 and 24 are unchanged once
+#: more.
+SUITE_SIZE = 113
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
