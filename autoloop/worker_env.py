@@ -713,6 +713,15 @@ class WorkerRepoManager:
         BEFORE calling this; nothing here knows about state directories or
         observed checkouts (see `orchestrator._recorded_worker_refusal`).
 
+        DEFENCE IN DEPTH, and deliberately so: the one production caller, the
+        lane-death recovery, now establishes the identity a level up
+        (`orchestrator._recreated_worker_refusal`) and refuses a record that
+        does NOT name `path_for(task_id)` — because a dispatch recreating the
+        worker would build here while the round worked over there. So the
+        foreign-path branch below is reached only by a caller that has not made
+        that check, and it stays because the alternative is a method whose
+        safety depends on every future caller remembering to.
+
         The hooks directory is NOT touched on the foreign-path branch:
         `hooks_dir_for(task_id)` belongs to the worker at `path_for(task_id)`,
         which is by definition not the directory being moved.

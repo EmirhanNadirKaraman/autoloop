@@ -1960,7 +1960,10 @@ def fleet_stop(config, blockers=None, lanes=None, exclude=None) -> FleetStop | N
 #      classifies LANE-fatal, so the fleet keeps running. Nothing is rebuilt,
 #      reset or deleted: `_lane_clone_violations` only READS.
 #   2. a WORKER repository that is not what its record says — quarantined, never
-#      deleted.
+#      deleted, and only when the record and today's `workers_root` name ONE
+#      directory, because that is the directory the next dispatch recreates in
+#      (`_recreated_worker_refusal`). Where they disagree the lane is refused
+#      rather than opened onto a round with no worker.
 #   3. the LEASE, released last of the three and only once the other two are
 #      settled, because releasing it is what lets the next tick in.
 #
@@ -1980,7 +1983,8 @@ def fleet_stop(config, blockers=None, lanes=None, exclude=None) -> FleetStop | N
 RECOVERY_RESUMED = "resumed"
 #: Its worker repository failed `worker_repo_is_reusable`, so that repository was
 #: MOVED ASIDE (never deleted) before the lease was released. The next dispatch
-#: creates a fresh one from the recorded base.
+#: creates a fresh one from the recorded base, at the path the record still
+#: names — the identity `_recreated_worker_refusal` establishes before the move.
 RECOVERY_QUARANTINED = "quarantined"
 #: A dead lease with nothing mid-round behind it — the lease is removed and no
 #: round is resumed, because there is none.
@@ -2533,13 +2537,15 @@ def _recover_lane_worker(
 
       * the session names no task, or has no execution record — there is no
         worker to judge;
-      * the record names no worker path, or the path is GONE — the next
-        dispatch creates one from the recorded base, which is exactly what a
-        resumed round already does today;
+      * the record names no worker path, or the path is GONE from the very place
+        the next dispatch would create one — that dispatch creates it there from
+        the recorded base, which is exactly what a resumed round already does
+        today;
       * the recorded worker still passes the probe — a git repository at the
         recorded path, checked out on the recorded branch — which is the wrk-01
         resume, and quarantining it would discard the interrupted round's own
-        partial work.
+        partial work. This one is coherent wherever that path sits: a reused
+        worker is the recorded one, and no `create` happens at all.
 
     QUARANTINED is the remaining case and the one the claim is about: a worker
     that is there and is NOT what the record says it is. It is moved aside by
@@ -2548,23 +2554,27 @@ def _recover_lane_worker(
     because that method refuses a colliding destination by design and two
     recoveries of one task in the same second must not be one of them.
 
-    THE DIRECTORY THAT MOVES IS THE ONE THAT WAS JUDGED, and that is why the
-    RECORDED path is passed down rather than the task id. `quarantine(task_id,
-    label)` moves `path_for(task_id)` — `<workers_root>/<task_id>` as the
-    manager is configured NOW — while every judgement above was made about
-    `execution.worktree_path` as it was written. A deployment whose
-    `workers_root` moved between the two makes those different directories, and
-    quarantining by id would then leave the broken worker exactly where it is
-    and carry a healthy one off instead: the wrong repository moved, on evidence
-    gathered about another, which is precisely the "touching something this lane
-    does not own" the claim forbids. `_recorded_worker_refusal` asks first
-    whether the recorded path can be moved at all, and a path it cannot place
-    fails CLOSED — nothing moves, the lane keeps its lease.
+    THE DIRECTORY THAT MOVES IS THE ONE THAT WAS JUDGED, AND IT IS ALSO THE ONE
+    THE NEXT DISPATCH FILLS — both halves, because the first without the second
+    opens a lane onto a round with no worker. Every judgement here is made about
+    `execution.worktree_path` as the record wrote it, while a recreating
+    dispatch builds at `path_for(task_id)` under TODAY's `workers_root` and then
+    works in the recorded path, which `create` never writes back. So the two
+    must already name one directory before the lease is released, and
+    `_recreated_worker_refusal` is that question, asked BEFORE anything moves: a
+    deployment whose `workers_root` moved between the record and now is REFUSED
+    rather than quarantined, and the lane keeps its lease. Quarantining by task
+    id instead would be the other half of the same fault — the broken worker
+    left exactly where it is and a healthy namesake carried off, the wrong
+    repository moved on evidence gathered about another — which is why the
+    RECORDED path is what is passed down. `_recorded_worker_refusal` asks the
+    third question, whether that path may be moved at all, and every one of the
+    three fails CLOSED.
 
     REFUSED is for the evidence, not for the worker: an execution record that
-    cannot be read, a recorded path that cannot be safely mapped, and a
-    quarantine that is required but cannot be performed. All three leave the
-    lane shut.
+    cannot be read, a recorded path that cannot be safely mapped, a record and a
+    `workers_root` that name different directories, and a quarantine that is
+    required but cannot be performed. All four leave the lane shut.
     """
     if not dead.task_id:
         return (
@@ -2611,12 +2621,13 @@ def _recover_lane_worker(
             f"its worker {path} is still a git repository on {branch}",
             "",
         )
-    if not path.exists():
-        return (
-            RECOVERY_RESUMED,
-            f"its worker {path} is gone, so the next dispatch creates one",
-            "",
-        )
+    # THE MANAGER IS ESTABLISHED BEFORE THE "IT IS GONE" ANSWER, not after: the
+    # path it would create at is half of the coherence question below, and that
+    # question is asked of an absent worker exactly as it is of a broken one —
+    # a record naming a directory that is missing SOMEWHERE ELSE opens a lane
+    # onto a dispatch that creates a worker here and then works over there. One
+    # that cannot be built cannot answer it, which is a refusal rather than the
+    # resume this returned before there was a question to fail.
     manager = worker_repos
     if manager is None:
         try:
@@ -2625,14 +2636,33 @@ def _recover_lane_worker(
             return (
                 RECOVERY_REFUSED,
                 f"its worker {path} does not pass the reuse probe and no worker "
-                f"manager could be built to quarantine it ({exc})",
+                f"manager could be built to judge it ({exc})",
                 "",
             )
-    refusal = _recorded_worker_refusal(path, config)
+    if path.exists():
+        # Asked FIRST of a path that is really there, because it names the more
+        # specific fault — a record pointing into the state directory or another
+        # lane's watched tree — and that is the sentence an operator needs. It is
+        # not asked of an absent path: "may this directory be moved" is not a
+        # question about a directory that does not exist.
+        refusal = _recorded_worker_refusal(path, config)
+        if refusal:
+            return (
+                RECOVERY_REFUSED,
+                f"its worker {path} does not pass the reuse probe and {refusal}",
+                "",
+            )
+    refusal = _recreated_worker_refusal(manager, dead.task_id, path)
     if refusal:
         return (
             RECOVERY_REFUSED,
             f"its worker {path} does not pass the reuse probe and {refusal}",
+            "",
+        )
+    if not path.exists():
+        return (
+            RECOVERY_RESUMED,
+            f"its worker {path} is gone, so the next dispatch creates one there",
             "",
         )
     label = f"lanedeath-{dead.lane_id}-{utcnow_iso().replace(':', '')}-{uuid.uuid4().hex[:8]}"
@@ -2650,6 +2680,73 @@ def _recover_lane_worker(
         f"its worker {path} is not a git repository checked out on "
         f"{branch or '(no branch recorded)'}",
         str(moved),
+    )
+
+
+def _recreated_worker_refusal(manager, task_id: str, path: Path) -> str:
+    """Why the next dispatch could not USE the worker it would create for this
+    record, in a clause a `RECOVERY_REFUSED` detail can carry, or `""` when it
+    could.
+
+    THE QUESTION THE QUARANTINE'S ANSWER DEPENDS ON. A worker that fails the
+    reuse probe is RECREATED by the next dispatch, and that dispatch does two
+    things in this order (`_dispatch_task_postcommit`): `WorkerRepoManager.
+    create(task.id, …)`, which builds at `path_for(task_id)` under TODAY's
+    `workers_root`, and then `GitGateway(Path(execution.worktree_path), …)`,
+    which works in the path the RECORD names. `create` never writes the record
+    back, so those two must already be one directory:
+
+      * where they agree — every deployment whose `workers_root` has not moved,
+        which is every one the loop configures for itself — the quarantine frees
+        exactly the path the create then fills, and nothing recorded changes;
+      * where they DIFFER, the create either REFUSES (something is already at
+        `path_for`: the healthy namesake) or succeeds and is then ignored, with
+        the round pointed at the directory the recovery has just carried off.
+        Both are a lane opened onto a round with no worker at all, so the lane is
+        not opened.
+
+    REFUSING RATHER THAN RE-POINTING THE RECORD is the smaller of the two
+    answers Decision 8 allows and the reversible one. Rewriting
+    `worktree_path` would need the create's own preconditions re-checked here,
+    and would silently re-aim a durable record at a directory no operator named,
+    on a deployment change nothing in the loop can verify was intended. The
+    refusal costs that ONE lane its recovery, names both directories every tick
+    in the transcript — which is the whole remedy — and forecloses nothing: a
+    later round that wants the re-point can add it above this line.
+
+    FAIL CLOSED ON NOT KNOWING, exactly as `_recorded_worker_refusal` does. A
+    `path_for` that cannot be built (an id the manager refuses) or two paths
+    that cannot be resolved to compare is a refusal, never a pass: this exists
+    to answer "will the round find a worker", and a check that cannot see either
+    directory has not answered it.
+    """
+    try:
+        target = Path(manager.path_for(task_id))
+    except Exception as exc:  # noqa: BLE001 - `validate_task_id` raises its own
+        # type, and a substituted manager may raise anything at all; a target
+        # that cannot be named is one this cannot compare against, which is the
+        # refusal below rather than an error that stops the whole pass.
+        return (
+            f"the worker this deployment would create for {task_id!r} could not "
+            f"be named ({type(exc).__name__}: {exc}), so nothing was moved and "
+            "its lease is left in place"
+        )
+    try:
+        agree = path.resolve() == target.resolve()
+    except (OSError, ValueError, TypeError) as exc:
+        return (
+            f"it could not be compared against {target}, where this deployment "
+            f"would create that task's worker ({type(exc).__name__}: {exc}), so "
+            "nothing was moved and its lease is left in place"
+        )
+    if agree:
+        return ""
+    return (
+        f"this deployment creates that task's worker at {target} instead: the "
+        f"next dispatch would build one there and then work in {path}, so "
+        "re-entering this lane would give the round no worker at all. Nothing "
+        "was moved and its lease is left in place until the execution record "
+        "and the workers root name one directory."
     )
 
 
