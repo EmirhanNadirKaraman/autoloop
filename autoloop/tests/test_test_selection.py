@@ -626,7 +626,12 @@ FLOOR_AFTER = 16
 #: not one of the change-note trackers a docs-only round changes, it resolves no
 #: `__file__`, and it spawns no process at all — so 20 and 24 are unchanged once
 #: more.
-SUITE_SIZE = 113
+#: 113 -> 114 when conc-08 added `test_lane_death_recovery.py` (2026-09-03), the
+#: DENOMINATOR once again and for conc-07's reason exactly: the one document it
+#: names is `docs/AUTOLOOP.md`, it resolves no `__file__`, and the git it needs
+#: is spawned by `gitrepo.py` rather than by anything this file binds — so 20 and
+#: 24 hold.
+SUITE_SIZE = 114
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
