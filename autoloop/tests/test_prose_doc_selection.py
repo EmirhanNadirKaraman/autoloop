@@ -504,7 +504,12 @@ DOCS_ONLY_SELECTED = 20
 #: it resolves no `__file__`, and it spawns nothing at all — so it reads no
 #: document under either half of the rule and the same 20 hold. The DENOMINATOR
 #: only.
-SUITE_SIZE = 113
+#: 113 -> 114 when conc-08 added `test_lane_death_recovery.py` (2026-09-03), for
+#: conc-07's reason exactly: `docs/AUTOLOOP.md` is the only document it names, it
+#: resolves no `__file__`, and the git repositories it builds are spawned by
+#: `gitrepo.py`, not by anything this file binds. The same 20 hold; the
+#: DENOMINATOR only.
+SUITE_SIZE = 114
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
