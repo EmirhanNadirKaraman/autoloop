@@ -327,10 +327,20 @@ def _load_tasks(config: AutoloopConfig) -> tuple[TaskStore, TaskRegistry]:
     builds its store — so the loop reads the same file the dashboard writes;
     both derive the path from `tasks.mutation_ledger_for`, never by spelling it
     twice.
+
+    `fleet` is the other half of that (conc-10b): above one lane the second
+    writer of `tasks.json` is a sibling LANE holding its own registry for a
+    whole round, so every save here reconciles the rows this registry did not
+    itself change (`TaskStore.reconcile_concurrent_rows`) instead of writing a
+    stale status back over a neighbour's transition. Decided from the config in
+    memory, at the one site that builds a running loop's store, and `False` at
+    `lanes = 1` — where no second lane exists and persistence is exactly what it
+    has always been.
     """
     task_store = TaskStore(
         config.tasks_file,
         ledger=mutation_ledger_for(config.workers_root, config.state_dir),
+        fleet=config.concurrency.lanes > 1,
     )
     registry = task_store.load()
     if registry is None:

@@ -29,6 +29,17 @@ Four sections, and each is one part of it:
    merges; the other defers and merges on its next sweep, with nothing stolen.
 4. **A lane that ends does not end the fleet**, and one that stops for the
    handoff is restarted when the replacement does not happen.
+5. **The two things N lanes SHARE, and both were lost updates.** `tasks.json` is
+   one file every lane holds a registry of for a whole round, so a lane saving
+   its own transition used to write a stale copy of every other row back over a
+   neighbour's — a completion, a quarantine or an `in_progress` claim, silently
+   undone, and a task then readable as dispatchable in two lanes at once. And
+   `publisher.git` is one repository every lane publishes through, where two
+   simultaneous fetches collide on git's own lock and the loser is a lane parked
+   for nothing but its neighbour's timing. Section 5 pins the registry half —
+   deterministically, with no threads, because the claim is about what a save
+   writes — and section 6 the publisher half, with two threads, because the claim
+   there is that the second one WAITS.
 
 DELIBERATELY NOT RE-TESTED HERE, because the mechanism is another candidate's
 and a second copy is a cost every round pays: the merge window's per-candidate
@@ -737,3 +748,297 @@ def test_one_lane_runs_in_the_calling_thread_and_builds_no_fleet(
     assert lane.fleet is None and lane.answered_upgrades == set()
     assert not (config.state_dir / LANES_DIRNAME).exists()
     assert not lane_paths(config.state_dir, 0).lease_file.exists()
+
+
+# =============================================================================
+# 5. one task file, N lanes
+# =============================================================================
+#
+# THE LOST UPDATE. Each lane loads `tasks.json` at the top of its outer
+# iteration and holds that registry object for the whole round; every save
+# writes the WHOLE registry back. So lane 0 recording its own completion also
+# writes its hour-old copy of lane 1's row — and lane 1's dispatch, completion
+# or quarantine is gone with no error anywhere. `TaskStore.save` reconciled
+# `priority` and nothing else, because until there was a second LANE the only
+# other writer was the operator's priority edit.
+#
+# No threads here on purpose: two lanes are two registries and two stores, which
+# a single thread can hold at once, and the claim is about what the second save
+# WRITES rather than about when it runs. The interleaving is written out step by
+# step, so a failure names the step.
+
+
+def two_lanes_holding(config: AutoloopConfig):
+    """Two lanes' (store, registry) pairs, loaded from one file at the same
+    instant — `cli._load_tasks` itself, so what is under test includes the
+    wiring that decides whether a store reconciles at all."""
+    return cli._load_tasks(config), cli._load_tasks(config)
+
+
+def test_a_lane_cannot_overwrite_another_lanes_status_transition(tmp_path):
+    """THE regression. Lane 1 dispatches t2; lane 0, whose registry still reads
+    t2 as `pending`, then saves its own dispatch of t1 — and used to write t2
+    back to `pending`, after which the supervisor reads t2 as READY and a second
+    lane runs the task lane 1 is already implementing.
+
+    Both directions are asserted, because a merge that simply preferred the disk
+    would pass the first assertion and lose lane 0's own work in the second."""
+    config = make_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(registry_of(a_task("t1"), a_task("t2")))
+    (store_zero, lane_zero), (store_one, lane_one) = two_lanes_holding(config)
+    assert store_zero.fleet and store_one.fleet, "above one lane a store reconciles"
+
+    lane_one.mark_in_progress("t2")
+    store_one.save(lane_one)
+    lane_zero.mark_in_progress("t1")  # on a registry that predates the line above
+    store_zero.save(lane_zero)
+
+    on_disk = TaskStore(config.tasks_file).load()
+    assert on_disk.get("t2").status == "in_progress", (
+        "lane 1's dispatch was overwritten by lane 0's stale registry"
+    )
+    assert on_disk.get("t1").status == "in_progress", "lane 0's own write survived"
+    assert lane_zero.get("t2").status == "in_progress", (
+        "lane 0 is still holding the stale row it would write again next save"
+    )
+
+    # And the round continues. This is the half a one-shot merge gets wrong: the
+    # row lane 0 ADOPTED is not lane 0's change, so its next save must not write
+    # it back over whatever lane 1 did after that.
+    lane_one.mark_completed("t2")
+    store_one.save(lane_one)
+    lane_zero.mark_completed("t1")
+    store_zero.save(lane_zero)
+
+    on_disk = TaskStore(config.tasks_file).load()
+    assert on_disk.get("t2").status == "completed", "an adopted row was written back"
+    assert on_disk.get("t1").status == "completed"
+
+
+def test_at_one_lane_a_save_is_the_one_it_has_always_been(tmp_path):
+    """The acceptance criterion, at the persistence layer: with `lanes = 1` no
+    store reconciles anything but priority, so the very same interleaving ends
+    exactly as it does today — last write wins. Asserted rather than assumed,
+    because a reconciliation that quietly ran below two lanes would be a change
+    to how every single-lane deployment's task file is written."""
+    config = make_config(tmp_path, lanes=1)
+    TaskStore(config.tasks_file).save(registry_of(a_task("t1"), a_task("t2")))
+    (store_zero, lane_zero), (store_other, other) = two_lanes_holding(config)
+    assert not store_zero.fleet and not store_other.fleet
+
+    other.mark_in_progress("t2")
+    store_other.save(other)
+    lane_zero.mark_in_progress("t1")
+    store_zero.save(lane_zero)
+
+    on_disk = TaskStore(config.tasks_file).load()
+    assert on_disk.get("t2").status == "pending", "today's behaviour, unchanged"
+    assert on_disk.get("t1").status == "in_progress"
+
+
+def test_the_reconciliation_never_undoes_this_lanes_own_change(tmp_path):
+    """The other direction, and the one that would make this cure worse than the
+    disease: a row THIS registry changed is its own and is written, whatever the
+    file says. Two lanes marking the same task is the race the dispatch claim
+    refuses; if one ever gets past it, the writer's own decision stands rather
+    than being silently replaced by the loser's."""
+    config = make_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(registry_of(a_task("t1")))
+    (store_zero, lane_zero), (store_one, lane_one) = two_lanes_holding(config)
+
+    lane_one.block("t1", "a question for the operator")
+    store_one.save(lane_one)
+    lane_zero.mark_in_progress("t1")
+    store_zero.save(lane_zero)
+
+    assert TaskStore(config.tasks_file).load().get("t1").status == "in_progress"
+
+
+def test_a_task_another_lane_added_is_not_dropped_by_a_stale_save(tmp_path):
+    """A whole row, not a field. Lane 1's approved plan adds two subtasks; lane
+    0's next ordinary save wrote a registry that had never heard of them, and the
+    tasks vanished — a plan the reviewer approved, gone, with the parent left
+    pointing at nothing."""
+    config = make_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(registry_of(a_task("t1"), a_task("t2")))
+    (store_zero, lane_zero), (store_one, lane_one) = two_lanes_holding(config)
+
+    lane_one.add_many([a_task("t2a"), a_task("t2b")])
+    store_one.save(lane_one)
+    lane_zero.mark_in_progress("t1")
+    store_zero.save(lane_zero)
+
+    on_disk = TaskStore(config.tasks_file).load()
+    assert sorted(task.id for task in on_disk.all_tasks()) == [
+        "t1", "t2", "t2a", "t2b",
+    ]
+    assert lane_zero.has("t2a"), "and lane 0 can see the tasks it just wrote"
+
+
+def test_a_task_file_nobody_can_parse_still_records_a_completion(tmp_path):
+    """FAILS OPEN, deliberately and in the direction `reconcile_priorities`
+    already chose: this method sits on the path that records completions and
+    quarantines, so a save that started REFUSING because the bytes it is about to
+    replace will not parse would be the worse failure of the two. The lane's own
+    work lands; what is lost is a merge with a file that had nothing readable in
+    it to merge."""
+    config = make_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(registry_of(a_task("t1")))
+    store, registry = cli._load_tasks(config)
+    config.tasks_file.write_text("{ not json at all", encoding="utf-8")
+
+    registry.mark_in_progress("t1")
+    store.save(registry)
+
+    assert TaskStore(config.tasks_file).load().get("t1").status == "in_progress"
+
+
+# =============================================================================
+# 6. one publisher repository, N lanes
+# =============================================================================
+#
+# `publisher.git` is ONE bare repository under the state directory and every
+# lane publishes through it. `import_candidate` runs `git fetch`, which takes
+# git's own `FETCH_HEAD` lock: a second lane arriving mid-fetch does not queue,
+# it FAILS (`Unable to create '.../FETCH_HEAD.lock': File exists`) — and a lane
+# parked on a push refusal for no reason but a neighbour's timing is the fleet
+# breaking work that a single loop did fine.
+#
+# Threads here, for section 1's reason inverted: the claim is that the second
+# lane WAITS, which nothing single-threaded can fail for the right reason.
+
+
+class SerialisedGit:
+    """A git runner that stands in for the publisher's repository, blocks the
+    first FETCH inside it until the test lets go, and records whether two ever
+    ran there at once."""
+
+    def __init__(self, url: str, hooks: Path):
+        self.url = url
+        self.hooks = hooks
+        self.entered = threading.Event()     # a fetch has begun
+        self.second_entered = threading.Event()
+        self.release = threading.Event()     # ...and may now finish
+        self.fetched: list[str] = []
+        self.inside = 0
+        self.overlapped = False
+        self.guard = threading.Lock()
+
+    def __call__(self, args, cwd=None, capture_output=True, text=False, env=None):
+        command = list(args[1:])
+        if command[0] == "fetch":
+            with self.guard:
+                self.fetched.append(command[-1])
+                self.inside += 1
+                self.overlapped = self.overlapped or self.inside > 1
+                if len(self.fetched) > 1:
+                    self.second_entered.set()
+            self.entered.set()
+            self.release.wait(timeout=OVERLAP_TIMEOUT)
+            with self.guard:
+                self.inside -= 1
+            return _proc("", text)
+        if command[:2] == ["cat-file", "commit"]:
+            # A commit object, as bytes: `read_commit` reads raw stdout.
+            return _proc(f"tree {'e' * 40}\n\nreviewed\n", text)
+        if command[:2] == ["rev-parse", "--git-path"]:
+            return _proc(str(self.hooks), text)
+        if command[:2] == ["config", "--get-all"]:
+            return _proc(self.url, text)
+        return _proc("", text)
+
+
+def _proc(out: str, text: bool):
+    class Done:
+        returncode = 0
+        stdout = out if text else out.encode("utf-8")
+        stderr = "" if text else b""
+
+    return Done()
+
+
+def a_publisher(tmp_path: Path, runner: SerialisedGit):
+    """A `Publisher` over `runner` — no git, no network. Construction runs the
+    same structural checks it always does; the runner answers them."""
+    from autoloop.publisher import Publisher
+
+    return Publisher(
+        tmp_path / ".al" / "publisher.git",
+        "origin",
+        PolicyEngine(PolicyConfig()),
+        runner=runner,
+    )
+
+
+def test_two_lanes_publishing_at_once_take_the_repository_one_at_a_time(tmp_path):
+    """THE claim: the second lane WAITS and then publishes. Not "the two calls
+    happened not to overlap" — the first lane is held INSIDE its fetch until this
+    test releases it, so without the mutex the second lane's fetch would start
+    immediately and `second_entered` would be set. Both calls then succeed, which
+    is the half that says the fix is not "one lane fails politely"."""
+    runner = SerialisedGit(str(tmp_path / "remote.git"), tmp_path / "no-hooks")
+    publisher = a_publisher(tmp_path, runner)
+    done: dict[str, str] = {}
+    failed: dict[str, BaseException] = {}
+
+    def publish(name: str, sha: str):
+        try:
+            done[name] = publisher.import_candidate(tmp_path, sha)
+        except BaseException as exc:  # noqa: BLE001 - reported, not raised
+            failed[name] = exc
+
+    first = threading.Thread(target=publish, args=("lane0", "a" * 40))
+    first.start()
+    assert runner.entered.wait(timeout=OVERLAP_TIMEOUT), "lane 0 never fetched"
+
+    second = threading.Thread(target=publish, args=("lane1", "b" * 40))
+    second.start()
+    assert not runner.second_entered.wait(0.25), (
+        "lane 1 entered the publisher repo while lane 0 was fetching in it"
+    )
+
+    runner.release.set()
+    first.join(timeout=OVERLAP_TIMEOUT)
+    second.join(timeout=OVERLAP_TIMEOUT)
+
+    assert failed == {}, f"a simultaneous publish failed a lane: {failed}"
+    assert done == {"lane0": "a" * 40, "lane1": "b" * 40}
+    assert sorted(runner.fetched) == ["a" * 40, "b" * 40], "both lanes published"
+    assert runner.overlapped is False
+
+
+def test_a_publisher_lock_that_cannot_be_taken_is_an_ordinary_git_failure(tmp_path):
+    """The bound on the wait, and the shape of losing it. `TaskStoreBusy` is a
+    `StateError`: raised out of a push it would leave the lane by traceback,
+    while every caller of `publish` already handles a git failure by parking
+    `push_refused` with the reason. So the conversion is the claim — and the
+    reason travels with it, because "the publisher lock" is what an operator
+    needs to read."""
+    from autoloop.errors import GitCommandError
+    from autoloop.publisher import publisher_mutex, publisher_mutex_path
+
+    repo = tmp_path / ".al" / "publisher.git"
+    lock = publisher_mutex_path(tmp_path / ".al")
+    assert lock.name == "publisher.git.lock", "beside the repository, never inside it"
+    assert lock.parent == (tmp_path / ".al").resolve(), "and under the state dir"
+    holding = threading.Event()
+    let_go = threading.Event()
+
+    def hold():
+        with publisher_mutex(repo):
+            holding.set()
+            let_go.wait(timeout=OVERLAP_TIMEOUT)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(timeout=OVERLAP_TIMEOUT)
+    try:
+        with pytest.raises(GitCommandError) as caught:
+            with publisher_mutex(repo, timeout=0.05):
+                pytest.fail("a held publisher lock let a second lane in")
+    finally:
+        let_go.set()
+        holder.join(timeout=OVERLAP_TIMEOUT)
+
+    assert "publisher" in str(caught.value)
+    assert "Nothing was fetched or pushed" in str(caught.value)
