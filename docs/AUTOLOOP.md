@@ -1500,15 +1500,56 @@ rather than an assertion — a runner that ran the lanes in sequence fails it by
 TIMING OUT — and the merge serialisation with two threads racing for the token,
 which is the half conc-08's own tests cannot fail for the right reason.
 
-**Three readers this candidate did NOT make fleet-aware, named so the next
-round inherits them rather than discovering them.** `TaskStore.save` reconciles
-only `priority` against the file underneath it, so two lanes each holding a
-registry across a round can lose each other's STATUS writes — the fix is
-load-mutate-save under `tasks.task_file_mutex` across the orchestrator's own
-registry usage, which is a task and not a step. `heartbeat.json` is one file per
-deployment that every lane overwrites with its own phase, and
+**THE TWO FILES N LANES SHARE, and both were lost updates.** They were first
+recorded here as work this candidate had NOT done; the review that authorised
+turning concurrency on required them closed first, and they are.
+
+* **`tasks.json`.** Each lane loads the registry at the top of its outer
+  iteration and holds that object for a whole round, and every save writes the
+  WHOLE registry — so a lane recording its own transition also wrote its stale
+  copy of every other row, and a sibling's dispatch, completion, quarantine or
+  newly planned subtasks went with it, silently. `TaskStore.save` reconciled
+  `priority` and nothing else, because until there was a second LANE the only
+  other writer was the operator's priority edit. It now reconciles the ROW:
+  `TaskRegistry` remembers what each row looked like when it loaded or last
+  saved (the baseline), and `TaskStore.reconcile_concurrent_rows` adopts, whole,
+  every row on disk that this registry did not itself change — including rows
+  only the file has, which are tasks another lane added. A row this registry
+  DID change is never overwritten, so the cure cannot lose the caller's own
+  work, and a registry built by hand rather than loaded has no baseline at all,
+  which is what makes the mechanism invisible below a fleet. The gate is
+  `TaskStore(fleet=...)`, set once from `[concurrency] lanes > 1` in
+  `cli._load_tasks` — an in-memory config value, no file to fail open on. And
+  because a status can move between the supervisor's scan and the line that
+  writes `in_progress`, the DISPATCH takes the reconcile, the decision and the
+  mark inside one `tasks.task_file_mutex` hold
+  (`orchestrator._claim_task_for_dispatch`; the denial is WRITTEN after the hold
+  is released, since a transcript entry and a blocker record are no other lane's
+  business): a task a sibling took in that window is refused with the
+  supervisor's own `HOLD_IN_FLIGHT` word, untouched, unattempted, on the
+  ordinary corrective re-prompt. `mark_in_progress` could not be that check — it
+  is idempotent on an already in-progress row. The refusal asks only about a row
+  THAT HOLD ADOPTED: a row that already read `in_progress` when the lane loaded
+  is the pre-existing in-flight case Decision 3 leaves to policy and to the
+  worker repo a second dispatch cannot create over the first.
+* **`publisher.git`.** One bare repository under the state directory, and every
+  lane publishes through it. Two lanes fetching into it at once contend on git's
+  own `FETCH_HEAD` lock, and git's answer is to FAIL the second — a lane parked
+  on a push refusal for nothing but a neighbour's timing. `publisher.
+  publisher_mutex` serialises `import_candidate` and `publish` on the same
+  primitive the task file uses, with a timeout taken from
+  `worker_env.OBSERVED_GIT_TIMEOUT_SECONDS` rather than the task file's ten
+  seconds, because the holder is inside a network push. A wait that does expire
+  leaves as a `GitCommandError`, not the `StateError` the primitive raises, so
+  it parks like any other push failure instead of ending the lane by traceback.
+  The lock order is a rule: the task-file mutex is never taken while the
+  publisher's is held.
+
+**Two readers this candidate still did NOT make fleet-aware, named so the next
+round inherits them rather than discovering them.** `heartbeat.json` is one file
+per deployment that every lane overwrites with its own phase, and
 `cli._cmd_status` reads lane 0's state file under a headline about the loop
-(both already recorded under Decision 7). All three are reachable only above one
+(both already recorded under Decision 7). Both are reachable only above one
 lane.
 
 ### Where each of the brief's required tests is proved
