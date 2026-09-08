@@ -1055,7 +1055,10 @@ def _carry_on_upgrade(
     cannot be written the record is REMOVED instead, which costs at most a
     delayed restart (the merged code is on disk, and the next process start
     loads it) where leaving `execed` costs both a false confirmation and the
-    upgrade. The branch that failed BECAUSE the write failed passes False: its
+    upgrade. That removal is a COMPARE-AND-CLEAR (conc-10b): it removes the
+    marker this process wrote and never a record a sibling lane's merge put
+    there since, which would be an upgrade nobody has answered, deleted while
+    cleaning up after a handoff that did not happen. The branch that failed BECAUSE the write failed passes False: its
     disk copy still says `pending` — `UpgradeStore.save` is temp + `os.replace`
     — so it is already in the state the others are restoring to, and clearing
     it would destroy a healthy record over a write that never landed.
@@ -1079,11 +1082,31 @@ def _carry_on_upgrade(
                 f"{exc}"
             )
             try:
-                store.clear()
-                record_kept = False
+                # COMPARE-AND-CLEAR, on the record this process itself wrote
+                # `execed` a moment ago (conc-10b). What is being removed here
+                # is that marker — and a sibling lane's merge can have replaced
+                # it with a fresh `pending` record since, which is an upgrade
+                # nobody has answered and must not be unlinked by a process
+                # cleaning up after its own refused handoff. A clear that does
+                # not fire therefore leaves a record BEHIND, which is what
+                # `record_kept` says.
+                record_kept = not store.clear(
+                    base_sha=record.base_sha, status=UPGRADE_EXECED
+                )
                 detail += (
                     " — it was REMOVED instead, so the merged code is picked "
                     "up by the next process START rather than at a boundary)"
+                    if not record_kept
+                    # DELIBERATELY NEUTRAL. A clear that did not fire says only
+                    # that the record on disk is not the one this process
+                    # wrote: a sibling lane's newer upgrade, or a file this
+                    # process could not read (`UpgradeStore.load` answers None
+                    # for both). Claiming a newer record here would be a
+                    # guess, and the operator reading it would be told the
+                    # opposite of the truth on the second one.
+                    else " — and nothing was removed: the record on disk is "
+                    "not the one this process wrote, so it was left exactly "
+                    "as it is — check it by hand)"
                 )
             except OSError as clear_exc:
                 detail += (
@@ -1240,7 +1263,10 @@ def _self_upgrade_at_boundary(
     before the exec, because unlike the lock it cannot survive the replacement,
     and re-entered if the exec does not happen after all.
     """
-    store = UpgradeStore(config.pending_upgrade_file)
+    # `for_config`: this function WRITES the record (the one-shot marker, and
+    # `_carry_on_upgrade`'s restore through the same store), and above one lane
+    # every write to it goes inside the fleet's hold — see `UpgradeStore`.
+    store = UpgradeStore.for_config(config)
     log = TranscriptLogger(config.transcript_file).append
     record = store.load()
     # THE SECOND READ OF A MUTABLE FILE. The orchestrator read this record to
@@ -1497,16 +1523,57 @@ def _confirm_self_upgrade(config: AutoloopConfig) -> bool:
     reason (`_carry_on_upgrade`, `execed_on_disk=True`) — the process carries
     on, the next iteration is the OLD code's, and there is nothing to confirm.
     A `pending` record is left strictly alone here, upgrade or no upgrade.
+
+    **AND IT REMOVES ONLY THE RECORD IT READ** (conc-10b). This runs at the top
+    of EVERY lane's second iteration, in every lane, so N lanes read one record
+    and N of them would unlink it — and the window between that read and the
+    unlink is one a sibling lane's merge can land inside
+    (`auto_merge._note_loop_code_merge` saves unconditionally, which is what
+    keeps a marker left armed from blocking a later upgrade). An unconditional
+    unlink there removes an upgrade NOTHING has answered: no boundary is ever
+    offered it, no entry says it went, and the merged code sits on disk with
+    nothing left able to act on it — the silent-no-outcome failure this whole
+    path exists to end, one function over. So the removal is a
+    compare-and-clear on the identity this call actually read
+    (`UpgradeStore.clear`), inside the fleet's own hold, and a lane that finds
+    the record has MOVED confirms nothing and says so. That also makes the
+    confirmation once per REPLACEMENT rather than once per lane: the first
+    lane's clear matches, and the rest do not.
     """
-    store = UpgradeStore(config.pending_upgrade_file)
+    store = UpgradeStore.for_config(config)
     record = store.load()
     if record is None or record.status != UPGRADE_EXECED:
         return False
+    log = TranscriptLogger(config.transcript_file).append
     try:
-        store.clear()
+        cleared = store.clear(base_sha=record.base_sha, status=UPGRADE_EXECED)
     except OSError:
+        # Includes `UpgradeRecordBusy` — a hold this lane could not take. The
+        # marker stays armed, which costs nothing: no boundary offers `execed`,
+        # and the next merge overwrites the record with a fresh `pending` one.
         return False
-    TranscriptLogger(config.transcript_file).append(
+    if not cleared:
+        # NOT SILENT, for the reason every other outcome on this path is
+        # logged. The record this lane read is not the one on disk any more,
+        # and there are two ways that happens: a sibling lane confirmed the
+        # same replacement first, or a newer merge landed in the window.
+        # Neither is distinguishable from here without a second racy read, and
+        # neither needs to be — what matters is that this lane removed NOTHING.
+        log(
+            "self_upgrade_confirm_skipped",
+            data={
+                "base_sha": record.base_sha,
+                "task_id": record.task_id,
+                "note": (
+                    "the pending-upgrade record moved between this lane's read "
+                    "and its clear — another lane confirmed the same "
+                    "replacement, or a newer merge wrote a fresh record — so "
+                    "nothing was removed"
+                ),
+            },
+        )
+        return False
+    log(
         "self_upgrade_confirmed",
         data={
             "base_sha": record.base_sha,
@@ -1620,7 +1687,7 @@ def _remaining_steps(max_steps: int | None, spent: int) -> int | None:
     return max(0, max_steps - spent)
 
 
-#: The lane that OWNS the self-upgrade boundary in a fleet (conc-10).
+#: Where ownership of the self-upgrade boundary STARTS in a fleet (conc-10).
 #:
 #: Lane 0, and the reason is that it is the only index that cannot be retired:
 #: a cap is at least 1, so index 0 is inside every fleet this build will run,
@@ -1628,23 +1695,34 @@ def _remaining_steps(max_steps: int | None, spent: int) -> int | None:
 #: operator's lowered `[concurrency] lanes` may have cut out mid-round. It is
 #: also the index a single-lane deployment already is, which is what makes
 #: `_lane_owns_upgrade` answer True for today's loop without a branch on the
-#: fleet size.
+#: fleet size, and it is the owner of every fleet that has not lost a lane.
 #:
-#: DELIBERATELY NOT AN ELECTION AND NOT A FILE. Ownership is decided from the
-#: in-memory lane index and nothing else, so it has no unreadable state and
-#: therefore no fail-open: a file-backed owner election that defaulted to
-#: "owner" would put back exactly the defect this constant exists to close (a
-#: non-owner consuming the pending upgrade), and one that defaulted to "not the
-#: owner" would lose the upgrade in silence, which is the failure
-#: docs/AUTOLOOP.md says concurrency must not reintroduce.
+#: IT IS NOT WHERE OWNERSHIP STAYS, and that half is conc-10b's
+#: (`_FleetRun.upgrade_owner`). `_run_fleet` does not restart a lane that ENDED,
+#: and thirteen codes are lane-fatal (`blockers.LANE_FATAL_CODES`), so a
+#: lane-fatal park in lane 0 used to leave the fleet running with no upgrade
+#: owner in it: an upgrade merged after that drained forever, every remaining
+#: lane being a non-owner landing on the drain's own hold, until an operator
+#: restarted. Ownership therefore follows the LOWEST LANE STILL RUNNING in this
+#: process, which is lane 0 for as long as lane 0 is there.
+#:
+#: DELIBERATELY NOT AN ELECTION AND NOT A FILE, and that is unchanged: which
+#: lanes are running is this process's own thread bookkeeping, held in memory
+#: by the `_FleetRun` its lanes share, so there is no unreadable state to fail
+#: open on. A file-backed owner election defaulting to "owner" would put back
+#: exactly the defect this closes (a non-owner consuming the pending upgrade),
+#: and one defaulting to "not the owner" would lose the upgrade in silence,
+#: which is the failure docs/AUTOLOOP.md says concurrency must not reintroduce.
 UPGRADE_OWNER_LANE = 0
 
 
 def _lane_owns_upgrade(lane: "_LaneEntry | None") -> bool:
     """May THIS lane act on a pending self-upgrade at a boundary?
 
-    True for lane `UPGRADE_OWNER_LANE` and for a caller holding no lane at all
-    — `_run_continuous(args, config)` and `(args, config, lock)` are both
+    True for the fleet's current owner (`_LaneEntry.owns_upgrade` — the lowest
+    lane still running, which is `UPGRADE_OWNER_LANE` in every fleet that has
+    not lost one) and for a caller holding no lane at all —
+    `_run_continuous(args, config)` and `(args, config, lock)` are both
     supported call shapes, and a caller that names no lane is the single-lane
     loop, which has always taken its own boundary.
 
@@ -1661,8 +1739,17 @@ def _lane_owns_upgrade(lane: "_LaneEntry | None") -> bool:
     left to fall through to a session either — `upgrade_boundary` is
     `draining and fleet_idle`, so `plan.draining` is True on exactly that tick
     and the hold branch below the boundary is what such a lane lands on.
+
+    EXACTLY ONE LANE ANSWERS TRUE at any instant, which is what keeps that
+    defect closed while ownership moves: a lane has to be RUNNING to own the
+    boundary, and a lane stops running only by leaving its own thread — so the
+    owner index moves UP, never back, and the lane it moves to cannot be
+    asking this while the lane it moved from still is. A fleet with no lane
+    left running has no owner and this answers False for every entry in it,
+    which is the fail-closed direction: nothing acts on a boundary in a fleet
+    that is unwinding.
     """
-    return lane is None or lane.lane_index == UPGRADE_OWNER_LANE
+    return lane is None or lane.owns_upgrade
 
 
 class _FleetRun:
@@ -1694,6 +1781,8 @@ class _FleetRun:
     * **which lanes stopped for that handoff**, so a refused replacement
       restarts exactly those and leaves a lane that parked for its own reason
       parked.
+    * **which lanes are still RUNNING**, which is the only thing that decides
+      who owns the self-upgrade boundary (conc-10b — `upgrade_owner`).
 
     Nothing here is reached at `lanes = 1`: `_cmd_run` runs the single lane in
     the calling thread exactly as it does today and never builds one of these.
@@ -1705,11 +1794,53 @@ class _FleetRun:
         self._guard = threading.Lock()
         self._handoff = threading.Event()
         self._stopped_for_handoff: set[int] = set()
+        #: The lanes this fleet is running right now. EVERY lane at
+        #: construction rather than none, so a `_FleetRun` nobody has opened a
+        #: pass on still answers "lane 0 owns the boundary" — which is what
+        #: every fleet answers before it has lost a lane, and what a caller
+        #: building one by hand means by it. `_open_lanes` narrows it to the
+        #: pass it is about to run and `lane_ended` removes a lane as its own
+        #: thread leaves.
+        self._live: set[int] = set(range(self.lanes))
 
     @property
     def handoff_wanted(self) -> bool:
         """Has the owning lane asked the fleet to stop for a self-upgrade?"""
         return self._handoff.is_set()
+
+    def begin_pass(self, running) -> None:
+        """The lanes this pass is opening — the fleet as it will be until one
+        of them ends. Called before a single thread starts, so no lane can read
+        a sibling that is about to start as one that has already finished."""
+        with self._guard:
+            self._live = set(running)
+
+    def lane_ended(self, lane_index: int) -> None:
+        """This lane's thread is leaving, for any reason at all — a park, a
+        fleet stop, an exception, or stepping aside for the handoff. Recorded
+        as the thread unwinds, so ownership of the boundary can move to a lane
+        that is still there (`upgrade_owner`)."""
+        with self._guard:
+            self._live.discard(lane_index)
+
+    def upgrade_owner(self) -> int | None:
+        """Which lane owns the self-upgrade boundary right now, or `None` when
+        no lane of this fleet is running.
+
+        **THE LOWEST LANE STILL RUNNING**, and the reason is the residual
+        conc-10 recorded and did not close: `_run_fleet` does not restart a
+        lane that ENDED, so a lane-fatal park in lane 0 left the fleet with no
+        owner in it and an upgrade merged afterwards drained forever. Lowest
+        rather than "whoever noticed" keeps the answer a single one at any
+        instant, and monotone: it moves only when the lane holding it leaves,
+        so two lanes can never both read themselves as the owner.
+
+        `None` is FAIL-CLOSED — no lane owns the boundary — which is the right
+        answer for a fleet that is unwinding, and it can only be read by a lane
+        that is not running, since a running lane is in this set.
+        """
+        with self._guard:
+            return min(self._live) if self._live else None
 
     def stopped_for_handoff(self) -> tuple[int, ...]:
         """The lanes that returned because of the request, in index order."""
@@ -1792,8 +1923,18 @@ class _LaneEntry:
     @property
     def owns_upgrade(self) -> bool:
         """Does the self-upgrade boundary belong to this lane
-        (`_lane_owns_upgrade`, which is where the reason is written)?"""
-        return self.lane_index == UPGRADE_OWNER_LANE
+        (`_lane_owns_upgrade`, which is where the reason is written)?
+
+        Asked of the FLEET when there is one, because ownership follows the
+        lowest lane still running and this lane cannot know on its own which
+        siblings are left (`_FleetRun.upgrade_owner`, conc-10b). Without a
+        fleet it is `UPGRADE_OWNER_LANE` by index — the single-lane loop, whose
+        one lane is lane 0 and has always taken its own boundary, and every
+        entry a test builds by hand.
+        """
+        if self.fleet is None:
+            return self.lane_index == UPGRADE_OWNER_LANE
+        return self.fleet.upgrade_owner() == self.lane_index
 
     @property
     def handoff_wanted(self) -> bool:
@@ -2176,21 +2317,40 @@ def _decline_boundary_not_ours(
     sha = upgrade_bound_sha(record) or MISSING_UPGRADE_RECORD
     lane_declined.add(sha)
     orchestrator.decline_self_upgrade(sha)
+    owner = _upgrade_owner_index(lane)
     TranscriptLogger(config.transcript_file).append(
         "self_upgrade_not_this_lane",
         data={
             "base_sha": sha,
             "lane_index": lane.lane_index if lane is not None else 0,
             "lane_id": lane_id(lane.lane_index if lane is not None else 0),
-            "owner_lane_id": lane_id(UPGRADE_OWNER_LANE),
+            "owner_lane_id": lane_id(owner),
             "detail": (
                 "the fleet's self-upgrade boundary belongs to "
-                f"{lane_id(UPGRADE_OWNER_LANE)}, so this lane declined the "
+                f"{lane_id(owner)}, so this lane declined the "
                 "record for itself and left it pending and unanswered for the "
                 "owner — nothing was replaced and nothing was settled"
             ),
         },
     )
+
+
+def _upgrade_owner_index(lane: "_LaneEntry | None") -> int:
+    """WHICH lane the refusal above names as the owner, for the operator
+    reading the transcript.
+
+    The fleet's own answer when there is one, because ownership moves to the
+    lowest lane still running (`_FleetRun.upgrade_owner`, conc-10b) and naming
+    lane 0 after lane 0 has parked would send a reader to a lane that is not
+    going to take the boundary. `UPGRADE_OWNER_LANE` is the fallback for the
+    two cases with no fleet to ask — a caller holding no lane, and a fleet with
+    no lane left running, where nothing will take the boundary and the honest
+    thing to name is where ownership starts.
+    """
+    if lane is None or lane.fleet is None:
+        return UPGRADE_OWNER_LANE
+    owner = lane.fleet.upgrade_owner()
+    return UPGRADE_OWNER_LANE if owner is None else owner
 
 
 def _drainable_upgrade_sha(config: AutoloopConfig, answered: set[str]) -> str:
@@ -2426,11 +2586,16 @@ def _run_fleet(
     the pid, and a lane lease has no adoption of its own, so a sibling lease
     still on disk at the replacement would name the successor's own pid, read as
     LIVE, and the successor would fail closed on its own lane. So the owning lane
-    (`_lane_owns_upgrade` — lane 0) does not exec: it asks the fleet to stop,
+    (`_lane_owns_upgrade` — the lowest lane still running, which is lane 0 in
+    every fleet that has not lost one) does not exec: it asks the fleet to stop,
     every lane returns at the top of its next iteration, and each unwinds its own
     `_LaneEntry` and releases its own lease. Only then, with lane 0's entry the
     only one left and `_self_upgrade_at_boundary` releasing that one itself, is
-    the boundary reached. A replacement that does not happen (preflight refused,
+    the boundary reached. It is lane 0's entry that is handed to the boundary
+    WHICHEVER lane asked for it, and that is not an inconsistency: `_cmd_run`
+    holds that lease for the whole fleet run — including after lane 0's own
+    thread has ended — so it is the one lease still on disk and the one the
+    replacement has to release. A replacement that does not happen (preflight refused,
     the lock unarmable, `os.execv` raising) leaves the sha in the fleet's
     `answered_upgrades`, and the lanes that stopped for it are restarted — which
     is why a refused handoff costs a fleet restart and not a fleet.
@@ -2440,6 +2605,14 @@ def _run_fleet(
     reads, and restarting it would spin on it. The exit code is the worst any
     lane returned, so a fleet with one parked lane exits 2 exactly as one loop
     does.
+
+    **AND THE BOUNDARY GOES WITH IT** (conc-10b). Because a lane that ends is
+    not restarted, pinning the upgrade owner to lane 0 meant a lane-fatal park
+    there left the fleet with no owner at all: an upgrade merged afterwards
+    drained forever, every remaining lane refusing it as somebody else's, until
+    an operator restarted. Ownership follows the lowest lane still running
+    (`_FleetRun.upgrade_owner`), so a fleet that loses lane 0 keeps upgrading
+    itself and lane 0's park stays exactly as loud as it was.
     """
     fleet = _FleetRun(config.concurrency.lanes)
     # Lane 0's entry belongs to `_cmd_run` (its lease is held by the `with`
@@ -2487,7 +2660,15 @@ def _open_lanes(
     that did not unwind, which is exactly the "lane that died mid-round" case
     `recover_dead_lanes` exists for and which `_run_fleet` asks about before it
     opens anything.
+
+    The pass is declared to the fleet BEFORE the first thread starts
+    (`begin_pass`), never from inside the threads: ownership of the self-upgrade
+    boundary is "the lowest lane still running" (conc-10b), and a lane that had
+    not started yet would otherwise read as one that had already finished —
+    which would put two owners in one fleet for as long as the last thread took
+    to start.
     """
+    fleet.begin_pass(running)
     threads = [
         threading.Thread(
             target=_lane_thread,
@@ -2528,9 +2709,21 @@ def _lane_thread(
     A lane that returned because the fleet asked it to (`stopped_for_handoff`)
     records NO exit code: it did not finish, it stepped out of the way, and
     `_run_fleet` restarts it if the replacement does not happen.
+
+    **`lane_ended` IN A `finally`**, for the fleet's own ownership question: a
+    lane that has left is no longer eligible to own the self-upgrade boundary
+    (`_FleetRun.upgrade_owner`, conc-10b), and it has left however this
+    function ends — a park, an exception, or the `SystemExit` the fleet lock's
+    SIGTERM handler raises, which is not this function's to swallow but is
+    still a lane that stopped.
     """
     try:
-        if index == UPGRADE_OWNER_LANE:
+        # Lane 0 reuses the entry `_cmd_run` is already holding, which is what
+        # `lane_zero.lane_index` names. Deliberately not `UPGRADE_OWNER_LANE`,
+        # though the two numbers agree: "whose lease does this process already
+        # hold" and "who owns the self-upgrade boundary" are different
+        # questions, and the second one moves (conc-10b).
+        if index == lane_zero.lane_index:
             code = _run_continuous(args, config, lock, lane_zero)
         else:
             with _LaneEntry(config, index, fleet) as lane:
@@ -2538,6 +2731,8 @@ def _lane_thread(
     except Exception as exc:  # noqa: BLE001 - one lane must not end the fleet
         _log_lane_failed(config, index, exc)
         code = 2
+    finally:
+        fleet.lane_ended(index)
     if index not in fleet.stopped_for_handoff():
         codes[index] = code
 
