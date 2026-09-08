@@ -386,7 +386,13 @@ def _seed_registry(config: AutoloopConfig) -> TaskRegistry:
                 # UNCONVERTED for `inbox.apply_requests`': a `tuple()` over the
                 # bare string `"ctx01"` is five ids `_ID_RE` accepts one at a
                 # time, while `_validate_context_ids` refuses the string itself.
-                context_ids=spec.get("context_ids", ()) or (),
+                # NOT `... or ()` either, for the same reason and the same
+                # doctrine: `0`, `false`, `{}` and `""` are all falsy and all
+                # malformed, and normalising them to "cites no record" would
+                # delete a seed row's provenance in silence. Only a MISSING key
+                # and an explicit `null` normalise (`[]` is already legal, and
+                # means the row cites nothing).
+                context_ids=() if spec.get("context_ids") is None else spec["context_ids"],
             )
             for spec in specs
         ]

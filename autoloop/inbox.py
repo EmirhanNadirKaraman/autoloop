@@ -864,15 +864,25 @@ def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], l
                 validation=tuple(tuple(c) for c in spec.get("validation", ()) or ()),
                 validation_cwd=str(spec.get("validation_cwd", "") or ""),
                 approved_paths=tuple(spec.get("approved_paths", ()) or ()),
-                # UNCONVERTED, deliberately unlike every line above it. A
-                # `tuple()` here would turn the bare string `"ctx01"` into five
+                # UNCONVERTED, deliberately unlike every line above it, and
+                # deliberately NOT `... or ()`. Both coercions look like
+                # tidying and both make an operator's mistake unreportable: a
+                # `tuple()` turns the bare string `"ctx01"` into five
                 # one-character ids, each of which `tasks._ID_RE` accepts on its
-                # own — so the coercion that looks like tidying is the thing
-                # that makes the mistake unreportable. Handed over as it
-                # arrived, `_validate_context_ids` refuses it in the registry's
+                # own, and an `or ()` turns `0`, `false`, `{}` and `""` — every
+                # one of them malformed — into "cites no record", DELETING the
+                # provenance this field exists to carry while the request
+                # reports success. Handed over as it arrived,
+                # `_validate_context_ids` refuses each of them in the registry's
                 # own words, which is the doctrine `_apply_mutation` states for
                 # the mutation half of this module.
-                context_ids=spec.get("context_ids", ()) or (),
+                #
+                # The two shapes that ARE normalised here are the two legacy
+                # ones `tasks._persisted_context_ids` normalises on load: a
+                # MISSING key and an explicit `null`, neither of which is
+                # malformed. `[]` is left alone because it is already legal —
+                # it is how a request says "this task cites no record".
+                context_ids=() if spec.get("context_ids") is None else spec["context_ids"],
             )
             # One at a time: `add_many` is atomic per call, so batching would let
             # one bad request reject every good one queued alongside it.
