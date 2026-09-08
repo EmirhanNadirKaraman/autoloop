@@ -209,6 +209,7 @@ def test_every_mutation_kind_reaches_its_registry_mutator(tmp_path):
     inbox.submit_mutation("description", "t", "rewritten instructions")
     inbox.submit_mutation("approved_paths", "t", ["autoloop/inbox.py"])
     inbox.submit_mutation("depends_on", "t", ["dep"])
+    inbox.submit_mutation("context_ids", "t", ["ctx-decision-01"])
     inbox.submit_mutation("block", "t", "waiting on the API key")
     inbox.submit_mutation("unblock", "t")
 
@@ -219,12 +220,13 @@ def test_every_mutation_kind_reaches_its_registry_mutator(tmp_path):
     added, applied, refused = apply_requests(registry, specs)
 
     assert (problems, added, refused) == ([], [], [])
-    assert len(applied) == 6, applied
+    assert len(applied) == 7, applied
     task = registry.get("t")
     assert task.priority == 1
     assert task.description == "rewritten instructions"
     assert task.approved_paths == ("autoloop/inbox.py",)
     assert task.depends_on == ("dep",)
+    assert task.context_ids == ("ctx-decision-01",)
     assert task.status == "pending", "blocked then released"
     assert task.blocked_reason == ""
 
@@ -338,6 +340,141 @@ def test_an_inbox_request_cannot_empty_a_running_tasks_scope(tmp_path):
     assert registry.get("running").approved_paths == ("autoloop/inbox.py",)
     assert applied == ["queued -> approved_paths: autoloop/tasks.py"]
     assert registry.get("queued").approved_paths == ("autoloop/tasks.py",)
+
+
+# ---- context_ids through the inbox (ctx-04) ---------------------------------
+#
+# The kind is shaped exactly like `approved_paths` and carries none of its
+# authority. These own both halves of that sentence: it behaves the same
+# (creation, correction, refused in flight) and it moves no scope.
+
+
+def test_a_creation_request_can_name_the_context_it_was_written_from(tmp_path):
+    """The half `CREATION_FIELDS` exists to make true: a field the contract
+    admits is a field the merge READS. `apply_requests`' creation branch builds
+    the `Task` kwarg by kwarg, so a name added to that set and forgotten there
+    would submit cleanly and then vanish — the exact silent drop the per-kind
+    rule was written against."""
+    from autoloop.inbox import apply_requests
+
+    inbox = TaskInbox(tmp_path / "inbox")
+    inbox.submit({"id": "t", "title": "T", "description": "d",
+                  "approved_paths": ["autoloop/tasks.py"],
+                  "context_ids": ["ctx-decision-01", "ctx-incident-02"]})
+
+    registry = TaskRegistry()
+    specs, _ = inbox.drain()
+    added, _applied, refused = apply_requests(registry, specs)
+
+    assert (len(added), refused) == (1, [])
+    assert registry.get("t").context_ids == ("ctx-decision-01", "ctx-incident-02")
+    assert registry.get("t").approved_paths == ("autoloop/tasks.py",)
+
+
+def test_a_creation_request_naming_a_bare_string_is_refused_not_split(tmp_path):
+    """The fail-open this route would otherwise have. `tuple("ctx01")` is five
+    ids that `tasks._ID_RE` accepts one at a time, so a `tuple()` on the way
+    past would make the mistake unreportable — the value is handed to the
+    registry as it arrived and refused in the registry's own words."""
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    added, _applied, refused = apply_requests(registry, [
+        {"id": "t", "title": "T", "description": "d", "context_ids": "ctx01"},
+    ])
+
+    assert added == []
+    assert len(refused) == 1 and "context_ids" in refused[0], refused
+    assert not registry.has("t"), "nothing half-created"
+
+
+def test_an_inbox_request_can_correct_an_existing_tasks_references(tmp_path):
+    """The reason this is a MUTATION kind and not creation-only: the reference
+    that turns out to be wrong is exactly the one written at planning time.
+    REPLACES, so a correction can drop an id as well as add one."""
+    from autoloop.inbox import apply_requests
+
+    inbox = TaskInbox(tmp_path / "inbox")
+    inbox.submit_mutation("context_ids", "t", ["ctx-decision-01", "ctx-incident-02"])
+    inbox.submit_mutation("context_ids", "t", ["ctx-decision-03"])
+
+    registry = TaskRegistry()
+    registry.add_many([Task(id="t", title="T", description="d",
+                            approved_paths=("autoloop/inbox.py",))])
+    specs, _ = inbox.drain()
+    _, applied, refused = apply_requests(registry, specs)
+
+    assert refused == []
+    assert len(applied) == 2 and "no scope change" in applied[-1], applied
+    assert registry.get("t").context_ids == ("ctx-decision-03",), "last write wins"
+
+
+def test_correcting_references_moves_no_authorized_path(tmp_path):
+    """THE claim, at the inbox gate. The request shape is
+    `KIND_APPROVED_PATHS`' shape, so the thing that must differ is the effect:
+    the scope is byte-identical before and after, and the ids it names are
+    still unauthorized paths."""
+    from autoloop.inbox import apply_requests
+    from autoloop.tasks import effective_approved_paths, unauthorized_paths
+
+    registry = TaskRegistry()
+    registry.add_many([Task(id="t", title="T", description="d",
+                            approved_paths=("autoloop/inbox.py",))])
+    before = effective_approved_paths(registry.get("t").approved_paths)
+
+    _, applied, refused = apply_requests(registry, [
+        {"kind": "context_ids", "id": "t",
+         "context_ids": ["autoloop", "ctx-decision-01"]},
+    ])
+
+    assert (len(applied), refused) == (1, [])
+    after = effective_approved_paths(registry.get("t").approved_paths)
+    assert json.dumps(after) == json.dumps(before)
+    assert unauthorized_paths({"autoloop/tasks.py"}, after) == {"autoloop/tasks.py"}
+
+
+def test_a_context_ids_request_is_refused_while_the_dispatch_is_in_flight(tmp_path):
+    """The same `_refuse_immutable` rule every other content mutation takes,
+    with the control in the same batch: the queued task's correction still
+    lands, so this is the guard refusing an in-flight edit rather than the kind
+    being wired to nothing."""
+    from autoloop.inbox import apply_requests
+
+    inbox = TaskInbox(tmp_path / "inbox")
+    inbox.submit_mutation("context_ids", "running", ["ctx-decision-09"])
+    inbox.submit_mutation("context_ids", "queued", ["ctx-decision-09"])
+
+    registry = TaskRegistry()
+    registry.add_many([
+        Task(id="running", title="R", description="d",
+             approved_paths=("autoloop/inbox.py",), context_ids=("ctx-decision-01",)),
+        Task(id="queued", title="Q", description="d",
+             approved_paths=("autoloop/inbox.py",)),
+    ])
+    registry.mark_in_progress("running")
+
+    specs, _ = inbox.drain()
+    _, applied, refused = apply_requests(registry, specs)
+
+    assert len(refused) == 1 and "in progress" in refused[0], refused
+    assert registry.get("running").context_ids == ("ctx-decision-01",)
+    assert len(applied) == 1, applied
+    assert registry.get("queued").context_ids == ("ctx-decision-09",)
+
+
+def test_a_context_ids_request_carries_only_its_own_field(tmp_path):
+    """The per-kind rule, on the new kind. `approved_paths` on a `context_ids`
+    request is the one that matters: it would read as a scope edit smuggled in
+    under a kind that moves none, and it is refused rather than dropped."""
+    inbox = TaskInbox(tmp_path / "inbox")
+    with pytest.raises(InboxError, match="carries only"):
+        inbox.submit({"kind": "context_ids", "id": "t",
+                      "context_ids": ["ctx-01"], "approved_paths": ["a.py"]})
+    with pytest.raises(InboxError, match="needs 'context_ids' as a list"):
+        inbox.submit({"kind": "context_ids", "id": "t", "context_ids": "ctx-01"})
+    with pytest.raises(InboxError, match="needs 'context_ids'"):
+        inbox.submit({"kind": "context_ids", "id": "t"})
+    assert inbox.pending() == [], "nothing malformed should reach the queue"
 
 
 def test_blocking_through_the_inbox_has_a_reverse_through_the_inbox(tmp_path):
@@ -672,3 +809,91 @@ def argparse_ns(config):
     import argparse
 
     return argparse.Namespace(config=config.state_dir / "config.toml", null_executor=True)
+
+
+def test_add_task_takes_context_id_repeatably_like_its_neighbours():
+    """Parser wiring, asserted against the SAME shape `--approved-path` and
+    `--depends-on` have: `action="append"`, defaulting to an empty list. A flag
+    that overwrote instead of appending would silently keep only the last
+    record an operator named."""
+    from autoloop import cli
+
+    args = cli.build_parser().parse_args([
+        "add-task", "--id", "t", "--title", "T", "--description", "d",
+        "--context-id", "ctx-decision-01", "--context-id", "ctx-incident-02",
+        "--approved-path", "autoloop/tasks.py",
+    ])
+    assert args.context_id == ["ctx-decision-01", "ctx-incident-02"]
+    assert cli.build_parser().parse_args(
+        ["add-task", "--id", "t", "--title", "T", "--description", "d"]
+    ).context_id == []
+
+
+def test_a_seed_tasks_row_can_name_its_context_and_a_bare_string_is_refused(tmp_path):
+    """The OTHER `Task` construction site, and it has the defect its own
+    comment warns about for `validation`/`validation_cwd`: a field the seed file
+    declares and `_seed_registry` forgets is dropped in silence. Driven through
+    the real function, both ways — the ids land, and a bare string is refused by
+    the registry rather than becoming one id per character."""
+    import types
+
+    from autoloop import cli
+
+    seed = tmp_path / "seed_tasks.json"
+    seed.write_text(json.dumps([
+        {"id": "s1", "title": "T", "description": "d",
+         "approved_paths": ["autoloop/tasks.py"],
+         "context_ids": ["ctx-decision-01"]},
+    ]), encoding="utf-8")
+    registry = cli._seed_registry(types.SimpleNamespace(seed_tasks_file=seed))
+    assert registry.get("s1").context_ids == ("ctx-decision-01",)
+    assert registry.get("s1").approved_paths == ("autoloop/tasks.py",)
+
+    seed.write_text(json.dumps([
+        {"id": "s2", "title": "T", "description": "d", "context_ids": "ctx01"},
+    ]), encoding="utf-8")
+    from autoloop.errors import TaskGraphError
+
+    with pytest.raises(TaskGraphError, match="context_ids"):
+        cli._seed_registry(types.SimpleNamespace(seed_tasks_file=seed))
+
+
+def test_add_task_context_id_round_trips_into_the_registry(tmp_path, monkeypatch):
+    """The whole operator route, end to end: the real CLI writes a real request
+    into a real inbox, and the real merge puts the ids on the real task. And
+    the scope it lands with is exactly the one `--approved-path` named — the
+    two flags are adjacent on the command line and must not be adjacent in
+    effect."""
+    from gitrepo import make_repo_from_template
+
+    from autoloop import cli
+    from autoloop.inbox import apply_requests
+
+    repo = make_repo_from_template(tmp_path / "repo")
+    workers_root = tmp_path / "outside" / "workers"
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[conversation]\n"
+        'provider = "codex_cli"\n'
+        "[paths]\n"
+        f'state_dir = "{tmp_path / "state"}"\n'
+        f'workers_root = "{workers_root}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    assert cli.main([
+        "add-task", "--config", str(config), "--id", "ctx-demo",
+        "--title", "T", "--description", "d",
+        "--approved-path", "autoloop/tasks.py",
+        "--context-id", "ctx-decision-01", "--context-id", "ctx-incident-02",
+    ]) == 0
+
+    specs, problems = TaskInbox(workers_root.parent / "inbox").drain()
+    registry = TaskRegistry()
+    added, _applied, refused = apply_requests(registry, specs)
+
+    assert (problems, refused, len(added)) == ([], [], 1)
+    task = registry.get("ctx-demo")
+    assert task.context_ids == ("ctx-decision-01", "ctx-incident-02")
+    assert task.approved_paths == ("autoloop/tasks.py",)

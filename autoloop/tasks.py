@@ -367,6 +367,99 @@ def _persisted_superseded_by(raw: dict) -> tuple[str, ...]:
         raise StateCorruptError(f"task file has an invalid superseded_by: {exc}") from exc
 
 
+def _validate_context_ids(task_id: object, ids: object) -> tuple[str, ...]:
+    """Return `ids` as a tuple, or raise `TaskGraphError`.
+
+    THE context-reference check, shared by `TaskRegistry.add_many` (creation,
+    so a `seed_tasks.json` row and an inbox creation go through one gate),
+    `TaskRegistry.set_context_ids` (mutation) and `_persisted_context_ids`
+    (load) — the same "one validator, every caller" rule
+    `_validate_superseded_by` is written for, and modelled on it because the
+    two answer the same kind of question: a list of ids that names records this
+    module never resolves.
+
+    SHAPE ONLY, and that is the whole of it. Each entry must be a well-formed
+    id and no id may repeat. What is NOT checked is whether the record exists,
+    is active, or asserts anything — the registry does not read the context
+    directory at all (`context_index` does), for the reason this module does no
+    git of its own: an id that never materialises costs a dangling pointer in a
+    record, and refusing one here would make the task graph depend on a
+    directory that is not part of it.
+
+    SHAPE is checked FIRST, for the reason `_validate_approved_paths` gives: a
+    bare string `"ctx01"` is iterable, so without this it would be stored as
+    five single-character "ids" — every one of which `_ID_RE` then accepts, so
+    nothing downstream would ever have said so.
+
+    `_ID_RE` — the registry's own id shape — rather than the broader spelling
+    `context_records._require_clean_string` accepts (any non-empty, unpadded
+    string). That is deliberately NARROWER than the record loader, and it is
+    narrower in the direction that costs nothing and buys one thing: these ids
+    are rendered into the CONTEXT block (`context.TaskBrief`), and `_ID_RE`
+    admits no whitespace and no ':', so a context id cannot render a second,
+    stamp-shaped line inside a block whose line ordering is load-bearing
+    (docs/SECURITY.md S33). A record id this refuses is one an operator renames;
+    a record id that could forge a stamp line is one nobody notices.
+
+    NOTHING here is authorization. `context_ids` names what a round may READ
+    about; what it may WRITE is `Task.approved_paths` and nothing else — see
+    `effective_approved_paths`, which never reads this field.
+    """
+    if isinstance(ids, str) or not isinstance(ids, (list, tuple)):
+        raise TaskGraphError(
+            "bad_context_id",
+            f"task '{task_id}' needs context_ids as a list of context record "
+            f"ids, got {ids!r}",
+        )
+    seen: set[str] = set()
+    for context_id in ids:
+        if not isinstance(context_id, str) or not _ID_RE.match(context_id):
+            raise TaskGraphError(
+                "bad_context_id",
+                f"task '{task_id}' names {context_id!r} as a context record, "
+                "which is not a valid id (slug of [A-Za-z0-9._-], max 64)",
+            )
+        if context_id in seen:
+            raise TaskGraphError(
+                "duplicate_context_id",
+                f"task '{task_id}' names context record {context_id!r} more than once",
+            )
+        seen.add(context_id)
+    return tuple(ids)
+
+
+def _persisted_context_ids(raw: dict) -> tuple[str, ...]:
+    """`context_ids` off a stored row, validated, as a tuple.
+
+    `TaskRegistry.from_dict` bypasses `add_many` by design, so this is the ONLY
+    gate a stored or hand-edited row passes — the same reasoning
+    `_persisted_superseded_by` and `_persisted_shipped_commits` carry, and the
+    same failure it prevents: `tuple(raw.get("context_ids", ()))` over a bare
+    string would load one single-character "record id" per character, silently,
+    and from there into the brief the reviewer reads.
+
+    A MISSING key defaults to `()` — that is every `tasks.json` written before
+    this field existed, and it is not malformed, which is why
+    `TASKS_SCHEMA_VERSION` stays 1 and no migration step exists. An explicit
+    `null` normalises to `()` as well, exactly like `hold_origin` /
+    `decomposition` / `urgent_at` do for their empty string: `asdict`
+    serialises `()` as `[]` and never as `null`, so a `null` can only be a hand
+    edit, and reading it as `None` would blow up on the next iteration of a
+    field every reader treats as a sequence.
+
+    Everything else FAILS CLOSED into `StateCorruptError`. Reading a malformed
+    reference list as "no references" would delete the provenance this field
+    exists to record while leaving the task looking fully described.
+    """
+    ids = raw.get("context_ids", ())
+    if ids is None or ids == () or ids == []:
+        return ()
+    try:
+        return _validate_context_ids(raw.get("id"), ids)
+    except TaskGraphError as exc:
+        raise StateCorruptError(f"task file has invalid context_ids: {exc}") from exc
+
+
 #: A FULL commit object id — 40 hex for SHA-1, 64 for SHA-256 — lowercase only.
 #:
 #: Full, deliberately, and this is the load-bearing half of "the record carries
@@ -1080,6 +1173,34 @@ class Task:
     #: instead when this is already set: the reviewer was asked, and an answer
     #: that did not classify the task is not grounds to ask again.
     ceiling_plan_requested_at: str = ""
+    #: The context records this task was written FROM — ids only, in the order
+    #: whoever wrote the task named them. Empty is the ordinary state and means
+    #: "no record was cited", which is a statement about provenance and about
+    #: nothing else.
+    #:
+    #: **DATA, never authorization, and that is the whole point of the field.**
+    #: A record's `source_paths` are what a round may READ ABOUT; what it may
+    #: WRITE is `Task.approved_paths` and nothing else. Nothing derived from
+    #: this field reaches `unauthorized_paths` or `effective_approved_paths` —
+    #: neither reads it, and neither takes an argument that could carry it — so
+    #: attaching a reference cannot widen one byte of a task's scope. Two named
+    #: tests pin exactly that (`test_tasks.py`).
+    #:
+    #: NOT a dependency and NOT resolved here. Only its SHAPE is validated
+    #: (`_validate_context_ids`); whether the record exists, is active or is
+    #: stale is `context_index`/`context_resolver`'s question, asked against a
+    #: directory this module has no awareness of — the same division of labour
+    #: `_validate_approved_path` describes for symlinks and
+    #: `_validate_shipped_commits` for ancestry.
+    #:
+    #: New field with a default, so a `tasks.json` written before it existed
+    #: loads unchanged (`Task(**raw)` falls back to `()`) and
+    #: `TASKS_SCHEMA_VERSION` stays 1 — the same backward-compatible pattern
+    #: `approved_paths`, `decomposition`, `blocked_reason`, `hold_origin` and
+    #: `urgent_at` each document above, plus the normalising read in `from_dict`
+    #: (`_persisted_context_ids`) that keeps a hand-edited `null` from becoming
+    #: `None` here.
+    context_ids: tuple[str, ...] = ()
 
 
 #: The repository trackers every task may update, WITHOUT naming them in its
@@ -1472,6 +1593,12 @@ class TaskRegistry:
             _validate_description(task.id, task.description)
             task.approved_paths = _validate_approved_paths(task.id, task.approved_paths)
             task.superseded_by = _validate_superseded_by(task.id, task.superseded_by)
+            # UNCONDITIONAL, deliberately unlike `shipped_commits` below: the
+            # empty case is legal here, so there is nothing to skip, and gating
+            # on truthiness would let a bare string through untouched — which
+            # `_validate_context_ids` exists to refuse before it becomes one id
+            # per character.
+            task.context_ids = _validate_context_ids(task.id, task.context_ids)
             # Only when something is there: every ordinary creation leaves this
             # empty, and `_validate_shipped_commits` refuses an empty list
             # because on the WRITE path emptiness means an evidence-free claim.
@@ -2640,9 +2767,10 @@ class TaskRegistry:
     def _refuse_immutable(self, task: Task, field: str) -> None:
         """Raise unless `task`'s content fields may still be rewritten.
 
-        THE strand guard, shared by `set_description`, `set_approved_paths` and
-        `set_depends_on` so the three cannot disagree about when an edit is
-        safe. `set_priority` deliberately does NOT call it: priority only
+        THE strand guard, shared by `set_description`, `set_approved_paths`,
+        `set_depends_on` and `set_context_ids` so the four cannot disagree about
+        when an edit is safe. `set_priority` deliberately does NOT call it:
+        priority only
         orders `next_ready()`, so changing it on a running or finished task is
         meaningless rather than damaging, and narrowing it now would break the
         one mutation the dashboard already queues.
@@ -2666,6 +2794,15 @@ class TaskRegistry:
             sent at dispatch. Rewriting them mid-round cannot reach the agent,
             and leaves the record disagreeing with what was actually asked, so
             the review packet describes work nobody requested.
+          * `context_ids` — the ONE field here that strands nothing: it
+            authorizes nothing, nothing dispatches off it, and a round is never
+            judged against it. It takes the rule anyway, for the reason
+            `description` does: the ids were rendered into the brief the round
+            in flight was authored from (`context.TaskBrief`), so rewriting them
+            mid-round cannot reach that round and leaves the record disagreeing
+            with what it was actually written from. Same guard as the three
+            above rather than a second, weaker one, so "a task under judgement
+            is not edited" stays ONE rule with no exceptions to remember.
 
         Deliberately checked on the STORED `status`, never on `state_of()`.
         `state_of` reports BLOCKED for an in-progress task with an incomplete
@@ -2959,6 +3096,37 @@ class TaskRegistry:
         task = self.get(task_id)
         self._refuse_immutable(task, "approved_paths")
         task.approved_paths = _validate_approved_paths(task_id, paths)
+        return task
+
+    def set_context_ids(self, task_id: str, ids) -> Task:
+        """Replace the context records an existing task cites.
+
+        REPLACES, never merges, for the reason `set_approved_paths` does: an
+        operator correcting a reference has to be able to take one away, and a
+        merging mutator could only ever add. Clearing it to `()` is legal and
+        means "this task cites no record", which is the ordinary state.
+
+        Reachable from the inbox as `kind: "context_ids"`, shaped exactly like
+        `KIND_APPROVED_PATHS` and subject to the same `_refuse_immutable` rule —
+        see that method for why a field that strands nothing takes the guard
+        anyway.
+
+        **This mutation cannot widen a scope, and that is checkable rather than
+        asserted:** the only field it writes is `Task.context_ids`, and neither
+        `unauthorized_paths` nor `effective_approved_paths` reads it. So the
+        widening `docs/SECURITY.md` records for `set_approved_paths` — an inbox
+        request changing what an existing task may write — has no analogue here,
+        even though the two kinds look identical from the operator's side.
+
+        Validation is `_validate_context_ids`, the same function `add_many` and
+        `from_dict` call, so a reference list the registry would refuse to
+        create a task with cannot be written onto an existing one. Atomic:
+        shape, every id and the duplicate rule are all checked before the single
+        assignment, so a refused call leaves the registry exactly as it was.
+        """
+        task = self.get(task_id)
+        self._refuse_immutable(task, "context_ids")
+        task.context_ids = _validate_context_ids(task_id, ids)
         return task
 
     def set_depends_on(self, task_id: str, depends_on) -> Task:
@@ -3592,6 +3760,14 @@ class TaskRegistry:
                     # only gate a stored row passes. See
                     # `_persisted_superseded_by`.
                     "superseded_by": _persisted_superseded_by(raw),
+                    # VALIDATED for the same reason, and NORMALISING for the
+                    # `hold_origin` one: a missing key is a `tasks.json` written
+                    # before ctx-04 and loads as "cites no record" (which is why
+                    # TASKS_SCHEMA_VERSION stays 1 and there is no migration
+                    # step), a hand-edited `null` becomes `()` rather than
+                    # `None`, and a bare string is refused rather than split
+                    # into one id per character. See `_persisted_context_ids`.
+                    "context_ids": _persisted_context_ids(raw),
                 })
                 for raw in data["tasks"]
             ]
