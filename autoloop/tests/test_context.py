@@ -479,6 +479,87 @@ def test_briefs_are_rendered_after_every_stamp_line():
     assert forged in block
 
 
+# ---- the brief names the context, and naming it widens nothing (ctx-04) -----
+
+
+def cited_registry(cite=("ctx-decision-01", "ctx-incident-02"), paths=("a.py",)):
+    return TaskRegistry([
+        Task(id="t1", title="First task", description="the whole task",
+             approved_paths=tuple(paths), context_ids=tuple(cite))
+    ])
+
+
+def test_the_ready_brief_names_the_records_the_task_was_written_from():
+    """The ids reach the reviewer, so "did this task cite the record I expected"
+    is answerable from the block alone — which is the one question an id can
+    answer on its own."""
+    ctx = context_for(cited_registry())
+    block = render_context(ctx)
+
+    assert ctx.next_ready.context_ids == ("ctx-decision-01", "ctx-incident-02")
+    assert "  context_ids (records this task was written from" in block
+    assert "ctx-decision-01, ctx-incident-02" in block
+
+
+def test_the_brief_carries_the_ids_and_never_a_records_text():
+    """IDS ONLY, deliberately. Rendering what a record SAYS is a different job
+    with a different budget — the block is not chunked and a record is
+    unbounded prose written outside this package — and it is not this task's.
+    The `TaskBrief` field is a tuple of ids and there is nowhere for text to
+    ride along."""
+    brief = context_for(cited_registry()).next_ready
+    assert all(isinstance(cited, str) for cited in brief.context_ids)
+    assert set(dataclasses.asdict(brief)) == {
+        "task_id", "title", "approved_paths", "decomposition", "description",
+        "context_ids",
+    }
+
+
+def test_a_task_that_cites_nothing_renders_no_context_line():
+    """No line at all rather than "(none)". The block is re-sent every round and
+    is not chunked, so a section that says nothing on most briefs is a cost
+    every request pays forever."""
+    block = render_context(context_for(cited_registry(cite=())))
+    assert "context_ids" not in block
+
+
+def test_citing_a_record_does_not_widen_the_scope_the_brief_shows():
+    """THE claim, at the last place a scope is shown to anyone. `_brief` reads
+    `effective_approved_paths(task.approved_paths, trackers)` — the citation
+    list is not one of those two arguments, and no rendering may quietly make
+    it a third."""
+    without = context_for(cited_registry(cite=())).next_ready
+    with_ids = context_for(cited_registry()).next_ready
+
+    assert with_ids.approved_paths == without.approved_paths
+    assert with_ids.approved_paths == tuple(sorted({"a.py", *TRACKER_PATHS}))
+    # The ids are NOT in the path list, even though they are in the block.
+    assert "ctx-decision-01" not in with_ids.approved_paths
+
+
+def test_an_unscoped_task_that_cites_records_still_cannot_be_dispatched():
+    """The fail-open worth naming: an empty `approved_paths` stays empty, so a
+    citation cannot turn an unscoped task into a dispatchable one that may
+    write whatever its records name."""
+    ctx = context_for(cited_registry(paths=()))
+    assert ctx.next_ready.approved_paths == ()
+    assert "cannot be dispatched until it is scoped" in render_context(ctx)
+
+
+def test_the_context_line_is_rendered_after_every_stamp_line():
+    """S33's ordering invariant, extended to the line ctx-04 adds. It holds
+    twice over: the line sits inside the brief, which is emitted strictly after
+    the stamp — and `tasks._validate_context_ids` uses `_ID_RE`, which admits
+    no whitespace and no ':', so an id cannot be stamp-shaped in the first
+    place."""
+    block = render_context(
+        build_context(make_state(), FakeGit(), cited_registry(), "r", "the payload")
+    )
+    stamp_line = f"report_sha256: {hashlib.sha256(b'the payload').hexdigest()}"
+    assert block.index(stamp_line) < block.index("  context_ids (")
+    assert block.count("report_sha256:") == 1
+
+
 # ---- naming what is in flight, and what holds the merge (ctx-01) ------------
 #
 # The counts above are not enough to APPLY the preference they exist for. On
