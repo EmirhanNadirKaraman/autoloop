@@ -16,6 +16,7 @@ from autoloop.errors import LockHeldError, StateCorruptError, StateError, TaskGr
 from autoloop.tasks import (
     LEDGER_PHASE_COMPLETE,
     LEDGER_PHASE_INTENT,
+    TRACKER_PATHS,
     StrandReport,
     Task,
     TaskRegistry,
@@ -378,6 +379,326 @@ def test_a_rejected_scope_leaves_the_registry_byte_identical():
         "duplicate_approved_path",
     )
     assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+# ---- context_ids: provenance that must never become authorization (ctx-04) --
+#
+# THE claim: a task can NAME the context it was written from, and naming it
+# widens nothing. The first four tests are the acceptance criteria a reviewer
+# should read first — they are written as attempts to widen a scope THROUGH the
+# new field, not as assertions about code shape, because "no derivation exists"
+# is only checkable by trying to make one.
+#
+# The fourth is the one that can fail on a leak the other three cannot reach:
+# they hand `effective_approved_paths` a path tuple themselves, so no citation
+# can arrive through their arguments however the field is wired, while the sites
+# that authorize a real round live in `orchestrator.py` and
+# `implement_executor.py`. Its behavioural half lives beside the prompt it is
+# about, in `test_implement_executor.py`:
+# `test_citing_context_records_changes_nothing_the_agent_may_write`.
+#
+# The rest pin the shape and persistence rules that keep the field from
+# becoming something else later: the bare string that splits per character, the
+# hand-edited `null`, the file written before the field existed.
+
+
+#: Ids that pass `_ID_RE`, spelled the way a real context record is
+#: (`context_records`' own fixtures use `good`, `typo`, `f1`, `x`).
+CITED = ["ctx-decision-01", "ctx-incident-02"]
+
+
+def scoped(*, cite=()):
+    """One task scoped to `autoloop/tasks.py`, citing `cite`. Two registries
+    built from this differ in exactly one field, which is what makes the
+    comparisons below about that field."""
+    reg = registry(task("a"))
+    reg.set_approved_paths("a", ["autoloop/tasks.py"])
+    if cite:
+        reg.set_context_ids("a", list(cite))
+    return reg
+
+
+def test_attaching_context_ids_does_not_change_effective_approved_paths():
+    """ACCEPTANCE. Byte-identical with and without the field set, asserted over
+    the serialised tuple rather than by eye — `effective_approved_paths` takes
+    the task's own scope and the reviewed tracker constant, and there is no
+    third argument a reference could arrive through."""
+    from autoloop.tasks import effective_approved_paths
+
+    without = effective_approved_paths(scoped().get("a").approved_paths)
+    with_ids = effective_approved_paths(scoped(cite=CITED).get("a").approved_paths)
+
+    assert json.dumps(with_ids) == json.dumps(without)
+    assert with_ids == tuple(sorted({"autoloop/tasks.py", *TRACKER_PATHS}))
+    # ...and the ids really are stored, so this is not passing because nothing
+    # was attached.
+    assert scoped(cite=CITED).get("a").context_ids == tuple(CITED)
+
+
+def test_no_context_id_reaches_unauthorized_paths():
+    """ACCEPTANCE, and the fail-open probe. `ctx-decision-01` is a legal id AND
+    a legal-looking file stem, so if anything anywhere folded the citation list
+    into the scope this is the shape that would slip through. Every one of them
+    must still be reported unauthorized."""
+    from autoloop.tasks import effective_approved_paths, unauthorized_paths
+
+    allowed = effective_approved_paths(scoped(cite=CITED).get("a").approved_paths)
+    claimed = {*CITED, "ctx-decision-01.py", "autoloop/orchestrator.py"}
+
+    assert unauthorized_paths(claimed, allowed) == claimed
+
+
+def test_a_records_own_source_paths_never_become_writable():
+    """The same probe through the REAL record type. A record's `source_paths`
+    are what a round may READ ABOUT; the registry never resolves a record at
+    all, so citing one cannot put its files in reach of a write."""
+    from autoloop.context_records import ContextRecord
+    from autoloop.tasks import deletable_paths, effective_approved_paths, unauthorized_paths
+
+    record = ContextRecord(
+        id="ctx-decision-01",
+        kind="decision",
+        source_paths=("autoloop/orchestrator.py", "autoloop/policy.py"),
+    )
+    reg = scoped(cite=[record.id])
+    scope = reg.get("a").approved_paths
+    allowed = effective_approved_paths(scope)
+
+    assert unauthorized_paths(set(record.source_paths), allowed) == set(record.source_paths)
+    # Deleting is the other verb that reads a scope, and it routes through the
+    # same `effective_approved_paths` — so it must refuse them too.
+    authorized, outside, _trackers = deletable_paths(record.source_paths, scope)
+    assert authorized == set()
+    assert outside == set(record.source_paths)
+
+
+#: The functions that decide what a round may WRITE or DELETE. Every scope the
+#: loop enforces is one of their return values. `authorized_cleanup_paths` is
+#: here for the reason the other three are, even though its second argument is
+#: an execution record rather than a task: it is the one route by which a round
+#: deletes a file its `approved_paths` never covered, so it is exactly where a
+#: reference list would be worth laundering into.
+SCOPE_DECIDING_CALLS = (
+    "effective_approved_paths",
+    "unauthorized_paths",
+    "deletable_paths",
+    "authorized_cleanup_paths",
+)
+
+
+def test_no_scope_decision_in_the_package_is_handed_a_context_reference():
+    """ACCEPTANCE, over every call site in the package rather than over one.
+
+    The three tests above pass a path tuple in themselves, so a citation has no
+    way into the argument and they cannot fail on a leak wired in ELSEWHERE —
+    and elsewhere is where a real round's authorization is decided
+    (`orchestrator.py`'s dispatch seed, its every-dispatch re-sync and its
+    post-commit ownership check; `implement_executor.py`'s prompt, its delete
+    gate and its two cleanup gates). This asks the question of all of them at
+    once: no argument to a scope decision anywhere in this package reads
+    `context_ids`.
+
+    PARSED, not grepped, and that is load-bearing twice. Two of the
+    orchestrator's calls spread their arguments over several lines, so a
+    line-oriented scan reads `unauthorized_paths(` off a line that does not
+    contain the arguments it is judging; and three of the mentions in these
+    files are DOCSTRING prose, which a grep counts as a call site and `ast` does
+    not.
+
+    WHAT IT CANNOT SEE, stated so it is not read as more than it is: an id
+    laundered through a local variable before the call. That half is covered
+    behaviourally — `test_context.py`'s brief and
+    `test_implement_executor.py`'s scope list both hold a whole `Task` — and
+    the two assertions at the end are what stop THIS one passing because it
+    read nothing at all."""
+    import ast
+
+    # Imported and then USED below, so the static test selector can see the
+    # dependency this test acquires by READING files at runtime: it narrows a
+    # round to the tests that reach the modules it changed (`per_test_deps`,
+    # from names a test mentions), and an `rglob` mentions nothing. Without
+    # this, the round that wires a citation into `orchestrator.py` is exactly
+    # the round that deselects the guard against it.
+    from autoloop import context, implement_executor, orchestrator, packet
+
+    must_scan = {
+        Path(reader.__file__).name
+        for reader in (context, implement_executor, orchestrator, packet)
+    }
+    package = PACKAGE_ROOT / "autoloop"
+    scanned: set[str] = set()
+    decisions = 0
+    for module in sorted(package.rglob("*.py")):
+        if "tests" in module.relative_to(package).parts:
+            continue
+        source = module.read_text(encoding="utf-8")
+        if not any(f"{name}(" in source for name in SCOPE_DECIDING_CALLS):
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if called not in SCOPE_DECIDING_CALLS:
+                continue
+            decisions += 1
+            scanned.add(module.name)
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                read = {
+                    inner.attr if isinstance(inner, ast.Attribute) else inner.id
+                    for inner in ast.walk(arg)
+                    if isinstance(inner, (ast.Attribute, ast.Name))
+                }
+                assert "context_ids" not in read, (
+                    f"{module.name}:{node.lineno} hands a context reference to "
+                    f"{called}() — a citation names what a round may READ ABOUT, "
+                    "never what it may write"
+                )
+    # Fail-closed on the scan itself, twice. A glob that matched nothing, a
+    # rename that moved a call site, or a pre-filter that skipped a file would
+    # otherwise report "no leak found" having examined none of the sites that
+    # matter — silently, which is the shape this whole test exists to refuse.
+    assert must_scan <= scanned, (
+        f"scope decisions were never found in {sorted(must_scan - scanned)} — "
+        "the scan is broken, or those call sites moved and this test no longer "
+        "covers them"
+    )
+    assert decisions >= 10, (
+        f"only {decisions} scope decisions were scanned — the scan is broken, "
+        "not the package clean"
+    )
+
+
+def test_a_task_file_written_before_context_ids_existed_still_loads():
+    """Backward compatibility, same pattern as `approved_paths`/`decomposition`
+    and the reason `TASKS_SCHEMA_VERSION` stays 1: a missing key loads as
+    "cites no record", a hand-edited `null` is normalised to `()` rather than
+    becoming `None`, and `[]` is not malformed."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "old", "title": "T", "description": "d"},
+            {"id": "edited", "title": "T", "description": "d", "context_ids": None},
+            {"id": "empty", "title": "T", "description": "d", "context_ids": []},
+        ],
+    })
+    assert reg.get("old").context_ids == ()
+    assert reg.get("edited").context_ids == ()
+    assert reg.get("empty").context_ids == ()
+    # `None` must be a TUPLE afterwards, not merely falsy: every reader
+    # iterates and joins this field without a None check.
+    assert isinstance(reg.get("edited").context_ids, tuple)
+
+
+def test_context_ids_survive_the_task_file(tmp_path):
+    """A reference is provenance, and provenance that does not outlive the
+    process holding it is not a record. Through `TaskStore`, so the round trip
+    is the real one — `asdict` out, `from_dict` back."""
+    store = TaskStore(tmp_path / "tasks.json")
+    store.save(scoped(cite=CITED))
+
+    assert store.load().get("a").context_ids == tuple(CITED)
+    # Order is preserved, not sorted: it is the order whoever wrote the task
+    # named the records in.
+    store.save(scoped(cite=list(reversed(CITED))))
+    assert store.load().get("a").context_ids == tuple(reversed(CITED))
+
+
+def test_a_persisted_context_ids_string_is_refused_rather_than_split():
+    """`from_dict` bypasses `add_many`, so `_persisted_context_ids` is the ONLY
+    gate a stored or hand-edited row passes. `tuple("ctx01")` is five ids that
+    `_ID_RE` accepts one at a time — a mistake that would never be reported —
+    so the load FAILS CLOSED instead."""
+    with pytest.raises(StateCorruptError, match="context_ids"):
+        TaskRegistry.from_dict({
+            "schema_version": 1,
+            "tasks": [{"id": "t", "title": "T", "description": "d",
+                       "context_ids": "ctx01"}],
+        })
+    with pytest.raises(StateCorruptError, match="context_ids"):
+        TaskRegistry.from_dict({
+            "schema_version": 1,
+            "tasks": [{"id": "t", "title": "T", "description": "d",
+                       "context_ids": ["ctx-01", "ctx-01"]}],
+        })
+
+
+#: One per branch of `_validate_context_ids`: whitespace (which would let an id
+#: render a second stamp-shaped line in the CONTEXT block), a colon (same), a
+#: leading '-', a non-string, a duplicate, and the bare string that would
+#: otherwise be iterated per character.
+#:
+#: The TRAILING NEWLINE is the one that is not obvious and the one the anchor
+#: exists for: `$` matches before it, so `_ID_RE.match("ctx-01\n")` succeeds and
+#: the "no whitespace can reach the block" claim would have been false for the
+#: single character that actually breaks a line-oriented block. `fullmatch` is
+#: what refuses it.
+BAD_CONTEXT_IDS = [
+    ["ctx 01"],
+    ["ctx:01"],
+    ["-ctx-01"],
+    [None],
+    ["ctx-01", "ctx-01"],
+    "ctx-01",
+    ["ctx-01\n"],
+    ["ctx-01\nctx-02"],
+]
+
+
+@pytest.mark.parametrize("bad", BAD_CONTEXT_IDS)
+def test_creation_and_mutation_reject_bad_context_ids_identically(bad):
+    """The `_validate_approved_paths` rule applied to the new field: one
+    validator, every caller. Comparing the MESSAGE is what makes it
+    load-bearing — a second implementation would word its refusal differently
+    long before it disagreed about what to accept."""
+    with pytest.raises(TaskGraphError) as created:
+        registry(Task(id="t1", title="T", description="d", context_ids=bad))
+    reg = registry(task("t1"))
+    with pytest.raises(TaskGraphError) as mutated:
+        reg.set_context_ids("t1", bad)
+    assert created.value.code == mutated.value.code
+    assert str(created.value) == str(mutated.value)
+
+
+def test_a_rejected_context_id_leaves_the_registry_byte_identical():
+    """Atomicity, over the whole serialised graph: the duplicate is the second
+    entry, so a validator that checked as it assigned would already have
+    written the first one."""
+    reg = scoped(cite=CITED)
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    expect_code(
+        lambda: reg.set_context_ids("a", ["ctx-99", "ctx-99"]), "duplicate_context_id"
+    )
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+def test_set_context_ids_replaces_rather_than_merges():
+    """REPLACES, like `set_approved_paths`: an operator who cannot remove a
+    reference cannot correct a mistaken one, and clearing to () is the legal
+    way to say "this task cites nothing"."""
+    reg = scoped(cite=CITED)
+    reg.set_context_ids("a", ["ctx-decision-01"])
+    assert reg.get("a").context_ids == ("ctx-decision-01",)
+    reg.set_context_ids("a", [])
+    assert reg.get("a").context_ids == ()
+
+
+def test_context_ids_cannot_be_edited_while_the_dispatch_is_in_flight():
+    """The same `_refuse_immutable` rule `approved_paths` takes. The ids were
+    rendered into the brief the running round was authored from, so a
+    correction now cannot reach it — and one rule with no exceptions is worth
+    more than an exemption for the field that happens to strand nothing."""
+    reg = scoped(cite=CITED)
+    reg.mark_in_progress("a")
+    expect_code(lambda: reg.set_context_ids("a", ["ctx-99"]), "task_in_progress")
+    assert reg.get("a").context_ids == tuple(CITED), "the refusal changed nothing"
+
+
+def test_an_unknown_task_is_refused_before_anything_is_validated():
+    """`get`'s own refusal, like every other mutator here: an id nobody knows
+    must name the task, not the field."""
+    expect_code(lambda: registry(task("a")).set_context_ids("ghost", ["ctx-01"]),
+                "task_unknown")
 
 
 def test_set_depends_on_replaces_and_redrives_the_derived_state():

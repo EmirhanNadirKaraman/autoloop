@@ -154,6 +154,21 @@ class TaskBrief:
     #: Empty means no plan is on record yet.
     decomposition: str
     description: str = ""
+    #: `tasks.Task.context_ids` verbatim — the context records this task says it
+    #: was written from. Empty means it cites none, which is the ordinary state.
+    #:
+    #: **THE IDS ONLY, never a record's text.** Rendering what a record SAYS is
+    #: a different job with a different budget (the block is not chunked, and a
+    #: record is unbounded prose written outside this package), and it is
+    #: deliberately not ctx-04's. What the ids buy the reviewer is the one thing
+    #: an id can carry on its own: whether the task cites the record the
+    #: reviewer expected it to.
+    #:
+    #: They authorize NOTHING. `approved_paths` above is
+    #: `tasks.effective_approved_paths` and remains the whole of what the
+    #: dispatch will allow — this line cannot add a path to it, because nothing
+    #: derives one from an id.
+    context_ids: tuple[str, ...] = ()
 
 
 #: `InFlightTask.record_state` values. Three outcomes, kept distinct because
@@ -382,6 +397,10 @@ def _brief(task: Task, trackers: tuple[str, ...], with_description: bool) -> Tas
         approved_paths=effective_approved_paths(task.approved_paths, trackers),
         decomposition=task.decomposition,
         description=task.description if with_description else "",
+        # Verbatim, and NOT fed to `effective_approved_paths` above — the two
+        # arguments that call takes are the task's own scope and the reviewed
+        # tracker constant, and a context id is neither.
+        context_ids=task.context_ids,
     )
 
 
@@ -494,6 +513,18 @@ def _render_brief(label: str, brief: TaskBrief, note: str) -> list[str]:
         f"{label}: {brief.task_id} — {brief.title} ({note})",
         f"  approved_paths (its own scope plus the always-allowed trackers): {paths}",
     ]
+    if brief.context_ids:
+        # ONE line, ids only, and only when there are some. Immediately after
+        # `approved_paths` so the two are read together and the parenthetical
+        # can say what the difference between them is — a reviewer who reads
+        # this as a second scope would plan work the dispatch then refuses.
+        # No line at all when the task cites nothing: a section that says
+        # "(none)" on every brief is paid for on every request forever, and the
+        # block is re-sent every round and is not chunked.
+        lines.append(
+            "  context_ids (records this task was written from — references "
+            f"only; they authorize nothing): {', '.join(brief.context_ids)}"
+        )
     if brief.decomposition:
         lines.append("  approved decomposition, exactly as recorded:")
         lines += _fenced("decomposition", brief.task_id, brief.decomposition)

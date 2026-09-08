@@ -382,6 +382,17 @@ def _seed_registry(config: AutoloopConfig) -> TaskRegistry:
                 validation=tuple(tuple(c) for c in spec.get("validation", ())),
                 validation_cwd=spec.get("validation_cwd", ""),
                 approved_paths=tuple(spec.get("approved_paths", ())),
+                # Threaded for the reason the comment above gives, and passed
+                # UNCONVERTED for `inbox.apply_requests`': a `tuple()` over the
+                # bare string `"ctx01"` is five ids `_ID_RE` accepts one at a
+                # time, while `_validate_context_ids` refuses the string itself.
+                # NOT `... or ()` either, for the same reason and the same
+                # doctrine: `0`, `false`, `{}` and `""` are all falsy and all
+                # malformed, and normalising them to "cites no record" would
+                # delete a seed row's provenance in silence. Only a MISSING key
+                # and an explicit `null` normalise (`[]` is already legal, and
+                # means the row cites nothing).
+                context_ids=() if spec.get("context_ids") is None else spec["context_ids"],
             )
             for spec in specs
         ]
@@ -4054,6 +4065,13 @@ def _cmd_add_task(args: argparse.Namespace) -> int:
         spec["depends_on"] = list(args.depends_on)
     if args.approved_path:
         spec["approved_paths"] = list(args.approved_path)
+    if args.context_id:
+        # Provenance, not scope. The list goes into the request under the field
+        # name the registry stores it under, exactly like `--approved-path`
+        # above, and `tasks._validate_context_ids` is what checks it on merge —
+        # nothing here validates, for the reason `add-task` validates nothing
+        # else either (the task graph is the registry's call, made once).
+        spec["context_ids"] = list(args.context_id)
     if args.validation_cwd:
         spec["validation_cwd"] = args.validation_cwd
     if args.validation:
@@ -9003,6 +9021,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_task.add_argument(
         "--approved-path", action="append", default=[],
         help="repeatable; the exact paths this task may touch",
+    )
+    add_task.add_argument(
+        "--context-id", action="append", default=[],
+        help=(
+            "repeatable; the context records this task was written from. "
+            "REFERENCES ONLY — they authorize nothing, and never widen "
+            "--approved-path"
+        ),
     )
     add_task.add_argument("--validation", action="append", default=[],
                           help='repeatable, e.g. --validation "ruff check ."')

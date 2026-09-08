@@ -6,6 +6,7 @@ repo". The real `claude` CLI is never invoked."""
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -561,6 +562,35 @@ def test_each_task_gets_its_own_scope_list_and_no_other_tasks_paths():
     assert _scope_paths(prompt_a) != _scope_paths(prompt_b)
     assert "autoloop/health.py" not in prompt_a
     assert "feature.py" not in prompt_b
+
+
+def test_citing_context_records_changes_nothing_the_agent_may_write():
+    """ACCEPTANCE for ctx-04, at the surface a write-capable round is actually
+    bounded by — the APPROVED SCOPE list this prompt states.
+
+    `test_tasks.py`'s pair compares `effective_approved_paths` with and without
+    the citation, and that function takes a PATH TUPLE: a citation has no way
+    into either argument, so that comparison cannot fail however the field is
+    wired. This one can. `_agent_prompt` is handed the whole `Task`, so a round
+    that folded `task.context_ids` into the list — or resolved a record and
+    appended its `source_paths` — would leave the pair green and turn this red.
+
+    The ids are checked against the whole SECTION rather than the parsed list:
+    an entry the parser skips is still text sitting under a heading that tells
+    an agent what it may write."""
+    cited = ("ctx-decision-01", "ctx-incident-02")
+    plain = make_scoped_task(approved=("feature.py",))
+    citing = replace(plain, context_ids=cited)
+
+    prompt = _agent_prompt(citing, None)
+
+    assert _scope_paths(prompt) == _scope_paths(_agent_prompt(plain, None))
+    assert _scope_paths(prompt) == effective_approved_paths(plain.approved_paths, TRACKER_PATHS)
+    # ...and the citation really is on the task, so this is not passing because
+    # nothing was attached.
+    assert citing.context_ids == cited
+    for cite in cited:
+        assert cite not in _scope_section(prompt)
 
 
 def test_an_unscoped_task_gets_a_fail_closed_scope_section_not_an_absent_one():
