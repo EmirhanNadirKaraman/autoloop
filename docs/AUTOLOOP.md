@@ -1552,6 +1552,45 @@ per deployment that every lane overwrites with its own phase, and
 (both already recorded under Decision 7). Both are reachable only above one
 lane.
 
+**And one WRITER of the shared upgrade record that is NOT gated on the owner,
+found by this candidate's own adversarial pass and left as a stated residual
+rather than closed here.** `cli._confirm_self_upgrade` retires the one-shot
+`execed` marker at the top of every lane's second iteration, in every lane, so
+one replacement can be confirmed more than once — up to once per lane, since a
+lane that loaded the record before another cleared it clears it too. That is
+NOT the ownership defect this candidate was recut for, and the difference is
+the STATUS it acts on: `execed` only, never `pending`, so a non-owner cannot
+consume an upgrade nobody has acted on, and the unlink is idempotent
+(`missing_ok=True`), so the visible cost is a duplicate
+`self_upgrade_confirmed` entry for one replacement. What it does leave open is
+a WINDOW: between its `load()` and its `clear()` a sibling lane's merge can
+write a fresh `pending` record (`auto_merge._note_loop_code_merge` saves
+unconditionally, which is also why a marker left armed cannot block a later
+upgrade), and the unlink then removes an upgrade nothing has answered — the
+silent-no-outcome failure, one function over. Closing it needs
+`pending_upgrade.json`'s writes SERIALISED — a compare-and-clear under a shared
+mutex, the shape conc-11 uses for the throttle episode — which is a mechanism
+rather than a gate, and building one was deliberately not taken on the round
+recut for the ownership boundary alone. Reachable only above one lane: at
+`lanes = 1` there is one thread, and the merger that writes the record and the
+confirmation that clears it are the same one.
+
+**And the price of pinning ownership to lane 0, named rather than left to be
+discovered.** `_run_fleet` does not restart a lane that ENDED, and thirteen
+codes are lane-fatal (`blockers.LANE_FATAL_CODES`), so a lane-fatal park in
+lane 0 leaves the fleet running with no upgrade owner in it. An upgrade merged
+after that drains and never arrives: every remaining lane sees
+`upgrade_boundary`, every one of them is a non-owner, and each lands on the
+drain's hold — until an operator restarts, where lane 0 exists again and takes
+the boundary at the next idle tick. It is LOUD rather than silent, which is
+what bounds it: lane 0's park has already written a blocker record and turned
+`health` red, and every poll adds a `fleet_hold` entry saying the fleet is
+draining. Fleet-fatal parks — the majority — do not reach it at all, because
+every lane stops and the restart is the answer. Closing it properly means
+deciding whether ownership follows the lowest LIVE lane, or whether the runner
+restarts a parked owner; both are scheduler decisions, neither is the boundary
+gate, and the candidate recut for that gate deliberately takes neither.
+
 ### Where each of the brief's required tests is proved
 
 | conc-01 asked for | proved by |
