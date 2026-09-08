@@ -22,7 +22,9 @@ Four sections, and each is one part of it:
    never sees the upgrade again and the merged code sits on disk with nothing
    able to act on it. A non-owner now takes no part: it neither calls
    `_reach_upgrade_boundary` nor writes `answered_upgrades`, and the owner
-   arriving afterwards still finds the record pending and unanswered. **One
+   arriving afterwards still finds the record pending and unanswered — on BOTH
+   doors, the drain's and the round's own `SELF_UPGRADE` outcome, each driven
+   in the order that produced the defect. **One
    lane, and never NO lane:** ownership follows the lowest lane still running,
    because a fleet does not restart a lane that ended and pinning it to lane 0
    left a fleet that lost lane 0 draining for an upgrade nothing could take.
@@ -493,6 +495,13 @@ def test_a_non_owner_declines_a_round_boundary_into_its_own_set(tmp_path, monkey
     goes into a set only that lane reads. The two are asserted together, because
     a refusal that wrote to `answered_upgrades` would look identical from the
     lane's own side and would be the defect above wearing another name.
+
+    THEN THE OWNER ARRIVES, in the second half below, and that is the ordering
+    the defect was reported in: the non-owner meets this door FIRST and leaves
+    the sha unanswered, and lane 0 — reaching the SAME door afterwards, on the
+    same record — still finds it pending and still acts on it. One test rather
+    than two, because the order is the claim: a fresh fixture would prove the
+    owner can take a boundary nobody refused, which was never in doubt.
     """
     config = upgrade_config(tmp_path, lanes=2)
     TaskStore(config.tasks_file).save(TaskRegistry())
@@ -556,6 +565,59 @@ def test_a_non_owner_declines_a_round_boundary_into_its_own_set(tmp_path, monkey
     )
     # And the round this lane ran was told which lane it belongs to.
     assert lanes_told == [1, 1, 1]
+
+    # ---- and now the OWNER, on the record the non-owner left pending --------
+    # The ordering half of the claim, asked of THIS door rather than the
+    # drain's: the non-owner met `SELF_UPGRADE` FIRST, so the owner arriving
+    # afterwards has to find the sha still unanswered and still act on it.
+    # Stated as what the owner CAN do rather than as what the non-owner did,
+    # because that is the direction the defect was reported in — without the
+    # gate the fleet's set already holds `b * 40` by this line and the boundary
+    # below is never offered to the lane that owns it.
+    StateStore(lane_paths(config.state_dir, 0).state_file).save(
+        _ready_session("lane-zero")
+    )
+    boundaries: list[str] = []
+
+    def reached(cfg, lock, args=None, lane=None):
+        boundaries.append(UpgradeStore(cfg.pending_upgrade_file).load().base_sha)
+        return UPGRADE_EXEC_FAILED
+
+    monkeypatch.setattr(cli, "_self_upgrade_at_boundary", reached)
+    # Exactly one boundary, counted rather than sampled: the double ends the
+    # loop on its next call (`len(rounds) > 2`), so seeding one round leaves
+    # the owner one `SELF_UPGRADE` to answer and one rebuild after it.
+    rounds[:] = [0]
+
+    with pytest.raises(StopTheLoop):
+        cli._run_continuous(
+            continuous_args(), config, None, cli._LaneEntry(config, 0, fleet)
+        )
+
+    assert boundaries == ["b" * 40], (
+        "the owner did not reach the boundary the non-owner left pending"
+    )
+    assert built[-2].declined == [], (
+        "the owner's round was handed a sha the non-owner had refused, so the "
+        "boundary it owns would have been declined before it saw it"
+    )
+    assert fleet.answered_upgrades == {"b" * 40}, (
+        "the owner's bound is the FLEET's — which is exactly what a "
+        "non-owner's refusal above is not"
+    )
+    assert built[-1].declined == ["b" * 40], "and it rides the rebuild after it"
+    assert lanes_told[-2:] == [0, 0], "the rounds the owner ran were lane 0's"
+    assert not fleet.handoff_wanted, (
+        "this door acts in place rather than asking the runner to empty the "
+        "fleet, and it may: it is unreachable in a real fleet — "
+        "`_round_boundary_may_upgrade` switches the per-round boundary off for "
+        "a continuous run above one lane — while the DRAIN is the door a fleet "
+        "actually arrives at, and that one hands off. The gate above it is "
+        "there anyway because 'unreachable' is a property of another function. "
+        "If this door is ever offered in a fleet, this line is what must "
+        "change, and it must change to a handoff: `os.execv` keeps the pid, so "
+        "a sibling lease still on disk would name the successor's own pid"
+    )
 
 
 def test_a_lane_that_is_the_whole_loop_still_owns_its_own_boundary(tmp_path):
