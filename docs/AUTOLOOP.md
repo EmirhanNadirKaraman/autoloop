@@ -601,12 +601,16 @@ rule `intake decline` already uses for an offered suggestion.
 
 ## Running several tasks at once — the split plan
 
-**Status: a PLAN, not a mechanism.** Nothing in this section is implemented.
-It is the design contract conc-01 was asked to produce, so that the work can be
-authorised as a sequence of independently reviewable candidates instead of one
-change nobody can review. The loop is single-lane today and stays single-lane
-until the last candidate below lands; every candidate before it ships with the
-concurrency setting at `1`, where the loop behaves exactly as it does now.
+**Status: BUILT, and shipped switched off.** This was the design contract
+conc-01 was asked to produce, so that the work could be authorised as a
+sequence of independently reviewable candidates instead of one change nobody
+can review; all nine have landed, and conc-10 turned the mechanism on
+(`cli._run_fleet`). What ships is `lanes = 1`, where every gate below answers
+before it reads anything and the loop behaves exactly as it always has —
+raising the setting is an operator's decision, taken against the costs
+`autoloop/config.example.toml` states beside the key. Each decision below is
+kept in the present tense, with a bolded paragraph recording what the candidate
+that built it actually did and where it differs from what was planned.
 
 The prize is measured, not assumed. Over the 126 rounds from 2026-08-22 to
 2026-08-26 the executor took 71.8 of 101.3 wall-clock hours (71%); submit took
@@ -1452,6 +1456,60 @@ stranded.
 *Tests:* an end-to-end round at `lanes = 2` with a stub executor: two candidates
 produced, two independent reviews, two merges one at a time, the second rebased
 and re-reviewed against the first; the shipped default stays `1`.
+
+**conc-10 landed that as `cli._run_fleet`, and the mechanism it needed was one
+thing the plan's scope line did not anticipate: a RUNNER.** Every candidate
+before this one is per LANE and was waiting for a second lane to be handed;
+nothing in the loop opened one, because `_cmd_run` entered lane 0 and called
+`_run_continuous` once. `_run_fleet` opens `lanes` of them — N threads in ONE
+process holding the one `LoopLock`, N `_LaneEntry` leases, N `_run_continuous`
+loops — and one process is not an implementation detail: `LaneLease.
+break_stale`, `merge_sweep.MergeToken`'s recovery and `recover_dead_lanes` are
+all check-then-act sequences whose own docstrings say they are safe only from
+the holder of the fleet lock, and lanes in separate processes would inherit that
+obligation with nothing to discharge it with. Lane index reaches the round
+through `_build_orchestrator`, which is what points a lane at its own clone
+(`ObservedCheckout.for_lane`) and its own sibling set; it is passed only when it
+is not zero, so every existing six-argument caller makes the call it always did.
+**The self-upgrade boundary is the one thing a lane may not take.**
+`FleetPlan.upgrade_boundary` is a fact about the FLEET — an upgrade is pending
+and every lane is idle — so every lane sees it on the same tick, and the first
+to arrive could fail to hand off and decline the sha into the run's
+`answered_upgrades`, after which `_drainable_upgrade_sha` answers `""`, the
+drain stops, and the merged code sits on disk with nothing left able to act on
+it. Both doors to the boundary are therefore gated on `_lane_owns_upgrade` —
+lane 0, because it is the only index a lowered cap can never retire, decided
+from the in-memory index and never from a file, so the gate has no unreadable
+state to fail open on. A non-owner neither reaches the boundary nor writes
+`answered_upgrades`; it declines into a set only it reads
+(`self_upgrade_not_this_lane`) and lands on the drain's own hold, since
+`upgrade_boundary` implies `draining`. And the OWNER does not `os.execv` inside
+a lane thread either: the replacement keeps the pid, a lease has no adoption of
+its own, and a sibling lease still on disk would name the successor's own pid,
+read as live, and fail the successor closed on its own lane. So the owner asks
+the fleet to stop, every lane returns at the top of its next iteration and
+unwinds its own lease, and `_run_fleet` reaches the boundary with lane 0's entry
+the only one left — the thread lifecycle IS the barrier. A replacement that does
+not happen restarts exactly the lanes that stepped aside, with the sha bound so
+the fleet does not drain for it again. A fleet killed without unwinding leaves
+those leases behind, which is conc-08's case exactly: `_cmd_run` calls
+`recover_dead_lanes` once above one lane, before any lane is entered, because
+lane 0's own stale lease would otherwise stop the next `run` before it started.
+`autoloop/tests/test_fleet_end_to_end.py` proves the overlap with a barrier
+rather than an assertion — a runner that ran the lanes in sequence fails it by
+TIMING OUT — and the merge serialisation with two threads racing for the token,
+which is the half conc-08's own tests cannot fail for the right reason.
+
+**Three readers this candidate did NOT make fleet-aware, named so the next
+round inherits them rather than discovering them.** `TaskStore.save` reconciles
+only `priority` against the file underneath it, so two lanes each holding a
+registry across a round can lose each other's STATUS writes — the fix is
+load-mutate-save under `tasks.task_file_mutex` across the orchestrator's own
+registry usage, which is a task and not a step. `heartbeat.json` is one file per
+deployment that every lane overwrites with its own phase, and
+`cli._cmd_status` reads lane 0's state file under a headline about the loop
+(both already recorded under Decision 7). All three are reachable only above one
+lane.
 
 ### Where each of the brief's required tests is proved
 

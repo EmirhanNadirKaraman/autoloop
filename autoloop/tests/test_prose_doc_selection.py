@@ -509,7 +509,11 @@ DOCS_ONLY_SELECTED = 20
 #: resolves no `__file__`, and the git repositories it builds are spawned by
 #: `gitrepo.py`, not by anything this file binds. The same 20 hold; the
 #: DENOMINATOR only.
-SUITE_SIZE = 114
+#: 114 -> 115 when conc-10 added `test_fleet_end_to_end.py` (2026-09-08), again
+#: for conc-07's reason: `docs/AUTOLOOP.md` is the only document it names, it
+#: resolves no `__file__`, and it builds no repository and spawns nothing — its
+#: only concurrency is `threading`. The same 20 hold; the DENOMINATOR only.
+SUITE_SIZE = 115
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
