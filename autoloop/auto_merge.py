@@ -140,6 +140,7 @@ it can never turn a real merge into a reported failure.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -152,7 +153,7 @@ from .errors import GitError, StateCorruptError
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .state import utcnow_iso
-from .tasks import TaskRegistry, TaskState
+from .tasks import TaskRegistry, TaskState, TaskStoreBusy, task_file_mutex
 from .worktask import TaskExecutionStore
 
 #: Outcome slugs. Returned from `AutoMerger.attempt` and used verbatim as the
@@ -385,6 +386,23 @@ class PendingUpgrade:
     detail: str = ""
 
 
+class UpgradeRecordBusy(OSError):
+    """`pending_upgrade.json`'s mutex could not be taken, so nothing was
+    written (conc-10b).
+
+    **An `OSError` on purpose.** Every caller of `save` and `clear` on this
+    store already answers a write that did not land — `_note_loop_code_merge`
+    logs `self_upgrade_error` and lets the merge stand, `_carry_on_upgrade`
+    says the record could not be restored, `_confirm_self_upgrade` leaves the
+    marker armed — and every one of those handlers is spelled `except OSError`.
+    A `StateError` (which is what `tasks.task_file_mutex` raises) arriving from
+    inside a merge or one statement past a boundary would leave by traceback
+    instead, which is the boundary-then-silence this whole path exists to end.
+    The same conversion, for the same reason, as `publisher.publisher_mutex`
+    turning a `TaskStoreBusy` into a `GitCommandError`.
+    """
+
+
 class UpgradeStore:
     """The single `pending_upgrade.json`, written atomically (temp +
     `os.replace`) like every other store here.
@@ -396,18 +414,92 @@ class UpgradeStore:
     refusing to act is the safe direction for an unreadable marker: the merged
     code is on disk either way and the next process start picks it up. Raising
     instead would take a bookkeeping file and park a loop that is working.
+
+    **N LANES WRITE THIS ONE FILE** (conc-10b), which is what `fleet` is for.
+    A fleet is one process with N lanes in it, and two of them touch this
+    record for opposite reasons: a lane whose merge changed `autoloop/` SAVES a
+    fresh `pending` one, and a lane one iteration past a replacement CLEARS the
+    `execed` one. Run unserialised those two interleave into a lost update —
+    the confirmation reads `execed`, the merger writes `pending`, the
+    confirmation unlinks, and an upgrade nothing has answered is gone with no
+    entry anywhere saying so. So every WRITE goes inside one cross-process
+    mutex and the removal is a compare-and-clear (`clear`). Loads stay
+    unserialised: `os.replace` is atomic, so a reader sees the old record or
+    the new one and never half of either.
+
+    The gate is `fleet`, set once from `[concurrency] lanes > 1`
+    (`for_config`) — the device `TaskStore(fleet=...)` already uses for the
+    task file, and for its reason: at one lane the merger that writes this
+    record and the confirmation that clears it are the SAME thread, so there is
+    nothing to serialise, no mutex file appears beside the record, and a
+    single-lane state directory holds exactly what it holds today. It is an
+    in-memory config value with no file to fail open on. The COMPARISON in
+    `clear` is not gated, because it is not a race fix: at one lane the record
+    it compares against is the one this thread just read.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, fleet: bool = False):
         self.path = Path(path)
+        #: Is this deployment a FLEET — several lanes writing this one file?
+        #: Default False, so every caller that builds a store by hand (an
+        #: operator tool, a test) gets exactly today's unserialised writes.
+        self.fleet = bool(fleet)
+
+    @classmethod
+    def for_config(cls, config: AutoloopConfig) -> "UpgradeStore":
+        """The store every WRITER in the loop builds, with the fleet gate
+        resolved from the config once rather than at each call site.
+
+        Readers may build one directly; nothing about a load is serialised.
+        """
+        return cls(config.pending_upgrade_file, fleet=config.concurrency.lanes > 1)
+
+    @contextlib.contextmanager
+    def _hold(self):
+        """Serialise a read-modify-write of this record across the lanes.
+
+        `tasks.task_file_mutex` rather than a second implementation of one, for
+        the argument `FleetThrottleStore._mutex` and `publisher.publisher_mutex`
+        both make: it is already this repository's answer to "serialise a
+        read-modify-write on a shared JSON file across threads AND across
+        processes", and a second one is a second chance to disagree with the
+        first. A no-op below two lanes (see the class docstring), where it would
+        only add a lock file to a state directory that must not gain one.
+
+        Only the ACQUISITION converts (`UpgradeRecordBusy`); a `TaskStoreBusy`
+        raised by anything inside the block is somebody else's fault and is
+        left alone — `publisher_mutex`'s rule, kept identical.
+        """
+        if not self.fleet:
+            yield
+            return
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(task_file_mutex(self.path))
+            except TaskStoreBusy as exc:
+                raise UpgradeRecordBusy(
+                    f"the mutex for {self.path} could not be taken: {exc}. "
+                    "Nothing was written and the record is exactly as it was."
+                ) from exc
+            yield
 
     def save(self, record: PendingUpgrade) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(asdict(record), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.replace(tmp, self.path)
+        """Replace the record, inside the fleet's hold.
+
+        The temp name carries this process's pid for `FleetThrottleStore.save`'s
+        reason — a shared `.tmp` name is two writers clobbering each other's
+        partial write and then renaming the result over the record — which
+        covers the one writer the hold does not: a store built by hand, outside
+        a fleet, beside a fleet that is running.
+        """
+        with self._hold():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+            tmp.write_text(
+                json.dumps(asdict(record), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.path)
 
     def load(self) -> PendingUpgrade | None:
         if not self.path.exists():
@@ -418,8 +510,43 @@ class UpgradeStore:
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             return None
 
-    def clear(self) -> None:
-        self.path.unlink(missing_ok=True)
+    def clear(self, *, base_sha: str | None = None, status: str | None = None) -> bool:
+        """Remove the record, and answer whether this call is what removed it.
+
+        **COMPARE-AND-CLEAR, and the comparison is the point** — the same shape,
+        and the same argument, as `state.FleetThrottleStore.clear`. "I read a
+        record that said `execed`, so remove it" is only true of the record that
+        was read. Between that read and this call a SIBLING LANE's merge can
+        write a fresh `pending` record over it (`_note_loop_code_merge` saves
+        unconditionally, which is what keeps a marker left armed from blocking a
+        later upgrade), and an unconditional unlink then deletes an upgrade
+        nothing has answered: no boundary is ever offered it, no entry says it
+        went, and the merged code sits on disk forever. That is the
+        silent-no-outcome failure the self-upgrade path exists to end, rebuilt
+        one function over.
+
+        The load, the comparison and the unlink happen inside ONE hold, so the
+        record cannot change underneath the decision; doing the read outside
+        would rebuild the race one line further out.
+
+        Both arguments `None` means UNCONDITIONAL, which is the operator-facing
+        "remove this file whatever it says" and what a caller removing a record
+        it is not identifying uses. A `base_sha`/`status` that no longer matches
+        what is on disk answers `False` and leaves the file exactly as it is —
+        which is also the answer for a record that has already gone.
+        """
+        with self._hold():
+            if base_sha is not None or status is not None:
+                record = self.load()
+                if record is None:
+                    return False
+                if base_sha is not None and record.base_sha != base_sha:
+                    return False
+                if status is not None and record.status != status:
+                    return False
+            existed = self.path.exists()
+            self.path.unlink(missing_ok=True)
+            return existed
 
 
 def upgrade_bound_sha(record: PendingUpgrade | None) -> str:
@@ -514,7 +641,12 @@ class AutoMerger:
         #: here and read at the restart boundary (`orchestrator.run`), never
         #: acted on inside this module: merging and replacing the process are
         #: two different moments, and this one is mid-round by construction.
-        self._upgrades = upgrades or UpgradeStore(config.pending_upgrade_file)
+        #:
+        #: `for_config`, so a lane merging into this record does it inside the
+        #: fleet's own hold: the confirmation one lane over reads and removes
+        #: the same file, and unserialised those two lose an upgrade
+        #: (`UpgradeStore`). A caller that passes its own store keeps it.
+        self._upgrades = upgrades or UpgradeStore.for_config(config)
 
     # ---- entry point --------------------------------------------------------
 
