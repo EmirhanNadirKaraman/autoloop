@@ -388,6 +388,57 @@ def test_a_creation_request_naming_a_bare_string_is_refused_not_split(tmp_path):
     assert not registry.has("t"), "nothing half-created"
 
 
+#: Values that are FALSY and are NOT a list of ids. Every one of them is
+#: malformed, and every one of them was normalised away by the `or ()` these
+#: two construction sites used to carry — a refusal turned into a silent "cites
+#: no record" with the request still reporting the task created. The bare
+#: string has its own test above; `""` is here because, being falsy, it took
+#: the other route past the validator entirely.
+FALSY_NOT_A_LIST = [0, False, {}, ""]
+FALSY_IDS = ["zero", "false", "object", "empty-string"]
+
+
+@pytest.mark.parametrize("bad", FALSY_NOT_A_LIST, ids=FALSY_IDS)
+def test_a_falsy_creation_context_ids_is_refused_rather_than_emptied(bad):
+    """The fail-open a falsy-test normalisation leaves behind: it deletes the
+    provenance the field exists to record and reports success while doing it,
+    so the operator has no line to read and the task looks fully described.
+    Handed to the registry as it arrived, each one is refused in the registry's
+    own words and nothing is created."""
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    added, _applied, refused = apply_requests(registry, [
+        {"id": "t", "title": "T", "description": "d", "context_ids": bad},
+    ])
+
+    assert added == []
+    assert len(refused) == 1 and "context_ids" in refused[0], refused
+    assert not registry.has("t"), "nothing half-created"
+
+
+def test_creation_still_accepts_the_three_ways_of_citing_nothing():
+    """The other half of the rule above, and what keeps it from being "refuse
+    everything falsy": `[]` is the documented way to say "this task cites no
+    record", a MISSING key is every request written before the field existed,
+    and `null` is the hand-edited spelling of the same. All three create the
+    task, and all three land as a TUPLE — every reader iterates and joins this
+    field without a `None` check."""
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    added, _applied, refused = apply_requests(registry, [
+        {"id": "empty", "title": "T", "description": "d", "context_ids": []},
+        {"id": "absent", "title": "T", "description": "d"},
+        {"id": "nulled", "title": "T", "description": "d", "context_ids": None},
+    ])
+
+    assert (len(added), refused) == (3, [])
+    for task_id in ("empty", "absent", "nulled"):
+        assert registry.get(task_id).context_ids == (), task_id
+        assert isinstance(registry.get(task_id).context_ids, tuple), task_id
+
+
 def test_an_inbox_request_can_correct_an_existing_tasks_references(tmp_path):
     """The reason this is a MUTATION kind and not creation-only: the reference
     that turns out to be wrong is exactly the one written at planning time.
@@ -856,6 +907,50 @@ def test_a_seed_tasks_row_can_name_its_context_and_a_bare_string_is_refused(tmp_
 
     with pytest.raises(TaskGraphError, match="context_ids"):
         cli._seed_registry(types.SimpleNamespace(seed_tasks_file=seed))
+
+
+@pytest.mark.parametrize("bad", FALSY_NOT_A_LIST, ids=FALSY_IDS)
+def test_a_falsy_seed_context_ids_is_refused_rather_than_emptied(tmp_path, bad):
+    """The same fail-open on the OTHER construction site, and the one where it
+    is least likely to be noticed: a seed file is read once, at a brand-new
+    deployment, so a reference list quietly emptied there is provenance nobody
+    ever sees go missing. It fails loudly instead, exactly as the bare string
+    above does."""
+    import types
+
+    from autoloop import cli
+    from autoloop.errors import TaskGraphError
+
+    seed = tmp_path / "seed_tasks.json"
+    seed.write_text(json.dumps([
+        {"id": "s1", "title": "T", "description": "d", "context_ids": bad},
+    ]), encoding="utf-8")
+
+    with pytest.raises(TaskGraphError, match="context_ids"):
+        cli._seed_registry(types.SimpleNamespace(seed_tasks_file=seed))
+
+
+def test_a_seed_row_may_cite_nothing_in_any_of_its_three_spellings(tmp_path):
+    """The seed half of "not everything falsy is malformed". A row carrying
+    `[]`, a row with no `context_ids` at all (which is every `seed_tasks.json`
+    written before ctx-04) and a hand-edited `null` all load as "cites no
+    record" rather than being refused."""
+    import types
+
+    from autoloop import cli
+
+    seed = tmp_path / "seed_tasks.json"
+    seed.write_text(json.dumps([
+        {"id": "empty", "title": "T", "description": "d", "context_ids": []},
+        {"id": "absent", "title": "T", "description": "d"},
+        {"id": "nulled", "title": "T", "description": "d", "context_ids": None},
+    ]), encoding="utf-8")
+
+    registry = cli._seed_registry(types.SimpleNamespace(seed_tasks_file=seed))
+
+    for task_id in ("empty", "absent", "nulled"):
+        assert registry.get(task_id).context_ids == (), task_id
+        assert isinstance(registry.get(task_id).context_ids, tuple), task_id
 
 
 def test_add_task_context_id_round_trips_into_the_registry(tmp_path, monkeypatch):
