@@ -40,7 +40,10 @@ Signals, and why these rather than the obvious ones:
   working is exempt from it only while that claim is young enough to be true
   (`round_ceiling_for`): an exemption with no bound on it is a second way for
   a task to sit unscheduled and unreported forever, which is the failure
-  being reported, not a way to report it.
+  being reported, not a way to report it. Above one lane EVERY lane claims
+  (`_lane_claims`), each judged by that same bound — `state.json` is lane 0's
+  file, so a survey that asked only it would report a task lane 1 is running
+  as stranded, which is this signal's own false alarm one lane over.
 
 * **A merge backlog that cannot drain is a fault nothing was reading.** The
   sweep (`merge_sweep.py`) refuses to merge past a completed task it cannot
@@ -704,6 +707,8 @@ def stranded_fault_rounds(
     current_task_id: str = "",
     current_round_age: float | None = None,
     round_ceiling_seconds: float = DEFAULT_ROUND_CEILING_SECONDS,
+    *,
+    lane_claims: tuple[tuple[str, float | None], ...] = (),
 ) -> tuple[StrandedRound, ...]:
     """Every task the loop has left `in_progress` after a round the ENVIRONMENT
     destroyed, in registry order.
@@ -749,6 +754,19 @@ def stranded_fault_rounds(
        died between stamping `current_task` and writing `task_execution`, whose
        task is genuinely abandoned. A record swept this way is flagged
        `stale_current` so both arms can say which case they are reporting.
+
+       **`lane_claims` is that same claim, made by the OTHER lanes of a fleet**
+       (conc-09): one `(task_id, age)` pair per lane, gathered by
+       `_lane_claims`. Above `[concurrency] lanes = 1` the caller's scalar
+       `current_task_id` is only LANE 0's claim — `config.state_file` is lane
+       0's file (`state.lane_paths`) — so a task lane 1 is actively running
+       would otherwise satisfy every one of these four conditions and be
+       reported as stranded while an agent works on it. Each pair is judged by
+       exactly the rule above, per lane and against the same ceiling: an
+       unbounded "exempt whatever any lane names" would rebuild the very bug the
+       BOUND paragraph records, N times over. Empty by default, so a
+       single-lane deployment and `orchestrator._reconcile_stranded_tasks` are
+       byte-identical to what they were.
     3. Its execution record's LAST attempt reads as a round the environment
        took: settled on the fault budget with an outcome that is not
        `sent_for_review`, or still OPEN (nothing ever stamped it, which
@@ -776,17 +794,21 @@ def stranded_fault_rounds(
     replace.
     """
     stranded: list[StrandedRound] = []
-    # Decided ONCE, outside the loop: it is a statement about the loop's own
-    # session, not about any particular task, and computing it per task would
-    # invite a second rule that disagrees with this one.
-    current_round_is_live = (
-        bool(current_task_id)
-        and current_round_age is not None
-        and current_round_age <= round_ceiling_seconds
-    )
+    # Decided ONCE, outside the loop: these are statements about the loop's own
+    # sessions, not about any particular task, and computing them per task would
+    # invite a second rule that disagrees with this one. Lane 0's claim is the
+    # scalar pair; every other lane's arrives in `lane_claims`, and both are
+    # judged by the same two lines — one bound, one place.
+    claims = ((current_task_id, current_round_age), *lane_claims)
+    claimed = {task_id for task_id, _ in claims if task_id}
+    live = {
+        task_id
+        for task_id, age in claims
+        if task_id and age is not None and age <= round_ceiling_seconds
+    }
     for task in registry.in_progress_tasks():
-        is_current = bool(current_task_id) and task.id == current_task_id
-        if is_current and current_round_is_live:
+        is_current = task.id in claimed
+        if task.id in live:
             continue
         try:
             execution = execution_store.load(task.id)
@@ -837,15 +859,104 @@ def stranded_fault_rounds(
     return tuple(stranded)
 
 
+def _session_task_id(state) -> str:
+    """The task a session CLAIMS to be executing, or `""`.
+
+    `state.task_execution` is a plain dict by construction and a hand-edited
+    state file can make it anything, so every shape but a string in a dict
+    answers `""` — the same suspicion `_dispatch_stamp` reads `current_task`
+    under, and the same field `current_round_age_seconds` matches the stamp
+    against. Claiming nothing REPORTS the task rather than hiding it, which is
+    the direction this module takes whenever a claim's shape cannot be read.
+
+    Deliberately NOT `orchestrator.session_task_id`, which answers the fleet
+    supervisor's question rather than this one: it returns `None` when a
+    session's two records DISAGREE, and this exemption is defined on
+    `task_execution` alone — the agreement between the two is separately what
+    `current_round_age_seconds` judges, and it is the difference between "the
+    loop still claims this task" (`stale_current`, reported) and "no lane has
+    ever heard of it". Borrowing that helper would make a lane mid-handoff read
+    differently from lane 0 in exactly the state both are most confusing in.
+    """
+    execution = getattr(state, "task_execution", None)
+    if not isinstance(execution, dict):
+        return ""
+    task_id = execution.get("task_id")
+    return task_id if isinstance(task_id, str) else ""
+
+
+def _lane_claims(config, lanes: int) -> tuple[tuple[tuple[str, float | None], ...], str]:
+    """What every lane ABOVE ZERO says it is working, as `(task_id, age)` pairs
+    — or `(), note` when a lane could not be read (conc-09).
+
+    Lane 0 is deliberately absent: `_strand_survey` already reads it through
+    `config.state_file`, which IS lane 0's state file (`state.lane_paths`), and
+    a second read of the same file is a second chance to disagree with itself.
+
+    **The `lanes <= 1` gate is the first statement, before any read**, exactly as
+    `fleet_health` makes it and for its reason: `_retired_lane_indices` will
+    happily hand back lanes 1..N left behind by a cap the operator lowered TO
+    one, and a single-lane loop must answer today's strand survey byte for byte.
+
+    RETIRED lanes are walked too, for `dead_lane_survey`'s reason: lowering the
+    cap does not end the session in a lane it stops walking, so a round running
+    there is one nothing else would exempt.
+
+    **FAIL-CLOSED, and abandoning the survey is the whole point.** A lane whose
+    state cannot be read is a lane whose claim cannot be known, and continuing
+    without it would report the task that lane is running as stranded — the
+    false alarm this module is written against, and the reason lane 0's own
+    unreadable-state arm returns a note rather than an empty claim. An unlistable
+    `lanes/` is the same answer for the same reason.
+
+    The age is `current_round_age_seconds` of the SAME state object the id came
+    from, so a lane's stamp and the id it is matched to cannot come from two
+    different reads of one file.
+    """
+    if lanes <= 1:
+        return (), ""
+    # Imported HERE rather than at module level because `orchestrator` imports
+    # this module at module level — `dead_lane_survey`'s device, for its reason.
+    from .orchestrator import _retired_lane_indices
+
+    state_dir = Path(config.state_dir)
+    retired = _retired_lane_indices(state_dir, lanes)
+    if retired is None:
+        return (), (
+            f"{LANES_DIRNAME}/ could not be listed, so what a lane above the cap "
+            "is running cannot be established"
+        )
+    claims: list[tuple[str, float | None]] = []
+    for index in (*range(1, lanes), *retired):
+        paths = lane_paths(state_dir, index)
+        try:
+            state = StateStore(paths.state_file).load()
+        except (StateError, OSError, ValueError, TypeError) as exc:
+            return (), f"lane {paths.lane_id}'s state could not be read ({exc})"
+        if state is None:
+            continue  # no session in that lane: nothing claimed, nothing to say
+        claims.append((_session_task_id(state), current_round_age_seconds(state)))
+    return tuple(claims), ""
+
+
 def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
     """`(strands, note)` for the loop `config` describes, read from disk.
 
     `note` non-empty means the survey COULD NOT RUN — an unreadable task file,
-    an unreadable state file — and the caller escalates on it rather than
-    reading a failed check as a clean one. A file that is simply ABSENT is not
-    a failure: no task file means no tasks, which is the honest answer for a
-    state directory the loop has never written to (and is what keeps this
-    silent for every caller that has no roadmap at all).
+    an unreadable state file, a LANE whose state could not be read — and the
+    caller escalates on it rather than reading a failed check as a clean one. A
+    file that is simply ABSENT is not a failure: no task file means no tasks,
+    which is the honest answer for a state directory the loop has never written
+    to (and is what keeps this silent for every caller that has no roadmap at
+    all), and a lane with no session claims nothing.
+
+    **THE STATE FILE IT READS IS LANE 0'S** (`state.lane_paths`), which is the
+    whole loop at one lane and one lane of N above that. So every OTHER lane's
+    claim is gathered too (`_lane_claims`, conc-09) and handed to the predicate
+    as `lane_claims`: without it a task lane 1 dispatched moments ago satisfies
+    all four of `stranded_fault_rounds`' conditions — `in_progress`, not lane
+    0's current task, an OPEN attempt, no published sha — and is reported as
+    stranded while an agent is working on it.
 
     Never raises. It is called from `check`, which is advisory, read-only and
     routinely run against a half-initialised state directory.
@@ -871,9 +982,28 @@ def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
         # reporting a healthy round as a strand is the false alarm this module
         # is written against, and reporting nothing would be the fail-open.
         return (), f"the loop state could not be read ({exc})"
-    current = ((state.task_execution if state is not None else None) or {}).get(
-        "task_id"
-    ) or ""
+    # LANE 0's claim, read by the same helper every other lane's is read by. It
+    # used to be spelled inline here, which was a second reading of one field in
+    # one function and raised `AttributeError` — through a function that
+    # promises never to raise — on a hand-edited `task_execution` that is not a
+    # dict. Every shape the loop itself writes gives the identical answer.
+    current = _session_task_id(state) if state is not None else ""
+    # EVERY OTHER LANE'S CLAIM, above one lane (conc-09). `config.state_file` is
+    # lane 0's, so without this a task lane 1 is actively running is a task no
+    # claim exempts — reported stranded while an agent works on it, which is the
+    # false alarm this whole module exists to avoid. `()` at one lane, before
+    # any read.
+    try:
+        claims, lane_note = _lane_claims(config, _fleet_lanes(config))
+    except Exception as exc:      # noqa: BLE001 - a monitor must not die here
+        # `_lane_claims` raises nothing this file does not already catch, but it
+        # reaches `orchestrator` through an import and this function's contract
+        # is "never raises" rather than "raises nothing I thought of".
+        return (), f"the fleet's lanes could not be read ({type(exc).__name__}: {exc})"
+    if lane_note:
+        # A lane nobody could read is not a lane with nothing in it: escalate on
+        # the note, exactly as the unreadable-state arm above does.
+        return (), lane_note
     try:
         strands = stranded_fault_rounds(
             registry,
@@ -885,6 +1015,7 @@ def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
             # different reads of the file.
             current_round_age_seconds(state),
             round_ceiling_for(config),
+            lane_claims=claims,
         )
     except (  # pragma: no cover - defensive
         StateError,
