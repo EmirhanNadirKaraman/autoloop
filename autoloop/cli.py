@@ -77,6 +77,7 @@ import re
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,7 +87,7 @@ from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
 from .blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from .changeset_review import build_changeset_binding, build_changeset_packet
-from .config import AutoloopConfig, load_config as _read_config_file
+from .config import AutoloopConfig, lane_id, load_config as _read_config_file
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
 from . import health, heartbeat
@@ -166,6 +167,7 @@ from .orchestrator import (
     Orchestrator,
     fleet_occupants,
     fleet_stop,
+    recover_dead_lanes,
     release_task_to_pending,
 )
 from .policy import PolicyConfig, PolicyEngine
@@ -647,7 +649,24 @@ def _round_boundary_may_upgrade(config: AutoloopConfig, args) -> bool:
     return not getattr(args, "continuous", False)
 
 
-def _build_orchestrator(config, args, store, state, task_store, registry) -> Orchestrator:
+#: Held across `_build_orchestrator` by the lanes of a fleet (conc-10).
+#:
+#: Constructing a round is per lane; the SETUP it runs is not. Every lane
+#: provisions the ONE publisher bare repository under the state directory, and
+#: `provision_publisher_repo` re-asserts `remote.<remote>.url` with `git config`
+#: — which takes git's own `config.lock` and FAILS rather than waiting when a
+#: sibling holds it. Two lanes building a round in the same instant would then
+#: lose one of them to a `GitCommandError` from a step that has nothing to do
+#: with either round. Serialising the CONSTRUCTION costs nothing (it is git
+#: config plus a few small reads) and serialises no round: the lock is released
+#: before `run()` is called. Uncontended at `lanes = 1`, where one thread ever
+#: takes it.
+_ORCHESTRATOR_SETUP_LOCK = threading.Lock()
+
+
+def _build_orchestrator(
+    config, args, store, state, task_store, registry, lane_index: int = 0
+) -> Orchestrator:
     """Construct the full produce-then-review collaborator set. After this,
     `run` (continuous or not) has exactly ONE dispatch path for
     audit/implement/revise — see docs/SECURITY.md S21."""
@@ -754,6 +773,14 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         # its default location is derived from the mandatory `workers_root` —
         # so production is never on the pre-esc-02 shared-tree path.
         observed_checkout=observed_checkout,
+        # WHICH LANE this round belongs to (conc-10). Zero for every caller that
+        # does not say otherwise, which is every caller a single-lane deployment
+        # has: at `lanes = 1` this is the value the constructor already defaults
+        # to, `for_lane(0, 1)` resolves to exactly `[paths].observed_checkout`,
+        # and nothing about the round moves. Above one lane it is what points the
+        # round at its OWN clone and its own sibling set — the isolation boundary
+        # conc-04 built and nothing until now had a second lane to hand it.
+        lane_index=lane_index,
     )
 
 
@@ -1583,6 +1610,124 @@ def _remaining_steps(max_steps: int | None, spent: int) -> int | None:
     return max(0, max_steps - spent)
 
 
+#: The lane that OWNS the self-upgrade boundary in a fleet (conc-10).
+#:
+#: Lane 0, and the reason is that it is the only index that cannot be retired:
+#: a cap is at least 1, so index 0 is inside every fleet this build will run,
+#: while "the first idle lane" or "whichever lane noticed" names a lane an
+#: operator's lowered `[concurrency] lanes` may have cut out mid-round. It is
+#: also the index a single-lane deployment already is, which is what makes
+#: `_lane_owns_upgrade` answer True for today's loop without a branch on the
+#: fleet size.
+#:
+#: DELIBERATELY NOT AN ELECTION AND NOT A FILE. Ownership is decided from the
+#: in-memory lane index and nothing else, so it has no unreadable state and
+#: therefore no fail-open: a file-backed owner election that defaulted to
+#: "owner" would put back exactly the defect this constant exists to close (a
+#: non-owner consuming the pending upgrade), and one that defaulted to "not the
+#: owner" would lose the upgrade in silence, which is the failure
+#: docs/AUTOLOOP.md says concurrency must not reintroduce.
+UPGRADE_OWNER_LANE = 0
+
+
+def _lane_owns_upgrade(lane: "_LaneEntry | None") -> bool:
+    """May THIS lane act on a pending self-upgrade at a boundary?
+
+    True for lane `UPGRADE_OWNER_LANE` and for a caller holding no lane at all
+    — `_run_continuous(args, config)` and `(args, config, lock)` are both
+    supported call shapes, and a caller that names no lane is the single-lane
+    loop, which has always taken its own boundary.
+
+    THE DEFECT THIS CLOSES, stated as the thing that used to happen: every lane
+    of a fleet evaluates `FleetPlan.upgrade_boundary` on the tick the fleet
+    reads idle, so without this any lane could reach the boundary, fail to hand
+    off, and DECLINE the sha into the run's `answered_upgrades` — after which
+    `_drainable_upgrade_sha` answers `""`, the drain stops, and the designated
+    owner never sees the upgrade again for the rest of the run. The merged code
+    then sits on disk with nothing left in the process able to act on it.
+
+    A lane this answers False for takes NO part in the boundary: it neither
+    calls `_reach_upgrade_boundary` nor touches `answered_upgrades`. It is not
+    left to fall through to a session either — `upgrade_boundary` is
+    `draining and fleet_idle`, so `plan.draining` is True on exactly that tick
+    and the hold branch below the boundary is what such a lane lands on.
+    """
+    return lane is None or lane.lane_index == UPGRADE_OWNER_LANE
+
+
+class _FleetRun:
+    """What the N lane threads of ONE process share (conc-10 — "turn it on").
+
+    A fleet is one process holding one `LoopLock`, N `_LaneEntry` leases and N
+    `_run_continuous` loops, one per thread. That arrangement is the plan's
+    ("the FLEET SUPERVISOR holds it, and at `lanes = 1` the supervisor IS the
+    loop"), and it is what makes the lock, the merge token and the recovery of
+    a dead lane sound: every one of them is a check-then-act that is only safe
+    from the holder of the fleet lock.
+
+    Three things are shared and nothing else is:
+
+    * **`answered_upgrades`**, the run's bound against re-offering a self-upgrade
+      it has already answered. ONE set for the fleet, because there is one
+      pending-upgrade record and one process to replace; N private sets would
+      let lane 1 drain for a sha lane 0 already refused. Only the fleet runner
+      ever writes it, and only while every lane thread is joined, so no lane
+      ever reads it while it moves.
+    * **the handoff request**, an `Event` the upgrade-owning lane sets when the
+      drain arrives. Every lane returns at the top of its next iteration — the
+      "next safe phase" this file already commits to for a fleet-fatal stop —
+      which unwinds its `_LaneEntry` and RELEASES ITS LEASE. That is the whole
+      reason the boundary is not taken inside a lane thread: `os.execv` keeps
+      the pid, so a sibling lease still on disk would name the successor's own
+      pid, read as live, and the successor would fail closed on its own lane.
+      The thread lifecycle is the barrier.
+    * **which lanes stopped for that handoff**, so a refused replacement
+      restarts exactly those and leaves a lane that parked for its own reason
+      parked.
+
+    Nothing here is reached at `lanes = 1`: `_cmd_run` runs the single lane in
+    the calling thread exactly as it does today and never builds one of these.
+    """
+
+    def __init__(self, lanes: int):
+        self.lanes = int(lanes)
+        self.answered_upgrades: set[str] = set()
+        self._guard = threading.Lock()
+        self._handoff = threading.Event()
+        self._stopped_for_handoff: set[int] = set()
+
+    @property
+    def handoff_wanted(self) -> bool:
+        """Has the owning lane asked the fleet to stop for a self-upgrade?"""
+        return self._handoff.is_set()
+
+    def stopped_for_handoff(self) -> tuple[int, ...]:
+        """The lanes that returned because of the request, in index order."""
+        with self._guard:
+            return tuple(sorted(self._stopped_for_handoff))
+
+    def request_handoff(self, lane_index: int) -> None:
+        """The owner's ask: stop every lane, then replace the process."""
+        with self._guard:
+            self._stopped_for_handoff.add(lane_index)
+        self._handoff.set()
+
+    def note_handoff_stop(self, lane_index: int) -> None:
+        """A lane recording that it returned FOR the request rather than for a
+        reason of its own — which is what makes the difference between a lane
+        the runner restarts after a refused replacement and one it does not."""
+        with self._guard:
+            self._stopped_for_handoff.add(lane_index)
+
+    def reset_handoff(self) -> None:
+        """Clear the request after the boundary has been reached (and, if it
+        returned, before the lanes are restarted — a lane that started while the
+        event was still set would return again on its first iteration)."""
+        self._handoff.clear()
+        with self._guard:
+            self._stopped_for_handoff.clear()
+
+
 class _LaneEntry:
     """Exclusive occupancy of ONE lane for as long as this process works in it
     — `lock.LaneLease` plus the rule about WHEN one is taken (conc-05).
@@ -1607,15 +1752,56 @@ class _LaneEntry:
     nothing on disk right now.
     """
 
-    def __init__(self, config: AutoloopConfig, lane_index: int = 0):
+    def __init__(
+        self,
+        config: AutoloopConfig,
+        lane_index: int = 0,
+        fleet: "_FleetRun | None" = None,
+    ):
         self.config = config
         self.lane_index = lane_index
         self.lease: LaneLease | None = None
+        #: The other lanes of this process, or `None` for a lane that is the
+        #: whole loop. `None` is what `_cmd_run` builds at `lanes = 1` and what
+        #: every test that constructs one by hand gets, and it is the reason the
+        #: fleet handoff below cannot fire in a deployment that has no fleet.
+        self.fleet = fleet
+        #: The shas this RUN has already answered at a self-upgrade boundary.
+        #: One set per run: private to this lane when there is no fleet (today's
+        #: loop, where the lane IS the run) and the FLEET's own when there is,
+        #: because one process replaces itself once for one pending record.
+        self.answered_upgrades: set[str] = (
+            set() if fleet is None else fleet.answered_upgrades
+        )
 
     @property
     def enabled(self) -> bool:
         """Whether this deployment has lanes at all — `[concurrency] lanes > 1`."""
         return self.config.concurrency.lanes > 1
+
+    @property
+    def owns_upgrade(self) -> bool:
+        """Does the self-upgrade boundary belong to this lane
+        (`_lane_owns_upgrade`, which is where the reason is written)?"""
+        return self.lane_index == UPGRADE_OWNER_LANE
+
+    @property
+    def handoff_wanted(self) -> bool:
+        """Has the owning lane asked this fleet to stop for a self-upgrade?
+        Always False without a fleet, so the single-lane loop never reads it as
+        anything but "carry on"."""
+        return self.fleet is not None and self.fleet.handoff_wanted
+
+    def request_fleet_handoff(self) -> None:
+        """Ask every lane of this fleet to stop so the runner can replace the
+        process with no lane lease left on disk. Only the owner calls it."""
+        if self.fleet is not None:
+            self.fleet.request_handoff(self.lane_index)
+
+    def note_handoff_stop(self) -> None:
+        """Record that this lane returned because of that ask."""
+        if self.fleet is not None:
+            self.fleet.note_handoff_stop(self.lane_index)
 
     def __enter__(self) -> "_LaneEntry":
         if self.enabled:
@@ -1704,9 +1890,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # returning silently. Lane 0, because until the fleet supervisor
             # lands (candidate 5) one process is one lane; at `lanes = 1` this
             # takes nothing at all.
+            #
+            # AND AT `lanes > 1` IT IS LANE 0 OF A FLEET (conc-10): the same
+            # entry, taken here for the same reason and by the same object, with
+            # `_run_fleet` opening the OTHER lanes beside it. Lane 0 stays the
+            # one this `with` holds so the boundary can release and re-enter it
+            # through the machinery that already exists.
+            #
+            # FIRST, THE LEASES A DEAD PROCESS LEFT BEHIND. A lease has no
+            # adoption of its own, so a fleet killed mid-round leaves every lane
+            # it was in unenterable — INCLUDING lane 0, whose lease is taken one
+            # line down, which would make the next `run` fail before it started.
+            # This is the one place the plan says a recovery is safe from: the
+            # holder of the fleet lock, with no lane open yet. Only above one
+            # lane, where a lease exists at all, and it never raises.
+            if config.concurrency.lanes > 1:
+                recover_dead_lanes(config)
             with _LaneEntry(config) as lane:
                 if getattr(args, "continuous", False):
                     _validate_continuous_args(args)
+                    if config.concurrency.lanes > 1:
+                        return _run_fleet(args, config, lock, lane)
                     # The lock travels with it: `_run_continuous` is where the
                     # process may replace itself, and the handoff has to be armed
                     # on the lock this `with` block actually holds. The lane
@@ -1933,6 +2137,52 @@ def _reach_upgrade_boundary(
             answered_upgrades.add(sha)
 
 
+def _decline_boundary_not_ours(
+    config: AutoloopConfig,
+    orchestrator,
+    lane: "_LaneEntry | None",
+    lane_declined: set[str],
+) -> None:
+    """Refuse a self-upgrade boundary that belongs to another lane, out loud
+    (conc-10).
+
+    THE HALF THAT IS NOT THE REFUSAL. Declining is easy; the trap is WHERE the
+    refusal is recorded. `answered_upgrades` is the FLEET's answer to "has this
+    run dealt with that sha", and `_drainable_upgrade_sha` reads it to decide
+    whether the fleet still has something to drain for — so a non-owner writing
+    into it would tell the supervisor the upgrade had been handled and the
+    designated owner would never be offered it again. The bound therefore goes
+    into this lane's own set, which nothing outside this lane reads.
+
+    Bounded for the same reason `answered_upgrades` is bounded: nothing settles
+    the record, so `_self_upgrade_due` offers it at the very next round, and a
+    refusal with no bound behind it is a `continue` at full speed. The sha is
+    read through `upgrade_bound_sha`, which answers `""` for anything that is
+    not a usable key, and `MISSING_UPGRADE_RECORD` stands in for that — the same
+    substitution `_defer_self_upgrade` makes, and for its reason: a boundary
+    keyed on nothing still has to be carried on from exactly once.
+    """
+    record = UpgradeStore(config.pending_upgrade_file).load()
+    sha = upgrade_bound_sha(record) or MISSING_UPGRADE_RECORD
+    lane_declined.add(sha)
+    orchestrator.decline_self_upgrade(sha)
+    TranscriptLogger(config.transcript_file).append(
+        "self_upgrade_not_this_lane",
+        data={
+            "base_sha": sha,
+            "lane_index": lane.lane_index if lane is not None else 0,
+            "lane_id": lane_id(lane.lane_index if lane is not None else 0),
+            "owner_lane_id": lane_id(UPGRADE_OWNER_LANE),
+            "detail": (
+                "the fleet's self-upgrade boundary belongs to "
+                f"{lane_id(UPGRADE_OWNER_LANE)}, so this lane declined the "
+                "record for itself and left it pending and unanswered for the "
+                "owner — nothing was replaced and nothing was settled"
+            ),
+        },
+    )
+
+
 def _drainable_upgrade_sha(config: AutoloopConfig, answered: set[str]) -> str:
     """The `base_sha` of a pending self-upgrade this run could still act on, or
     `""` — the supervisor's `upgrade_pending` input (conc-06).
@@ -2104,6 +2354,184 @@ def _log_fleet_stop(config: AutoloopConfig, stop: FleetStop) -> None:
     )
 
 
+def _log_lane_failed(config: AutoloopConfig, lane_index: int, exc: BaseException) -> None:
+    """Record a lane thread that ended by raising (conc-10).
+
+    `_log_fleet_hold`'s and `_log_fleet_stop`'s sibling, and it exists for the
+    thing threads do that a single-lane loop never had to answer for: an
+    exception out of `_run_continuous` used to reach the operator as a traceback
+    on the terminal, and out of a THREAD it reaches nobody at all — the fleet
+    would simply run one lane short with nothing said. The entry is the durable
+    half; the print is what a person watching the run sees.
+    """
+    TranscriptLogger(config.transcript_file).append(
+        "fleet_lane_failed",
+        data={
+            "lane_index": lane_index,
+            "lane_id": lane_id(lane_index),
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+            "detail": (
+                "the lane's own loop ended by raising; the other lanes are "
+                "unaffected and this one is not restarted in this process"
+            ),
+        },
+    )
+    print(f"\nlane {lane_index} stopped: {type(exc).__name__}: {exc}\n")
+
+
+def _run_fleet(
+    args: argparse.Namespace,
+    config: AutoloopConfig,
+    lock: LoopLock,
+    lane_zero: "_LaneEntry",
+) -> int:
+    """Run `[concurrency] lanes` lanes of this loop at once — the candidate that
+    TURNS CONCURRENCY ON (conc-10, docs/AUTOLOOP.md "Running several tasks at
+    once — the split plan").
+
+    One process, one `LoopLock`, N `_LaneEntry` leases, N `_run_continuous`
+    loops in N threads. Every mechanism the eight candidates before this one
+    built is per LANE already and needed only a second lane to be handed:
+    `state.lane_paths` gives each its own state file (lane 0's is literally
+    `state.json`), `ObservedCheckout.for_lane` gives each its own clone and
+    therefore its own escape-detection boundary, `FleetSupervisor.plan` decides
+    which lane may open a session, `merge_sweep.MergeToken` serialises the
+    merges, and `blockers.fatal_scope` decides whether a park stops one lane or
+    all of them.
+
+    **ONE PROCESS, not N.** The fleet lock is single-holder per state directory
+    and every check-then-act in this system is written against exactly that —
+    `LaneLease.break_stale`, `MergeToken`'s recovery and
+    `recover_dead_lanes` all say so in their own docstrings. Separate lane
+    processes would inherit that obligation and have nothing to discharge it
+    with, so the supervisor holds the lock and the lanes are threads under it.
+
+    **NEVER AT `lanes = 1`.** `_cmd_run` calls this only above one lane, so the
+    single-lane loop runs its one lane in the calling thread exactly as it does
+    today: no thread is started, no `_FleetRun` is built, and nothing in this
+    function is reached. That is the acceptance criterion made structural rather
+    than asserted.
+
+    **THE SELF-UPGRADE BOUNDARY IS TAKEN HERE, not in a lane.** `os.execv` keeps
+    the pid, and a lane lease has no adoption of its own, so a sibling lease
+    still on disk at the replacement would name the successor's own pid, read as
+    LIVE, and the successor would fail closed on its own lane. So the owning lane
+    (`_lane_owns_upgrade` — lane 0) does not exec: it asks the fleet to stop,
+    every lane returns at the top of its next iteration, and each unwinds its own
+    `_LaneEntry` and releases its own lease. Only then, with lane 0's entry the
+    only one left and `_self_upgrade_at_boundary` releasing that one itself, is
+    the boundary reached. A replacement that does not happen (preflight refused,
+    the lock unarmable, `os.execv` raising) leaves the sha in the fleet's
+    `answered_upgrades`, and the lanes that stopped for it are restarted — which
+    is why a refused handoff costs a fleet restart and not a fleet.
+
+    **A LANE THAT ENDS IS NOT RESTARTED**, and that is deliberate: a lane that
+    parked, stopped for a fleet-fatal fault or raised has left a record a person
+    reads, and restarting it would spin on it. The exit code is the worst any
+    lane returned, so a fleet with one parked lane exits 2 exactly as one loop
+    does.
+    """
+    fleet = _FleetRun(config.concurrency.lanes)
+    # Lane 0's entry belongs to `_cmd_run` (its lease is held by the `with`
+    # there), so it is JOINED to the fleet rather than rebuilt: the boundary
+    # above has to release and re-enter that very object.
+    lane_zero.fleet = fleet
+    lane_zero.answered_upgrades = fleet.answered_upgrades
+    codes: dict[int, int] = {}
+    running: tuple[int, ...] = tuple(range(fleet.lanes))
+    while running:
+        _open_lanes(args, config, lock, lane_zero, fleet, running, codes)
+        stopped = fleet.stopped_for_handoff()
+        if not stopped:
+            break
+        # Cleared BEFORE the boundary, so a lane restarted below does not read a
+        # request that has already been answered and return on its first
+        # iteration — which would be a fleet that never runs again.
+        fleet.reset_handoff()
+        # Normally does not return: the process is replaced, with the pid and the
+        # lock intact, and comes back at the top of `_cmd_run` running the merged
+        # code. When it does return, the sha it acted on is bound into the
+        # fleet's `answered_upgrades` (`_reach_upgrade_boundary`), so the drain
+        # that produced this stop cannot immediately produce another one.
+        _reach_upgrade_boundary(config, lock, args, lane_zero, fleet.answered_upgrades)
+        running = stopped
+    return max(codes.values(), default=0)
+
+
+def _open_lanes(
+    args: argparse.Namespace,
+    config: AutoloopConfig,
+    lock: LoopLock,
+    lane_zero: "_LaneEntry",
+    fleet: "_FleetRun",
+    running: tuple[int, ...],
+    codes: dict[int, int],
+) -> None:
+    """Run one pass of the fleet: a thread per lane in `running`, joined.
+
+    DAEMON threads, because the fleet lock's SIGTERM handler raises `SystemExit`
+    in the MAIN thread and a `join()` on a lane mid-agent-call would hold the
+    process open for as long as that call takes — today's loop dies on that
+    signal at once and a fleet must not be slower to stop than the loop it
+    replaces. What a killed fleet leaves behind is the lane leases of the lanes
+    that did not unwind, which is exactly the "lane that died mid-round" case
+    `recover_dead_lanes` exists for and which `_run_fleet` asks about before it
+    opens anything.
+    """
+    threads = [
+        threading.Thread(
+            target=_lane_thread,
+            args=(args, config, lock, lane_zero, fleet, index, codes),
+            name=f"autoloop-lane-{index}",
+            daemon=True,
+        )
+        for index in running
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def _lane_thread(
+    args: argparse.Namespace,
+    config: AutoloopConfig,
+    lock: LoopLock,
+    lane_zero: "_LaneEntry",
+    fleet: "_FleetRun",
+    index: int,
+    codes: dict[int, int],
+) -> None:
+    """One lane's whole life: enter the lane, run its loop, record how it ended.
+
+    Lane 0 reuses the entry `_cmd_run` already holds; every other lane takes its
+    own for the duration of this pass and releases it by unwinding, which is what
+    makes the fleet handoff safe.
+
+    `Exception` and not `BaseException`: a lane that ends by raising must leave a
+    record and must not take the other lanes with it, but `SystemExit` and
+    `KeyboardInterrupt` are the process stopping and are not this function's to
+    swallow. A lane that could not be ENTERED at all (a lease this process must
+    refuse) fails here like any other — the fleet runs one lane short, and says
+    so, rather than refusing to start at all.
+
+    A lane that returned because the fleet asked it to (`stopped_for_handoff`)
+    records NO exit code: it did not finish, it stepped out of the way, and
+    `_run_fleet` restarts it if the replacement does not happen.
+    """
+    try:
+        if index == UPGRADE_OWNER_LANE:
+            code = _run_continuous(args, config, lock, lane_zero)
+        else:
+            with _LaneEntry(config, index, fleet) as lane:
+                code = _run_continuous(args, config, lock, lane)
+    except Exception as exc:  # noqa: BLE001 - one lane must not end the fleet
+        _log_lane_failed(config, index, exc)
+        code = 2
+    if index not in fleet.stopped_for_handoff():
+        codes[index] = code
+
+
 def _run_continuous(
     args: argparse.Namespace,
     config: AutoloopConfig,
@@ -2177,6 +2605,21 @@ def _run_continuous(
     SURVIVES the replacement and the lane lease must not, so the boundary
     releases it in the instant before the exec (`_LaneEntry`).
 
+    **AND IN A FLEET THE BOUNDARY IS NOT THIS LANE'S TO TAKE** (conc-10). Both
+    doors to it — the `SELF_UPGRADE` outcome and the drain's
+    `FleetPlan.upgrade_boundary` — are gated on `_lane_owns_upgrade`, so a
+    NON-OWNER lane neither reaches the boundary nor writes to
+    `answered_upgrades`. Without that gate every lane evaluates the drain on the
+    tick the fleet reads idle, and whichever one got there first could fail to
+    hand off and DECLINE the sha for the whole run — after which
+    `_drainable_upgrade_sha` answers `""`, the drain stops, and the designated
+    owner never sees the upgrade again. The owner itself does not exec inside a
+    lane thread either: it asks the fleet to stop (`_FleetRun`) so that no
+    sibling lease is on disk when the pid is reused, and `_run_fleet` takes the
+    boundary once every lane has unwound. At `lanes = 1` — and for any caller
+    holding no lane — the owner is the only lane there is, and both doors behave
+    exactly as they do today.
+
     **EXHAUSTION.** Once a clean boundary finds no READY task AND the
     repository fingerprint is unchanged, that used to always mean "sleep and
     poll again" — and still does, UNLESS there is at least one OPEN blocker
@@ -2209,7 +2652,24 @@ def _run_continuous(
     #: read on its way in — two reads of a mutable file, which can disagree.
     #: See the `SELF_UPGRADE` branch below for why both are needed and why
     #: declining the extra one is the safe direction.
-    answered_upgrades: set[str] = set()
+    #:
+    #: TAKEN FROM THE LANE when there is one, which is every production call:
+    #: at one lane that object is this run's own and the set is exactly the
+    #: per-run one this line has always created, and in a fleet it is the
+    #: FLEET's, because one process replaces itself once for one pending record
+    #: (`_FleetRun`). Only the upgrade-owning lane ever adds to it.
+    answered_upgrades: set[str] = set() if lane is None else lane.answered_upgrades
+    #: The shas THIS LANE refused to act on because the boundary is not its own
+    #: (conc-10). Kept apart from `answered_upgrades` on purpose: a non-owner
+    #: must not tell the fleet an upgrade has been answered, but it still has to
+    #: stop its OWN orchestrator re-offering the same record at every round, and
+    #: each iteration builds a new instance. Empty at one lane and for every
+    #: caller holding no lane, where the owner is the only lane there is.
+    lane_declined: set[str] = set()
+    #: This lane's index, and the only value the single-lane loop ever sees is
+    #: 0 — which is `state.lane_paths`' "literally `state.json`" and
+    #: `ObservedCheckout.for_lane(0, 1)`'s "exactly `[paths].observed_checkout`".
+    lane_index = 0 if lane is None else lane.lane_index
     while True:
         if pause_requested(config):
             print("paused")
@@ -2253,6 +2713,18 @@ def _run_continuous(
                 "restart this lane."
             )
             return 2
+        # THE FLEET IS STOPPING SO THE PROCESS CAN BE REPLACED (conc-10). Here
+        # for `_fleet_stop_reached`'s own reason — this is the next safe phase,
+        # and a round in flight has already returned or continued by the time
+        # control is back at the top — and AFTER it, so a lane with a fault to
+        # report still reports it rather than leaving quietly. Returning is what
+        # releases this lane's lease, and no lease left on disk is the whole
+        # precondition of the handoff (`_run_fleet`). Never set at `lanes = 1`
+        # and never for a caller holding no lane, where `handoff_wanted` is
+        # False without reading anything.
+        if lane is not None and lane.handoff_wanted:
+            lane.note_handoff_stop()
+            return 0
         # One completed iteration is what retires a self-upgrade's one-shot
         # marker (`_confirm_self_upgrade`). Checked at the TOP of the second
         # iteration rather than at the bottom of the first: every branch below
@@ -2262,7 +2734,7 @@ def _run_continuous(
             upgrade_checked = True
             _confirm_self_upgrade(config)
         iterations += 1
-        store, state = _load_state(config)
+        store, state = _load_state(config, lane_index)
         task_store, registry = _load_tasks(config)
         # At the TOP of the iteration, not down at the exhaustion check: the
         # readers that see an orphaned QUARANTINE are out of process
@@ -2289,11 +2761,31 @@ def _run_continuous(
         _print_auto_unblocked(_reconcile_unblocked_tasks(config, task_store, registry))
 
         if state is not None and Phase(state.phase) not in TERMINAL_PHASES:
-            orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
+            # Under the setup lock, and only the CONSTRUCTION is: see
+            # `_ORCHESTRATOR_SETUP_LOCK`, which says which shared file two lanes
+            # building a round in the same instant collide on. Released before
+            # `run()` below, so nothing about the round is serialised.
+            with _ORCHESTRATOR_SETUP_LOCK:
+                orchestrator = _build_orchestrator(
+                    config,
+                    args,
+                    store,
+                    state,
+                    task_store,
+                    registry,
+                    # Passed only when there IS a lane above zero, so a caller
+                    # that substitutes its own six-argument builder — several
+                    # tests do — makes the identical call it always did. Same
+                    # device as `_reach_upgrade_boundary`'s `lane_arg`.
+                    **({} if lane_index == 0 else {"lane_index": lane_index}),
+                )
             # Carried across the rebuild: this orchestrator is a new object each
             # iteration, so the shas this RUN has already answered have to be
-            # re-declined on it. See `answered_upgrades`.
-            for answered in answered_upgrades:
+            # re-declined on it. See `answered_upgrades`. `lane_declined` rides
+            # with them because a non-owner's refusal has to survive the rebuild
+            # too — it is the bound that keeps a boundary this lane may not take
+            # from being offered again at the speed of a `continue`.
+            for answered in (*answered_upgrades, *lane_declined):
                 orchestrator.decline_self_upgrade(answered)
             outcome = orchestrator.run()
             if outcome == "paused":
@@ -2381,6 +2873,20 @@ def _run_continuous(
                 # callers substitute their own function for. The swap
                 # regression in `test_self_upgrade.py` fails loudly if the
                 # identity ever stops arriving.
+                #
+                # AND ONLY THE LANE THAT OWNS THE BOUNDARY (conc-10). This door
+                # is unreachable in a fleet today — `_round_boundary_may_upgrade`
+                # switches the per-round boundary off for a continuous run above
+                # one lane, so `Orchestrator.run` does not offer it there — and
+                # it is gated all the same, because "unreachable" is a property
+                # of one other function and this is the branch that would
+                # otherwise let a non-owner answer for the fleet. A lane that may
+                # not act declines the sha into its OWN set and carries on: it
+                # tells the fleet nothing, and its own next round is not offered
+                # the same record again.
+                if not _lane_owns_upgrade(lane):
+                    _decline_boundary_not_ours(config, orchestrator, lane, lane_declined)
+                    continue
                 _reach_upgrade_boundary(config, lock, args, lane, answered_upgrades)
                 continue
             if outcome == Phase.NEEDS_USER.value:
@@ -2441,7 +2947,7 @@ def _run_continuous(
         # returned or continued above), so a plan taken at this point is a plan
         # taken with this lane free.
         plan = _fleet_plan(config, registry, answered_upgrades)
-        if plan is not None and plan.upgrade_boundary:
+        if plan is not None and plan.upgrade_boundary and _lane_owns_upgrade(lane):
             # The drain has arrived: an upgrade is pending and every lane is
             # empty. REACHED, not waited for — withholding admission alone
             # would leave the record `pending` while the loop slept beside it
@@ -2450,6 +2956,24 @@ def _run_continuous(
             # same boundary the `SELF_UPGRADE` branch above takes, by the same
             # call, with the same per-run bound: a boundary that cannot hand
             # off declines its sha and the fleet admits again on the next tick.
+            #
+            # AND ONLY THE OWNING LANE EVALUATES IT (conc-10). Every lane sees
+            # this tick — `upgrade_boundary` is a fact about the FLEET, not
+            # about a lane — so without `_lane_owns_upgrade` the first lane to
+            # arrive would answer for all of them, and a boundary it could not
+            # hand off from would decline the sha into `answered_upgrades` and
+            # take the upgrade away from the owner for the rest of the run. A
+            # lane this refuses is not left free either: `upgrade_boundary` is
+            # `draining and fleet_idle`, so `plan.draining` is True on exactly
+            # this tick and the hold immediately below is where it lands.
+            if lane is not None and lane.fleet is not None:
+                # In a FLEET the replacement belongs to the runner, not to a
+                # lane thread: `os.execv` keeps the pid, so every sibling lease
+                # has to be off disk first or the successor fails closed on its
+                # own lane. Asking stops every lane; returning releases this
+                # one's lease; `_run_fleet` takes the boundary once they have.
+                lane.request_fleet_handoff()
+                return 0
             _reach_upgrade_boundary(config, lock, args, lane, answered_upgrades)
             continue
         if plan is not None and (
