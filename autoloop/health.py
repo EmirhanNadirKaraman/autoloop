@@ -40,7 +40,10 @@ Signals, and why these rather than the obvious ones:
   working is exempt from it only while that claim is young enough to be true
   (`round_ceiling_for`): an exemption with no bound on it is a second way for
   a task to sit unscheduled and unreported forever, which is the failure
-  being reported, not a way to report it.
+  being reported, not a way to report it. Above one lane EVERY lane claims
+  (`_lane_claims`), each judged by that same bound — `state.json` is lane 0's
+  file, so a survey that asked only it would report a task lane 1 is running
+  as stranded, which is this signal's own false alarm one lane over.
 
 * **A merge backlog that cannot drain is a fault nothing was reading.** The
   sweep (`merge_sweep.py`) refuses to merge past a completed task it cannot
@@ -81,6 +84,18 @@ Signals, and why these rather than the obvious ones:
   check FAILS TOWARD QUIET on this one axis — a false "stuck" trains a
   human to ignore the monitor, while a missed detection is retried by the
   next check minutes later.
+
+* **N lanes, judged one at a time, and no phase for the fleet.** Above
+  `[concurrency] lanes = 1` there is no such thing as the system's phase:
+  `state.json` is lane 0's file, and reporting its phase as the loop's would be
+  worse than reporting nothing (docs/AUTOLOOP.md, "Decision 7 — observability:
+  N lanes, truthfully"). So `_judge` reads no lane's state at all above one
+  lane, `_lane_health` judges each lane on its own state and its own lease in
+  the vocabulary above, and the fleet's verdict is the most severe of them —
+  never lane 0's by position. `FleetHealth` carries the shape beside the rows,
+  because a fleet holding every lane and a fleet with nothing to do look
+  identical from outside and must not read identically. At one lane none of it
+  runs and every byte of this module's output is what it was.
 
 Verdicts are advisory. Nothing here writes, locks, or touches the loop's
 state — it is safe to run on any schedule, including while the loop is
@@ -337,6 +352,129 @@ class DeadLaneView:
 
 
 @dataclass(frozen=True)
+class LaneHealth:
+    """One lane, judged on its OWN state file and its OWN lease (conc-09,
+    docs/AUTOLOOP.md "Decision 7 — observability: N lanes, truthfully").
+
+    `code` is one of `VERDICT_CODES` and nothing else. The plan is explicit that
+    a fleet reports itself in the vocabulary an operator has already learned —
+    the `projects_status` precedent, which added exactly one word and put it in
+    this module rather than in a second vocabulary — so a lane says `parked`,
+    `idle` or `unknown` in the words `health` has always used.
+
+    `busy` is `orchestrator._lane_occupant`'s answer and deliberately not a
+    second reading of it: it is what the SCHEDULER counts against the cap, so
+    borrowing it is what makes `FleetHealth.at_cap` the same arithmetic the
+    supervisor admits on rather than a monitor's independent guess at it. It is
+    also NOT the same question as the code — a lane parked at `needs_user` is
+    terminal, so it is not busy and still needs a person, and a lane whose
+    process died is busy (it holds a slot until the next tick recovers it) while
+    nothing at all is running in it.
+    """
+
+    lane_index: int
+    lane_id: str
+    code: str
+    needs_attention: bool
+    summary: str
+    detail: str = ""
+    #: This lane's phase, which is the ONLY place a phase is reported for a
+    #: fleet — `Health.phase` is empty above one lane, deliberately.
+    phase: str = ""
+    task_id: str = ""
+    #: `state.current_task["started_at"]`, verbatim, or `""`. Carried so a
+    #: reader can say WHICH of N in-flight tasks started first without opening
+    #: every lane's state file again — `dashboard._fleet_task` is the one that
+    #: needs it, and re-deriving it there would be a second reading of the file
+    #: this row was already built from.
+    dispatched_at: str = ""
+    busy: bool = False
+    #: True for a lane a LOWERED cap cut out of the fleet that is still holding
+    #: a round (`orchestrator.retired_lane_occupants`). Reported because the cap
+    #: does not end the session in a lane it stops walking, and a fleet that
+    #: hid it would read as having a free slot it does not have.
+    retired: bool = False
+
+    def describe(self) -> str:
+        """One line for an operator's terminal and for the transcript."""
+        line = f"lane {self.lane_id} ({self.code})"
+        if self.retired:
+            line += ", outside the cap"
+        if self.task_id:
+            line += f" on {self.task_id}"
+        return f"{line}: {self.detail}" if self.detail else line
+
+
+@dataclass(frozen=True)
+class FleetHealth:
+    """Every lane of one loop, and what the fleet is doing with them (conc-09).
+
+    `None` at one lane — see `fleet_health` — so nothing about a single-lane
+    deployment is changed by any of this.
+
+    **`at_cap` and `idle` are FIELDS, not properties**, for `dashboard.
+    projects_json`'s reason: they are the one answer this record exists to give
+    (Decision 4: "a fleet sitting at its cap and a fleet with nothing to do look
+    identical from outside and must not read identically"), and the audience for
+    the JSON is a cron wrapper that must not have to re-derive it from the rows.
+    They are computed together, once, so `busy`, `at_cap` and `idle` cannot
+    disagree about the same fleet.
+    """
+
+    #: `[concurrency] lanes` — the fleet the config asks for.
+    cap: int
+    #: One row per lane inside the cap, in index order, then every RETIRED lane
+    #: still holding a round or needing a person.
+    lanes: tuple[LaneHealth, ...] = ()
+    #: How many of those rows hold a round. May EXCEED `cap` when the operator
+    #: lowered it under a running fleet.
+    busy: int = 0
+    at_cap: bool = False
+    idle: bool = True
+
+    @property
+    def worst(self) -> LaneHealth | None:
+        """The most severe lane that needs a person, or `None` when none does.
+
+        Severity is `VERDICT_CODES`' own escalating order — the one vocabulary,
+        ranked where it is defined — and NEVER the row's position, which is the
+        whole of the plan's "never lane 0's by position". Ties keep the lowest
+        lane index, so the answer is stable between two reads of one fleet.
+        """
+        attention = [lane for lane in self.lanes if lane.needs_attention]
+        return max(attention, key=lambda lane: _severity(lane.code), default=None)
+
+    def describe(self) -> str:
+        """The fleet's shape, then every lane that needs a person.
+
+        Every one of them, not a sample — `_describe_strands`' rule, for its
+        reason: the failure being reported is a lane nobody can see.
+        """
+        if self.idle:
+            shape = f"{self.cap} lane(s), none busy — the fleet is idle"
+        elif self.at_cap:
+            shape = f"{self.cap} lane(s), {self.busy} busy — the fleet is at its cap"
+        else:
+            shape = f"{self.cap} lane(s), {self.busy} busy"
+        parts = [shape]
+        parts.extend(lane.describe() for lane in self.lanes if lane.needs_attention)
+        return "; ".join(parts)
+
+
+def _severity(code: str) -> int:
+    """How far up `VERDICT_CODES` a verdict word sits.
+
+    A word this build does not know sorts ABOVE every word it does: an
+    unrecognised verdict is precisely the one nothing here can reason about, and
+    ranking it lowest would let it hide behind a healthy lane.
+    """
+    try:
+        return VERDICT_CODES.index(code)
+    except ValueError:
+        return len(VERDICT_CODES)
+
+
+@dataclass(frozen=True)
 class Health:
     code: str
     needs_attention: bool
@@ -380,9 +518,21 @@ class Health:
     #: `asdict` renders it as a nested object and `None` as `null`, so a reader
     #: gains a key and loses nothing.
     dead_lanes: "DeadLaneView | None" = None
+    #: Every lane, judged on its own state (conc-09), or `None` at one lane —
+    #: where the fleet record IS the lane record and there is nothing to
+    #: aggregate. Unlike every other optional field above this one is OMITTED
+    #: from `to_json` when it is `None`, and that is the acceptance criterion
+    #: rather than an inconsistency: at `lanes = 1` this candidate's own tests
+    #: pin `health`'s JSON against a snapshot of today's output, and a key that
+    #: is always `null` there would move exactly the bytes that must not move.
+    #: `asdict` still carries it, so a programmatic reader loses nothing.
+    fleet: "FleetHealth | None" = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        payload = asdict(self)
+        if self.fleet is None:
+            del payload["fleet"]
+        return json.dumps(payload, indent=2)
 
 
 @dataclass(frozen=True)
@@ -557,6 +707,8 @@ def stranded_fault_rounds(
     current_task_id: str = "",
     current_round_age: float | None = None,
     round_ceiling_seconds: float = DEFAULT_ROUND_CEILING_SECONDS,
+    *,
+    lane_claims: tuple[tuple[str, float | None], ...] = (),
 ) -> tuple[StrandedRound, ...]:
     """Every task the loop has left `in_progress` after a round the ENVIRONMENT
     destroyed, in registry order.
@@ -602,6 +754,19 @@ def stranded_fault_rounds(
        died between stamping `current_task` and writing `task_execution`, whose
        task is genuinely abandoned. A record swept this way is flagged
        `stale_current` so both arms can say which case they are reporting.
+
+       **`lane_claims` is that same claim, made by the OTHER lanes of a fleet**
+       (conc-09): one `(task_id, age)` pair per lane, gathered by
+       `_lane_claims`. Above `[concurrency] lanes = 1` the caller's scalar
+       `current_task_id` is only LANE 0's claim — `config.state_file` is lane
+       0's file (`state.lane_paths`) — so a task lane 1 is actively running
+       would otherwise satisfy every one of these four conditions and be
+       reported as stranded while an agent works on it. Each pair is judged by
+       exactly the rule above, per lane and against the same ceiling: an
+       unbounded "exempt whatever any lane names" would rebuild the very bug the
+       BOUND paragraph records, N times over. Empty by default, so a
+       single-lane deployment and `orchestrator._reconcile_stranded_tasks` are
+       byte-identical to what they were.
     3. Its execution record's LAST attempt reads as a round the environment
        took: settled on the fault budget with an outcome that is not
        `sent_for_review`, or still OPEN (nothing ever stamped it, which
@@ -629,17 +794,21 @@ def stranded_fault_rounds(
     replace.
     """
     stranded: list[StrandedRound] = []
-    # Decided ONCE, outside the loop: it is a statement about the loop's own
-    # session, not about any particular task, and computing it per task would
-    # invite a second rule that disagrees with this one.
-    current_round_is_live = (
-        bool(current_task_id)
-        and current_round_age is not None
-        and current_round_age <= round_ceiling_seconds
-    )
+    # Decided ONCE, outside the loop: these are statements about the loop's own
+    # sessions, not about any particular task, and computing them per task would
+    # invite a second rule that disagrees with this one. Lane 0's claim is the
+    # scalar pair; every other lane's arrives in `lane_claims`, and both are
+    # judged by the same two lines — one bound, one place.
+    claims = ((current_task_id, current_round_age), *lane_claims)
+    claimed = {task_id for task_id, _ in claims if task_id}
+    live = {
+        task_id
+        for task_id, age in claims
+        if task_id and age is not None and age <= round_ceiling_seconds
+    }
     for task in registry.in_progress_tasks():
-        is_current = bool(current_task_id) and task.id == current_task_id
-        if is_current and current_round_is_live:
+        is_current = task.id in claimed
+        if task.id in live:
             continue
         try:
             execution = execution_store.load(task.id)
@@ -690,15 +859,104 @@ def stranded_fault_rounds(
     return tuple(stranded)
 
 
+def _session_task_id(state) -> str:
+    """The task a session CLAIMS to be executing, or `""`.
+
+    `state.task_execution` is a plain dict by construction and a hand-edited
+    state file can make it anything, so every shape but a string in a dict
+    answers `""` — the same suspicion `_dispatch_stamp` reads `current_task`
+    under, and the same field `current_round_age_seconds` matches the stamp
+    against. Claiming nothing REPORTS the task rather than hiding it, which is
+    the direction this module takes whenever a claim's shape cannot be read.
+
+    Deliberately NOT `orchestrator.session_task_id`, which answers the fleet
+    supervisor's question rather than this one: it returns `None` when a
+    session's two records DISAGREE, and this exemption is defined on
+    `task_execution` alone — the agreement between the two is separately what
+    `current_round_age_seconds` judges, and it is the difference between "the
+    loop still claims this task" (`stale_current`, reported) and "no lane has
+    ever heard of it". Borrowing that helper would make a lane mid-handoff read
+    differently from lane 0 in exactly the state both are most confusing in.
+    """
+    execution = getattr(state, "task_execution", None)
+    if not isinstance(execution, dict):
+        return ""
+    task_id = execution.get("task_id")
+    return task_id if isinstance(task_id, str) else ""
+
+
+def _lane_claims(config, lanes: int) -> tuple[tuple[tuple[str, float | None], ...], str]:
+    """What every lane ABOVE ZERO says it is working, as `(task_id, age)` pairs
+    — or `(), note` when a lane could not be read (conc-09).
+
+    Lane 0 is deliberately absent: `_strand_survey` already reads it through
+    `config.state_file`, which IS lane 0's state file (`state.lane_paths`), and
+    a second read of the same file is a second chance to disagree with itself.
+
+    **The `lanes <= 1` gate is the first statement, before any read**, exactly as
+    `fleet_health` makes it and for its reason: `_retired_lane_indices` will
+    happily hand back lanes 1..N left behind by a cap the operator lowered TO
+    one, and a single-lane loop must answer today's strand survey byte for byte.
+
+    RETIRED lanes are walked too, for `dead_lane_survey`'s reason: lowering the
+    cap does not end the session in a lane it stops walking, so a round running
+    there is one nothing else would exempt.
+
+    **FAIL-CLOSED, and abandoning the survey is the whole point.** A lane whose
+    state cannot be read is a lane whose claim cannot be known, and continuing
+    without it would report the task that lane is running as stranded — the
+    false alarm this module is written against, and the reason lane 0's own
+    unreadable-state arm returns a note rather than an empty claim. An unlistable
+    `lanes/` is the same answer for the same reason.
+
+    The age is `current_round_age_seconds` of the SAME state object the id came
+    from, so a lane's stamp and the id it is matched to cannot come from two
+    different reads of one file.
+    """
+    if lanes <= 1:
+        return (), ""
+    # Imported HERE rather than at module level because `orchestrator` imports
+    # this module at module level — `dead_lane_survey`'s device, for its reason.
+    from .orchestrator import _retired_lane_indices
+
+    state_dir = Path(config.state_dir)
+    retired = _retired_lane_indices(state_dir, lanes)
+    if retired is None:
+        return (), (
+            f"{LANES_DIRNAME}/ could not be listed, so what a lane above the cap "
+            "is running cannot be established"
+        )
+    claims: list[tuple[str, float | None]] = []
+    for index in (*range(1, lanes), *retired):
+        paths = lane_paths(state_dir, index)
+        try:
+            state = StateStore(paths.state_file).load()
+        except (StateError, OSError, ValueError, TypeError) as exc:
+            return (), f"lane {paths.lane_id}'s state could not be read ({exc})"
+        if state is None:
+            continue  # no session in that lane: nothing claimed, nothing to say
+        claims.append((_session_task_id(state), current_round_age_seconds(state)))
+    return tuple(claims), ""
+
+
 def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
     """`(strands, note)` for the loop `config` describes, read from disk.
 
     `note` non-empty means the survey COULD NOT RUN — an unreadable task file,
-    an unreadable state file — and the caller escalates on it rather than
-    reading a failed check as a clean one. A file that is simply ABSENT is not
-    a failure: no task file means no tasks, which is the honest answer for a
-    state directory the loop has never written to (and is what keeps this
-    silent for every caller that has no roadmap at all).
+    an unreadable state file, a LANE whose state could not be read — and the
+    caller escalates on it rather than reading a failed check as a clean one. A
+    file that is simply ABSENT is not a failure: no task file means no tasks,
+    which is the honest answer for a state directory the loop has never written
+    to (and is what keeps this silent for every caller that has no roadmap at
+    all), and a lane with no session claims nothing.
+
+    **THE STATE FILE IT READS IS LANE 0'S** (`state.lane_paths`), which is the
+    whole loop at one lane and one lane of N above that. So every OTHER lane's
+    claim is gathered too (`_lane_claims`, conc-09) and handed to the predicate
+    as `lane_claims`: without it a task lane 1 dispatched moments ago satisfies
+    all four of `stranded_fault_rounds`' conditions — `in_progress`, not lane
+    0's current task, an OPEN attempt, no published sha — and is reported as
+    stranded while an agent is working on it.
 
     Never raises. It is called from `check`, which is advisory, read-only and
     routinely run against a half-initialised state directory.
@@ -724,9 +982,28 @@ def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
         # reporting a healthy round as a strand is the false alarm this module
         # is written against, and reporting nothing would be the fail-open.
         return (), f"the loop state could not be read ({exc})"
-    current = ((state.task_execution if state is not None else None) or {}).get(
-        "task_id"
-    ) or ""
+    # LANE 0's claim, read by the same helper every other lane's is read by. It
+    # used to be spelled inline here, which was a second reading of one field in
+    # one function and raised `AttributeError` — through a function that
+    # promises never to raise — on a hand-edited `task_execution` that is not a
+    # dict. Every shape the loop itself writes gives the identical answer.
+    current = _session_task_id(state) if state is not None else ""
+    # EVERY OTHER LANE'S CLAIM, above one lane (conc-09). `config.state_file` is
+    # lane 0's, so without this a task lane 1 is actively running is a task no
+    # claim exempts — reported stranded while an agent works on it, which is the
+    # false alarm this whole module exists to avoid. `()` at one lane, before
+    # any read.
+    try:
+        claims, lane_note = _lane_claims(config, _fleet_lanes(config))
+    except Exception as exc:      # noqa: BLE001 - a monitor must not die here
+        # `_lane_claims` raises nothing this file does not already catch, but it
+        # reaches `orchestrator` through an import and this function's contract
+        # is "never raises" rather than "raises nothing I thought of".
+        return (), f"the fleet's lanes could not be read ({type(exc).__name__}: {exc})"
+    if lane_note:
+        # A lane nobody could read is not a lane with nothing in it: escalate on
+        # the note, exactly as the unreadable-state arm above does.
+        return (), lane_note
     try:
         strands = stranded_fault_rounds(
             registry,
@@ -738,6 +1015,7 @@ def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
             # different reads of the file.
             current_round_age_seconds(state),
             round_ceiling_for(config),
+            lane_claims=claims,
         )
     except (  # pragma: no cover - defensive
         StateError,
@@ -802,6 +1080,13 @@ def _with_strands(config, verdict: Health) -> Health:
         open_blockers=verdict.open_blockers,
         silent_minutes=verdict.silent_minutes,
         stranded_tasks=ids,
+        # Carried EXPLICITLY because this arm rebuilds the verdict rather than
+        # `replace`-ing it: `_with_lanes` runs before this one (it is the base
+        # verdict's own lane pass, not a late check), so a field left out here
+        # would be dropped by the one arm that does not copy it — the fleet
+        # would lose every lane row exactly when a task went missing. `None` at
+        # one lane, which is what keeps that path byte-identical.
+        fleet=verdict.fleet,
     )
 
 
@@ -1581,13 +1866,347 @@ def _with_dead_lanes(config, verdict: Health, exclude=None) -> Health:
     recovery refuses such a lane, so nothing enters it, `DeadLaneView.refused`
     names it here, and the refusal is a durable `lane_recovered` transcript
     entry carrying `action="refused"`. Which VERDICT WORD a fleet reports per lane is Decision 7's question
-    and belongs to conc-09, whose scope is exactly that; inventing a code for it
-    here would be a second vocabulary for the fleet to report itself in.
+    and conc-09 answered it in `_lane_health`, in this module's existing
+    vocabulary and on this decision's terms: a lane whose lease is dead reads
+    `idle` — nothing is running in it — and a lane nobody can read reads
+    `unknown`, which does need a person.
     """
     view = dead_lane_view(config, exclude=exclude)
     if view is None:
         return verdict
     return replace(verdict, dead_lanes=view)
+
+
+def _lane_row(
+    lane_index: int,
+    lane_id: str,
+    code: str,
+    summary: str,
+    detail: str = "",
+    *,
+    phase: str = "",
+    task_id: str = "",
+    dispatched_at: str = "",
+    busy: bool = False,
+    retired: bool = False,
+) -> LaneHealth:
+    """One `LaneHealth`, with `needs_attention` DERIVED from the code rather
+    than passed beside it.
+
+    One rule, in one place, for the reason `StrandedRound.safe_to_requeue` is
+    derived rather than re-tested: a caller that could hand in a code and a
+    disagreeing flag would eventually hand in `parked` with `needs_attention`
+    False, and `FleetHealth.worst` — which is what makes the fleet red — reads
+    the flag.
+    """
+    return LaneHealth(
+        lane_index=lane_index,
+        lane_id=lane_id,
+        code=code,
+        needs_attention=code not in (OK_RUNNING, OK_PAUSED, OK_IDLE),
+        summary=summary,
+        detail=detail,
+        phase=phase,
+        task_id=task_id,
+        dispatched_at=dispatched_at,
+        busy=busy,
+        retired=retired,
+    )
+
+
+def _dispatch_stamp(state) -> str:
+    """When this lane's round was dispatched, as written, or `""`.
+
+    `state.current_task` is a plain dict by construction and a hand-edited state
+    file can make it anything, so every shape but a string in a dict answers
+    `""` — an unknown stamp, never a guessed one. `current_round_age_seconds`
+    reads the same field under the same suspicion.
+    """
+    current = getattr(state, "current_task", None)
+    if not isinstance(current, dict):
+        return ""
+    stamp = current.get("started_at")
+    return stamp if isinstance(stamp, str) else ""
+
+
+def _lane_health(
+    state_dir: Path, index: int, lock_live: bool, retired: bool = False
+) -> LaneHealth:
+    """Lane `index`, judged from ITS OWN state file and ITS OWN lease.
+
+    The lane-level twin of `_judge`, and deliberately only the part of it that
+    is about a lane: the fleet lock, the pause file, the open blockers and the
+    transcript are facts about the whole loop, and asking them once per lane
+    would report one fleet fault N times.
+
+    **FAIL-CLOSED, and it is the point of the whole pass.** A lease, a state
+    file or a phase this build cannot read answers `STUCK_UNKNOWN` — the word
+    that already means "I could not look" rather than "I looked and it is fine"
+    — and it is `busy`, because a lane that might hold anything must not read as
+    a free slot. That is `_dead_lane`'s rule and `orchestrator._lane_occupant`'s
+    rule, in this function's vocabulary.
+
+    **A DEAD LEASE IS `OK_IDLE`, not an alarm, and that is a decision.** Nothing
+    is running in such a lane, which is what `idle` says; the death is named in
+    the detail and carried in `Health.dead_lanes`, and the next tick recovers it
+    without touching a sibling (conc-08). It cannot be an attention code because
+    the fleet needs attention if any lane does — so a word that needed one here
+    would turn the whole fleet red on every interrupted `run`, which is exactly
+    what `_with_dead_lanes` decided it must not do. The lane nobody can READ
+    is the other half of that decision and stays `STUCK_UNKNOWN`: conc-08's own
+    `DeadLaneView.refused` says those are the entries that need a person.
+    """
+    from .orchestrator import _lane_occupant, session_task_id
+
+    paths = lane_paths(state_dir, index)
+    dead = _dead_lane(state_dir, index)
+    if dead is not None and dead.unreadable:
+        return _lane_row(
+            index,
+            paths.lane_id,
+            STUCK_UNKNOWN,
+            f"lane {paths.lane_id} cannot be judged",
+            dead.unreadable,
+            busy=True,
+            retired=retired,
+        )
+    try:
+        state = StateStore(paths.state_file).load()
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        return _lane_row(
+            index,
+            paths.lane_id,
+            STUCK_UNKNOWN,
+            f"lane {paths.lane_id} cannot be judged",
+            f"its state could not be read ({exc})",
+            busy=True,
+            retired=retired,
+        )
+    gone = "" if dead is None else f"its lease is dead ({dead.lease or 'no record'})"
+    if state is None:
+        return _lane_row(
+            index,
+            paths.lane_id,
+            OK_IDLE,
+            f"lane {paths.lane_id} is idle",
+            gone or "no session in this lane",
+            retired=retired,
+        )
+    try:
+        phase = Phase(state.phase)
+    except (ValueError, TypeError):
+        return _lane_row(
+            index,
+            paths.lane_id,
+            STUCK_UNKNOWN,
+            f"lane {paths.lane_id} cannot be judged",
+            f"its phase {state.phase!r} is not one this build knows",
+            busy=True,
+            retired=retired,
+        )
+    task_id = session_task_id(state) or ""
+    # The SCHEDULER's own predicate, borrowed rather than restated — see
+    # `LaneHealth.busy`.
+    busy = _lane_occupant(state_dir, index) is not None
+
+    def row(code: str, summary: str, detail: str) -> LaneHealth:
+        """The four arms below differ in three fields and agree in six."""
+        return _lane_row(
+            index,
+            paths.lane_id,
+            code,
+            summary,
+            detail,
+            phase=phase.value,
+            task_id=task_id,
+            dispatched_at=_dispatch_stamp(state),
+            busy=busy,
+            retired=retired,
+        )
+
+    if phase is Phase.FAILED:
+        return row(
+            STUCK_FAILED,
+            f"lane {paths.lane_id} FAILED",
+            "resolve with `python -m autoloop run --retry`",
+        )
+    if phase is Phase.NEEDS_USER:
+        # `_judge`'s own exemption, per lane: a `task_fatal` park is one
+        # continuous mode handles by quarantining that task and carrying on, so
+        # it is only worth waking somebody for when nothing is running to handle
+        # it. The fleet lock is what says something is.
+        if not (getattr(state, "park_kind", None) == "task_fatal" and lock_live):
+            return row(
+                STUCK_PARKED,
+                f"lane {paths.lane_id} is parked and waiting for you",
+                (state.question or "(no question recorded)")[:200],
+            )
+        return row(
+            OK_IDLE,
+            f"lane {paths.lane_id} is idle",
+            "its last task was quarantined and the lane is free",
+        )
+    if not busy:
+        return row(OK_IDLE, f"lane {paths.lane_id} is idle", gone)
+    if dead is not None:
+        return row(
+            OK_IDLE,
+            f"lane {paths.lane_id} is not running — the process that held it is gone",
+            f"{dead.describe()}; the fleet recovers it on the next tick",
+        )
+    return row(OK_RUNNING, f"lane {paths.lane_id} is working", "")
+
+
+def fleet_health(config, lanes: int | None = None, now: datetime | None = None):
+    """Every lane of this loop, and the fleet's shape — or `None` at one lane.
+
+    **THE `lanes <= 1` GATE IS THE FIRST STATEMENT, before any read at all**, and
+    it is the acceptance criterion made structural exactly as `state.lane_paths`
+    makes it: at one lane there is no fleet to aggregate, the verdict `check`
+    returns IS lane 0's verdict, and `Health.fleet` stays `None` so today's
+    output does not move by a byte. Gating later would be a real difference —
+    `_retired_lane_indices` will happily hand back lanes 1..N from a cap the
+    operator lowered TO one, and a single-lane deployment would grow rows.
+
+    Above one lane every lane inside the cap is a row, in index order, and then
+    every RETIRED lane that is still holding a round or still needs a person —
+    the lanes `retired_lane_occupants` exists to see, since lowering the cap does
+    not end the session in a lane it cuts out. A retired lane that holds nothing
+    is not a row: it is a directory the fleet has finished with, and listing it
+    forever would bury the lanes that matter.
+
+    NEVER RAISES, for `dead_lane_view`'s reason: a monitor that died on one
+    corrupt lane would report nothing at all about a fleet that is, at that
+    moment, N-1 lanes down. The failure is reported as itself instead — one
+    `STUCK_UNKNOWN` row, which needs a person and is never `idle`.
+
+    Takes NO LOCK and writes nothing, like everything else in this module. The
+    fleet lock is READ (`LoopLock.is_live`) for the one question a lane's own
+    files cannot answer: whether anything is running to handle a `task_fatal`
+    park in it.
+
+    `now` is accepted and unused today, so every reader in this module passes
+    the same instant and a later signal that needs one does not change the
+    call sites.
+    """
+    cap = _fleet_lanes(config) if lanes is None else int(lanes)
+    if cap <= 1:
+        return None
+    try:
+        return _fleet_survey(config, cap)
+    except Exception as exc:      # noqa: BLE001 - a monitor must not die here
+        return FleetHealth(
+            cap=cap,
+            lanes=(
+                _lane_row(
+                    UNLISTABLE_LANES_INDEX_FALLBACK,
+                    LANES_DIRNAME,
+                    STUCK_UNKNOWN,
+                    "the fleet's lanes could not be surveyed",
+                    f"{type(exc).__name__}: {exc}",
+                    busy=True,
+                ),
+            ),
+            busy=1,
+            at_cap=False,
+            # NOT idle: "nobody could look" and "nothing is running" are the two
+            # answers this record exists to keep apart.
+            idle=False,
+        )
+
+
+#: What a row that is not a lane carries when the survey could not reach
+#: `orchestrator` at all to borrow its own sentinel. Negative for that constant's
+#: reason — it can never equal a real lane index — and defined here so the
+#: never-raises path above cannot itself raise on an import.
+UNLISTABLE_LANES_INDEX_FALLBACK = -1
+
+
+def _fleet_survey(config, cap: int) -> FleetHealth:
+    """`fleet_health`'s body, above one lane. Separated so the wrapper's
+    never-raises guard covers the imports too."""
+    from .orchestrator import UNLISTABLE_LANES_INDEX, _retired_lane_indices
+
+    state_dir = Path(config.state_dir)
+    info = LoopLock(state_dir).read()
+    lock_live = info is not None and LoopLock.is_live(info)
+    rows = [_lane_health(state_dir, index, lock_live) for index in range(cap)]
+    retired = _retired_lane_indices(state_dir, cap)
+    if retired is None:
+        rows.append(
+            _lane_row(
+                UNLISTABLE_LANES_INDEX,
+                LANES_DIRNAME,
+                STUCK_UNKNOWN,
+                f"{LANES_DIRNAME}/ could not be listed",
+                "whether a lane above the cap is still running cannot be decided",
+                busy=True,
+            )
+        )
+        retired = ()
+    for index in retired:
+        row = _lane_health(state_dir, index, lock_live, retired=True)
+        if row.busy or row.needs_attention:
+            rows.append(row)
+    busy = sum(1 for row in rows if row.busy)
+    return FleetHealth(
+        cap=cap,
+        lanes=tuple(rows),
+        busy=busy,
+        # `>=`, not `==`: a cap the operator lowered under a running fleet can
+        # leave more rounds running than the cap describes, and that fleet is
+        # not admitting anything either (`FleetPlan.free_lanes` clamps for the
+        # same reason).
+        at_cap=busy >= cap,
+        idle=busy == 0,
+    )
+
+
+def _with_lanes(config, verdict: Health, lanes: int, now: datetime | None) -> Health:
+    """`verdict`, plus every lane — and, above one lane, no phase.
+
+    Three things happen here and each is one clause of Decision 7:
+
+    * **`phase` is emptied.** Above one lane `state.json` is lane 0's file and
+      lane 0 is a lane like any other, so a phase on the fleet verdict would be
+      one lane's string presented as the system's — "worse than reporting
+      nothing", in the brief's words. `_judge` does not even READ a lane's state
+      above one lane, so this is belt and braces rather than the mechanism.
+    * **The rows are attached**, on every verdict, for `_with_strands`' reason:
+      a lane in trouble co-occurs happily with an open blocker or a held sweep,
+      and both of those return long before a late check could fire.
+    * **The most severe lane that needs a person becomes the fleet's verdict**,
+      never lane 0's by position — but only when the fleet-level verdict does
+      not already need one. That precedence is `_with_held_sweep`'s, for its
+      reason: a stale fleet lock, an open blocker or a loop that is not running
+      is a fault of the FLEET, the operator is being sent there for a reason,
+      and the lanes are named in the detail either way rather than being lost.
+
+    The fleet's shape goes in the DETAIL of every verdict, including the healthy
+    ones: that is the line that tells "every lane busy" from "nothing to do",
+    which Decision 4 says must not read identically from outside.
+    """
+    fleet = fleet_health(config, lanes=lanes, now=now)
+    if fleet is None:
+        return verdict
+    described = fleet.describe()
+    detail = f"{verdict.detail}; {described}" if verdict.detail else described
+    worst = fleet.worst
+    if verdict.needs_attention or worst is None:
+        return replace(verdict, fleet=fleet, phase="", detail=detail)
+    others = sum(1 for lane in fleet.lanes if lane.needs_attention) - 1
+    summary = worst.summary
+    if others:
+        summary += f" (+{others} more lane(s) need attention)"
+    return replace(
+        verdict,
+        code=worst.code,
+        needs_attention=True,
+        summary=summary,
+        detail=detail,
+        phase="",
+        fleet=fleet,
+    )
 
 
 def check(
@@ -1629,7 +2248,15 @@ def check(
     same terms and outside the same ordering — see `_with_dead_lanes`. Both are
     `None` at one lane, where neither file exists, so a single-lane deployment's
     verdict is untouched by either.
+
+    And `_judge`'s own answer is wrapped FIRST by the per-lane pass (conc-09,
+    Decision 7). Innermost deliberately: it is not a late check but part of the
+    base verdict — the fleet's code, and the absence of a phase on it, are what
+    the three checks above then apply themselves to, exactly as they do to one
+    lane's verdict today. At `lanes = 1` it is `None` and changes nothing, which
+    is why the whole chain still returns today's bytes for a single-lane loop.
     """
+    lanes = _fleet_lanes(config)
     return _with_dead_lanes(
         config,
         _with_fleet_throttle(
@@ -1638,8 +2265,19 @@ def check(
                 config,
                 _with_strands(
                     config,
-                    _judge(
-                        config, now, silence_minutes, agent_probe, work_probe, sleep_probe
+                    _with_lanes(
+                        config,
+                        _judge(
+                            config,
+                            now,
+                            silence_minutes,
+                            agent_probe,
+                            work_probe,
+                            sleep_probe,
+                            lanes,
+                        ),
+                        lanes,
+                        now,
                     ),
                 ),
                 now,
@@ -1657,9 +2295,23 @@ def _judge(
     agent_probe=_agent_running,
     work_probe=_work_running,
     sleep_probe=machine_sleep_in_window,
+    lanes: int = 1,
 ) -> Health:
     """Is the LOOP working? The verdict `check` starts from — every signal in
-    the module docstring except the strand survey, unchanged."""
+    the module docstring except the strand survey, unchanged.
+
+    `lanes` is the fleet size, and above one it changes exactly one thing: THIS
+    FUNCTION READS NO LANE'S STATE FILE. `config.state_file` is lane 0's file
+    (`state.lane_paths`), so every phase, park and failure it carries belongs to
+    one lane — and Decision 7's rule is that reporting the first lane's phase as
+    the system's would be worse than reporting nothing. `_with_lanes` reports
+    all of them instead, in their own rows, and the fleet's verdict is the most
+    severe of them. Everything left here is a fact about the whole loop: its
+    lock, its blockers, its pause file, its transcript.
+
+    At `lanes = 1` — the default, and the acceptance criterion — the state file
+    is read exactly as it always was and every branch below behaves identically.
+    """
     now = now or datetime.now(timezone.utc)
 
     lock = LoopLock(config.state_dir)
@@ -1675,7 +2327,12 @@ def _judge(
         )
 
     blockers = BlockerStore(config.blockers_dir).open_blockers_by_severity()
-    state = StateStore(config.state_file).load() if config.state_file.exists() else None
+    fleet = lanes > 1
+    state = (
+        StateStore(config.state_file).load()
+        if not fleet and config.state_file.exists()
+        else None
+    )
     phase = state.phase if state is not None else ""
 
     # Blockers first: they are the reason a human is needed, and they outlive
@@ -1796,7 +2453,14 @@ def _judge(
                 code=STUCK_SILENT,
                 needs_attention=True,
                 summary=f"autoloop looks stuck — no activity for {awake_silent:.0f} minutes",
-                detail=f"phase={phase}, no subagent running{discount}",
+                # No phase above one lane, for the reason in this function's
+                # docstring: there is no such thing as the fleet's phase, and
+                # `_with_lanes` puts each lane's own in its own row.
+                detail=(
+                    f"no subagent running{discount}"
+                    if fleet
+                    else f"phase={phase}, no subagent running{discount}"
+                ),
                 phase=phase,
                 silent_minutes=awake_silent,
             )
@@ -1814,7 +2478,15 @@ def _judge(
     return Health(
         code=OK_RUNNING,
         needs_attention=False,
-        summary=f"autoloop is running (phase={phase or 'starting'})",
+        # `phase=starting` above one lane would be a phase invented for a fleet
+        # that has none — the exact failure Decision 7 forbids, arriving through
+        # a default. `_with_lanes` appends the fleet's shape to the detail
+        # instead, which is the line that tells an at-cap fleet from an idle one.
+        summary=(
+            "autoloop is running"
+            if fleet
+            else f"autoloop is running (phase={phase or 'starting'})"
+        ),
         phase=phase,
         silent_minutes=silent,
     )

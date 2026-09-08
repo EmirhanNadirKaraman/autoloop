@@ -7881,6 +7881,38 @@ def _cmd_projects(args: argparse.Namespace) -> int:
     return 1 if any(row.needs_attention for row in rows) else 0
 
 
+def _cmd_lanes(args: argparse.Namespace) -> int:
+    """The lanes panel: one row per lane of THIS loop's fleet (conc-09,
+    docs/AUTOLOOP.md "Decision 7 — observability: N lanes, truthfully").
+
+    The call site of `dashboard.lanes_status`, and it is a command rather than a
+    route for `_cmd_projects`' reason, one level in: the dashboard's front door
+    is bound to a CHECKOUT (`Handler.repo`) and resolves its paths from it,
+    while a fleet is not a checkout — `[concurrency] lanes` exists only in a
+    config, which is what this command already loads. Decision 7 puts the panel
+    BESIDE the front door for exactly that reason, and a route would have had to
+    invent config discovery inside the server to reach it.
+
+    Read-only and lock-free, exactly like `health` and `projects`: the loop
+    holds `LoopLock` for its whole run, so a panel that waited for it could only
+    ever render a stopped fleet.
+
+    Exit codes mirror `health`, so the same cron wrapper works: 0 = every lane
+    is fine, 1 = at least one needs you. **One lane is 0**, not a "nothing
+    configured" code — a single-lane loop is an ordinary healthy deployment
+    whose one lane `health` already reports, and a wrapper that read it as
+    misconfigured would fire on every deployment shipping today.
+    """
+    from . import dashboard
+
+    config = load_config(args.config)
+    fleet = dashboard.lanes_status(config)
+    print(dashboard.lanes_json(fleet) if args.json else dashboard.render_lanes_text(fleet))
+    if fleet is None:
+        return 0
+    return 1 if any(lane.needs_attention for lane in fleet.lanes) else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autoloop")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -8440,6 +8472,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     projects.add_argument("--json", action="store_true", help="machine-readable rows")
     projects.set_defaults(func=_cmd_projects)
+
+    lanesp = sub.add_parser(
+        "lanes",
+        help=(
+            "one row per lane of this loop's fleet: health, busy, phase, task "
+            "(read-only, no lock; exit 0 = all fine or one lane, 1 = a lane "
+            "needs you)"
+        ),
+    )
+    add_config(lanesp)
+    lanesp.add_argument("--json", action="store_true", help="machine-readable rows")
+    lanesp.set_defaults(func=_cmd_lanes)
 
     reset = sub.add_parser(
         "reset", help="archive the session state (keeps the task registry)"

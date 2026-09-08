@@ -5,18 +5,36 @@ the loop is fine teaches you to ignore alerts. So the tests that matter most
 here are the ones proving it stays QUIET: an audit fan-out is legitimately
 silent for fifteen-plus minutes, and a deliberate pause is a decision rather
 than a fault.
+
+The last section is conc-09's: above one lane the loop is a FLEET, every lane is
+judged on its own state file and its own lease, and no single string is
+presented as the fleet's phase. Its own last two tests are the acceptance
+criterion the whole concurrency split carries — at `lanes = 1` the JSON, the
+text and the exit code are pinned against a literal snapshot, and no `fleet` key
+exists at all.
 """
 
+import argparse
+import dataclasses
 import json
+import os
+import socket
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from autoloop import health
+from autoloop import cli, health
+from autoloop import lock as lock_module
 from autoloop.blockers import BlockerStore
-from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
-from autoloop.lock import LoopLock
-from autoloop.state import LoopState, Phase, StateStore
+from autoloop.config import (
+    AutoloopConfig,
+    BrowserConfig,
+    ConcurrencyConfig,
+    PolicyConfig,
+    lane_id,
+)
+from autoloop.lock import LaneLease, LoopLock
+from autoloop.state import LoopState, Phase, StateStore, lane_paths, utcnow_iso
 
 URL = "https://chatgpt.com/c/health"
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
@@ -562,4 +580,639 @@ def test_check_never_writes_anything(config):
         _check(config)
 
     after = {p: p.stat().st_mtime_ns for p in config.state_dir.rglob("*") if p.is_file()}
+    assert before == after
+
+
+# =============================================================================
+# N lanes, truthfully — conc-09, docs/AUTOLOOP.md "Decision 7 — observability"
+#
+# One claim: `health` reports every lane truthfully, and NO SINGLE STRING is
+# presented as the fleet's phase. The tests that matter most are the two that
+# say what must NOT happen: lane 0's phase is never the system's, and at
+# `lanes = 1` the JSON, the text and the exit code are what they were — pinned
+# against a literal snapshot, because that is the acceptance criterion every
+# candidate in the split carries and a paraphrase of it would not catch a key
+# quietly appearing in the output.
+# =============================================================================
+
+
+def _fleet(config, lanes: int):
+    return dataclasses.replace(config, concurrency=ConcurrencyConfig(lanes=lanes))
+
+
+def _lane(config, index: int, phase=Phase.EXECUTING, **kw):
+    """A session in lane `index`'s own state file. Lane 0's is literally
+    `state.json`, which is `state.lane_paths`' asymmetry and the whole of why
+    one lane needs no new file."""
+    state = LoopState(session_id=f"lane-{index}", conversation_url=URL, **kw)
+    state.phase = phase.value if isinstance(phase, Phase) else phase
+    paths = lane_paths(config.state_dir, index)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    StateStore(paths.state_file).save(state)
+    return state
+
+
+def _unreadable_lane(config, index: int):
+    paths = lane_paths(config.state_dir, index)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text("]", encoding="utf-8")
+
+
+def _pin_boot(monkeypatch):
+    """Boot an hour ago, so a lease stamped two hours ago is dead however its
+    pid probes — `test_lane_death_recovery`'s discipline, for its reason."""
+    boot = datetime.now(timezone.utc) - timedelta(hours=1)
+    monkeypatch.setattr(lock_module, "boot_time_epoch", lambda: boot.timestamp())
+    return boot
+
+
+def _lease(config, index: int, *, alive: bool, boot=None):
+    lease = LaneLease(config.state_dir, index)
+    lease.path.parent.mkdir(parents=True, exist_ok=True)
+    started = (
+        utcnow_iso()
+        if alive
+        else (boot - timedelta(hours=2)).isoformat(timespec="seconds")
+    )
+    lease.path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "started_at": started,
+                "run_id": f"run-{index}",
+                "lane_id": lane_id(index),
+                "state_dir": str(lane_paths(config.state_dir, index).state_dir),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return lease
+
+
+# --- one object per lane, in the one vocabulary --------------------------------
+
+
+def test_the_json_carries_one_object_per_lane_with_a_known_code(config):
+    fleet = _fleet(config, 3)
+    _lane(fleet, 0)
+    _lane(fleet, 2, phase=Phase.NEEDS_USER, question="which base?")
+
+    with LoopLock(fleet.state_dir):
+        payload = json.loads(_check(fleet).to_json())
+
+    rows = payload["fleet"]["lanes"]
+    assert [row["lane_id"] for row in rows] == [lane_id(i) for i in range(3)]
+    assert [row["code"] for row in rows] == [
+        health.OK_RUNNING, health.OK_IDLE, health.STUCK_PARKED
+    ]
+    assert all(row["code"] in health.VERDICT_CODES for row in rows)
+    assert payload["fleet"]["cap"] == 3
+
+
+def test_the_fleet_code_is_the_most_severe_lane_code_not_lane_zeros(config):
+    """THE claim's sharp edge: lane 0 is healthy and the fleet is not."""
+    fleet = _fleet(config, 3)
+    _lane(fleet, 0)
+    _lane(fleet, 2, phase=Phase.NEEDS_USER, question="which base?")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.code == health.STUCK_PARKED
+    assert verdict.needs_attention is True
+    assert verdict.fleet.lanes[0].code == health.OK_RUNNING
+    assert lane_id(2) in verdict.summary
+    assert "which base?" in verdict.detail
+
+
+def test_the_worst_lane_wins_over_a_less_severe_one_that_comes_first(config):
+    """Severity, never position: a parked lane at index 1 does not shadow a lane
+    at index 2 that nobody can read."""
+    fleet = _fleet(config, 3)
+    _lane(fleet, 1, phase=Phase.NEEDS_USER, question="parked")
+    _unreadable_lane(fleet, 2)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.code == health.STUCK_UNKNOWN
+    assert lane_id(2) in verdict.summary
+    assert "+1 more lane(s) need attention" in verdict.summary
+    assert lane_id(1) in verdict.detail, "every lane in trouble is named, not a sample"
+
+
+def test_a_fleet_level_fault_keeps_its_own_code_and_still_names_the_lanes(config):
+    """A stale FLEET lock is a fault of the fleet, not of a lane. The operator
+    is sent there for a reason, and the lanes are carried rather than lost."""
+    fleet = _fleet(config, 2)
+    _lane(fleet, 1, phase=Phase.NEEDS_USER, question="parked")
+    lock = LoopLock(fleet.state_dir)
+    lock.acquire()
+    lock._owned = False  # keep the file behind
+    data = json.loads(lock.path.read_text(encoding="utf-8"))
+    data["pid"] = 999_999_999
+    lock.path.write_text(json.dumps(data), encoding="utf-8")
+
+    verdict = _check(fleet)
+
+    assert verdict.code == health.STUCK_STALE_LOCK
+    assert verdict.fleet is not None
+    assert lane_id(1) in verdict.detail
+
+
+# --- no single string is the fleet's phase -------------------------------------
+
+
+def test_no_lanes_phase_is_presented_as_the_fleets(config):
+    """`state.json` is lane 0's file above one lane. Reporting its phase as the
+    system's would be worse than reporting nothing."""
+    fleet = _fleet(config, 2)
+    _lane(fleet, 0, phase=Phase.EXECUTING)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.phase == ""
+    assert "phase=" not in verdict.summary
+    assert "phase=" not in verdict.detail
+    assert verdict.fleet.lanes[0].phase == Phase.EXECUTING.value
+
+
+def test_at_one_lane_the_phase_is_still_reported(config):
+    """The control for the test above: at one lane the phase IS the loop's, and
+    nothing about that moved."""
+    _state(config, phase=Phase.EXECUTING.value)
+
+    with LoopLock(config.state_dir):
+        verdict = _check(config)
+
+    assert verdict.phase == Phase.EXECUTING.value
+    assert verdict.summary == "autoloop is running (phase=executing)"
+
+
+def test_a_silent_fleet_reports_no_phase_either(config):
+    """The other line that interpolated one — the stuck-silent detail."""
+    fleet = _fleet(config, 2)
+    _lane(fleet, 0)
+    _transcript(fleet, minutes_ago=90)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet, work_probe=lambda _pid: False)
+
+    assert verdict.code == health.STUCK_SILENT
+    assert "phase=" not in verdict.detail
+
+
+# --- at its cap, or with nothing to do -----------------------------------------
+
+
+def test_a_fleet_at_its_cap_is_distinguishable_from_an_idle_one(config):
+    fleet = _fleet(config, 2)
+
+    with LoopLock(fleet.state_dir):
+        idle = _check(fleet)
+        _lane(fleet, 0)
+        _lane(fleet, 1)
+        at_cap = _check(fleet)
+
+    assert (idle.fleet.busy, idle.fleet.idle, idle.fleet.at_cap) == (0, True, False)
+    assert (at_cap.fleet.busy, at_cap.fleet.idle, at_cap.fleet.at_cap) == (2, False, True)
+    # And the two must not READ identically either — the detail is what the
+    # text mode prints and what a notifier truncates.
+    assert "the fleet is idle" in idle.detail
+    assert "at its cap" in at_cap.detail
+    assert idle.detail != at_cap.detail
+
+
+def test_a_lowered_cap_still_reads_as_at_its_cap(config):
+    """More rounds running than the cap describes is not a free slot."""
+    fleet = _fleet(config, 2)
+    for index in range(3):
+        _lane(fleet, index)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.fleet.busy == 3 and verdict.fleet.at_cap is True
+    assert verdict.fleet.lanes[-1].retired is True
+    assert verdict.fleet.lanes[-1].lane_id == lane_id(2)
+
+
+def test_a_fleet_of_parked_lanes_is_idle_and_still_red(config):
+    """`idle` is about OCCUPANCY, not about health: `needs_user` is a terminal
+    phase, so a parked lane holds no slot — and the alarm rides on the code and
+    the summary, which is what stops the pair reading as fail-open."""
+    fleet = _fleet(config, 2)
+    for index in range(2):
+        _lane(fleet, index, phase=Phase.NEEDS_USER, question=f"lane {index}?")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.fleet.idle is True and verdict.fleet.busy == 0
+    assert verdict.code == health.STUCK_PARKED
+    assert verdict.needs_attention is True
+    assert lane_id(0) in verdict.detail and lane_id(1) in verdict.detail
+
+
+def test_a_retired_lane_holding_nothing_is_not_a_row(config):
+    """The cap has finished with it; listing it forever would bury the lanes
+    that matter."""
+    fleet = _fleet(config, 2)
+    _lane(fleet, 2, phase=Phase.STOPPED)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert [row.lane_id for row in verdict.fleet.lanes] == [lane_id(0), lane_id(1)]
+    assert verdict.fleet.idle is True
+
+
+# --- what must never read as "fine" --------------------------------------------
+
+
+def test_a_lane_nobody_can_read_is_unknown_and_never_free(config):
+    """The fail-open this pass exists to close: a lane that might hold anything
+    must not read as a free slot, and 'I could not look' is not 'it is fine'."""
+    fleet = _fleet(config, 2)
+    _unreadable_lane(fleet, 1)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    row = verdict.fleet.lanes[1]
+    assert row.code == health.STUCK_UNKNOWN
+    assert row.needs_attention is True and row.busy is True
+    assert verdict.fleet.idle is False
+    assert verdict.code == health.STUCK_UNKNOWN
+
+
+def test_a_lanes_directory_that_cannot_be_listed_is_reported(config):
+    """A lane ABOVE the cap can only be found by listing `lanes/`. A listing
+    that fails must not read as 'no lane above the cap'."""
+    fleet = _fleet(config, 2)
+    fleet.state_dir.mkdir(parents=True, exist_ok=True)
+    (fleet.state_dir / "lanes").write_text("not a directory", encoding="utf-8")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    sentinel = verdict.fleet.lanes[-1]
+    assert sentinel.lane_id == "lanes" and sentinel.code == health.STUCK_UNKNOWN
+    assert sentinel.busy is True and verdict.fleet.idle is False
+    assert verdict.code == health.STUCK_UNKNOWN
+
+
+def test_a_survey_that_raises_is_reported_as_itself(config, monkeypatch):
+    """A monitor that died on one corrupt lane would report nothing at all about
+    a fleet that is, at that moment, N-1 lanes down."""
+    fleet = _fleet(config, 2)
+    monkeypatch.setattr(
+        health, "_lane_health", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.fleet.lanes[0].code == health.STUCK_UNKNOWN
+    assert "boom" in verdict.fleet.lanes[0].detail
+    assert verdict.fleet.idle is False, "'nobody could look' is not 'nothing is running'"
+
+
+def test_a_dead_lane_is_reported_without_turning_the_fleet_red(config, monkeypatch):
+    """conc-08's decision, in this pass's vocabulary: nothing is RUNNING in a
+    lane whose process is gone, the next tick recovers it, and a monitor that
+    went red on every interrupted run is the alarm people learn to ignore."""
+    boot = _pin_boot(monkeypatch)
+    fleet = _fleet(config, 2)
+    _lane(fleet, 1)
+    _lease(fleet, 1, alive=False, boot=boot)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    row = verdict.fleet.lanes[1]
+    assert row.code == health.OK_IDLE and row.needs_attention is False
+    assert row.busy is True, "it holds a slot until the recovery runs"
+    assert "dead lease" in row.detail
+    assert verdict.needs_attention is False
+    assert verdict.dead_lanes is not None, "conc-08's own field is untouched"
+
+
+def test_the_lane_rows_survive_a_stranded_task(config, monkeypatch):
+    """`_with_strands` REBUILDS the verdict rather than replacing fields on it,
+    so a field it forgot would vanish exactly when a task went missing."""
+    fleet = _fleet(config, 2)
+    _lane(fleet, 0)
+    monkeypatch.setattr(
+        health,
+        "_strand_survey",
+        lambda _config: ((health.StrandedRound(task_id="t-1", fault_code="x"),), ""),
+    )
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.code == health.STUCK_STRANDED
+    assert verdict.fleet is not None
+    assert [row.lane_id for row in verdict.fleet.lanes] == [lane_id(0), lane_id(1)]
+
+
+# --- the strand survey asks EVERY lane, never lane 0 alone ---------------------
+#
+# `config.state_file` is lane 0's file above one lane, so a survey that asked
+# only it would report a task lane 1 dispatched minutes ago as stranded: it is
+# `in_progress`, it is not lane 0's current task, its attempt is OPEN and it has
+# no published sha — all four of `stranded_fault_rounds`' conditions. That is
+# this module's own false alarm, one lane over.
+
+
+def _in_progress_with_open_attempt(config, task_id: str):
+    """`task_id` held `in_progress` with an OPEN attempt and no published sha —
+    the shape the sweep looks at, with only the current-task exemption left to
+    decide it. Written straight to the stores `_strand_survey` reads rather than
+    driven through a dispatch: the claim under test is which STATE FILES the
+    exemption is read from, not how a record comes to exist."""
+    from autoloop.tasks import Task, TaskRegistry, TaskStore
+    from autoloop.worktask import (
+        ATTEMPT_PENDING,
+        TaskExecution,
+        TaskExecutionStore,
+        format_attempt,
+    )
+
+    registry = TaskRegistry(
+        [Task(id=task_id, title=f"T {task_id}", description="d", approved_paths=("A.py",))]
+    )
+    registry.mark_in_progress(task_id)
+    TaskStore(config.tasks_file).save(registry)
+    TaskExecutionStore(config.executions_dir).save(
+        TaskExecution(
+            task_id=task_id,
+            task_branch=f"autoloop/{task_id}",
+            worktree_path=str(config.workers_root / task_id),
+            task_base_sha="0" * 40,
+            attempt_ledger=(format_attempt(1, ATTEMPT_PENDING, "dispatched"),),
+        )
+    )
+
+
+def _dispatched_in(config, index: int, task_id: str, age_seconds: float = 0.0):
+    """Lane `index`, mid-round on `task_id`, dispatched `age_seconds` ago.
+
+    BOTH halves of the claim, because the age is only readable when they agree
+    (`current_round_age_seconds`), and the age is built by moving the STAMP
+    rather than a clock — the production reader takes its `now` from the wall
+    clock in every real call."""
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat()
+    return _lane(
+        config,
+        index,
+        task_execution={"task_id": task_id},
+        current_task={"task_id": task_id, "started_at": stamp},
+    )
+
+
+def test_a_task_another_lane_is_running_is_not_stranded(config):
+    """THE regression: lane 1 is working it right now, and lane 0's state file
+    has never heard of it."""
+    fleet = _fleet(config, 3)
+    _lane(fleet, 0)
+    _dispatched_in(fleet, 1, "brw-19")
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert health._strand_survey(fleet) == ((), "")
+    assert verdict.stranded_tasks == ()
+    assert verdict.code != health.STUCK_STRANDED
+
+
+def test_a_retired_lanes_round_is_exempt_too(config):
+    """Lowering the cap does not end the round in a lane it stops walking, so a
+    lane above the cap claims exactly like one inside it."""
+    fleet = _fleet(config, 2)
+    _dispatched_in(fleet, 2, "brw-19")
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.stranded_tasks == ()
+
+
+def test_a_lane_claim_past_the_round_ceiling_is_stranded_again(config):
+    """The BOUND, per lane. An exemption with no bound on it is the bug the
+    scalar exemption already shipped once — N times over here, since a lane
+    whose round died still names its task forever."""
+    fleet = _fleet(config, 3)
+    _dispatched_in(
+        fleet, 1, "brw-19", age_seconds=health.round_ceiling_for(fleet) + 60
+    )
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    strands, note = health._strand_survey(fleet)
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert note == ""
+    assert [(s.task_id, s.stale_current) for s in strands] == [("brw-19", True)]
+    assert verdict.code == health.STUCK_STRANDED
+    assert verdict.stranded_tasks == ("brw-19",)
+
+
+def test_a_lane_mid_handoff_claims_nothing_it_cannot_date(config):
+    """`current_task` and `task_execution` naming different tasks is a dispatch
+    that died between its two writes — no evidence of a live round, and no
+    evidence is not an exemption."""
+    fleet = _fleet(config, 2)
+    _lane(
+        fleet,
+        1,
+        task_execution={"task_id": "brw-19"},
+        current_task={"task_id": "someone-else", "started_at": utcnow_iso()},
+    )
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    strands, note = health._strand_survey(fleet)
+
+    assert note == ""
+    assert [(s.task_id, s.stale_current) for s in strands] == [("brw-19", True)]
+
+
+def test_a_lane_nobody_can_read_stops_the_survey_rather_than_guessing(config):
+    """The fail-open this closes: a lane whose state cannot be read is a lane
+    whose claim cannot be known, and sweeping on without it reports the task it
+    is running as stranded."""
+    fleet = _fleet(config, 2)
+    _in_progress_with_open_attempt(fleet, "brw-19")
+    _unreadable_lane(fleet, 1)
+
+    strands, note = health._strand_survey(fleet)
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert strands == ()
+    assert lane_id(1) in note
+    assert verdict.stranded_tasks == ()
+    assert verdict.needs_attention is True, "a survey that could not run escalates"
+    assert note in verdict.detail
+
+
+def test_a_lanes_directory_that_cannot_be_listed_stops_the_survey(config):
+    """A round in a lane ABOVE the cap can only be found by listing `lanes/`. A
+    listing that fails is not 'no lane above the cap is running anything'."""
+    fleet = _fleet(config, 2)
+    fleet.state_dir.mkdir(parents=True, exist_ok=True)
+    (fleet.state_dir / "lanes").write_text("not a directory", encoding="utf-8")
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    strands, note = health._strand_survey(fleet)
+
+    assert strands == ()
+    assert "lanes/ could not be listed" in note
+
+
+def test_a_survey_that_raises_on_the_lanes_is_reported_as_itself(config, monkeypatch):
+    """`_strand_survey` never raises: `check` is advisory and runs against
+    half-initialised state directories on a schedule."""
+    fleet = _fleet(config, 2)
+    _in_progress_with_open_attempt(fleet, "brw-19")
+    monkeypatch.setattr(
+        health,
+        "_lane_claims",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    strands, note = health._strand_survey(fleet)
+
+    assert strands == ()
+    assert "boom" in note
+
+
+def test_a_hand_edited_claim_that_is_not_a_dict_is_reported_not_raised(config):
+    """`_strand_survey` promises never to raise, and `check` is what a monitor
+    runs: reading lane 0's claim through the same helper every other lane's goes
+    through means an unusable shape claims NOTHING, which reports the task
+    rather than taking the monitor down with it."""
+    _state(config, phase=Phase.EXECUTING.value)
+    raw = json.loads(config.state_file.read_text(encoding="utf-8"))
+    raw["task_execution"] = ["brw-19"]
+    config.state_file.write_text(json.dumps(raw), encoding="utf-8")
+    _in_progress_with_open_attempt(config, "brw-19")
+
+    strands, note = health._strand_survey(config)
+
+    assert note == ""
+    assert [(s.task_id, s.stale_current) for s in strands] == [("brw-19", False)]
+
+
+def test_at_one_lane_a_stale_lanes_directory_changes_no_strand_answer(config):
+    """The `lanes <= 1` gate is `_lane_claims`' first statement, before any
+    read: a `lanes/` directory left by a cap the operator lowered TO one must
+    not start exempting tasks on a single-lane loop."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _dispatched_in(config, 1, "brw-19")
+    _in_progress_with_open_attempt(config, "brw-19")
+
+    strands, note = health._strand_survey(config)
+
+    assert note == ""
+    assert [s.task_id for s in strands] == ["brw-19"], "today's answer, unchanged"
+
+
+# --- the acceptance criterion: one lane, byte for byte -------------------------
+
+
+#: `health --json` at one lane, in full. A literal rather than a computed
+#: expectation on purpose: the criterion is that today's output does not move,
+#: and an expectation built from the dataclass would move with it.
+ONE_LANE_JSON = """{
+  "code": "running",
+  "needs_attention": false,
+  "summary": "autoloop is running (phase=executing)",
+  "detail": "",
+  "phase": "executing",
+  "open_blockers": 0,
+  "silent_minutes": null,
+  "stranded_tasks": [],
+  "held_merge_sweep": null,
+  "fleet_throttle": null,
+  "dead_lanes": null
+}"""
+
+
+def _health_command(config, monkeypatch, as_json: bool) -> int:
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    return cli._cmd_health(
+        argparse.Namespace(
+            config=None,
+            json=as_json,
+            silence_minutes=health.DEFAULT_SILENCE_MINUTES,
+            held_sweep_hours=health.DEFAULT_HELD_SWEEP_HOURS,
+        )
+    )
+
+
+def test_at_one_lane_the_json_the_text_and_the_exit_code_are_unchanged(
+    config, monkeypatch, capsys
+):
+    """THE acceptance criterion, through the command an operator and every cron
+    wrapper actually run. No transcript is written, so `silent_minutes` is
+    `null` and the snapshot is exact rather than nearly exact."""
+    _state(config, phase=Phase.EXECUTING.value)
+
+    with LoopLock(config.state_dir):
+        code = _health_command(config, monkeypatch, as_json=True)
+        payload = capsys.readouterr().out
+        text_code = _health_command(config, monkeypatch, as_json=False)
+        text = capsys.readouterr().out
+
+    assert payload == ONE_LANE_JSON + "\n"
+    assert text == "autoloop is running (phase=executing)\n"
+    assert (code, text_code) == (0, 0)
+
+
+def test_at_one_lane_no_fleet_key_exists_and_nothing_is_surveyed(config):
+    """The `lanes <= 1` gate is the FIRST thing `fleet_health` does, before any
+    read: a lane directory left by a cap the operator lowered TO one must not
+    grow rows on a single-lane loop."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _lane(config, 1)  # a lane 1 directory, at `lanes = 1`
+
+    with LoopLock(config.state_dir):
+        verdict = _check(config)
+
+    assert verdict.fleet is None
+    assert health.fleet_health(config) is None
+    assert '"fleet"' not in verdict.to_json()
+
+
+def test_above_one_lane_the_key_is_there(config):
+    """The other half of the same rule — additive, and only above one lane."""
+    fleet = _fleet(config, 2)
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.fleet is not None
+    assert '"fleet"' in verdict.to_json()
+
+
+def test_the_lane_pass_writes_nothing_and_takes_no_lease(config, monkeypatch):
+    """Read-only is this module's contract, and a lease taken by a monitor is
+    how a lane gets a second occupant."""
+    boot = _pin_boot(monkeypatch)
+    fleet = _fleet(config, 3)
+    _lane(fleet, 0)
+    _lane(fleet, 1)
+    _lease(fleet, 1, alive=False, boot=boot)
+    before = {p: p.stat().st_mtime_ns for p in fleet.state_dir.rglob("*") if p.is_file()}
+
+    with LoopLock(fleet.state_dir):
+        _check(fleet)
+
+    after = {p: p.stat().st_mtime_ns for p in fleet.state_dir.rglob("*") if p.is_file()}
     assert before == after
