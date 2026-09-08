@@ -740,9 +740,9 @@ HOLD_ORIGIN_OPERATOR = "operator"
 #: back.
 OPERATOR_HOLD_PREFIX = "operator hold: "
 
-#: Statuses whose task FIELDS (description, approved_paths, depends_on) an
-#: operator may still rewrite: the task is still ahead of the loop, so nothing
-#: is currently being judged against them.
+#: Statuses whose task FIELDS (description, approved_paths, depends_on,
+#: context_ids) an operator may still rewrite: the task is still ahead of the
+#: loop, so nothing is currently being judged against them.
 #:
 #: `in_progress` is excluded because every one of those fields is live during a
 #: dispatch — see `TaskRegistry._refuse_immutable` for what each one strands.

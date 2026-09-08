@@ -384,10 +384,18 @@ def test_a_rejected_scope_leaves_the_registry_byte_identical():
 # ---- context_ids: provenance that must never become authorization (ctx-04) --
 #
 # THE claim: a task can NAME the context it was written from, and naming it
-# widens nothing. The first three tests are the acceptance criteria a reviewer
+# widens nothing. The first four tests are the acceptance criteria a reviewer
 # should read first — they are written as attempts to widen a scope THROUGH the
 # new field, not as assertions about code shape, because "no derivation exists"
 # is only checkable by trying to make one.
+#
+# The fourth is the one that can fail on a leak the other three cannot reach:
+# they hand `effective_approved_paths` a path tuple themselves, so no citation
+# can arrive through their arguments however the field is wired, while the sites
+# that authorize a real round live in `orchestrator.py` and
+# `implement_executor.py`. Its behavioural half lives beside the prompt it is
+# about, in `test_implement_executor.py`:
+# `test_citing_context_records_changes_nothing_the_agent_may_write`.
 #
 # The rest pin the shape and persistence rules that keep the field from
 # becoming something else later: the bare string that splits per character, the
@@ -462,6 +470,103 @@ def test_a_records_own_source_paths_never_become_writable():
     authorized, outside, _trackers = deletable_paths(record.source_paths, scope)
     assert authorized == set()
     assert outside == set(record.source_paths)
+
+
+#: The functions that decide what a round may WRITE or DELETE. Every scope the
+#: loop enforces is one of their return values. `authorized_cleanup_paths` is
+#: here for the reason the other three are, even though its second argument is
+#: an execution record rather than a task: it is the one route by which a round
+#: deletes a file its `approved_paths` never covered, so it is exactly where a
+#: reference list would be worth laundering into.
+SCOPE_DECIDING_CALLS = (
+    "effective_approved_paths",
+    "unauthorized_paths",
+    "deletable_paths",
+    "authorized_cleanup_paths",
+)
+
+
+def test_no_scope_decision_in_the_package_is_handed_a_context_reference():
+    """ACCEPTANCE, over every call site in the package rather than over one.
+
+    The three tests above pass a path tuple in themselves, so a citation has no
+    way into the argument and they cannot fail on a leak wired in ELSEWHERE —
+    and elsewhere is where a real round's authorization is decided
+    (`orchestrator.py`'s dispatch seed, its every-dispatch re-sync and its
+    post-commit ownership check; `implement_executor.py`'s prompt, its delete
+    gate and its two cleanup gates). This asks the question of all of them at
+    once: no argument to a scope decision anywhere in this package reads
+    `context_ids`.
+
+    PARSED, not grepped, and that is load-bearing twice. Two of the
+    orchestrator's calls spread their arguments over several lines, so a
+    line-oriented scan reads `unauthorized_paths(` off a line that does not
+    contain the arguments it is judging; and three of the mentions in these
+    files are DOCSTRING prose, which a grep counts as a call site and `ast` does
+    not.
+
+    WHAT IT CANNOT SEE, stated so it is not read as more than it is: an id
+    laundered through a local variable before the call. That half is covered
+    behaviourally — `test_context.py`'s brief and
+    `test_implement_executor.py`'s scope list both hold a whole `Task` — and
+    the two assertions at the end are what stop THIS one passing because it
+    read nothing at all."""
+    import ast
+
+    # Imported and then USED below, so the static test selector can see the
+    # dependency this test acquires by READING files at runtime: it narrows a
+    # round to the tests that reach the modules it changed (`per_test_deps`,
+    # from names a test mentions), and an `rglob` mentions nothing. Without
+    # this, the round that wires a citation into `orchestrator.py` is exactly
+    # the round that deselects the guard against it.
+    from autoloop import context, implement_executor, orchestrator, packet
+
+    must_scan = {
+        Path(reader.__file__).name
+        for reader in (context, implement_executor, orchestrator, packet)
+    }
+    package = PACKAGE_ROOT / "autoloop"
+    scanned: set[str] = set()
+    decisions = 0
+    for module in sorted(package.rglob("*.py")):
+        if "tests" in module.relative_to(package).parts:
+            continue
+        source = module.read_text(encoding="utf-8")
+        if not any(f"{name}(" in source for name in SCOPE_DECIDING_CALLS):
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if called not in SCOPE_DECIDING_CALLS:
+                continue
+            decisions += 1
+            scanned.add(module.name)
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                read = {
+                    inner.attr if isinstance(inner, ast.Attribute) else inner.id
+                    for inner in ast.walk(arg)
+                    if isinstance(inner, (ast.Attribute, ast.Name))
+                }
+                assert "context_ids" not in read, (
+                    f"{module.name}:{node.lineno} hands a context reference to "
+                    f"{called}() — a citation names what a round may READ ABOUT, "
+                    "never what it may write"
+                )
+    # Fail-closed on the scan itself, twice. A glob that matched nothing, a
+    # rename that moved a call site, or a pre-filter that skipped a file would
+    # otherwise report "no leak found" having examined none of the sites that
+    # matter — silently, which is the shape this whole test exists to refuse.
+    assert must_scan <= scanned, (
+        f"scope decisions were never found in {sorted(must_scan - scanned)} — "
+        "the scan is broken, or those call sites moved and this test no longer "
+        "covers them"
+    )
+    assert decisions >= 10, (
+        f"only {decisions} scope decisions were scanned — the scan is broken, "
+        "not the package clean"
+    )
 
 
 def test_a_task_file_written_before_context_ids_existed_still_loads():
