@@ -919,6 +919,210 @@ def test_the_lane_rows_survive_a_stranded_task(config, monkeypatch):
     assert [row.lane_id for row in verdict.fleet.lanes] == [lane_id(0), lane_id(1)]
 
 
+# --- the strand survey asks EVERY lane, never lane 0 alone ---------------------
+#
+# `config.state_file` is lane 0's file above one lane, so a survey that asked
+# only it would report a task lane 1 dispatched minutes ago as stranded: it is
+# `in_progress`, it is not lane 0's current task, its attempt is OPEN and it has
+# no published sha — all four of `stranded_fault_rounds`' conditions. That is
+# this module's own false alarm, one lane over.
+
+
+def _in_progress_with_open_attempt(config, task_id: str):
+    """`task_id` held `in_progress` with an OPEN attempt and no published sha —
+    the shape the sweep looks at, with only the current-task exemption left to
+    decide it. Written straight to the stores `_strand_survey` reads rather than
+    driven through a dispatch: the claim under test is which STATE FILES the
+    exemption is read from, not how a record comes to exist."""
+    from autoloop.tasks import Task, TaskRegistry, TaskStore
+    from autoloop.worktask import (
+        ATTEMPT_PENDING,
+        TaskExecution,
+        TaskExecutionStore,
+        format_attempt,
+    )
+
+    registry = TaskRegistry(
+        [Task(id=task_id, title=f"T {task_id}", description="d", approved_paths=("A.py",))]
+    )
+    registry.mark_in_progress(task_id)
+    TaskStore(config.tasks_file).save(registry)
+    TaskExecutionStore(config.executions_dir).save(
+        TaskExecution(
+            task_id=task_id,
+            task_branch=f"autoloop/{task_id}",
+            worktree_path=str(config.workers_root / task_id),
+            task_base_sha="0" * 40,
+            attempt_ledger=(format_attempt(1, ATTEMPT_PENDING, "dispatched"),),
+        )
+    )
+
+
+def _dispatched_in(config, index: int, task_id: str, age_seconds: float = 0.0):
+    """Lane `index`, mid-round on `task_id`, dispatched `age_seconds` ago.
+
+    BOTH halves of the claim, because the age is only readable when they agree
+    (`current_round_age_seconds`), and the age is built by moving the STAMP
+    rather than a clock — the production reader takes its `now` from the wall
+    clock in every real call."""
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat()
+    return _lane(
+        config,
+        index,
+        task_execution={"task_id": task_id},
+        current_task={"task_id": task_id, "started_at": stamp},
+    )
+
+
+def test_a_task_another_lane_is_running_is_not_stranded(config):
+    """THE regression: lane 1 is working it right now, and lane 0's state file
+    has never heard of it."""
+    fleet = _fleet(config, 3)
+    _lane(fleet, 0)
+    _dispatched_in(fleet, 1, "brw-19")
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert health._strand_survey(fleet) == ((), "")
+    assert verdict.stranded_tasks == ()
+    assert verdict.code != health.STUCK_STRANDED
+
+
+def test_a_retired_lanes_round_is_exempt_too(config):
+    """Lowering the cap does not end the round in a lane it stops walking, so a
+    lane above the cap claims exactly like one inside it."""
+    fleet = _fleet(config, 2)
+    _dispatched_in(fleet, 2, "brw-19")
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert verdict.stranded_tasks == ()
+
+
+def test_a_lane_claim_past_the_round_ceiling_is_stranded_again(config):
+    """The BOUND, per lane. An exemption with no bound on it is the bug the
+    scalar exemption already shipped once — N times over here, since a lane
+    whose round died still names its task forever."""
+    fleet = _fleet(config, 3)
+    _dispatched_in(
+        fleet, 1, "brw-19", age_seconds=health.round_ceiling_for(fleet) + 60
+    )
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    strands, note = health._strand_survey(fleet)
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert note == ""
+    assert [(s.task_id, s.stale_current) for s in strands] == [("brw-19", True)]
+    assert verdict.code == health.STUCK_STRANDED
+    assert verdict.stranded_tasks == ("brw-19",)
+
+
+def test_a_lane_mid_handoff_claims_nothing_it_cannot_date(config):
+    """`current_task` and `task_execution` naming different tasks is a dispatch
+    that died between its two writes — no evidence of a live round, and no
+    evidence is not an exemption."""
+    fleet = _fleet(config, 2)
+    _lane(
+        fleet,
+        1,
+        task_execution={"task_id": "brw-19"},
+        current_task={"task_id": "someone-else", "started_at": utcnow_iso()},
+    )
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    strands, note = health._strand_survey(fleet)
+
+    assert note == ""
+    assert [(s.task_id, s.stale_current) for s in strands] == [("brw-19", True)]
+
+
+def test_a_lane_nobody_can_read_stops_the_survey_rather_than_guessing(config):
+    """The fail-open this closes: a lane whose state cannot be read is a lane
+    whose claim cannot be known, and sweeping on without it reports the task it
+    is running as stranded."""
+    fleet = _fleet(config, 2)
+    _in_progress_with_open_attempt(fleet, "brw-19")
+    _unreadable_lane(fleet, 1)
+
+    strands, note = health._strand_survey(fleet)
+    with LoopLock(fleet.state_dir):
+        verdict = _check(fleet)
+
+    assert strands == ()
+    assert lane_id(1) in note
+    assert verdict.stranded_tasks == ()
+    assert verdict.needs_attention is True, "a survey that could not run escalates"
+    assert note in verdict.detail
+
+
+def test_a_lanes_directory_that_cannot_be_listed_stops_the_survey(config):
+    """A round in a lane ABOVE the cap can only be found by listing `lanes/`. A
+    listing that fails is not 'no lane above the cap is running anything'."""
+    fleet = _fleet(config, 2)
+    fleet.state_dir.mkdir(parents=True, exist_ok=True)
+    (fleet.state_dir / "lanes").write_text("not a directory", encoding="utf-8")
+    _in_progress_with_open_attempt(fleet, "brw-19")
+
+    strands, note = health._strand_survey(fleet)
+
+    assert strands == ()
+    assert "lanes/ could not be listed" in note
+
+
+def test_a_survey_that_raises_on_the_lanes_is_reported_as_itself(config, monkeypatch):
+    """`_strand_survey` never raises: `check` is advisory and runs against
+    half-initialised state directories on a schedule."""
+    fleet = _fleet(config, 2)
+    _in_progress_with_open_attempt(fleet, "brw-19")
+    monkeypatch.setattr(
+        health,
+        "_lane_claims",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    strands, note = health._strand_survey(fleet)
+
+    assert strands == ()
+    assert "boom" in note
+
+
+def test_a_hand_edited_claim_that_is_not_a_dict_is_reported_not_raised(config):
+    """`_strand_survey` promises never to raise, and `check` is what a monitor
+    runs: reading lane 0's claim through the same helper every other lane's goes
+    through means an unusable shape claims NOTHING, which reports the task
+    rather than taking the monitor down with it."""
+    _state(config, phase=Phase.EXECUTING.value)
+    raw = json.loads(config.state_file.read_text(encoding="utf-8"))
+    raw["task_execution"] = ["brw-19"]
+    config.state_file.write_text(json.dumps(raw), encoding="utf-8")
+    _in_progress_with_open_attempt(config, "brw-19")
+
+    strands, note = health._strand_survey(config)
+
+    assert note == ""
+    assert [(s.task_id, s.stale_current) for s in strands] == [("brw-19", False)]
+
+
+def test_at_one_lane_a_stale_lanes_directory_changes_no_strand_answer(config):
+    """The `lanes <= 1` gate is `_lane_claims`' first statement, before any
+    read: a `lanes/` directory left by a cap the operator lowered TO one must
+    not start exempting tasks on a single-lane loop."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _dispatched_in(config, 1, "brw-19")
+    _in_progress_with_open_attempt(config, "brw-19")
+
+    strands, note = health._strand_survey(config)
+
+    assert note == ""
+    assert [s.task_id for s in strands] == ["brw-19"], "today's answer, unchanged"
+
+
 # --- the acceptance criterion: one lane, byte for byte -------------------------
 
 

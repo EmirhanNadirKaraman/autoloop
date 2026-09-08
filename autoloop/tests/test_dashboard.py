@@ -7404,6 +7404,115 @@ def test_the_panel_renders_the_rows_health_built_rather_than_re_deriving_them(
     assert json.loads(dash.lanes_json(dash.lanes_status(config)))["cap"] == 2
 
 
+# ---- the panel's call site: `autoloop lanes` (conc-09) ------------------------
+#
+# A panel nothing calls is a panel no operator sees. The command is the surface,
+# and it is a command rather than an HTTP route for `_cmd_projects`' reason: the
+# front door is bound to a CHECKOUT (`Handler.repo`) while `[concurrency] lanes`
+# exists only in a config, which is what the command already loads.
+
+
+def _lanes_command(config, monkeypatch, *, as_json: bool = False) -> int:
+    import argparse
+
+    from autoloop import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    return cli._cmd_lanes(argparse.Namespace(config=None, json=as_json))
+
+
+def test_the_lanes_command_prints_every_lane_and_takes_no_lock(
+    tmp_path, monkeypatch, capsys
+):
+    """The two load-bearing properties, through the surface an operator runs."""
+    from autoloop.config import lane_id
+    from autoloop.lock import LoopLock
+
+    config = lane_config(tmp_path, lanes=3)
+    seed_lane_state(config, 0, "executing", task_id="brw-19")
+    seed_lane_state(config, 1, "executing", task_id="brw-20")
+
+    with LoopLock(config.state_dir):
+        before = sorted(p.name for p in config.state_dir.rglob("*"))
+        code = _lanes_command(config, monkeypatch)
+        out = capsys.readouterr().out
+        after = sorted(p.name for p in config.state_dir.rglob("*"))
+
+    assert code == 0, "no lane needs a person"
+    assert after == before, "a panel that wrote would stop the loop it observes"
+    for index in range(3):
+        assert lane_id(index) in out
+    assert "2 of 3 lane(s) busy" in out
+    assert "brw-19" in out and "brw-20" in out
+
+
+def test_the_lanes_command_exits_one_when_a_lane_needs_a_person(
+    tmp_path, monkeypatch, capsys
+):
+    """`health`'s exit contract, so the same cron wrapper works."""
+    from autoloop.config import lane_id
+    from autoloop.state import lane_paths
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing")
+    paths = lane_paths(config.state_dir, 1)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text("]", encoding="utf-8")
+
+    code = _lanes_command(config, monkeypatch)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert f"1 need attention: {lane_id(1)}" in out
+
+
+def test_the_lanes_command_json_is_the_same_rows_health_judged(
+    tmp_path, monkeypatch, capsys
+):
+    """One aggregation, and the command prints it rather than a second reading
+    of the same files."""
+    import autoloop.dashboard as dash
+    from autoloop import health
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing", task_id="brw-19")
+
+    code = _lanes_command(config, monkeypatch, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload == json.loads(dash.lanes_json(health.fleet_health(config)))
+    assert payload["cap"] == 2 and len(payload["lanes"]) == 2
+
+
+def test_the_lanes_command_at_one_lane_says_so_and_is_not_an_error(
+    tmp_path, monkeypatch, capsys
+):
+    """One lane is an ordinary healthy deployment, not a misconfigured fleet: a
+    wrapper that read a non-zero code as trouble would fire on every deployment
+    shipping today."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=1)
+    seed_lane_state(config, 0, "executing")
+
+    code = _lanes_command(config, monkeypatch)
+
+    assert code == 0
+    assert capsys.readouterr().out == dash.SINGLE_LANE_PANEL + "\n"
+
+
+def test_the_lanes_command_is_wired_into_the_parser():
+    """A function nothing dispatches to is not a surface."""
+    from autoloop import cli
+
+    args = cli.build_parser().parse_args(["lanes"])
+
+    assert args.func is cli._cmd_lanes
+    assert args.json is False
+    assert "lanes" in cli.build_parser().format_help()
+
+
 # ---- the projects view's TASK column (conc-09, Decision 7's last bullet) ------
 
 
