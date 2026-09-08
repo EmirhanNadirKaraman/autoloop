@@ -7272,3 +7272,322 @@ def test_a_since_dispatch_timer_never_outlives_the_execution_it_belongs_to(tmp_p
     # The page says so in words rather than printing a zero it never measured.
     fmt = PAGE.split("function fmtDur(s){", 1)[1].split("\n}", 1)[0]
     assert 'if (typeof s !== "number") return "unknown";' in fmt
+
+
+# ---- the lanes panel (conc-09) -----------------------------------------------
+#
+# `docs/AUTOLOOP.md` Decision 7: "the dashboard grows a lanes panel over the
+# same aggregation, kept separate from its front door exactly as
+# `dashboard.projects_status` is". Two properties are load-bearing and both are
+# pinned here: it renders EVERY lane (never one lane standing in for the fleet),
+# and it takes NO LOCK — the loop holds `LoopLock` for its whole run, so a panel
+# that waited for it could only ever render a stopped fleet.
+
+
+def lane_config(tmp_path, lanes: int):
+    from autoloop.config import (
+        AutoloopConfig,
+        BrowserConfig,
+        ConcurrencyConfig,
+        PolicyConfig,
+    )
+
+    return AutoloopConfig(
+        browser=BrowserConfig(conversation_url="https://chatgpt.com/c/lanes"),
+        policy=PolicyConfig(),
+        state_dir=tmp_path / ".autoloop",
+        workers_root=tmp_path / "workers",
+        concurrency=ConcurrencyConfig(lanes=lanes),
+    )
+
+
+def seed_lane_state(config, index: int, phase, *, task_id="", started_at=""):
+    from autoloop.state import LoopState, StateStore, lane_paths
+
+    state = LoopState(session_id=f"lane-{index}", conversation_url="https://x/c")
+    state.phase = phase
+    if task_id:
+        state.task_execution = {"task_id": task_id}
+        state.current_task = {"task_id": task_id, "started_at": started_at}
+    paths = lane_paths(config.state_dir, index)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    StateStore(paths.state_file).save(state)
+
+
+def test_the_lanes_panel_renders_every_lane_and_takes_no_lock(tmp_path):
+    import autoloop.dashboard as dash
+    from autoloop.lock import LoopLock
+
+    config = lane_config(tmp_path, lanes=3)
+    seed_lane_state(config, 0, "executing")
+    seed_lane_state(config, 1, "executing")
+
+    # Held for the whole call, exactly as the loop holds it for a whole run.
+    with LoopLock(config.state_dir):
+        before = sorted(p.name for p in config.state_dir.rglob("*"))
+        fleet = dash.lanes_status(config)
+        text = dash.render_lanes_text(fleet)
+        after = sorted(p.name for p in config.state_dir.rglob("*"))
+
+    from autoloop.config import lane_id
+
+    assert len(fleet.lanes) == 3
+    assert after == before, "a panel that wrote would stop the loop it observes"
+    for index in range(3):
+        assert lane_id(index) in text
+    assert "2 of 3 lane(s) busy" in text
+
+
+def test_the_panel_tells_a_fleet_at_its_cap_from_an_idle_one(tmp_path):
+    import autoloop.dashboard as dash
+
+    idle = lane_config(tmp_path / "idle", lanes=2)
+    full = lane_config(tmp_path / "full", lanes=2)
+    seed_lane_state(full, 0, "executing")
+    seed_lane_state(full, 1, "executing")
+
+    idle_text = dash.render_lanes_text(dash.lanes_status(idle))
+    full_text = dash.render_lanes_text(dash.lanes_status(full))
+
+    assert "the fleet is idle" in idle_text
+    assert "the fleet is at its cap" in full_text
+
+
+def test_the_panel_names_a_lane_that_needs_a_person(tmp_path):
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing")
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    from autoloop.state import lane_paths
+
+    paths = lane_paths(config.state_dir, 1)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text("]", encoding="utf-8")
+
+    text = dash.render_lanes_text(dash.lanes_status(config))
+
+    from autoloop.config import lane_id
+
+    marked = [line for line in text.splitlines() if line.startswith("!")]
+    assert [line for line in marked if lane_id(1) in line], text
+    assert f"1 need attention: {lane_id(1)}" in text
+
+
+def test_at_one_lane_the_panel_says_so_rather_than_rendering_an_empty_table(
+    tmp_path,
+):
+    """One lane and "N lanes, all idle" must never render alike."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=1)
+    seed_lane_state(config, 0, "executing")
+
+    fleet = dash.lanes_status(config)
+
+    assert fleet is None
+    assert dash.render_lanes_text(fleet) == dash.SINGLE_LANE_PANEL
+    assert dash.lanes_json(fleet) == "null"
+
+
+def test_the_panel_renders_the_rows_health_built_rather_than_re_deriving_them(
+    tmp_path,
+):
+    """One aggregation, two consumers — the whole reason it lives in `health`."""
+    import autoloop.dashboard as dash
+    from autoloop import health
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing")
+
+    assert dash.lanes_status(config) == health.fleet_health(config)
+    assert json.loads(dash.lanes_json(dash.lanes_status(config)))["cap"] == 2
+
+
+# ---- the panel's call site: `autoloop lanes` (conc-09) ------------------------
+#
+# A panel nothing calls is a panel no operator sees. The command is the surface,
+# and it is a command rather than an HTTP route for `_cmd_projects`' reason: the
+# front door is bound to a CHECKOUT (`Handler.repo`) while `[concurrency] lanes`
+# exists only in a config, which is what the command already loads.
+
+
+def _lanes_command(config, monkeypatch, *, as_json: bool = False) -> int:
+    import argparse
+
+    from autoloop import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    return cli._cmd_lanes(argparse.Namespace(config=None, json=as_json))
+
+
+def test_the_lanes_command_prints_every_lane_and_takes_no_lock(
+    tmp_path, monkeypatch, capsys
+):
+    """The two load-bearing properties, through the surface an operator runs."""
+    from autoloop.config import lane_id
+    from autoloop.lock import LoopLock
+
+    config = lane_config(tmp_path, lanes=3)
+    seed_lane_state(config, 0, "executing", task_id="brw-19")
+    seed_lane_state(config, 1, "executing", task_id="brw-20")
+
+    with LoopLock(config.state_dir):
+        before = sorted(p.name for p in config.state_dir.rglob("*"))
+        code = _lanes_command(config, monkeypatch)
+        out = capsys.readouterr().out
+        after = sorted(p.name for p in config.state_dir.rglob("*"))
+
+    assert code == 0, "no lane needs a person"
+    assert after == before, "a panel that wrote would stop the loop it observes"
+    for index in range(3):
+        assert lane_id(index) in out
+    assert "2 of 3 lane(s) busy" in out
+    assert "brw-19" in out and "brw-20" in out
+
+
+def test_the_lanes_command_exits_one_when_a_lane_needs_a_person(
+    tmp_path, monkeypatch, capsys
+):
+    """`health`'s exit contract, so the same cron wrapper works."""
+    from autoloop.config import lane_id
+    from autoloop.state import lane_paths
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing")
+    paths = lane_paths(config.state_dir, 1)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text("]", encoding="utf-8")
+
+    code = _lanes_command(config, monkeypatch)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert f"1 need attention: {lane_id(1)}" in out
+
+
+def test_the_lanes_command_json_is_the_same_rows_health_judged(
+    tmp_path, monkeypatch, capsys
+):
+    """One aggregation, and the command prints it rather than a second reading
+    of the same files."""
+    import autoloop.dashboard as dash
+    from autoloop import health
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing", task_id="brw-19")
+
+    code = _lanes_command(config, monkeypatch, as_json=True)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload == json.loads(dash.lanes_json(health.fleet_health(config)))
+    assert payload["cap"] == 2 and len(payload["lanes"]) == 2
+
+
+def test_the_lanes_command_at_one_lane_says_so_and_is_not_an_error(
+    tmp_path, monkeypatch, capsys
+):
+    """One lane is an ordinary healthy deployment, not a misconfigured fleet: a
+    wrapper that read a non-zero code as trouble would fire on every deployment
+    shipping today."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=1)
+    seed_lane_state(config, 0, "executing")
+
+    code = _lanes_command(config, monkeypatch)
+
+    assert code == 0
+    assert capsys.readouterr().out == dash.SINGLE_LANE_PANEL + "\n"
+
+
+def test_the_lanes_command_is_wired_into_the_parser():
+    """A function nothing dispatches to is not a surface."""
+    from autoloop import cli
+
+    args = cli.build_parser().parse_args(["lanes"])
+
+    assert args.func is cli._cmd_lanes
+    assert args.json is False
+    assert "lanes" in cli.build_parser().format_help()
+
+
+# ---- the projects view's TASK column (conc-09, Decision 7's last bullet) ------
+
+
+def test_the_projects_task_column_shows_the_fleet_never_one_lane(tmp_path):
+    """`3 lanes: brw-19 +2` — the oldest in-flight task and how many others.
+    Lane 0's task printed alone in a column headed TASK is exactly the single
+    string presented as the system's that this candidate abolishes."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=3)
+    seed_lane_state(config, 0, "executing", task_id="zzz-01",
+                    started_at="2026-09-02T10:00:00+00:00")
+    seed_lane_state(config, 1, "executing", task_id="brw-19",
+                    started_at="2026-09-01T09:00:00+00:00")
+    seed_lane_state(config, 2, "executing", task_id="aaa-03",
+                    started_at="2026-09-03T11:00:00+00:00")
+
+    task, phase, note = dash._current_task(config)
+
+    assert task == "3 lanes: brw-19 +2", "the OLDEST names it, not the lowest lane"
+    assert phase == "", "there is no such thing as the fleet's phase"
+    assert note == ""
+
+
+def test_a_lane_with_no_dispatch_stamp_never_names_the_fleet(tmp_path):
+    """An empty stamp is an unknown time, not an early one: letting it sort
+    first would name the fleet after the lane we know least about."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing", task_id="no-stamp")
+    seed_lane_state(config, 1, "executing", task_id="brw-19",
+                    started_at="2026-09-01T09:00:00+00:00")
+
+    assert dash._current_task(config)[0] == "2 lanes: brw-19 +1"
+
+
+def test_an_idle_fleet_says_idle_rather_than_borrowing_the_dash(tmp_path):
+    """`—` means UNREADABLE in every column of that view and must not be
+    borrowed for 'several' — or for 'none'."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=2)
+
+    task, _phase, note = dash._current_task(config)
+
+    assert task == "2 lanes: idle" and "—" not in task
+    assert note == ""
+
+
+def test_a_lane_nobody_can_read_reaches_the_projects_row_as_a_note(tmp_path):
+    import autoloop.dashboard as dash
+    from autoloop.config import lane_id
+    from autoloop.state import lane_paths
+
+    config = lane_config(tmp_path, lanes=2)
+    seed_lane_state(config, 0, "executing", task_id="brw-19",
+                    started_at="2026-09-01T09:00:00+00:00")
+    paths = lane_paths(config.state_dir, 1)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text("]", encoding="utf-8")
+
+    task, _phase, note = dash._current_task(config)
+
+    assert task == "2 lanes: brw-19"
+    assert lane_id(1) in note
+
+
+def test_at_one_lane_the_task_column_is_what_it_always_was(tmp_path):
+    """The acceptance criterion, one column over: at one lane the loop's own
+    state file answers, exactly as it did before there were lanes."""
+    import autoloop.dashboard as dash
+
+    config = lane_config(tmp_path, lanes=1)
+    seed_lane_state(config, 0, "executing", task_id="brw-19",
+                    started_at="2026-09-01T09:00:00+00:00")
+
+    assert dash._current_task(config) == ("brw-19", "executing", "")
