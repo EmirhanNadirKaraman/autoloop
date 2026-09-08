@@ -601,12 +601,16 @@ rule `intake decline` already uses for an offered suggestion.
 
 ## Running several tasks at once — the split plan
 
-**Status: a PLAN, not a mechanism.** Nothing in this section is implemented.
-It is the design contract conc-01 was asked to produce, so that the work can be
-authorised as a sequence of independently reviewable candidates instead of one
-change nobody can review. The loop is single-lane today and stays single-lane
-until the last candidate below lands; every candidate before it ships with the
-concurrency setting at `1`, where the loop behaves exactly as it does now.
+**Status: BUILT, and shipped switched off.** This was the design contract
+conc-01 was asked to produce, so that the work could be authorised as a
+sequence of independently reviewable candidates instead of one change nobody
+can review; all nine have landed, and conc-10 turned the mechanism on
+(`cli._run_fleet`). What ships is `lanes = 1`, where every gate below answers
+before it reads anything and the loop behaves exactly as it always has —
+raising the setting is an operator's decision, taken against the costs
+`autoloop/config.example.toml` states beside the key. Each decision below is
+kept in the present tense, with a bolded paragraph recording what the candidate
+that built it actually did and where it differs from what was planned.
 
 The prize is measured, not assumed. Over the 126 rounds from 2026-08-22 to
 2026-08-26 the executor took 71.8 of 101.3 wall-clock hours (71%); submit took
@@ -1452,6 +1456,159 @@ stranded.
 *Tests:* an end-to-end round at `lanes = 2` with a stub executor: two candidates
 produced, two independent reviews, two merges one at a time, the second rebased
 and re-reviewed against the first; the shipped default stays `1`.
+
+**conc-10 landed that as `cli._run_fleet`, and the mechanism it needed was one
+thing the plan's scope line did not anticipate: a RUNNER.** Every candidate
+before this one is per LANE and was waiting for a second lane to be handed;
+nothing in the loop opened one, because `_cmd_run` entered lane 0 and called
+`_run_continuous` once. `_run_fleet` opens `lanes` of them — N threads in ONE
+process holding the one `LoopLock`, N `_LaneEntry` leases, N `_run_continuous`
+loops — and one process is not an implementation detail: `LaneLease.
+break_stale`, `merge_sweep.MergeToken`'s recovery and `recover_dead_lanes` are
+all check-then-act sequences whose own docstrings say they are safe only from
+the holder of the fleet lock, and lanes in separate processes would inherit that
+obligation with nothing to discharge it with. Lane index reaches the round
+through `_build_orchestrator`, which is what points a lane at its own clone
+(`ObservedCheckout.for_lane`) and its own sibling set; it is passed only when it
+is not zero, so every existing six-argument caller makes the call it always did.
+**The self-upgrade boundary is the one thing a lane may not take.**
+`FleetPlan.upgrade_boundary` is a fact about the FLEET — an upgrade is pending
+and every lane is idle — so every lane sees it on the same tick, and the first
+to arrive could fail to hand off and decline the sha into the run's
+`answered_upgrades`, after which `_drainable_upgrade_sha` answers `""`, the
+drain stops, and the merged code sits on disk with nothing left able to act on
+it. Both doors to the boundary are therefore gated on `_lane_owns_upgrade` —
+lane 0, because it is the only index a lowered cap can never retire, decided
+from the in-memory index and never from a file, so the gate has no unreadable
+state to fail open on. A non-owner neither reaches the boundary nor writes
+`answered_upgrades`; it declines into a set only it reads
+(`self_upgrade_not_this_lane`) and lands on the drain's own hold, since
+`upgrade_boundary` implies `draining`. And the OWNER does not `os.execv` inside
+a lane thread either: the replacement keeps the pid, a lease has no adoption of
+its own, and a sibling lease still on disk would name the successor's own pid,
+read as live, and fail the successor closed on its own lane. So the owner asks
+the fleet to stop, every lane returns at the top of its next iteration and
+unwinds its own lease, and `_run_fleet` reaches the boundary with lane 0's entry
+the only one left — the thread lifecycle IS the barrier. A replacement that does
+not happen restarts exactly the lanes that stepped aside, with the sha bound so
+the fleet does not drain for it again. A fleet killed without unwinding leaves
+those leases behind, which is conc-08's case exactly: `_cmd_run` calls
+`recover_dead_lanes` once above one lane, before any lane is entered, because
+lane 0's own stale lease would otherwise stop the next `run` before it started.
+`autoloop/tests/test_fleet_end_to_end.py` proves the overlap with a barrier
+rather than an assertion — a runner that ran the lanes in sequence fails it by
+TIMING OUT — and the merge serialisation with two threads racing for the token,
+which is the half conc-08's own tests cannot fail for the right reason.
+
+**TWO OF THE THREE FILES N LANES SHARE, and both were lost updates.** They were
+first recorded here as work this candidate had NOT done; the review that
+authorised turning concurrency on required them closed first, and they are. The
+third is `pending_upgrade.json`, below.
+
+* **`tasks.json`.** Each lane loads the registry at the top of its outer
+  iteration and holds that object for a whole round, and every save writes the
+  WHOLE registry — so a lane recording its own transition also wrote its stale
+  copy of every other row, and a sibling's dispatch, completion, quarantine or
+  newly planned subtasks went with it, silently. `TaskStore.save` reconciled
+  `priority` and nothing else, because until there was a second LANE the only
+  other writer was the operator's priority edit. It now reconciles the ROW:
+  `TaskRegistry` remembers what each row looked like when it loaded or last
+  saved (the baseline), and `TaskStore.reconcile_concurrent_rows` adopts, whole,
+  every row on disk that this registry did not itself change — including rows
+  only the file has, which are tasks another lane added. A row this registry
+  DID change is never overwritten, so the cure cannot lose the caller's own
+  work, and a registry built by hand rather than loaded has no baseline at all,
+  which is what makes the mechanism invisible below a fleet. The gate is
+  `TaskStore(fleet=...)`, set once from `[concurrency] lanes > 1` in
+  `cli._load_tasks` — an in-memory config value, no file to fail open on. And
+  because a status can move between the supervisor's scan and the line that
+  writes `in_progress`, the DISPATCH takes the reconcile, the decision and the
+  mark inside one `tasks.task_file_mutex` hold
+  (`orchestrator._claim_task_for_dispatch`; the denial is WRITTEN after the hold
+  is released, since a transcript entry and a blocker record are no other lane's
+  business): a task a sibling took in that window is refused with the
+  supervisor's own `HOLD_IN_FLIGHT` word, untouched, unattempted, on the
+  ordinary corrective re-prompt. `mark_in_progress` could not be that check — it
+  is idempotent on an already in-progress row. The refusal asks only about a row
+  THAT HOLD ADOPTED: a row that already read `in_progress` when the lane loaded
+  is the pre-existing in-flight case Decision 3 leaves to policy and to the
+  worker repo a second dispatch cannot create over the first.
+* **`publisher.git`.** One bare repository under the state directory, and every
+  lane publishes through it. Two lanes fetching into it at once contend on git's
+  own `FETCH_HEAD` lock, and git's answer is to FAIL the second — a lane parked
+  on a push refusal for nothing but a neighbour's timing. `publisher.
+  publisher_mutex` serialises `import_candidate` and `publish` on the same
+  primitive the task file uses, with a timeout taken from
+  `worker_env.OBSERVED_GIT_TIMEOUT_SECONDS` rather than the task file's ten
+  seconds, because the holder is inside a network push. A wait that does expire
+  leaves as a `GitCommandError`, not the `StateError` the primitive raises, so
+  it parks like any other push failure instead of ending the lane by traceback.
+  The lock order is a rule: the task-file mutex is never taken while the
+  publisher's is held.
+
+**Two readers this candidate still did NOT make fleet-aware, named so the next
+round inherits them rather than discovering them.** `heartbeat.json` is one file
+per deployment that every lane overwrites with its own phase, and
+`cli._cmd_status` reads lane 0's state file under a headline about the loop
+(both already recorded under Decision 7). Both are reachable only above one
+lane.
+
+**THE THIRD FILE N LANES SHARE — `pending_upgrade.json`, and it was a lost
+update of the same shape.** It was first recorded here as a residual of the
+ownership round; the review that authorised turning concurrency on required it
+closed first, and it is. One record: the lane whose merge changed `autoloop/`
+SAVES a fresh `pending` one (`auto_merge._note_loop_code_merge`, which saves
+unconditionally — that is also why a marker left armed cannot block a later
+upgrade), and the top of EVERY lane's second iteration reads it and clears it
+if it says `execed` (`cli._confirm_self_upgrade`). Run unserialised those two
+interleave: the confirmation reads `execed`, a sibling's merge writes `pending`
+over it, and the unlink then removes an upgrade nothing has answered — no
+boundary is ever offered it, no entry says it went, and the merged code sits on
+disk forever. The silent-no-outcome failure, one function over. Two things
+close it, and they are the shape conc-11 uses for the throttle episode. Every
+WRITE to the record goes inside one cross-process hold (`UpgradeStore._hold`,
+`tasks.task_file_mutex` borrowed rather than rebuilt, and only the ACQUISITION
+converts — to `UpgradeRecordBusy`, an `OSError` subclass, because every caller
+on this path already answers a write that did not land with `except OSError`
+and a `StateError` arriving from inside a merge or one statement past a
+boundary would leave by traceback). And the removal is a COMPARE-AND-CLEAR on
+the identity that was read (`UpgradeStore.clear(base_sha=…, status=…)`, load
+and comparison and unlink inside one hold), so a lane removes the record it
+read and never a newer one — which also makes the confirmation once per
+REPLACEMENT rather than once per lane, since the first lane's clear matches and
+the rest do not. A refusal is not silent either: it writes
+`self_upgrade_confirm_skipped`. `_carry_on_upgrade`'s own removal — the marker
+a process cleans up after a handoff that did not happen — takes the same
+comparison for the same reason. **And at `lanes = 1` none of it exists**: the
+gate is `UpgradeStore.for_config`, `[concurrency] lanes > 1` read once from an
+in-memory config with no file to fail open on, so no mutex file appears beside
+the record and a single-lane state directory holds what it always did. The
+comparison is not gated, because it is not a race fix — at one lane the record
+it compares against is the one that thread just read.
+
+**And the price of pinning ownership to lane 0, which is closed too.**
+`_run_fleet` does not restart a lane that ENDED, and thirteen codes are
+lane-fatal (`blockers.LANE_FATAL_CODES`), so a lane-fatal park in lane 0 left
+the fleet running with no upgrade owner in it: an upgrade merged after that
+drained and never arrived, every remaining lane being a non-owner landing on
+the drain's own hold, until an operator restarted. Of the two answers this plan
+listed — ownership follows the lowest LIVE lane, or the runner restarts a
+parked owner — the FIRST is taken, because the second re-enters a lane whose
+park is the reason a person was summoned. `_FleetRun.upgrade_owner` is the
+lowest lane still running in this process; `_open_lanes` declares the pass
+before a single thread starts and `_lane_thread` records a lane's departure in
+a `finally`, so a lane that has not started yet never reads as one that has
+finished. It stays lane 0 in every fleet that has not lost one, which is what
+keeps `lanes = 1` and every ordinary fleet exactly as they were. The two
+properties that keep the ORIGINAL defect closed are properties of the sequence
+rather than of one tick: a lane must be running to own the boundary and a lane
+stops running only by leaving its own thread, so exactly one lane answers True
+at any instant and the answer only ever moves UP. A fleet with no lane left
+running has no owner at all, which is the fail-closed direction — nothing is
+left to act on a boundary in a fleet that is unwinding — and it can only be
+read by a lane that is not running. Ownership is still decided in memory and
+never from a file: which lanes are running is this process's own thread
+bookkeeping, so there is no unreadable state for the gate to fail open on.
 
 ### Where each of the brief's required tests is proved
 

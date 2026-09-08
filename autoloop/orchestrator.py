@@ -8630,6 +8630,21 @@ class Orchestrator:
             return False
         return base_sha not in self._declined_upgrades
 
+    def _fleet_lane_count(self) -> int:
+        """How many lanes this loop is running, as this round can read it.
+
+        A fleet size this build cannot read is ONE lane, not a comparison
+        against a string: `config.load_config` refuses every such value at load
+        time, so reaching the fallback means a hand-built config, and the
+        single-lane reading is the one that changes nothing. One function
+        because two readings of "how big is the fleet" would drift, and the one
+        that drifts is the one that lets a second lane past a gate.
+        """
+        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            return 1
+        return lanes
+
     def _refused_outside_fleet_admission(
         self, directive: Directive, task: Task
     ) -> bool:
@@ -8719,13 +8734,7 @@ class Orchestrator:
         denial budget instead. That bound is the same one every refused directive
         in this loop has.
         """
-        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
-        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
-            # A fleet size this build cannot read is ONE lane, not a comparison
-            # against a string: `config.load_config` refuses every such value at
-            # load time, so reaching this is a hand-built config, and the
-            # single-lane reading is the one that changes nothing.
-            lanes = 1
+        lanes = self._fleet_lane_count()
         if task.id in self._session_task_ids():
             # Ahead of every other check, retired lane included: a lane the
             # operator has cut out of the fleet still FINISHES the arc it is
@@ -8847,6 +8856,11 @@ class Orchestrator:
         supervisor is holding. An audit passes the second one by construction —
         it takes no task out of the queue, so there is no admission to decide,
         and the round it does take is what the urgent gate above answers for.
+
+        The LAST gate is `_claim_task_for_dispatch`, and it is last because it
+        is not a policy question: it is the moment this task actually becomes
+        this lane's, taken atomically against the task file so two lanes cannot
+        both take it (conc-10b). Inert at one lane.
         """
         state = self.state
         is_audit = (
@@ -8871,19 +8885,12 @@ class Orchestrator:
                 # mid-task plan reshape from silently widening a ceiling: the
                 # grant happens there, gated on the request, or not at all.
                 return
-            if directive.decomposition is not None:
-                # The approved plan, made durable BEFORE the executor runs, in
-                # the same save as `mark_in_progress` — so a task can never be
-                # in progress against a plan nothing recorded. `implement`
-                # cannot get this far without one (policy's
-                # `_check_decomposition`); `revise` reaching here with one is a
-                # deliberate reshape, and reaching here without one leaves the
-                # stored plan exactly as it was.
-                self._registry.set_decomposition(
-                    task.id, directive.decomposition.render()
-                )
-            self._registry.mark_in_progress(task.id)
-            self._task_store.save(self._registry)
+            task = self._claim_task_for_dispatch(directive, task)
+            if task is None:
+                # Another lane took this task between the plan and this line.
+                # Refused, never parked, and nothing was written — see
+                # `_claim_task_for_dispatch`. Answers instantly at one lane.
+                return
             state.current_task = {
                 "task_id": task.id,
                 "title": task.title,
@@ -8896,6 +8903,138 @@ class Orchestrator:
                 return  # parked; _resolve_audit_task already reported why
 
         self._dispatch_task_postcommit(directive, task, state)
+
+    def _claim_task_for_dispatch(
+        self, directive: Directive, task: Task
+    ) -> Task | None:
+        """Take this task for this lane, or refuse. Returns the task as it now
+        stands (`None` when another lane already holds it).
+
+        **THE CHECK AND THE MARK ARE ONE HOLD**, and that is the whole point.
+        The supervisor's own `HOLD_IN_FLIGHT` reads the registry and the lanes'
+        state files a tick earlier; between that tick and this line another lane
+        can mark the same id `in_progress`, because two lanes each opened a
+        session before either had written anything a scan could see. Reading the
+        file and writing it back as two steps is exactly how one task gets
+        dispatched twice — so the reconciliation, the refusal and
+        `mark_in_progress` all happen inside ONE `task_file_mutex` hold, which
+        every other writer of that file takes too.
+
+        `mark_in_progress` cannot be the check: it is IDEMPOTENT on an already
+        in-progress row (it raises for completed, blocked, quarantined, retired
+        and shipped-elsewhere, and for nothing else), so a second lane marking a
+        task the first is running succeeds silently. The refusal is therefore
+        explicit, and it is narrow on purpose — it asks about the rows this hold
+        just ADOPTED, which is exactly "another holder moved this task while this
+        registry was in memory". Moved to `in_progress` is a sibling that took it
+        (the duplicate dispatch this exists to stop, reported with the
+        supervisor's own `HOLD_IN_FLIGHT` word so a reader sees one vocabulary);
+        moved to anything else that is not `pending` — completed, quarantined,
+        retired, shipped elsewhere — is a row `mark_in_progress` would RAISE on
+        one line later, which above one lane would end a lane by traceback over
+        an ordinary race.
+
+        What it deliberately does NOT ask about is a row that already read
+        `in_progress` when this registry loaded. Nothing moved under this lane
+        there, `plan` never scheduled such a task (it is not in the queue), and
+        the refusal belongs to `policy._check_task_reference` and to the worker
+        repo a second dispatch cannot create over the first
+        (`worker_repo_is_reusable`) — which is what
+        `_refused_outside_fleet_admission` already says about the in-flight race
+        and what `test_fleet_supervisor.py` pins. A second, weaker copy of a
+        correctness check is not what this gate is for.
+
+        Work THIS session already owns passes as well (`_session_task_ids`) —
+        but only where the adopted row still reads `in_progress`: a `revise`
+        continues an arc this lane wrote that row for, and refusing it would deny
+        every second directive of every round, while an arc an OPERATOR
+        quarantined or retired mid-round is a decision this dispatch must not
+        write over and `mark_in_progress` would raise on anyway.
+
+        Refused through `_handle_policy_denial` like every other admission
+        refusal: the task is left EXACTLY as it was — `in_progress` for the lane
+        that has it, nothing written here, no attempt charged, no worker repo —
+        and the reviewer is told to send `stop`, which ends this round at a clean
+        boundary and frees the lane.
+
+        **AT ONE LANE THIS READS NOTHING AND REFUSES NOTHING.** The gate is
+        `_fleet_lane_count() > 1`, decided from the config in memory rather than
+        from a file, so there is no unreadable state for it to fail open on: a
+        single-lane loop executes the same three statements it always did —
+        `set_decomposition`, `mark_in_progress`, `save` — inside a mutex hold
+        that `save` was taking anyway (it is re-entrant per thread, so the nested
+        take is free).
+        """
+        taken_elsewhere = ""
+        with self._task_store.lock():
+            if self._fleet_lane_count() > 1:
+                # The neighbour's writes, adopted before anything is decided:
+                # this registry has been in memory for a whole round and its row
+                # for this task may predate another lane taking it.
+                adopted = self._task_store.reconcile_concurrent_rows(self._registry)
+                status = (
+                    self._registry.get(task.id).status
+                    if self._registry.has(task.id)
+                    else task.status
+                )
+                # The carve-out is for `in_progress` ALONE. A `revise` continues
+                # an arc whose in-progress row this lane wrote itself — but every
+                # OTHER status this hold adopted is one `mark_in_progress` raises
+                # on two lines down, and an operator quarantining a task this lane
+                # is mid-arc on is exactly that: `policy._check_task_reference`
+                # passed on the stale row a moment earlier, so without this the
+                # round would end by traceback (nothing in `Orchestrator.run`'s
+                # step loop catches `TaskGraphError`) over an operator's ordinary
+                # decision. Refusing is also the right answer on its own terms:
+                # the quarantine records something a human has not decided yet,
+                # and the old behaviour — a stale in-memory row marking it in
+                # progress again — overwrote it silently.
+                own_arc = task.id in self._session_task_ids()
+                if task.id in adopted and status != "pending" and not (
+                    status == "in_progress" and own_arc
+                ):
+                    taken_elsewhere = status
+                else:
+                    task = self._registry.get(task.id)
+            if not taken_elsewhere:
+                if directive.decomposition is not None:
+                    # The approved plan, made durable BEFORE the executor runs,
+                    # in the same save as `mark_in_progress` — so a task can
+                    # never be in progress against a plan nothing recorded.
+                    # `implement` cannot get this far without one (policy's
+                    # `_check_decomposition`); `revise` reaching here with one is
+                    # a deliberate reshape, and reaching here without one leaves
+                    # the stored plan exactly as it was.
+                    self._registry.set_decomposition(
+                        task.id, directive.decomposition.render()
+                    )
+                self._registry.mark_in_progress(task.id)
+                self._task_store.save(self._registry)
+        if not taken_elsewhere:
+            return task
+        # OUTSIDE the hold: the decision is made, nothing more is written to the
+        # task file, and a denial writes a transcript entry, a state file and —
+        # at an exhausted budget — a blocker record. None of that is any lane's
+        # business but this one's, and holding a mutex every lane waits on while
+        # it happens is how a wait turns into a `TaskStoreBusy` nobody needs.
+        self._log(
+            "fleet_task_claimed_elsewhere",
+            data={"task_id": task.id, "lane": self.lane_id, "status": taken_elsewhere},
+        )
+        self._handle_policy_denial(
+            directive,
+            Verdict.deny(
+                FLEET_HOLD_DENIAL_CODE,
+                f"task '{task.id}' is not this lane's to take: another holder of "
+                f"the task file has it at '{taken_elsewhere}' ({HOLD_IN_FLIGHT}), "
+                "taken between the supervisor's last scan and this dispatch. "
+                "Running it a second time is what this refusal exists to "
+                "prevent. The task is untouched: nothing was executed and no "
+                "attempt was spent. Send `stop`, which ends this round at a "
+                "clean boundary and frees this lane for something else.",
+            ),
+        )
+        return None
 
     def _audit_unit_quarantined(self, unit_id: str) -> bool:
         """Has the operator quarantined this exact audit unit?
