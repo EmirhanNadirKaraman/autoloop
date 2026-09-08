@@ -7310,6 +7310,13 @@ class ProjectStatus:
     #: The task the loop's OWN state names. It outlives its round (`state.
     #: current_task` is replaced by the next dispatch), so it is "the last task
     #: this loop dispatched" whenever `loop_state` is not `live`.
+    #:
+    #: ABOVE ONE LANE IT IS NOT A TASK ID AT ALL but a sentence about the fleet
+    #: — `3 lanes: brw-19 +2`, or `3 lanes: idle` — because one lane's task
+    #: printed here would be exactly the single string presented as the system's
+    #: that conc-09 exists to abolish. A reader that needs the ids themselves
+    #: reads `health.FleetHealth.lanes` (`dashboard.lanes_status`), which carries
+    #: one row per lane. `phase` is empty for the same reason.
     current_task: str = ""
     #: Wall-clock minutes since the newest transcript entry, or `None` when
     #: there is no transcript to date. Deliberately NOT sleep-discounted: that
@@ -7467,10 +7474,60 @@ def _silent_minutes(config, now: datetime) -> float | None:
         return None
 
 
+def _fleet_task(fleet) -> tuple[str, str, str]:
+    """`(task, phase, note)` for a loop running N lanes — `3 lanes: brw-19 +2`.
+
+    Decision 7's last bullet, verbatim: the column shows THE FLEET, not a lane.
+    The oldest in-flight task names the row and the rest are counted, because
+    one lane's task printed in a column headed TASK is exactly the "single
+    string presented as the system's" this candidate exists to abolish — and the
+    count is what stops it reading as the only one.
+
+    **`—` is never borrowed for "several".** That dash means UNREADABLE
+    everywhere else in this view (`_minutes_text`, `open_blockers`), and a fleet
+    with nothing dispatched says `idle` in words instead.
+
+    OLDEST is `LaneHealth.dispatched_at`, the stamp the lane's own state file
+    carries, and a lane with no readable stamp sorts LAST rather than first: an
+    empty string is not an early one, and letting it win would name the fleet
+    after the lane we know least about. The PHASE is empty for the reason
+    `health._judge` leaves it empty above one lane.
+    """
+    inflight = sorted(
+        (row for row in fleet.lanes if row.busy and row.task_id),
+        key=lambda row: (not row.dispatched_at, row.dispatched_at, row.lane_index),
+    )
+    unreadable = [row for row in fleet.lanes if row.code == health.STUCK_UNKNOWN]
+    note = ""
+    if unreadable:
+        # Escalates through `_observe`'s note rule: a lane this view could not
+        # read is not a lane it may report as quietly fine.
+        note = "lane(s) that could not be read: " + ", ".join(
+            row.lane_id for row in unreadable
+        )
+    if not inflight:
+        return f"{fleet.cap} lanes: idle", "", note
+    text = f"{fleet.cap} lanes: {inflight[0].task_id}"
+    if len(inflight) > 1:
+        text += f" +{len(inflight) - 1}"
+    return text, "", note
+
+
 def _current_task(config) -> tuple[str, str, str]:
-    """`(task_id, phase, note)` from the loop's own state file."""
+    """`(task_id, phase, note)` from the loop's own state file — or, above one
+    lane, from the whole fleet (`_fleet_task`).
+
+    `config.state_file` is LANE 0's file above one lane (`state.lane_paths`), so
+    reading it here would put one lane's task and one lane's phase in a row
+    describing the loop. The fleet is asked instead, through the same
+    aggregation `health` reports with; at one lane `fleet_health` answers `None`
+    before it reads anything and this function is what it always was.
+    """
     from .state import StateStore
 
+    fleet = health.fleet_health(config)
+    if fleet is not None:
+        return _fleet_task(fleet)
     try:
         if not config.state_file.exists():
             return "", "", ""
@@ -7748,6 +7805,115 @@ def projects_json(rows) -> str:
     return json.dumps(
         [{**dataclasses.asdict(row), "stopped": row.stopped} for row in rows], indent=2
     )
+
+
+# ---------------------------------------------------------------------------
+# The lanes panel (conc-09, docs/AUTOLOOP.md "Decision 7 — observability: N
+# lanes, truthfully").
+#
+# Kept out of `collect` deliberately, exactly as `projects_status` is, and for
+# that section's own reasons:
+#
+# * it renders one loop's LANES, which is a different question from the one the
+#   front door answers — that page describes a checkout, and a fleet is not a
+#   checkout;
+# * it reuses `health`'s aggregation rather than re-deriving it. Every row here
+#   is a `health.LaneHealth` verbatim, so a later consumer — a second panel, a
+#   notifier, an operator's `watch` — renders the same rows the verdict was
+#   built from instead of a second reading of the same files that eventually
+#   disagrees with it;
+# * it takes NO LOCK and writes nothing, which is what makes it safe to look at
+#   a fleet while every lane is mid-round — the only time anyone wants to.
+# ---------------------------------------------------------------------------
+
+
+#: What the panel says for a loop that has no fleet. NOT an empty table: "one
+#: lane" and "N lanes, all idle" must never render alike, and at one lane the
+#: honest answer is that `health`'s own verdict already IS that lane's.
+SINGLE_LANE_PANEL = (
+    "one lane — `health` reports it as the loop (set [concurrency] lanes > 1 "
+    "for a fleet)"
+)
+
+
+def lanes_status(config, now: datetime | None = None):
+    """Every lane of one loop, as `health` judges them, or `None` at one lane.
+
+    A thin seam over `health.fleet_health` on purpose: the aggregation belongs
+    beside the vocabulary it reports in, and a panel that judged lanes itself
+    would be a second answer to "is this lane in trouble" for an operator to
+    reconcile with `health --json`.
+
+    Read-only, lock-free and never raises — `fleet_health`'s own contract, plus
+    this section's `_no_bytecode_writes` guarantee, because reaching a lane's
+    state imports `orchestrator` and a page must not leave `__pycache__` in a
+    tree the escape detector is watching.
+    """
+    with _no_bytecode_writes():
+        return health.fleet_health(config, now=now)
+
+
+def render_lanes_text(fleet) -> str:
+    """The panel an operator reads: one line per lane, then the reasons.
+
+    Plain text for `render_projects_text`'s reason — a terminal, a `watch`, a
+    launchd log and a notification body are the paths this operator already gets
+    told things on.
+
+    The FOOTER is the panel's whole argument: `2 of 3 lane(s) busy` says a thing
+    no per-lane row does, and "at its cap" and "idle" are printed as words
+    rather than left to be counted off the rows (Decision 4 — a fleet holding
+    every lane and a fleet with nothing to do must not read identically).
+    """
+    if fleet is None:
+        return SINGLE_LANE_PANEL
+    header = ("", "LANE", "HEALTH", "STATE", "PHASE", "TASK")
+    body = [
+        (
+            "!" if lane.needs_attention else " ",
+            # A retired lane is marked rather than hidden: the cap stopped
+            # walking it, which did not stop the round inside it.
+            ("*" if lane.retired else "") + lane.lane_id,
+            lane.code,
+            "busy" if lane.busy else "free",
+            lane.phase or "—",
+            lane.task_id or "—",
+        )
+        for lane in fleet.lanes
+    ]
+    widths = [max(len(cell) for cell in column) for column in zip(header, *body)]
+    lines = ["  ".join(cell.ljust(width) for cell, width in zip(header, widths)).rstrip()]
+    for lane, cells in zip(fleet.lanes, body):
+        lines.append("  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip())
+        # The reason goes UNDER its row, never truncated into a column — the
+        # projects view's rule, for the same reason it has it.
+        for reason in (lane.summary, lane.detail):
+            if reason:
+                lines.append(f"      {_one_line(reason)}")
+    tail = f"{fleet.busy} of {fleet.cap} lane(s) busy"
+    if fleet.idle:
+        tail += " — the fleet is idle"
+    elif fleet.at_cap:
+        tail += " — the fleet is at its cap"
+    attention = [lane for lane in fleet.lanes if lane.needs_attention]
+    if attention:
+        tail += f"; {len(attention)} need attention: " + ", ".join(
+            lane.lane_id for lane in attention
+        )
+    if any(lane.retired for lane in fleet.lanes):
+        tail += "; * outside the current cap"
+    lines.append(tail)
+    return "\n".join(lines)
+
+
+def lanes_json(fleet) -> str:
+    """The same panel, machine-readable, for a scheduler or a notifier.
+
+    `null` at one lane, which is the same answer `health --json` gives by
+    omitting the key: there is no fleet to describe, and an empty list would
+    claim there is one with nothing in it.
+    """
+    return json.dumps(None if fleet is None else dataclasses.asdict(fleet), indent=2)
 
 
 def main(argv=None) -> int:
