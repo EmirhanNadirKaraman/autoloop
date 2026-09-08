@@ -401,6 +401,21 @@ def _validate_context_ids(task_id: object, ids: object) -> tuple[str, ...]:
     (docs/SECURITY.md S33). A record id this refuses is one an operator renames;
     a record id that could forge a stamp line is one nobody notices.
 
+    `fullmatch`, NOT `match`, and that is the whole of what makes the sentence
+    above true of THIS field: Python's `$` also matches immediately before a
+    TRAILING NEWLINE, so `_ID_RE.match("ctx-01\\n")` succeeds and the id it
+    accepts renders a line break into the middle of a block whose lines are the
+    unit of meaning. The other `_ID_RE` callers here (`task.id`, `depends_on`,
+    `superseded_by`) still use `match` and still accept that trailing newline.
+
+    So this closes the field ctx-04 adds and NOT the block: `context.TaskBrief`
+    already renders `task_id` and `title` on its first line, and `title` has no
+    shape check at all — it is free text and may contain a literal
+    `report_sha256:`. What answers that is S33's ORDERING guarantee (every brief
+    is emitted strictly after every stamp line) plus `test_context.py`'s
+    single-`report_sha256:` count, not an absence of injectable characters. The
+    claim here is only that the new field does not add a second way in.
+
     NOTHING here is authorization. `context_ids` names what a round may READ
     about; what it may WRITE is `Task.approved_paths` and nothing else — see
     `effective_approved_paths`, which never reads this field.
@@ -413,7 +428,7 @@ def _validate_context_ids(task_id: object, ids: object) -> tuple[str, ...]:
         )
     seen: set[str] = set()
     for context_id in ids:
-        if not isinstance(context_id, str) or not _ID_RE.match(context_id):
+        if not isinstance(context_id, str) or not _ID_RE.fullmatch(context_id):
             raise TaskGraphError(
                 "bad_context_id",
                 f"task '{task_id}' names {context_id!r} as a context record, "
