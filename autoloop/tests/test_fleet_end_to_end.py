@@ -22,7 +22,10 @@ Four sections, and each is one part of it:
    never sees the upgrade again and the merged code sits on disk with nothing
    able to act on it. A non-owner now takes no part: it neither calls
    `_reach_upgrade_boundary` nor writes `answered_upgrades`, and the owner
-   arriving afterwards still finds the record pending and unanswered.
+   arriving afterwards still finds the record pending and unanswered. **One
+   lane, and never NO lane:** ownership follows the lowest lane still running,
+   because a fleet does not restart a lane that ended and pinning it to lane 0
+   left a fleet that lost lane 0 draining for an upgrade nothing could take.
 3. **Merges stay one at a time under real concurrency.** conc-08 pins the merge
    token against a token file a test wrote; what only a fleet can show is two
    sweeps racing for it, which is why this one uses two threads. Exactly one
@@ -40,6 +43,12 @@ Four sections, and each is one part of it:
    deterministically, with no threads, because the claim is about what a save
    writes — and section 6 the publisher half, with two threads, because the claim
    there is that the second one WAITS.
+6. **And a third: `pending_upgrade.json`.** One record, saved by the lane whose
+   merge changed `autoloop/` and cleared by every lane's second iteration — so
+   unserialised, a confirmation reads `execed`, a sibling's merge writes
+   `pending` over it, and the confirmation unlinks an upgrade nobody has
+   answered. Section 7 pins the store's compare-and-clear directly, then drives
+   the window itself.
 
 DELIBERATELY NOT RE-TESTED HERE, because the mechanism is another candidate's
 and a second copy is a cost every round pays: the merge window's per-candidate
@@ -69,6 +78,7 @@ import pytest
 from autoloop import auto_merge, cli
 from autoloop.auto_merge import (
     UPGRADE_EXEC_FAILED,
+    UPGRADE_EXECED,
     UPGRADE_PENDING,
     PendingUpgrade,
     UpgradeStore,
@@ -94,7 +104,13 @@ from autoloop.state import (
     lane_paths,
     utcnow_iso,
 )
-from autoloop.tasks import CO_SCHEDULE_EXEMPT_PATHS, Task, TaskRegistry, TaskStore
+from autoloop.tasks import (
+    CO_SCHEDULE_EXEMPT_PATHS,
+    Task,
+    TaskRegistry,
+    TaskStore,
+    mutex_path_for,
+)
 from autoloop.worktask import TaskExecution, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/conc-10"
@@ -141,6 +157,21 @@ def registry_of(*tasks: Task) -> TaskRegistry:
 
 def continuous_args() -> argparse.Namespace:
     return argparse.Namespace(config=None, continuous=True, null_executor=False)
+
+
+def an_upgrade(base_sha: str, status: str = UPGRADE_PENDING) -> PendingUpgrade:
+    """One record of the shape `auto_merge._note_loop_code_merge` writes, with
+    the two fields every bound in this design is keyed on named by the caller."""
+    return PendingUpgrade(
+        base_sha=base_sha,
+        previous_base_sha="a" * 40,
+        candidate_sha="c" * 40,
+        task_id="conc-10b",
+        repo_root=A_REPO_ROOT,
+        paths=["autoloop/cli.py"],
+        status=status,
+        recorded_at=utcnow_iso(),
+    )
 
 
 def upgrade_config(tmp_path: Path, lanes: int = 2) -> AutoloopConfig:
@@ -611,6 +642,114 @@ def test_the_fleet_restarts_the_lanes_when_the_replacement_does_not_happen(
     assert UpgradeStore(config.pending_upgrade_file).load().status == UPGRADE_PENDING
 
 
+def test_the_upgrade_owner_moves_to_the_lowest_lane_still_running(tmp_path):
+    """THE PRICE OF PINNING OWNERSHIP TO LANE 0, and the residual conc-10 named
+    rather than closed: `_run_fleet` does not restart a lane that ENDED, and
+    thirteen codes are lane-fatal, so a lane-fatal park in lane 0 left the fleet
+    running with NO upgrade owner in it. Every remaining lane then refuses every
+    boundary as somebody else's, the drain never ends, and an upgrade merged
+    after that point waits for an operator to restart the process.
+
+    Ownership therefore follows the lowest lane still running. Asserted as a
+    sequence rather than a single case, because the two properties that keep the
+    original defect closed are properties of the SEQUENCE: exactly one lane
+    answers True at every step, and the answer only ever moves UP — so no two
+    lanes can both consume one pending upgrade, whichever order they tick in.
+    """
+    config = make_config(tmp_path, lanes=3)
+    fleet = cli._FleetRun(3)
+    lanes = [cli._LaneEntry(config, index, fleet) for index in range(3)]
+
+    def owners():
+        return [cli._lane_owns_upgrade(lane) for lane in lanes]
+
+    assert owners() == [True, False, False], "a fresh fleet is lane 0's"
+    fleet.begin_pass((0, 1, 2))
+    assert owners() == [True, False, False], "and so is one that has just opened"
+
+    fleet.lane_ended(0)
+    assert owners() == [False, True, False], "lane 0 left; lane 1 owns it now"
+    assert cli._upgrade_owner_index(lanes[2]) == 1, "and the refusal names it"
+    fleet.lane_ended(1)
+    assert owners() == [False, False, True]
+
+    fleet.lane_ended(2)
+    assert owners() == [False, False, False], (
+        "a fleet with nothing running has no owner — the fail-closed direction, "
+        "since nothing is left to act on a boundary in a fleet that is unwinding"
+    )
+    assert fleet.upgrade_owner() is None
+    assert cli._upgrade_owner_index(lanes[0]) == cli.UPGRADE_OWNER_LANE, (
+        "and with no owner the refusal names where ownership starts"
+    )
+
+    # A restarted pass opens only the lanes that stepped aside, and the lowest
+    # of THOSE owns the boundary — not the lane an earlier pass had.
+    fleet.begin_pass((1, 2))
+    assert owners() == [False, True, False]
+
+
+def test_a_fleet_that_lost_lane_zero_still_reaches_the_upgrade_boundary(
+    tmp_path, monkeypatch
+):
+    """The same residual, driven through the real runner rather than the gate.
+
+    Lane 0 falls out of the fleet on its first tick — a lane-fatal ending, which
+    `_run_fleet` deliberately does not restart — and the upgrade that is pending
+    the whole time must still be reached. Before this, every lane left was a
+    non-owner: each one refused the boundary, `plan.draining` held it, and the
+    fleet polled beside a merged tree until an operator restarted it.
+
+    The wait on `lane.owns_upgrade` is what makes this deterministic rather than
+    a race: lane 1's tick under test is taken AFTER lane 0 has really gone.
+    """
+    config = upgrade_config(tmp_path, lanes=2)
+    TaskStore(config.tasks_file).save(TaskRegistry())
+    boundaries: list[str] = []
+    real_sleep = time.sleep
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: real_sleep(0.01))
+    monkeypatch.setattr(cli, "_select_and_kickoff", lambda *a, **k: False)
+
+    def reached(cfg, lock, args=None, lane=None):
+        boundaries.append(UpgradeStore(cfg.pending_upgrade_file).load().base_sha)
+        return UPGRADE_EXEC_FAILED
+
+    monkeypatch.setattr(cli, "_self_upgrade_at_boundary", reached)
+
+    def observe(cfg, blockers, lane):
+        index = 0 if lane is None else lane.lane_index
+        if index == 0:
+            raise RuntimeError("lane 0 fell out of the fleet")
+        if boundaries:
+            # The boundary has been taken; end the restarted pass the ordinary
+            # way rather than polling forever.
+            cfg.pause_file.parent.mkdir(parents=True, exist_ok=True)
+            cfg.pause_file.write_text("done\n", encoding="utf-8")
+            return None
+        deadline = time.monotonic() + OVERLAP_TIMEOUT
+        while not lane.owns_upgrade and time.monotonic() < deadline:
+            real_sleep(0.005)
+        return None
+
+    monkeypatch.setattr(cli, "_fleet_stop_reached", observe)
+
+    lane_zero = cli._LaneEntry(config)
+    with lane_zero:
+        code = cli._run_fleet(continuous_args(), config, None, lane_zero)
+
+    assert boundaries == ["b" * 40], (
+        "the fleet never reached the boundary after losing lane 0 — the upgrade "
+        "would sit on disk until an operator restarted the process"
+    )
+    assert entries(config, "self_upgrade_not_this_lane") == [], (
+        "the surviving lane refused a boundary it now owns"
+    )
+    failed = entries(config, "fleet_lane_failed")
+    assert [row["lane_index"] for row in failed] == [0], "lane 0 really did end"
+    assert code == 2, "and its ending is still what the fleet exits on"
+    assert "b" * 40 in lane_zero.answered_upgrades
+
+
 def _ready_session(session_id: str) -> LoopState:
     state = LoopState(session_id=session_id, conversation_url=URL)
     state.phase = Phase.READY.value
@@ -1042,3 +1181,161 @@ def test_a_publisher_lock_that_cannot_be_taken_is_an_ordinary_git_failure(tmp_pa
 
     assert "publisher" in str(caught.value)
     assert "Nothing was fetched or pushed" in str(caught.value)
+
+
+# =============================================================================
+# 7. one pending-upgrade record, N lanes
+# =============================================================================
+#
+# THE THIRD LOST UPDATE, and the one that loses an UPGRADE rather than a row.
+# `pending_upgrade.json` is a single record: a lane whose merge changed
+# `autoloop/` SAVES a fresh `pending` one, and every lane's second iteration
+# reads it and CLEARS it if it says `execed` (`cli._confirm_self_upgrade`).
+# Unserialised, those two interleave — the confirmation reads `execed`, a
+# sibling's merge writes `pending` over it, the confirmation unlinks — and the
+# new upgrade is gone with no boundary ever offered it and no entry saying so.
+# That is the silent-no-outcome failure the self-upgrade path exists to end,
+# rebuilt one function over.
+#
+# The store contract is pinned first, with no threads and no patching, because
+# that is where the claim actually lives; the window itself is then driven
+# deterministically, and the two-lane case with threads because "exactly one
+# confirmation" is not a claim a single thread can fail for the right reason.
+
+
+def test_the_upgrade_record_is_cleared_only_by_the_identity_that_read_it(tmp_path):
+    """COMPARE-AND-CLEAR, asked of the store directly. Both halves of the
+    identity are checked, and separately: a clear keyed on the sha alone would
+    still delete a record whose STATUS moved on under it, and one keyed on the
+    status alone would delete a newer record that happens to carry the same
+    one — which is why the sha is compared even though the `pending` a sibling's
+    merge writes already fails the status half."""
+    config = make_config(tmp_path, lanes=2)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    store = UpgradeStore.for_config(config)
+    store.save(an_upgrade("b" * 40, UPGRADE_EXECED))
+    # ...and a sibling lane's merge lands, which is a DIFFERENT upgrade rather
+    # than a retry of the first (`PendingUpgrade`'s own docstring).
+    store.save(an_upgrade("d" * 40, UPGRADE_PENDING))
+    before = config.pending_upgrade_file.read_bytes()
+
+    assert store.clear(base_sha="b" * 40, status=UPGRADE_EXECED) is False
+    assert store.clear(base_sha="d" * 40, status=UPGRADE_EXECED) is False
+    assert store.clear(base_sha="b" * 40, status=UPGRADE_PENDING) is False
+    assert config.pending_upgrade_file.read_bytes() == before, (
+        "a refused clear rewrote the record it refused to remove"
+    )
+
+    assert store.clear(base_sha="d" * 40, status=UPGRADE_PENDING) is True
+    assert not config.pending_upgrade_file.exists()
+    assert store.clear(base_sha="d" * 40, status=UPGRADE_PENDING) is False, (
+        "a record that is already gone was not removed by this call either"
+    )
+
+    # And the unconditional form is untouched: it is what an operator-facing
+    # caller means by "remove this file whatever it says".
+    store.save(an_upgrade("e" * 40, UPGRADE_PENDING))
+    assert store.clear() is True
+    assert not config.pending_upgrade_file.exists()
+
+
+def test_a_merge_that_lands_inside_the_confirmation_window_is_not_deleted(
+    tmp_path, monkeypatch
+):
+    """THE RACE, made deterministic: the sibling's merge is injected into the
+    exact window it used to be lost in — between the confirmation's read of the
+    `execed` record and its removal of it.
+
+    The injection fires on the FIRST load only, which is the one
+    `_confirm_self_upgrade` makes outside any hold. The clear's own load happens
+    inside the hold, and a test whose injection reached that one would be
+    proving nothing about the window.
+    """
+    config = make_config(tmp_path, lanes=2)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    UpgradeStore(config.pending_upgrade_file).save(an_upgrade("b" * 40, UPGRADE_EXECED))
+    real_load = UpgradeStore.load
+    reads: list[int] = []
+
+    def load_then_merge(self):
+        record = real_load(self)
+        reads.append(1)
+        if len(reads) == 1:
+            UpgradeStore(self.path).save(an_upgrade("d" * 40, UPGRADE_PENDING))
+        return record
+
+    monkeypatch.setattr(UpgradeStore, "load", load_then_merge)
+
+    assert cli._confirm_self_upgrade(config) is False, (
+        "a lane confirmed a replacement whose record it did not remove"
+    )
+
+    monkeypatch.undo()
+    survivor = UpgradeStore(config.pending_upgrade_file).load()
+    assert survivor is not None, "the sibling lane's upgrade was deleted unanswered"
+    assert (survivor.base_sha, survivor.status) == ("d" * 40, UPGRADE_PENDING)
+    assert cli._drainable_upgrade_sha(config, set()) == "d" * 40, (
+        "and the fleet would still drain for it"
+    )
+    assert entries(config, "self_upgrade_confirmed") == [], (
+        "a confirmation that removed nothing must not report a retirement"
+    )
+    skipped = entries(config, "self_upgrade_confirm_skipped")
+    assert len(skipped) == 1 and skipped[0]["base_sha"] == "b" * 40, (
+        "and it must not be silent either"
+    )
+
+
+def test_two_lanes_confirming_one_replacement_confirm_it_once(tmp_path):
+    """One replacement is one `self_upgrade_confirmed` entry, however many lanes
+    reach the top of their second iteration holding the same record.
+
+    Both interleavings are the same answer, which is what makes this
+    deterministic without pinning a schedule: a lane whose read came after the
+    other's clear finds nothing to confirm, and one whose read came before it
+    finds the record no longer its own."""
+    config = make_config(tmp_path, lanes=2)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    UpgradeStore(config.pending_upgrade_file).save(an_upgrade("b" * 40, UPGRADE_EXECED))
+    ready = threading.Barrier(2)
+    answers: dict[int, bool] = {}
+
+    def confirm(index: int):
+        ready.wait(timeout=OVERLAP_TIMEOUT)
+        answers[index] = cli._confirm_self_upgrade(config)
+
+    threads = [threading.Thread(target=confirm, args=(index,)) for index in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=OVERLAP_TIMEOUT)
+
+    assert sorted(answers.values()) == [False, True], f"both lanes: {answers}"
+    assert len(entries(config, "self_upgrade_confirmed")) == 1
+    assert not config.pending_upgrade_file.exists(), "the marker was retired once"
+
+
+def test_at_one_lane_the_upgrade_record_is_written_as_it_always_was(tmp_path):
+    """THE ACCEPTANCE CRITERION at this store: below two lanes nothing is
+    serialised, so no mutex file appears beside the record and a single-lane
+    state directory holds exactly what it holds today. The fleet store is
+    asserted in the same test, because "the gate is real" and "the gate is off"
+    are the same claim read from its two sides."""
+    one = make_config(tmp_path / "one", lanes=1)
+    one.state_dir.mkdir(parents=True, exist_ok=True)
+    store = UpgradeStore.for_config(one)
+    assert store.fleet is False
+    store.save(an_upgrade("b" * 40, UPGRADE_EXECED))
+
+    assert cli._confirm_self_upgrade(one) is True, "and the confirmation still fires"
+    assert [p.name for p in one.state_dir.iterdir() if "pending_upgrade" in p.name] == []
+
+    two = make_config(tmp_path / "two", lanes=2)
+    two.state_dir.mkdir(parents=True, exist_ok=True)
+    fleet_store = UpgradeStore.for_config(two)
+    assert fleet_store.fleet is True
+    fleet_store.save(an_upgrade("b" * 40, UPGRADE_EXECED))
+
+    assert mutex_path_for(two.pending_upgrade_file).exists(), (
+        "the fleet's writes are not going through the mutex at all"
+    )

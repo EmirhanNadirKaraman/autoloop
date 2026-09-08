@@ -1500,9 +1500,10 @@ rather than an assertion — a runner that ran the lanes in sequence fails it by
 TIMING OUT — and the merge serialisation with two threads racing for the token,
 which is the half conc-08's own tests cannot fail for the right reason.
 
-**THE TWO FILES N LANES SHARE, and both were lost updates.** They were first
-recorded here as work this candidate had NOT done; the review that authorised
-turning concurrency on required them closed first, and they are.
+**TWO OF THE THREE FILES N LANES SHARE, and both were lost updates.** They were
+first recorded here as work this candidate had NOT done; the review that
+authorised turning concurrency on required them closed first, and they are. The
+third is `pending_upgrade.json`, below.
 
 * **`tasks.json`.** Each lane loads the registry at the top of its outer
   iteration and holds that object for a whole round, and every save writes the
@@ -1552,44 +1553,62 @@ per deployment that every lane overwrites with its own phase, and
 (both already recorded under Decision 7). Both are reachable only above one
 lane.
 
-**And one WRITER of the shared upgrade record that is NOT gated on the owner,
-found by this candidate's own adversarial pass and left as a stated residual
-rather than closed here.** `cli._confirm_self_upgrade` retires the one-shot
-`execed` marker at the top of every lane's second iteration, in every lane, so
-one replacement can be confirmed more than once — up to once per lane, since a
-lane that loaded the record before another cleared it clears it too. That is
-NOT the ownership defect this candidate was recut for, and the difference is
-the STATUS it acts on: `execed` only, never `pending`, so a non-owner cannot
-consume an upgrade nobody has acted on, and the unlink is idempotent
-(`missing_ok=True`), so the visible cost is a duplicate
-`self_upgrade_confirmed` entry for one replacement. What it does leave open is
-a WINDOW: between its `load()` and its `clear()` a sibling lane's merge can
-write a fresh `pending` record (`auto_merge._note_loop_code_merge` saves
-unconditionally, which is also why a marker left armed cannot block a later
-upgrade), and the unlink then removes an upgrade nothing has answered — the
-silent-no-outcome failure, one function over. Closing it needs
-`pending_upgrade.json`'s writes SERIALISED — a compare-and-clear under a shared
-mutex, the shape conc-11 uses for the throttle episode — which is a mechanism
-rather than a gate, and building one was deliberately not taken on the round
-recut for the ownership boundary alone. Reachable only above one lane: at
-`lanes = 1` there is one thread, and the merger that writes the record and the
-confirmation that clears it are the same one.
+**THE THIRD FILE N LANES SHARE — `pending_upgrade.json`, and it was a lost
+update of the same shape.** It was first recorded here as a residual of the
+ownership round; the review that authorised turning concurrency on required it
+closed first, and it is. One record: the lane whose merge changed `autoloop/`
+SAVES a fresh `pending` one (`auto_merge._note_loop_code_merge`, which saves
+unconditionally — that is also why a marker left armed cannot block a later
+upgrade), and the top of EVERY lane's second iteration reads it and clears it
+if it says `execed` (`cli._confirm_self_upgrade`). Run unserialised those two
+interleave: the confirmation reads `execed`, a sibling's merge writes `pending`
+over it, and the unlink then removes an upgrade nothing has answered — no
+boundary is ever offered it, no entry says it went, and the merged code sits on
+disk forever. The silent-no-outcome failure, one function over. Two things
+close it, and they are the shape conc-11 uses for the throttle episode. Every
+WRITE to the record goes inside one cross-process hold (`UpgradeStore._hold`,
+`tasks.task_file_mutex` borrowed rather than rebuilt, and only the ACQUISITION
+converts — to `UpgradeRecordBusy`, an `OSError` subclass, because every caller
+on this path already answers a write that did not land with `except OSError`
+and a `StateError` arriving from inside a merge or one statement past a
+boundary would leave by traceback). And the removal is a COMPARE-AND-CLEAR on
+the identity that was read (`UpgradeStore.clear(base_sha=…, status=…)`, load
+and comparison and unlink inside one hold), so a lane removes the record it
+read and never a newer one — which also makes the confirmation once per
+REPLACEMENT rather than once per lane, since the first lane's clear matches and
+the rest do not. A refusal is not silent either: it writes
+`self_upgrade_confirm_skipped`. `_carry_on_upgrade`'s own removal — the marker
+a process cleans up after a handoff that did not happen — takes the same
+comparison for the same reason. **And at `lanes = 1` none of it exists**: the
+gate is `UpgradeStore.for_config`, `[concurrency] lanes > 1` read once from an
+in-memory config with no file to fail open on, so no mutex file appears beside
+the record and a single-lane state directory holds what it always did. The
+comparison is not gated, because it is not a race fix — at one lane the record
+it compares against is the one that thread just read.
 
-**And the price of pinning ownership to lane 0, named rather than left to be
-discovered.** `_run_fleet` does not restart a lane that ENDED, and thirteen
-codes are lane-fatal (`blockers.LANE_FATAL_CODES`), so a lane-fatal park in
-lane 0 leaves the fleet running with no upgrade owner in it. An upgrade merged
-after that drains and never arrives: every remaining lane sees
-`upgrade_boundary`, every one of them is a non-owner, and each lands on the
-drain's hold — until an operator restarts, where lane 0 exists again and takes
-the boundary at the next idle tick. It is LOUD rather than silent, which is
-what bounds it: lane 0's park has already written a blocker record and turned
-`health` red, and every poll adds a `fleet_hold` entry saying the fleet is
-draining. Fleet-fatal parks — the majority — do not reach it at all, because
-every lane stops and the restart is the answer. Closing it properly means
-deciding whether ownership follows the lowest LIVE lane, or whether the runner
-restarts a parked owner; both are scheduler decisions, neither is the boundary
-gate, and the candidate recut for that gate deliberately takes neither.
+**And the price of pinning ownership to lane 0, which is closed too.**
+`_run_fleet` does not restart a lane that ENDED, and thirteen codes are
+lane-fatal (`blockers.LANE_FATAL_CODES`), so a lane-fatal park in lane 0 left
+the fleet running with no upgrade owner in it: an upgrade merged after that
+drained and never arrived, every remaining lane being a non-owner landing on
+the drain's own hold, until an operator restarted. Of the two answers this plan
+listed — ownership follows the lowest LIVE lane, or the runner restarts a
+parked owner — the FIRST is taken, because the second re-enters a lane whose
+park is the reason a person was summoned. `_FleetRun.upgrade_owner` is the
+lowest lane still running in this process; `_open_lanes` declares the pass
+before a single thread starts and `_lane_thread` records a lane's departure in
+a `finally`, so a lane that has not started yet never reads as one that has
+finished. It stays lane 0 in every fleet that has not lost one, which is what
+keeps `lanes = 1` and every ordinary fleet exactly as they were. The two
+properties that keep the ORIGINAL defect closed are properties of the sequence
+rather than of one tick: a lane must be running to own the boundary and a lane
+stops running only by leaving its own thread, so exactly one lane answers True
+at any instant and the answer only ever moves UP. A fleet with no lane left
+running has no owner at all, which is the fail-closed direction — nothing is
+left to act on a boundary in a fleet that is unwinding — and it can only be
+read by a lane that is not running. Ownership is still decided in memory and
+never from a file: which lanes are running is this process's own thread
+bookkeeping, so there is no unreadable state for the gate to fail open on.
 
 ### Where each of the brief's required tests is proved
 
