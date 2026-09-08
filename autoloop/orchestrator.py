@@ -335,6 +335,7 @@ import hashlib
 import json
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import tempfile
@@ -412,10 +413,12 @@ from .errors import (
     EnvironmentDriftError,
     GitCommandError,
     GitError,
+    LockHeldError,
     LoginExpiredError,
     QuotaExhaustedError,
     RateLimitedError,
     ResponseTimeoutError,
+    StaleLockError,
     StateCorruptError,
     StateError,
     TaskGraphError,
@@ -433,11 +436,15 @@ from .execution_records import (
 from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
 from .health import (
+    DeadLane,
     StrandedRound,
     current_round_age_seconds,
+    dead_lane_survey,
     round_ceiling_for,
     stranded_fault_rounds,
 )
+from .lock import LaneLease
+from .merge_sweep import MergeToken
 from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import (
@@ -453,11 +460,13 @@ from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
 from .worker_env import (
     ObservedCheckout,
+    WorkerRepoManager,
     validate_lane_checkout_distinctness,
     verify_worker_isolation,
     worker_env,
     worker_repo_is_reusable,
 )
+from .worker_env import _is_nested as _path_is_nested  # one containment predicate
 from .prompts import (
     TEMPLATES,
     build_prompt,
@@ -1928,6 +1937,992 @@ def fleet_stop(config, blockers=None, lanes=None, exclude=None) -> FleetStop | N
     return None
 
 
+# ---- lane death and recovery (conc-08, 2026-09-03) --------------------------
+#
+# Decision 8 of the split plan, and most of it already existed per TASK:
+# `worker_repo_is_reusable` decides whether a worker can be resumed as it
+# stands, `WorkerRepoManager.quarantine` moves a failed attempt aside without
+# deleting evidence, `ObservedCheckout` already refuses a clone that is not a
+# tree only the loop has written to, execution records are per-task files that
+# survive any process, and `health.dead_lane_survey` (conc-08's own addition,
+# beside `stranded_fault_rounds` for its reason) is the predicate that says
+# which lane a death left behind. What is added here is the ACTING half, and its
+# whole claim is the scope of what it touches: a recovered lane's own state
+# file, its own lease, its own observed clone and its own worker repository, and
+# nothing else. No other lane names any of those, which is why the recovery
+# cannot reach one.
+#
+# THE THREE THINGS A DEATH CAN LEAVE, and Decision 8 answers them in this order
+# because the order is what keeps the lane shut while any of them is unresolved:
+#
+#   1. an observed CLONE that is not the loop's tree any more — the lane is
+#      parked, `loop_fatal`/`observed_checkout_unusable`, which conc-07 already
+#      classifies LANE-fatal, so the fleet keeps running. Nothing is rebuilt,
+#      reset or deleted: `_lane_clone_violations` only READS.
+#   2. a WORKER repository that is not what its record says — quarantined, never
+#      deleted, and only when the record and today's `workers_root` name ONE
+#      directory, because that is the directory the next dispatch recreates in
+#      (`_recreated_worker_refusal`). Where they disagree the lane is refused
+#      rather than opened onto a round with no worker.
+#   3. the LEASE, released last of the three and only once the other two are
+#      settled, because releasing it is what lets the next tick in.
+#
+# WHO MAY CALL IT: the holder of the FLEET LOCK, and that is a real
+# precondition rather than a note. Every decision here is a check-then-act on a
+# shared file — read the lease, judge it dead, unlink it — and `lock.LaneLease`
+# refuses to do that for itself precisely because two processes racing on it
+# both enter one lane. `LoopLock` is single-holder-per-state-dir, so today the
+# process running a round IS that holder and the ordering is free; a future
+# arrangement that runs lanes in separate processes inherits the obligation,
+# which is stated here rather than discovered by conc-10.
+
+
+#: The lane may be re-entered exactly as it stands: its dead lease is gone and
+#: the next tick resumes the saved phase through the ordinary `Orchestrator.run`
+#: path, which is what a killed-and-restarted `run --continuous` has always done.
+RECOVERY_RESUMED = "resumed"
+#: Its worker repository failed `worker_repo_is_reusable`, so that repository was
+#: MOVED ASIDE (never deleted) before the lease was released. The next dispatch
+#: creates a fresh one from the recorded base, at the path the record still
+#: names — the identity `_recreated_worker_refusal` establishes before the move.
+RECOVERY_QUARANTINED = "quarantined"
+#: A dead lease with nothing mid-round behind it — the lease is removed and no
+#: round is resumed, because there is none.
+RECOVERY_RELEASED = "released"
+#: Its observed clone is not a tree only the loop has written to, so that LANE
+#: was parked — `loop_fatal`/`observed_checkout_unusable`, which conc-07
+#: classifies LANE-fatal — instead of being opened again. Nothing in the clone
+#: was reset, rebuilt or deleted; the park names the directory and waits for a
+#: person, and every other lane keeps running.
+RECOVERY_PARKED = "parked"
+#: NOTHING WAS TOUCHED. The evidence needed to decide was unreadable, so the
+#: lease stays exactly where it is and the lane stays closed. This is the
+#: fail-closed direction and it is the one an operator has to act on.
+RECOVERY_REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class LaneRecovery:
+    """What the recovery did about ONE lane, and why.
+
+    A record of an action, unlike `FleetPlan` and `FleetStop`, which are values
+    produced by reading. It is returned so the caller can write it to the
+    transcript: a lane recovered silently is a round that vanished, and the
+    quarantine in particular moves a directory an operator may go looking for.
+    """
+
+    lane_index: int
+    lane_id: str
+    #: One of the five `RECOVERY_*` words above.
+    action: str
+    #: The task that lane's session named, `""` when it named none.
+    task_id: str = ""
+    #: Why this action and not another, in a sentence.
+    detail: str = ""
+    #: Where a quarantined worker repository was moved to. Set on a refusal too
+    #: when the move had already happened — the evidence exists either way and
+    #: the report must not lose it.
+    quarantined_at: str = ""
+
+    def describe(self) -> str:
+        line = f"lane {self.lane_id}: {self.action}"
+        if self.task_id:
+            line += f" ({self.task_id})"
+        if self.detail:
+            line += f" — {self.detail}"
+        if self.quarantined_at:
+            line += f"; worker moved to {self.quarantined_at}"
+        return line
+
+
+@dataclass(frozen=True)
+class FleetRecovery:
+    """Everything one recovery pass did, across the lanes and the merge token."""
+
+    lanes: tuple[LaneRecovery, ...] = ()
+    #: `RECOVERY_RELEASED` when a dead lane's merge token was released,
+    #: `RECOVERY_REFUSED` when there is one this pass could not read or remove,
+    #: and `""` — the ordinary state — when there was nothing to do.
+    merge_token: str = ""
+    #: The dead holder, described, or the reason the token could not be judged.
+    merge_token_detail: str = ""
+    #: Set when the pass itself could not be completed. Reported rather than
+    #: raised: a recovery that stopped a round would be a worse failure than the
+    #: one it exists to fix.
+    detail: str = ""
+
+    def describe(self) -> str:
+        parts = [entry.describe() for entry in self.lanes]
+        if self.merge_token:
+            parts.append(f"merge token {self.merge_token}: {self.merge_token_detail}")
+        if self.detail:
+            parts.append(self.detail)
+        return "; ".join(parts) if parts else "no lane needed recovering"
+
+
+def recover_dead_lanes(
+    config,
+    *,
+    exclude=None,
+    worker_repos=None,
+    execution_store=None,
+    lanes: int | None = None,
+    blockers=None,
+    observed=None,
+) -> FleetRecovery:
+    """Recover every lane a dead process left behind, and release the fleet's
+    merge token if its holder is one of them. Never raises.
+
+    ONE LANE AT A TIME AND NOTHING SHARED. Each recovery reads and writes only
+    `state.lane_paths(state_dir, index)`'s own files, the observed clone
+    `config.lane_observed_checkout` gives THAT lane, and the worker repository
+    that lane's own execution record names; no other lane's state file, lease,
+    clone or worker is opened, which is the whole of "recovered without touching
+    the others". The merge token is the one deliberate exception and it is not a
+    lane's: it is the fleet's, and a dead holder of it strands every lane.
+
+    THE TOKEN IS JUDGED ON ITS OWN RECORD, not on the holder's lease. A lease
+    that cannot be read refuses that LANE — correctly — and if the token
+    depended on it, one corrupt file would stop the whole fleet merging until a
+    person arrived. The two questions are separate and are answered separately.
+
+    `exclude` is the caller's own lane index, which is alive by construction.
+    `worker_repos`, `execution_store`, `blockers` and `observed` are the caller's
+    own collaborators when it has them; all four are derived from `config` when
+    it does not, so a caller with none still recovers (see `_recover_lane_worker`
+    and `_park_dead_lane`, which refuse only when the thing they would have to
+    WRITE cannot be reached). `observed` is the DEPLOYMENT's checkout, never a
+    lane's: `ObservedCheckout.for_lane` derives the lane's own from it, which is
+    also what carries an injected `runner` forward instead of silently restoring
+    the real `subprocess.run`.
+    """
+    detail = ""
+    try:
+        dead = dead_lane_survey(config, lanes=lanes, exclude=exclude)
+    except Exception as exc:      # noqa: BLE001 - a recovery must not stop a round
+        dead, detail = (), (
+            f"the lanes could not be surveyed ({type(exc).__name__}: {exc})"
+        )
+    count = _recovery_lane_count(config, lanes)
+    if observed is None:
+        observed = _deployment_observed_checkout(config)
+    recovered: list[LaneRecovery] = []
+    for entry in dead:
+        try:
+            recovered.append(
+                _recover_one_lane(
+                    entry,
+                    config,
+                    worker_repos,
+                    execution_store,
+                    blockers,
+                    observed,
+                    count,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - one lane must not stop the pass
+            recovered.append(
+                LaneRecovery(
+                    entry.lane_index,
+                    entry.lane_id,
+                    RECOVERY_REFUSED,
+                    task_id=entry.task_id,
+                    detail=(
+                        f"recovering it raised {type(exc).__name__}: {exc}, so "
+                        "nothing about it was changed"
+                    ),
+                )
+            )
+    try:
+        action, described = _release_dead_merge_token(config)
+    except Exception as exc:      # noqa: BLE001 - the docstring's promise
+        action, described = (
+            RECOVERY_REFUSED,
+            f"the merge token could not be judged ({type(exc).__name__}: {exc})",
+        )
+    return FleetRecovery(
+        lanes=tuple(recovered),
+        merge_token=action,
+        merge_token_detail=described,
+        detail=detail,
+    )
+
+
+def _recovery_lane_count(config, lanes: int | None) -> int:
+    """The fleet size the clone paths are derived against.
+
+    THE SAME DEFENSIVE READING every fleet-aware site here uses
+    (`Orchestrator._fleet_lanes`, `health._fleet_lanes`): a hand-built config
+    with no `[concurrency]` section, a bool, a float or a value below one is ONE
+    lane. It matters here rather than being a formality, because
+    `lane_observed_checkout`'s asymmetry is on the fleet SIZE — at one lane, lane
+    0's clone is the configured path itself, and deriving `observed/_lane-0` for
+    it would have the recovery inspect a tree the deployment does not watch.
+    """
+    if lanes is None:
+        lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+        return 1
+    return lanes
+
+
+def _deployment_observed_checkout(config) -> "ObservedCheckout | None":
+    """The DEPLOYMENT's observed checkout, or `None` when this deployment wires
+    none — the pre-esc-02 arrangement, which observes the primary checkout and
+    has no loop-owned clone for a recovery to judge.
+
+    `None` on any failure to build one, deliberately, and it is not a fail-open:
+    the caller then inspects no clone and takes the path it took before this
+    existed, while the clone a round actually runs against is still established
+    by `_synchronise_observed_checkout` at the next dispatch — which refuses,
+    lane-fatally, exactly the trees this inspection refuses. Nothing is rebuilt
+    silently either way; what is lost is only the EARLIER refusal.
+    """
+    try:
+        configured = getattr(config, "observed_checkout", None)
+        return ObservedCheckout(configured) if configured else None
+    except Exception:  # noqa: BLE001 - `recover_dead_lanes` promises never to
+        # raise, and this is the one thing it does OUTSIDE the per-lane `try` —
+        # so an escaping error here skips `_release_dead_merge_token` too, and
+        # one unbuildable path would leave the whole FLEET unable to merge.
+        # That is exactly the coupling Decision 8 says the token must not have,
+        # and it is why the catch is broad rather than a tuple of the errors
+        # `Path(...).resolve()` happens to raise on this build.
+        return None
+
+
+def _recover_one_lane(
+    dead: DeadLane, config, worker_repos, execution_store, blockers, observed, lanes
+) -> LaneRecovery:
+    """Recover the one lane `dead` describes.
+
+    THE REFUSAL COMES FIRST, before a path is even built: a `DeadLane` carrying
+    `unreadable` is the survey saying it could not establish what that lane
+    holds — including the one entry that is not a lane at all, the unlistable
+    `lanes/` directory, whose index is negative and would raise if it reached
+    `lane_paths`. Nothing is touched, the lease stays where it is, and the lane
+    stays closed until a person looks.
+
+    THE CLONE IS DEALT WITH BEFORE THE WORKER, AND BOTH BEFORE THE LEASE, and
+    that order is the safety property: releasing the lease is what lets the next
+    tick into the lane, so a quarantine that failed — or a clone that is no
+    longer a tree only the loop has written to — must leave the lane shut rather
+    than open onto something nobody could make safe. The clone comes first
+    because its answer is a PARK: a lane whose watched tree cannot be
+    established has no round to resume into, so judging its worker would be
+    deciding what to do with a repository nobody is going to use, and
+    quarantining one would move evidence out from under the person the park is
+    summoning.
+
+    AND NOTHING CAN ENTER THE LANE IN BETWEEN, which is what makes acting on the
+    survey's older judgement safe rather than a race. A dead lease REFUSES
+    `LaneLease.acquire` (`StaleLockError` — leases are never stolen), so the only
+    way into that lane is the removal below, and only the fleet-lock holder
+    performs it. `break_stale` re-reads and re-judges anyway before it unlinks,
+    so a lease that has somehow become live or unreadable in the interval refuses
+    there too and the lane keeps it.
+    """
+    if dead.unreadable:
+        return LaneRecovery(
+            dead.lane_index,
+            dead.lane_id,
+            RECOVERY_REFUSED,
+            task_id=dead.task_id,
+            detail=dead.unreadable,
+        )
+    lease = LaneLease(config.state_dir, dead.lane_index)
+    action, detail, quarantined_at = RECOVERY_RELEASED, "", ""
+    if _lane_is_mid_round(dead):
+        violations, refusal = _lane_clone_violations(dead, config, observed, lanes)
+        if refusal:
+            return LaneRecovery(
+                dead.lane_index,
+                dead.lane_id,
+                RECOVERY_REFUSED,
+                task_id=dead.task_id,
+                detail=refusal,
+            )
+        if violations:
+            action, detail = _park_dead_lane(dead, config, violations, blockers)
+        else:
+            action, detail, quarantined_at = _recover_lane_worker(
+                dead, config, worker_repos, execution_store
+            )
+    else:
+        detail = (
+            "its lease is dead and its session is at "
+            f"{dead.phase or 'no phase at all'}, so there is no round to resume"
+        )
+    if action == RECOVERY_REFUSED:
+        return LaneRecovery(
+            dead.lane_index,
+            dead.lane_id,
+            action,
+            task_id=dead.task_id,
+            detail=detail,
+            quarantined_at=quarantined_at,
+        )
+    try:
+        lease.break_stale()
+    except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
+        # `break_stale` re-reads and re-judges before it unlinks, so a lease
+        # that has become LIVE (a process entered the lane between the survey
+        # and here) or unreadable in the interval refuses — which is the whole
+        # reason the removal is not `unlink()`. The lane keeps its lease.
+        #
+        # WHATEVER WAS ALREADY DONE IS STILL REPORTED. A park or a quarantine
+        # that happened before this point is durable, and a refusal that dropped
+        # the sentence saying so would send an operator looking for a worker, or
+        # for a park, that the transcript never mentioned.
+        return LaneRecovery(
+            dead.lane_index,
+            dead.lane_id,
+            RECOVERY_REFUSED,
+            task_id=dead.task_id,
+            detail=(
+                f"its lease could not be released ({exc})"
+                + (f", after {action}: {detail}" if detail else "")
+            ),
+            quarantined_at=quarantined_at,
+        )
+    return LaneRecovery(
+        dead.lane_index,
+        dead.lane_id,
+        action,
+        task_id=dead.task_id,
+        detail=detail,
+        quarantined_at=quarantined_at,
+    )
+
+
+def _lane_is_mid_round(dead: DeadLane) -> bool:
+    """Was the lane holding a round when its process died?
+
+    The same test `_lane_occupant` applies to decide whether a lane is BUSY —
+    the state file exists and its phase is not terminal — asked of the phase the
+    survey already read. Two spellings of "is this lane running something" is
+    how a recovery comes to quarantine a worker for a lane that had cleanly
+    finished.
+    """
+    if not dead.phase:
+        return False
+    try:
+        return Phase(dead.phase) not in TERMINAL_PHASES
+    except (ValueError, TypeError):      # pragma: no cover - the survey refuses these
+        return False
+
+
+def _lane_clone_violations(dead: DeadLane, config, observed, lanes) -> tuple[list[str], str]:
+    """`(violations, refusal)` for the observed clone of the ONE lane `dead`
+    describes — Decision 8's "a lane whose observed clone is unclean or diverged
+    is not silently rebuilt".
+
+    `([], "")` is "there is nothing here to refuse". Non-empty `violations` is a
+    tree the loop may not observe, and the caller PARKS that lane on them.
+    Non-empty `refusal` is this function saying it established nothing at all,
+    and the caller then touches the lane in no way whatsoever.
+
+    THE READ-ONLY HALF OF `ObservedCheckout.synchronize`, in its own order and in
+    its own words, and nothing else: exists-and-not-a-directory, present-but-not
+    -a-repository, and residue. Nothing here fetches, checks out, creates or
+    deletes anything — a recovery that reset a lane's clone would destroy the one
+    piece of evidence the park exists to preserve, which is that tree's own
+    contents. The two halves this deliberately does NOT ask are the ones that
+    need a commit to compare against: AHEAD/DIVERGED, and "is the clone at the
+    sha the round wanted". Neither is lost, and neither can be silently rebuilt
+    past — `_synchronise_observed_checkout` asks both at the next dispatch,
+    against the primary checkout's head, and refuses with the same `loop_fatal`/
+    `observed_checkout_unusable` park this one writes. What the earlier answer
+    buys is that a lane whose tree is visibly not the loop's is parked BEFORE
+    anything re-enters it.
+
+    ABSENT AND EMPTY ARE NOT VIOLATIONS, exactly as `synchronize` treats them: a
+    clone that is not there is one the next dispatch creates, and an empty
+    directory is an ordinary `mkdir -p` on the way to looking at something.
+    Reading either as a fault would park every lane whose clone a death
+    interrupted before it existed.
+
+    THE DISTINCTNESS QUESTION IS ASKED BEFORE EVERY OTHER ONE, of every lane
+    this deployment holds state for rather than of the lanes the cap describes —
+    `_sibling_lane_checkouts`, which unions the retired indices in, because the
+    lane being recovered is frequently one of them and so is the lane its clone
+    can alias.
+
+    `for_lane` derives the lane's own tree rather than a hand-built
+    `ObservedCheckout`, for the reason that method's docstring gives: a new
+    instance drops an injected `runner`, and a guard that silently gets the real
+    `subprocess.run` back is one that stops testing what it claims to test.
+    """
+    if observed is None:
+        return [], ""
+    try:
+        clone = observed.for_lane(dead.lane_index, lanes)
+        path = clone.path
+        # ISOLATION BEFORE ANYTHING ELSE, and before a single git command, for
+        # `_synchronise_observed_checkout`'s reason one level up: `git status`
+        # refreshes `.git/index`, so asking a tree ANOTHER lane also watches
+        # would write into that lane while proving nothing about this one —
+        # this claim's own failure, committed by the code that exists to protect
+        # it. `_lane-0` symlinked onto `_lane-1` is exactly the layout, and it is
+        # a REFUSAL rather than a park: nothing is established, so nothing is
+        # touched, and the fault is named every tick, by lane and by directory,
+        # in the `lane_recovered` entry this refusal becomes. It is NOT left to
+        # the next dispatch to catch — `_lane_isolation_violations` compares
+        # against the IN-CAP lanes only, and a lane above the cap never
+        # dispatches at all (`HOLD_LANE_RETIRED`) — so for two RETIRED lanes
+        # sharing one tree this refusal is the whole of the answer, which is
+        # why `_sibling_lane_checkouts` asks about every lane that EXISTS
+        # rather than every lane the cap describes.
+        others, unlistable = _sibling_lane_checkouts(
+            observed.path, dead, config, lanes
+        )
+        if unlistable:
+            return [], unlistable
+        problems = validate_lane_checkout_distinctness(path, others)
+        if problems:
+            return [], (
+                f"lane {dead.lane_id}'s observed checkout is not a tree only "
+                "that lane watches, so nothing about it was read or changed: "
+                + "; ".join(problems)
+            )
+        if not path.exists():
+            return [], ""
+        if not path.is_dir():
+            return [
+                f"the observed checkout path {path} exists and is not a "
+                "directory — nothing here deletes it; move it aside by hand"
+            ], ""
+        if not any(path.iterdir()):
+            return [], ""
+        if not clone.is_repo():
+            return [
+                f"the observed checkout path {path} exists but is not the top "
+                "level of a git repository. Nothing here deletes it: inspect it, "
+                "then remove it and the loop will rebuild the clone on the next "
+                "round."
+            ], ""
+        dirt = clone.residue()
+    except Exception as exc:  # noqa: BLE001 - established nothing; touch nothing
+        return [], (
+            f"whether lane {dead.lane_id}'s observed checkout is still a tree "
+            f"only the loop has written to could not be established "
+            f"({type(exc).__name__}: {exc}), so nothing about that lane was "
+            "changed"
+        )
+    if dirt:
+        # `residue()` answers its own "I could not look" as a violation string
+        # rather than as an empty list, and that string is treated here exactly
+        # as dirt is — a park — because that is what `_synchronise_observed_
+        # checkout` does with the identical string on a live lane. A guard that
+        # could not read the tree must not resume a round into it.
+        return [
+            f"the observed checkout {path} is not clean, so it is not a tree "
+            "only the loop has written to: "
+            + "; ".join(sorted(dirt)[:20])
+            + ". Inspect it, then remove the directory and the loop will rebuild "
+            "the clone."
+        ], ""
+    return [], ""
+
+
+def _sibling_lane_checkouts(root, dead: DeadLane, config, lanes: int):
+    """`(others, refusal)` — the observed clone of every lane that is NOT `dead`,
+    for the distinctness question `_lane_clone_violations` asks before it reads a
+    dead lane's tree at all.
+
+    EVERY LANE THAT EXISTS, NOT EVERY LANE THE CAP DESCRIBES, and that is the
+    whole reason this is a function rather than a `range`. The recovery walks
+    `dead_lane_survey`'s own order — the lanes inside the cap, then the lanes a
+    LOWERED cap cut out of the fleet — so the lane being recovered can itself be
+    a retired one, and so can the lane its clone turns out to alias. Deriving the
+    siblings from `range(lanes)` alone compares a retired lane against the in-cap
+    lanes and against nothing else, so two RETIRED clones that resolve to one
+    tree pass the check: `residue()` then runs `git status` inside the OTHER
+    retired lane's repository and refreshes its `.git/index` — one lane's
+    recovery writing into another, committed by the guard written to prevent it.
+    The two sources are disjoint by construction, because `_retired_lane_indices`
+    drops every index the same `lanes` `range` already covers.
+
+    FAIL-CLOSED ON THE LISTING, as `fleet_stop` and `dead_lane_survey` are with
+    the identical scan: a `lanes/` directory that cannot be listed means which
+    other lanes exist is UNKNOWN, which is not "there are none". The caller then
+    touches that lane in no way whatsoever — no git runs, no park is written, the
+    lease stays — and says so every tick.
+
+    THE RESIDUAL, stated where the code is: the set is derived from the STATE
+    directory, so a clone at `<root>/_lane-7` with no `lanes/_lane-7/` behind it
+    — a lane whose state an operator removed and whose tree they did not — is not
+    in it, and a dead lane aliased onto that tree would still be read. Listing
+    the observed ROOT instead would close that class and is deliberately not done
+    here: it answers a question about lanes with a listing of a tree whose layout
+    the loop does not own, and it needs an unlistable-root refusal of its own.
+    Every lane this deployment holds state for is covered.
+    """
+    retired = _retired_lane_indices(config.state_dir, lanes)
+    if retired is None:
+        return [], (
+            f"whether lane {dead.lane_id}'s observed checkout is a tree only "
+            f"that lane watches could not be established — {LANES_DIRNAME}/ "
+            "could not be listed, so which other lanes exist is unknown — and "
+            "nothing about that lane was read or changed"
+        )
+    return [
+        lane_observed_checkout(root, index, lanes)
+        for index in (*range(lanes), *retired)
+        if index != dead.lane_index
+    ], ""
+
+
+def _park_dead_lane(dead: DeadLane, config, violations, blockers) -> tuple[str, str]:
+    """Park the dead lane `dead` on its own unusable clone — `(action, detail)`,
+    either `RECOVERY_PARKED` or `RECOVERY_REFUSED`.
+
+    THE SAME PARK A LIVE LANE WRITES, field for field: `needs_user`, `park_kind`
+    literally `"loop_fatal"`, and a blocker record carrying
+    `observed_checkout_unusable` and THIS lane's id. That is not imitation for
+    tidiness — it is what makes the outcome one the rest of the system already
+    understands. `blockers.fatal_scope` classifies that code LANE-fatal (conc-07,
+    on Decision 8's own sentence), so `fleet_stop` walks past it and the other
+    lanes keep running; `cli` handles the park exactly as it handles the one
+    `_synchronise_observed_checkout` writes; and an operator sees one vocabulary
+    for one fault rather than a second one invented here.
+
+    THE BLOCKER RECORD IS WRITTEN FIRST, AND THE PARK IS ABANDONED IF IT CANNOT
+    BE — the single ordering in this function that can invert the claim.
+    `_lane_fleet_stop` reads the park's KIND from the state file and its CODE
+    from the record `park_blocker_id` names, and `_blocker_code` answers `None`
+    for a record that is missing or unreadable, which `fatal_scope` reads as
+    FLEET-fatal. So a park written with no record behind it would stop every lane
+    over one lane's dirty clone — the exact opposite of this candidate's claim,
+    arrived at through a guard that looks like it fired.
+
+    A LANE WITH NO SESSION TO PARK IS REFUSED, not invented. Only a mid-round
+    lane reaches here, so this is the state file that was read by the survey and
+    is gone by the time the park is written — an operator's `reset` between the
+    two. There is then no round for a park to be about, and writing one would
+    manufacture a session nobody opened. Refusing leaves that lane's lease in
+    place, which keeps the lane shut just as durably, and says so every tick.
+    """
+    paths = lane_paths(config.state_dir, dead.lane_index)
+    detail = "; ".join(violations)
+    store = blockers
+    try:
+        if store is None:
+            store = BlockerStore(config.blockers_dir)
+        state = StateStore(paths.state_file).load()
+    except (StateError, OSError, ValueError, TypeError, AttributeError) as exc:
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the park that "
+            f"would stop this lane could not be prepared ({exc})"
+        )
+    if state is None:
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and it holds no "
+            "session to park, so its lease is left in place and the lane stays "
+            "shut"
+        )
+    question = (
+        f"lane {dead.lane_id} died mid-round and its loop-owned observed "
+        f"checkout could not be established — {detail}. This is LANE-FATAL: that "
+        "clone is the ONLY tree the escape detector watches for this lane, so "
+        "re-entering it would mean running a write-capable agent with no escape "
+        "detection at all. Nothing in it was reset, rebuilt or deleted, and no "
+        "other lane is affected."
+    )
+    try:
+        blocker = store.record(
+            task_id=dead.task_id or NO_TASK,
+            kind="loop_fatal",
+            code="observed_checkout_unusable",
+            question=question,
+            detail=detail,
+            phase=dead.phase or "",
+            now=utcnow_iso(),
+            session_id=getattr(state, "session_id", "") or "",
+            lane_id=dead.lane_id,
+        )
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the blocker record "
+            f"that classifies the park could not be written ({exc}), so it was "
+            "not parked and its lease is left in place"
+        )
+    blocker_id = getattr(blocker, "id", "")
+    if not isinstance(blocker_id, str) or not blocker_id:
+        # The same inversion as an unwritable record, one step later and easier
+        # to miss: `_blocker_code` needs an id to look the code up with, and a
+        # park carrying none is classified FLEET-fatal. A store that recorded
+        # something this cannot name is a store this must not park behind.
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the blocker record "
+            "that classifies the park carries no id, so the park could not be "
+            "read as this lane's own and was not written"
+        )
+    state.question = question
+    state.resume_phase = None
+    state.phase = Phase.NEEDS_USER.value
+    state.stop_kind = ""
+    state.park_kind = "loop_fatal"
+    state.park_task_id = dead.task_id or None
+    state.park_blocker_id = blocker_id
+    try:
+        StateStore(paths.state_file).save(state)
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        # The record above is now open with no park behind it, which stops
+        # nothing: `_lane_fleet_stop` reads the STATE file and treats a record
+        # without one as history (its own docstring's argument). So this is a
+        # refusal in the ordinary direction — the lease stays, nothing enters
+        # the lane, and an operator has the record naming what is wrong with it.
+        return RECOVERY_REFUSED, (
+            f"its observed checkout is unusable ({detail}) and the park could not "
+            f"be written to its state file ({exc}), so its lease is left in place"
+        )
+    return RECOVERY_PARKED, (
+        f"its observed checkout is unusable, so this lane is parked "
+        f"lane-fatally rather than re-entered: {detail}"
+    )
+
+
+def _recover_lane_worker(
+    dead: DeadLane, config, worker_repos, execution_store
+) -> tuple[str, str, str]:
+    """`(action, detail, quarantined_at)` for the worker repository the dead
+    lane's round was using — Decision 8's "resumed or quarantined".
+
+    RESUMED is the answer whenever there is nothing to make safe, and the three
+    ways that happens are kept apart deliberately, because `worker_repo_is_
+    reusable` answers False to all of them and only one is a broken worker:
+
+      * the session names no task, or has no execution record — there is no
+        worker to judge;
+      * the record names no worker path, or the path is GONE from the very place
+        the next dispatch would create one — that dispatch creates it there from
+        the recorded base, which is exactly what a resumed round already does
+        today;
+      * the recorded worker still passes the probe — a git repository at the
+        recorded path, checked out on the recorded branch — which is the wrk-01
+        resume, and quarantining it would discard the interrupted round's own
+        partial work. This one is coherent wherever that path sits: a reused
+        worker is the recorded one, and no `create` happens at all.
+
+    QUARANTINED is the remaining case and the one the claim is about: a worker
+    that is there and is NOT what the record says it is. It is moved aside by
+    `WorkerRepoManager.quarantine_recorded` — never deleted, so the evidence
+    survives — and the label carries the lane, the instant and a random suffix,
+    because that method refuses a colliding destination by design and two
+    recoveries of one task in the same second must not be one of them.
+
+    THE DIRECTORY THAT MOVES IS THE ONE THAT WAS JUDGED, AND IT IS ALSO THE ONE
+    THE NEXT DISPATCH FILLS — both halves, because the first without the second
+    opens a lane onto a round with no worker. Every judgement here is made about
+    `execution.worktree_path` as the record wrote it, while a recreating
+    dispatch builds at `path_for(task_id)` under TODAY's `workers_root` and then
+    works in the recorded path, which `create` never writes back. So the two
+    must already name one directory before the lease is released, and
+    `_recreated_worker_refusal` is that question, asked BEFORE anything moves: a
+    deployment whose `workers_root` moved between the record and now is REFUSED
+    rather than quarantined, and the lane keeps its lease. Quarantining by task
+    id instead would be the other half of the same fault — the broken worker
+    left exactly where it is and a healthy namesake carried off, the wrong
+    repository moved on evidence gathered about another — which is why the
+    RECORDED path is what is passed down. `_recorded_worker_refusal` asks the
+    third question, whether that path may be moved at all, and every one of the
+    three fails CLOSED.
+
+    REFUSED is for the evidence, not for the worker: an execution record that
+    cannot be read, a recorded path that cannot be safely mapped, a record and a
+    `workers_root` that name different directories, and a quarantine that is
+    required but cannot be performed. All four leave the lane shut.
+    """
+    if not dead.task_id:
+        return (
+            RECOVERY_RESUMED,
+            "its session names no task, so it holds no worker to judge",
+            "",
+        )
+    store = execution_store
+    if store is None:
+        try:
+            store = TaskExecutionStore(config.executions_dir)
+        except (AttributeError, TypeError, OSError) as exc:
+            return (
+                RECOVERY_REFUSED,
+                f"its execution records could not be located ({exc})",
+                "",
+            )
+    try:
+        execution = store.load(dead.task_id)
+    except (StateError, OSError, ValueError, TypeError) as exc:
+        return (
+            RECOVERY_REFUSED,
+            f"the execution record for {dead.task_id} could not be read ({exc})",
+            "",
+        )
+    if execution is None:
+        return (
+            RECOVERY_RESUMED,
+            f"{dead.task_id} has no execution record, so it holds no worker",
+            "",
+        )
+    recorded = (getattr(execution, "worktree_path", "") or "").strip()
+    branch = getattr(execution, "task_branch", "") or ""
+    if not recorded:
+        return (
+            RECOVERY_RESUMED,
+            "its execution record names no worker repository",
+            "",
+        )
+    path = Path(recorded)
+    if worker_repo_is_reusable(path, branch):
+        return (
+            RECOVERY_RESUMED,
+            f"its worker {path} is still a git repository on {branch}",
+            "",
+        )
+    # THE MANAGER IS ESTABLISHED BEFORE THE "IT IS GONE" ANSWER, not after: the
+    # path it would create at is half of the coherence question below, and that
+    # question is asked of an absent worker exactly as it is of a broken one —
+    # a record naming a directory that is missing SOMEWHERE ELSE opens a lane
+    # onto a dispatch that creates a worker here and then works over there. One
+    # that cannot be built cannot answer it, which is a refusal rather than the
+    # resume this returned before there was a question to fail.
+    manager = worker_repos
+    if manager is None:
+        try:
+            manager = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+        except (AttributeError, TypeError, OSError) as exc:
+            return (
+                RECOVERY_REFUSED,
+                f"its worker {path} does not pass the reuse probe and no worker "
+                f"manager could be built to judge it ({exc})",
+                "",
+            )
+    if path.exists():
+        # Asked FIRST of a path that is really there, because it names the more
+        # specific fault — a record pointing into the state directory or another
+        # lane's watched tree — and that is the sentence an operator needs. It is
+        # not asked of an absent path: "may this directory be moved" is not a
+        # question about a directory that does not exist.
+        refusal = _recorded_worker_refusal(path, config)
+        if refusal:
+            return (
+                RECOVERY_REFUSED,
+                f"its worker {path} does not pass the reuse probe and {refusal}",
+                "",
+            )
+    refusal = _recreated_worker_refusal(manager, dead.task_id, path)
+    if refusal:
+        return (
+            RECOVERY_REFUSED,
+            f"its worker {path} does not pass the reuse probe and {refusal}",
+            "",
+        )
+    if not path.exists():
+        return (
+            RECOVERY_RESUMED,
+            f"its worker {path} is gone, so the next dispatch creates one there",
+            "",
+        )
+    label = f"lanedeath-{dead.lane_id}-{utcnow_iso().replace(':', '')}-{uuid.uuid4().hex[:8]}"
+    try:
+        moved = manager.quarantine_recorded(dead.task_id, label, path)
+    except Exception as exc:  # noqa: BLE001 - any failure leaves the lane shut
+        return (
+            RECOVERY_REFUSED,
+            f"its worker {path} does not pass the reuse probe and could not be "
+            f"quarantined ({type(exc).__name__}: {exc})",
+            "",
+        )
+    return (
+        RECOVERY_QUARANTINED,
+        f"its worker {path} is not a git repository checked out on "
+        f"{branch or '(no branch recorded)'}",
+        str(moved),
+    )
+
+
+def _recreated_worker_refusal(manager, task_id: str, path: Path) -> str:
+    """Why the next dispatch could not USE the worker it would create for this
+    record, in a clause a `RECOVERY_REFUSED` detail can carry, or `""` when it
+    could.
+
+    THE QUESTION THE QUARANTINE'S ANSWER DEPENDS ON. A worker that fails the
+    reuse probe is RECREATED by the next dispatch, and that dispatch does two
+    things in this order (`_dispatch_task_postcommit`): `WorkerRepoManager.
+    create(task.id, …)`, which builds at `path_for(task_id)` under TODAY's
+    `workers_root`, and then `GitGateway(Path(execution.worktree_path), …)`,
+    which works in the path the RECORD names. `create` never writes the record
+    back, so those two must already be one directory:
+
+      * where they agree — every deployment whose `workers_root` has not moved,
+        which is every one the loop configures for itself — the quarantine frees
+        exactly the path the create then fills, and nothing recorded changes;
+      * where they DIFFER, the create either REFUSES (something is already at
+        `path_for`: the healthy namesake) or succeeds and is then ignored, with
+        the round pointed at the directory the recovery has just carried off.
+        Both are a lane opened onto a round with no worker at all, so the lane is
+        not opened.
+
+    REFUSING RATHER THAN RE-POINTING THE RECORD is the smaller of the two
+    answers Decision 8 allows and the reversible one. Rewriting
+    `worktree_path` would need the create's own preconditions re-checked here,
+    and would silently re-aim a durable record at a directory no operator named,
+    on a deployment change nothing in the loop can verify was intended. The
+    refusal costs that ONE lane its recovery, names both directories every tick
+    in the transcript — which is the whole remedy — and forecloses nothing: a
+    later round that wants the re-point can add it above this line.
+
+    FAIL CLOSED ON NOT KNOWING, exactly as `_recorded_worker_refusal` does. A
+    `path_for` that cannot be built (an id the manager refuses) or two paths
+    that cannot be resolved to compare is a refusal, never a pass: this exists
+    to answer "will the round find a worker", and a check that cannot see either
+    directory has not answered it.
+    """
+    try:
+        target = Path(manager.path_for(task_id))
+    except Exception as exc:  # noqa: BLE001 - `validate_task_id` raises its own
+        # type, and a substituted manager may raise anything at all; a target
+        # that cannot be named is one this cannot compare against, which is the
+        # refusal below rather than an error that stops the whole pass.
+        return (
+            f"the worker this deployment would create for {task_id!r} could not "
+            f"be named ({type(exc).__name__}: {exc}), so nothing was moved and "
+            "its lease is left in place"
+        )
+    try:
+        agree = path.resolve() == target.resolve()
+    except (OSError, ValueError, TypeError) as exc:
+        return (
+            f"it could not be compared against {target}, where this deployment "
+            f"would create that task's worker ({type(exc).__name__}: {exc}), so "
+            "nothing was moved and its lease is left in place"
+        )
+    if agree:
+        return ""
+    return (
+        f"this deployment creates that task's worker at {target} instead: the "
+        f"next dispatch would build one there and then work in {path}, so "
+        "re-entering this lane would give the round no worker at all. Nothing "
+        "was moved and its lease is left in place until the execution record "
+        "and the workers root name one directory."
+    )
+
+
+def _recorded_worker_refusal(path: Path, config) -> str:
+    """Why the worker recorded at `path` must NOT be moved aside, in a clause a
+    `RECOVERY_REFUSED` detail can carry, or `""` when moving it is safe.
+
+    THE HALF OF THE QUESTION `WorkerRepoManager` CANNOT ANSWER. That class
+    checks its own invariants — the path is a real directory named for the task
+    and does not contain the workers root, the hooks root or the quarantine
+    directory — and it deliberately knows nothing about the rest of the
+    deployment. This asks the other half, from the one place that has the
+    config: is the recorded path somewhere ANOTHER part of this deployment owns?
+
+    Two boundaries, and both are this candidate's own claim rather than general
+    tidiness:
+
+      * the STATE DIRECTORY — every lane's state file, lease and the fleet's
+        merge token live under it, so a record naming a path there would have a
+        recovery move the very files it recovers lanes THROUGH;
+      * the OBSERVED CHECKOUT ROOT — every lane's clone is `<root>/_lane-N`
+        (`lane_observed_checkout`), so a path under it is another lane's watched
+        tree, and moving it would be "touching the others" performed by the code
+        written to prove the opposite.
+
+    Asked in BOTH directions, like `validate_lane_checkout_distinctness`: a
+    recorded path INSIDE a boundary is a directory that belongs to something
+    else, and one that CONTAINS a boundary would carry that whole thing away
+    with it.
+
+    FAIL CLOSED ON NOT KNOWING. A path or a configured boundary that cannot be
+    resolved is a refusal, not a pass: this exists to answer "may this directory
+    be moved", and a check that cannot see where the directory is has not
+    answered it. Refusing costs a lane its recovery for one tick and says so;
+    passing costs whatever the move takes with it.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, ValueError, TypeError) as exc:
+        return (
+            f"where it sits could not be established ({type(exc).__name__}: "
+            f"{exc}), so it was left exactly where it is"
+        )
+    boundaries: list[tuple[str, Path]] = []
+    for what, configured in (
+        ("the loop's state directory", getattr(config, "state_dir", None)),
+        ("the observed checkout root", getattr(config, "observed_checkout", None)),
+    ):
+        if not configured:
+            # An unset `observed_checkout` is the pre-esc-02 deployment and has
+            # no boundary to violate. `state_dir` is never unset on a real
+            # config — a hand-built one without it simply has no such boundary
+            # either, and the manager's own checks still apply.
+            continue
+        try:
+            boundaries.append((what, Path(configured).resolve()))
+        except (OSError, ValueError, TypeError) as exc:
+            return (
+                f"{what} could not be resolved to compare it against "
+                f"({type(exc).__name__}: {exc}), so it was left exactly where "
+                "it is"
+            )
+    for what, boundary in boundaries:
+        if _path_is_nested(resolved, boundary):
+            return (
+                f"it sits inside {what} ({boundary}), which this deployment "
+                "owns and no worker repository belongs in, so it was left "
+                "exactly where it is"
+            )
+        if _path_is_nested(boundary, resolved):
+            return (
+                f"it contains {what} ({boundary}), so moving it would carry "
+                "that away too, and it was left exactly where it is"
+            )
+    return ""
+
+
+def _release_dead_merge_token(config) -> tuple[str, str]:
+    """`(action, detail)` for the fleet's merge token — Decision 8's "a dead
+    lane holding the merge token releases it".
+
+    `("", "")` when there is nothing to do, which is every ordinary state: one
+    lane, no token file, or a token a LIVE lane is merging under. A live token
+    is never removed — `MergeToken.break_stale` refuses one, and the refusal is
+    the point: the alternative is two lanes merging into one base.
+
+    An unreadable token is `RECOVERY_REFUSED` rather than removed, for the
+    reason `LaneLease.read` gives about its own refusal: "remove what you cannot
+    read" is how a resource with a live holder gets handed to somebody else.
+    That leaves the fleet unable to merge until a person looks, which is the
+    direction this whole module fails in.
+
+    THE FLEET SIZE IS READ FROM THE CONFIG, deliberately, and NOT from
+    `recover_dead_lanes`' `lanes=` argument — which exists so a caller can
+    survey a different number of LANES, a question about `lanes/` and nothing
+    else. The token is written by exactly one site (`BacklogSweeper.
+    _take_merge_token`) under exactly this test, so reading it here keeps the
+    writer and the releaser asking one question. A deployment lowered back to
+    one lane strands nothing by it: at one lane the sweep never looks at the
+    file, so a token left over from a larger fleet is inert rather than held.
+    """
+    lanes = getattr(getattr(config, "concurrency", None), "lanes", 1)
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes <= 1:
+        return "", ""
+    token = MergeToken(config.state_dir)
+    try:
+        info = token.read()
+    except (StateCorruptError, OSError) as exc:
+        return RECOVERY_REFUSED, f"the merge token could not be read ({exc})"
+    if info is None or MergeToken.is_live(info):
+        return "", ""
+    try:
+        removed = token.break_stale()
+    except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
+        return RECOVERY_REFUSED, f"the merge token could not be released ({exc})"
+    return RECOVERY_RELEASED, removed.describe()
+
+
 class FleetSupervisor:
     """Scheduling across N lanes: the cap, the admission rule, and the drain
     that reaches a self-upgrade boundary (conc-06, `docs/AUTOLOOP.md`
@@ -2545,6 +3540,12 @@ class Orchestrator:
         # `is_dir()` when no split has ever been accepted, which is the ordinary
         # case, and never raises.
         self._reconcile_split_acceptance()
+        # AND THE LANES A DEATH LEFT BEHIND (conc-08), at the same boundary and
+        # for the same reason: a lane whose process was killed mid-round leaves
+        # a dead lease that nothing else removes, and until it is removed no
+        # process may enter that lane. A no-op at `lanes = 1`, where it reads
+        # nothing; never raises.
+        self._recover_dead_lanes()
         steps = 0
         while True:
             # BOTH locations: the flag moved outside the checkout (see
@@ -4043,6 +5044,79 @@ class Orchestrator:
         if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
             return 1
         return lanes
+
+    def _recover_dead_lanes(self) -> None:
+        """Recover the lanes a dead process left behind, once per tick, before
+        this lane takes a step (conc-08, Decision 8).
+
+        NOTHING AT ALL AT `lanes = 1`, and structurally rather than by a flag:
+        `_fleet_lanes` answers 1 for every single-lane deployment and every
+        hand-built config in the suite, so no lease is read, no survey runs and
+        no file is touched. That is the acceptance criterion this candidate
+        carries, in the one place a per-tick hook could otherwise break it.
+
+        HERE, at the top of `run`, for `_reconcile_split_acceptance`'s reason
+        one line up: it is the moment before anything else reads the state
+        directory, it recurs every tick a lane takes, and the process is holding
+        the fleet lock — which is what makes the check-then-act inside
+        `LaneLease.break_stale` safe (see `recover_dead_lanes`). THIS lane is
+        excluded by index: it is alive by construction, and a process offered
+        its own lane to recover would be recovering itself.
+
+        NEVER RAISES, and every outcome is written to the transcript, including
+        the refusals. A recovery that stopped a round would be a worse failure
+        than the death it exists to repair; a recovery that fixed a lane
+        silently would be a round that vanished, and one that REFUSED a lane
+        silently would be the fail-open shape this whole candidate is written
+        against — the lane stays shut and nothing says why.
+
+        THE BLOCKER STORE IS THIS LANE'S, and the observed checkout is
+        deliberately NOT: a dead lane's park is filed in the one store the whole
+        deployment shares (`config.blockers_dir`, which is also where
+        `fleet_stop` looks the code up), while `self._observed` has already been
+        narrowed to THIS lane's clone by `for_lane` — deriving another lane's
+        tree from it would name a directory inside this one. `recover_dead_lanes`
+        therefore re-derives the deployment's checkout from `config`, which is
+        the same value `cli` built this lane's from.
+        """
+        if self._fleet_lanes() <= 1:
+            return
+        try:
+            recovery = recover_dead_lanes(
+                self._config,
+                exclude=self.lane_index,
+                worker_repos=self._worker_repos,
+                execution_store=self._execution_store,
+                blockers=self._blocker_store,
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self._log(
+                "lane_recovery_error",
+                data={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            return
+        for entry in recovery.lanes:
+            self._log(
+                "lane_recovered",
+                data={
+                    "lane_id": entry.lane_id,
+                    "lane_index": entry.lane_index,
+                    "action": entry.action,
+                    "task_id": entry.task_id,
+                    "detail": entry.detail,
+                    "quarantined_at": entry.quarantined_at,
+                },
+            )
+        if recovery.merge_token:
+            self._log(
+                "merge_token_recovered",
+                data={
+                    "action": recovery.merge_token,
+                    "detail": recovery.merge_token_detail,
+                },
+            )
+        if recovery.detail:
+            self._log("lane_recovery_error", data={"error": recovery.detail})
 
     def _fleet_throttle_store(self) -> FleetThrottleStore | None:
         """The fleet's shared throttle record, or `None` at one lane.
@@ -7556,6 +8630,21 @@ class Orchestrator:
             return False
         return base_sha not in self._declined_upgrades
 
+    def _fleet_lane_count(self) -> int:
+        """How many lanes this loop is running, as this round can read it.
+
+        A fleet size this build cannot read is ONE lane, not a comparison
+        against a string: `config.load_config` refuses every such value at load
+        time, so reaching the fallback means a hand-built config, and the
+        single-lane reading is the one that changes nothing. One function
+        because two readings of "how big is the fleet" would drift, and the one
+        that drifts is the one that lets a second lane past a gate.
+        """
+        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
+        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+            return 1
+        return lanes
+
     def _refused_outside_fleet_admission(
         self, directive: Directive, task: Task
     ) -> bool:
@@ -7645,13 +8734,7 @@ class Orchestrator:
         denial budget instead. That bound is the same one every refused directive
         in this loop has.
         """
-        lanes = getattr(getattr(self._config, "concurrency", None), "lanes", 1)
-        if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
-            # A fleet size this build cannot read is ONE lane, not a comparison
-            # against a string: `config.load_config` refuses every such value at
-            # load time, so reaching this is a hand-built config, and the
-            # single-lane reading is the one that changes nothing.
-            lanes = 1
+        lanes = self._fleet_lane_count()
         if task.id in self._session_task_ids():
             # Ahead of every other check, retired lane included: a lane the
             # operator has cut out of the fleet still FINISHES the arc it is
@@ -7773,6 +8856,11 @@ class Orchestrator:
         supervisor is holding. An audit passes the second one by construction —
         it takes no task out of the queue, so there is no admission to decide,
         and the round it does take is what the urgent gate above answers for.
+
+        The LAST gate is `_claim_task_for_dispatch`, and it is last because it
+        is not a policy question: it is the moment this task actually becomes
+        this lane's, taken atomically against the task file so two lanes cannot
+        both take it (conc-10b). Inert at one lane.
         """
         state = self.state
         is_audit = (
@@ -7797,19 +8885,12 @@ class Orchestrator:
                 # mid-task plan reshape from silently widening a ceiling: the
                 # grant happens there, gated on the request, or not at all.
                 return
-            if directive.decomposition is not None:
-                # The approved plan, made durable BEFORE the executor runs, in
-                # the same save as `mark_in_progress` — so a task can never be
-                # in progress against a plan nothing recorded. `implement`
-                # cannot get this far without one (policy's
-                # `_check_decomposition`); `revise` reaching here with one is a
-                # deliberate reshape, and reaching here without one leaves the
-                # stored plan exactly as it was.
-                self._registry.set_decomposition(
-                    task.id, directive.decomposition.render()
-                )
-            self._registry.mark_in_progress(task.id)
-            self._task_store.save(self._registry)
+            task = self._claim_task_for_dispatch(directive, task)
+            if task is None:
+                # Another lane took this task between the plan and this line.
+                # Refused, never parked, and nothing was written — see
+                # `_claim_task_for_dispatch`. Answers instantly at one lane.
+                return
             state.current_task = {
                 "task_id": task.id,
                 "title": task.title,
@@ -7822,6 +8903,138 @@ class Orchestrator:
                 return  # parked; _resolve_audit_task already reported why
 
         self._dispatch_task_postcommit(directive, task, state)
+
+    def _claim_task_for_dispatch(
+        self, directive: Directive, task: Task
+    ) -> Task | None:
+        """Take this task for this lane, or refuse. Returns the task as it now
+        stands (`None` when another lane already holds it).
+
+        **THE CHECK AND THE MARK ARE ONE HOLD**, and that is the whole point.
+        The supervisor's own `HOLD_IN_FLIGHT` reads the registry and the lanes'
+        state files a tick earlier; between that tick and this line another lane
+        can mark the same id `in_progress`, because two lanes each opened a
+        session before either had written anything a scan could see. Reading the
+        file and writing it back as two steps is exactly how one task gets
+        dispatched twice — so the reconciliation, the refusal and
+        `mark_in_progress` all happen inside ONE `task_file_mutex` hold, which
+        every other writer of that file takes too.
+
+        `mark_in_progress` cannot be the check: it is IDEMPOTENT on an already
+        in-progress row (it raises for completed, blocked, quarantined, retired
+        and shipped-elsewhere, and for nothing else), so a second lane marking a
+        task the first is running succeeds silently. The refusal is therefore
+        explicit, and it is narrow on purpose — it asks about the rows this hold
+        just ADOPTED, which is exactly "another holder moved this task while this
+        registry was in memory". Moved to `in_progress` is a sibling that took it
+        (the duplicate dispatch this exists to stop, reported with the
+        supervisor's own `HOLD_IN_FLIGHT` word so a reader sees one vocabulary);
+        moved to anything else that is not `pending` — completed, quarantined,
+        retired, shipped elsewhere — is a row `mark_in_progress` would RAISE on
+        one line later, which above one lane would end a lane by traceback over
+        an ordinary race.
+
+        What it deliberately does NOT ask about is a row that already read
+        `in_progress` when this registry loaded. Nothing moved under this lane
+        there, `plan` never scheduled such a task (it is not in the queue), and
+        the refusal belongs to `policy._check_task_reference` and to the worker
+        repo a second dispatch cannot create over the first
+        (`worker_repo_is_reusable`) — which is what
+        `_refused_outside_fleet_admission` already says about the in-flight race
+        and what `test_fleet_supervisor.py` pins. A second, weaker copy of a
+        correctness check is not what this gate is for.
+
+        Work THIS session already owns passes as well (`_session_task_ids`) —
+        but only where the adopted row still reads `in_progress`: a `revise`
+        continues an arc this lane wrote that row for, and refusing it would deny
+        every second directive of every round, while an arc an OPERATOR
+        quarantined or retired mid-round is a decision this dispatch must not
+        write over and `mark_in_progress` would raise on anyway.
+
+        Refused through `_handle_policy_denial` like every other admission
+        refusal: the task is left EXACTLY as it was — `in_progress` for the lane
+        that has it, nothing written here, no attempt charged, no worker repo —
+        and the reviewer is told to send `stop`, which ends this round at a clean
+        boundary and frees the lane.
+
+        **AT ONE LANE THIS READS NOTHING AND REFUSES NOTHING.** The gate is
+        `_fleet_lane_count() > 1`, decided from the config in memory rather than
+        from a file, so there is no unreadable state for it to fail open on: a
+        single-lane loop executes the same three statements it always did —
+        `set_decomposition`, `mark_in_progress`, `save` — inside a mutex hold
+        that `save` was taking anyway (it is re-entrant per thread, so the nested
+        take is free).
+        """
+        taken_elsewhere = ""
+        with self._task_store.lock():
+            if self._fleet_lane_count() > 1:
+                # The neighbour's writes, adopted before anything is decided:
+                # this registry has been in memory for a whole round and its row
+                # for this task may predate another lane taking it.
+                adopted = self._task_store.reconcile_concurrent_rows(self._registry)
+                status = (
+                    self._registry.get(task.id).status
+                    if self._registry.has(task.id)
+                    else task.status
+                )
+                # The carve-out is for `in_progress` ALONE. A `revise` continues
+                # an arc whose in-progress row this lane wrote itself — but every
+                # OTHER status this hold adopted is one `mark_in_progress` raises
+                # on two lines down, and an operator quarantining a task this lane
+                # is mid-arc on is exactly that: `policy._check_task_reference`
+                # passed on the stale row a moment earlier, so without this the
+                # round would end by traceback (nothing in `Orchestrator.run`'s
+                # step loop catches `TaskGraphError`) over an operator's ordinary
+                # decision. Refusing is also the right answer on its own terms:
+                # the quarantine records something a human has not decided yet,
+                # and the old behaviour — a stale in-memory row marking it in
+                # progress again — overwrote it silently.
+                own_arc = task.id in self._session_task_ids()
+                if task.id in adopted and status != "pending" and not (
+                    status == "in_progress" and own_arc
+                ):
+                    taken_elsewhere = status
+                else:
+                    task = self._registry.get(task.id)
+            if not taken_elsewhere:
+                if directive.decomposition is not None:
+                    # The approved plan, made durable BEFORE the executor runs,
+                    # in the same save as `mark_in_progress` — so a task can
+                    # never be in progress against a plan nothing recorded.
+                    # `implement` cannot get this far without one (policy's
+                    # `_check_decomposition`); `revise` reaching here with one is
+                    # a deliberate reshape, and reaching here without one leaves
+                    # the stored plan exactly as it was.
+                    self._registry.set_decomposition(
+                        task.id, directive.decomposition.render()
+                    )
+                self._registry.mark_in_progress(task.id)
+                self._task_store.save(self._registry)
+        if not taken_elsewhere:
+            return task
+        # OUTSIDE the hold: the decision is made, nothing more is written to the
+        # task file, and a denial writes a transcript entry, a state file and —
+        # at an exhausted budget — a blocker record. None of that is any lane's
+        # business but this one's, and holding a mutex every lane waits on while
+        # it happens is how a wait turns into a `TaskStoreBusy` nobody needs.
+        self._log(
+            "fleet_task_claimed_elsewhere",
+            data={"task_id": task.id, "lane": self.lane_id, "status": taken_elsewhere},
+        )
+        self._handle_policy_denial(
+            directive,
+            Verdict.deny(
+                FLEET_HOLD_DENIAL_CODE,
+                f"task '{task.id}' is not this lane's to take: another holder of "
+                f"the task file has it at '{taken_elsewhere}' ({HOLD_IN_FLIGHT}), "
+                "taken between the supervisor's last scan and this dispatch. "
+                "Running it a second time is what this refusal exists to "
+                "prevent. The task is untouched: nothing was executed and no "
+                "attempt was spent. Send `stop`, which ends this round at a "
+                "clean boundary and frees this lane for something else.",
+            ),
+        )
+        return None
 
     def _audit_unit_quarantined(self, unit_id: str) -> bool:
         """Has the operator quarantined this exact audit unit?
@@ -9720,12 +10933,13 @@ class Orchestrator:
         """Is the tree this lane is about to synchronise and bracket a tree only
         THIS lane writes to? Human-readable violations; empty means yes.
 
-        THE PRODUCTION CALLER of `worker_env.validate_lane_checkout_distinctness`
+        THE ROUND'S CALLER of `worker_env.validate_lane_checkout_distinctness`
         — the rule Decision 1 states as the whole claim, asked where it can still
         stop something: `_synchronise_observed_checkout` runs it before the clone
         is fetched into, checked out, or bracketed, and a violation parks the
         round with nothing executed. A rule only a validator function knows is a
-        rule that never fires.
+        rule that never fires. `_lane_clone_violations` (conc-08) is the other
+        caller, asking it of a DEAD lane's clone before that tree is read.
 
         The siblings are DERIVED, from the two values `__init__` recorded — the
         deployment's configured checkout and the fleet size this lane's own path

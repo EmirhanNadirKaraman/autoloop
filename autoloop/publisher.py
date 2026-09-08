@@ -49,6 +49,7 @@ like every other write path in this codebase.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -60,10 +61,26 @@ from .errors import GitCommandError
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .state import utcnow_iso
+from .tasks import TaskStoreBusy, mutex_path_for, task_file_mutex
+from .worker_env import OBSERVED_GIT_TIMEOUT_SECONDS
 
 #: Mirrors `git_gateway._SHA_RE` — a push/fetch source or want token must be
 #: a literal, already-resolved 40-hex commit id, never a ref, tag or HEAD.
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+#: How long a lane waits for the publisher mutex before giving up.
+#:
+#: NOT `tasks.MUTEX_TIMEOUT_SECONDS` (10s), and the difference is the claim:
+#: that number bounds a file read, an in-memory mutation and a file write, so
+#: ten seconds means something is wrong. A holder here is running `git fetch`
+#: against a local worker repo or `git push` across a NETWORK, and a lane that
+#: gave up after ten seconds of an ordinary simultaneous publish would fail for
+#: the contention this lock exists to remove. Taken from the longest a single
+#: git command is allowed to run anywhere in this codebase
+#: (`worker_env.OBSERVED_GIT_TIMEOUT_SECONDS`), which is the bound on how long
+#: the holder can be inside one — read from there rather than copied, because a
+#: second number agrees today and disagrees the first time it moves.
+PUBLISHER_MUTEX_TIMEOUT_SECONDS = float(OBSERVED_GIT_TIMEOUT_SECONDS)
 
 
 def _run(args: list[str], cwd: Path) -> None:
@@ -88,6 +105,61 @@ def publisher_hooks_path(state_dir: Path) -> Path:
     # Resolved for the same reason as WorkerRepoManager: these become
     # subprocess cwd / `git init` targets, and the shipped state_dir is relative.
     return Path(state_dir).resolve() / "publisher-hooks"
+
+
+def publisher_mutex_path(state_dir: Path) -> Path:
+    """The lock file serialising publication through the ONE publisher repo.
+
+    Beside the repository, never inside it: a lock file under `publisher.git`
+    would be a path in a repo whose contents this module keeps controlled.
+    """
+    return mutex_path_for(publisher_repo_path(state_dir))
+
+
+@contextlib.contextmanager
+def publisher_mutex(repo_root: Path, timeout: float = PUBLISHER_MUTEX_TIMEOUT_SECONDS):
+    """Hold the publisher's mutex for the body of the block.
+
+    **ONE PUBLISHER REPO, N LANES** (conc-10b). `publisher.git` is a single
+    repository under the state directory and every lane publishes through it.
+    Two lanes fetching into it at the same moment contend on git's own index and
+    `FETCH_HEAD` locks, and git's answer to that is to FAIL the second one
+    (`Unable to create '.../FETCH_HEAD.lock': File exists`) — a lane parked on a
+    push refusal for no reason but its neighbour's timing. So publication is
+    serialised here instead: the second lane WAITS and then publishes, which is
+    the whole of the fix.
+
+    The same primitive as the task file's mutex (`tasks.task_file_mutex`) rather
+    than a second implementation of one: re-entrant within a thread, exclusive
+    across threads and across processes, and already the thing every writer of a
+    shared file in this loop takes. What differs is the timeout, and only that
+    (`PUBLISHER_MUTEX_TIMEOUT_SECONDS`).
+
+    **LOCK ORDER, and it is a rule rather than an observation: the task-file
+    mutex is never taken while this one is held.** Nothing under `Publisher`
+    touches `tasks.json`, and the orchestrator's own `mark_completed` runs after
+    publication returns, not inside it. Inverting that — publishing from inside a
+    task-file hold — would let two lanes deadlock until two long timeouts
+    expired, so a later author adding a publish under `TaskStore.lock()` must
+    move it out instead.
+
+    A wait that does time out leaves as a `GitCommandError`, never as the
+    `TaskStoreBusy` the primitive raises: every caller of `publish` already
+    handles a git failure (it parks `push_refused`, with the reason), and a
+    `StateError` arriving from a push would leave the lane by traceback instead.
+    Only the ACQUISITION is converted — a `TaskStoreBusy` raised by anything
+    inside the block would be somebody else's fault and is left alone.
+    """
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(task_file_mutex(Path(repo_root), timeout=timeout))
+        except TaskStoreBusy as exc:
+            raise GitCommandError(
+                f"publication is serialised through one publisher repository and "
+                f"the lock for {Path(repo_root)} could not be taken: {exc}. "
+                "Nothing was fetched or pushed."
+            ) from exc
+        yield
 
 
 def publisher_url_snapshot_path(state_dir: Path) -> Path:
@@ -157,6 +229,14 @@ def provision_publisher_repo(
     checkout's current config, and `Orchestrator._dispatch_task_push` refuses
     to publish while one exists (see its own docstring).
 
+    Also creates the (always empty) publication mutex file, for the reason
+    `TaskStore.ensure_mutex_file` creates its own ahead of time rather than on
+    first use: a coordination file that appears mid-round is a change in a
+    directory something may be watching, and one that is already there is
+    byte-identical on both sides of every snapshot. Created here because this is
+    the function that establishes the publisher, and pre-creating it removes the
+    question rather than answering it.
+
     Returns the publisher repo's path. Raises `GitCommandError` if
     `source_git` has no `remote.<remote>.url` configured on first-ever
     provisioning, or if the bare repo already carries MULTIPLE values for
@@ -166,6 +246,11 @@ def provision_publisher_repo(
     publisher_path = publisher_repo_path(state_dir)
     hooks_dir = publisher_hooks_path(state_dir)
     hooks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = publisher_mutex_path(state_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        with open(lock_path, "a+b"):  # NEVER written to — see `publisher_mutex`
+            pass
     if not publisher_path.exists():
         _run(["git", "init", "-q", "--bare", str(publisher_path)], cwd=Path(state_dir).resolve())
     _run(["git", "config", "core.hooksPath", str(hooks_dir)], cwd=publisher_path)
@@ -331,8 +416,13 @@ class Publisher:
                 f"import_candidate refuses a non-40-hex candidate_sha: {candidate_sha!r}"
             )
         source = str(Path(worker_repo_path).resolve())
-        self._git.fetch_object(source, candidate_sha)
-        info = self._git.read_commit(candidate_sha)
+        # SERIALISED (conc-10b): one publisher repo serves every lane, and two
+        # concurrent fetches into it collide on git's own `FETCH_HEAD` lock. The
+        # refusal above is outside the hold deliberately — a malformed sha is
+        # this caller's error and needs no lane to wait for it.
+        with publisher_mutex(self.repo_root):
+            self._git.fetch_object(source, candidate_sha)
+            info = self._git.read_commit(candidate_sha)
         if not info.get("tree"):
             raise GitCommandError(
                 f"import_candidate: {candidate_sha} did not parse as a commit object"
@@ -374,11 +464,22 @@ class Publisher:
         construction and re-verified by `push_exact` immediately before the
         push), and nothing here evaluates or runs anything from the pushed
         commit's own tree.
+
+        **SERIALISED across lanes** (`publisher_mutex`, conc-10b), for
+        `import_candidate`'s reason one step further on: N lanes share this one
+        repository, and a push that fails because a sibling was mid-fetch in it
+        would park a lane over nothing but timing. The wait is bounded and a
+        wait that expires is an ordinary `GitCommandError`.
         """
-        self._git.read_commit(candidate_sha)
-        return self._git.push_exact(
-            self.remote, candidate_sha, dest_ref, protected_refs, expected_url=expected_url
-        )
+        with publisher_mutex(self.repo_root):
+            self._git.read_commit(candidate_sha)
+            return self._git.push_exact(
+                self.remote,
+                candidate_sha,
+                dest_ref,
+                protected_refs,
+                expected_url=expected_url,
+            )
 
     def remote_ref_sha(self, dest_ref: str) -> str:
         """The sha `dest_ref` currently resolves to on `self.remote`, via a

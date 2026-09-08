@@ -1558,6 +1558,18 @@ class TaskRegistry:
         #: request is exactly that case: it is a deliberate write, so it takes
         #: precedence over whatever the file says.
         self._priority_overrides: set[str] = set()
+        #: What each row looked like the last time this registry and the file
+        #: AGREED — set when a registry is loaded (`from_dict`) and refreshed by
+        #: every save. In-memory only, never persisted.
+        #:
+        #: It answers the one question a second writer makes necessary: of the
+        #: rows in memory, which ones did THIS registry change? Anything else on
+        #: disk was written by somebody else and is theirs to have changed (see
+        #: `TaskStore.reconcile_concurrent_rows`). A registry built by hand
+        #: rather than loaded has an EMPTY baseline, so every row reads as this
+        #: caller's own and its save is byte-identical to today's — which is
+        #: what keeps the mechanism invisible to a test that hand-builds one.
+        self._baseline: dict[str, dict] = {}
         if tasks:
             self.add_many(tasks)
 
@@ -1570,6 +1582,57 @@ class TaskRegistry:
         the file and this registry agree, so the next reconciliation has
         nothing to protect."""
         self._priority_overrides.clear()
+
+    # ---- the load baseline (conc-10b) ---------------------------------------
+
+    def rebaseline(self) -> None:
+        """This registry and the file now agree: measure the next round of
+        changes from HERE.
+
+        Called by `TaskStore.save` after the bytes land, and it is not
+        decoration. Without it a row this registry adopted from another lane
+        would read as its own change forever after, and its next save would
+        write the adopted value back over whatever that lane did next — the
+        same lost update, one step later.
+        """
+        self._baseline = {tid: asdict(task) for tid, task in self._tasks.items()}
+
+    def changed_since_baseline(self, task_id: str) -> bool:
+        """Has THIS registry changed `task_id` since it was loaded or last
+        saved?
+
+        An id the baseline has never heard of — added since, or built by hand
+        rather than loaded — counts as changed. That is the fail-safe direction
+        for a merge: "this caller's own value wins" is exactly today's
+        behaviour, and the reconciliation is only ever allowed to overwrite a
+        row nobody here touched.
+        """
+        if task_id not in self._tasks:
+            return False
+        return asdict(self._tasks[task_id]) != self._baseline.get(task_id)
+
+    def adopt_rows(self, tasks: list[Task]) -> list[str]:
+        """Take whole rows another writer of the same file persisted, replacing
+        or inserting each. Returns the ids adopted.
+
+        `from_dict`'s bypass of `add_many`, for `from_dict`'s reason: these rows
+        were validated on the way INTO the file that holds them, and
+        re-validating a completed graph would reject exactly the states this
+        exists to carry (a completed task, a quarantine, a retirement). The one
+        check that does run is `_check_acyclic`, over the MERGED graph — two
+        writers can each add a task depending on the other's, and neither side's
+        own file shows the cycle that makes.
+        """
+        if not tasks:
+            return []
+        candidate = dict(self._tasks)
+        for task in tasks:
+            candidate[task.id] = task
+        _check_acyclic(candidate)
+        self._tasks = candidate
+        for task in tasks:
+            self._baseline[task.id] = asdict(task)
+        return [task.id for task in tasks]
 
     # ---- mutation -----------------------------------------------------------
 
@@ -3782,6 +3845,10 @@ class TaskRegistry:
             registry._tasks[task.id] = task
         _migrate_retirements(registry._tasks)
         _check_acyclic(registry._tasks)
+        # What this registry and the file agreed on at load. Every later
+        # question of "did THIS holder change that row, or did another one?"
+        # is answered against it (`changed_since_baseline`).
+        registry.rebaseline()
         return registry
 
 
@@ -4365,11 +4432,20 @@ class TaskStore:
     edit (`apply_priority` refuses rather than writing something the escape
     detector would report as an agent escape). Production wiring passes
     `mutation_ledger_for(config.workers_root, config.state_dir)`.
+
+    `fleet` turns on the OTHER reconciliation (`reconcile_concurrent_rows`,
+    conc-10b): above one lane a second holder of this file is another LANE, not
+    an operator, and what it writes is a status transition rather than a
+    priority. Off by default and set from `[concurrency] lanes > 1` at the one
+    production construction site (`cli._load_tasks`) — an in-memory config
+    value, so the gate has no file to fail open on — which is what keeps a
+    single-lane deployment's persistence byte-identical to today's.
     """
 
-    def __init__(self, path: Path, ledger: Path | None = None):
+    def __init__(self, path: Path, ledger: Path | None = None, fleet: bool = False):
         self.path = Path(path)
         self.ledger = MutationLedger(ledger) if ledger is not None else None
+        self.fleet = bool(fleet)
 
     # ---- coordination -------------------------------------------------------
 
@@ -4476,21 +4552,100 @@ class TaskStore:
         that records completions and quarantines, and a save that started
         refusing because the file it is about to overwrite will not parse would
         be a far worse bug than a late priority.
+
+        **ABOVE ONE LANE THE OTHER WRITER IS A LANE** (conc-10b), and priority
+        is not what it changed. `reconcile_concurrent_rows` runs FIRST, and the
+        order is load-bearing rather than tidy: it decides what to adopt by
+        comparing the in-memory row against the baseline, and
+        `reconcile_priorities` MUTATES that row — so a task an operator had
+        re-prioritised would read as "this lane changed it" and its neighbour's
+        status transition would be skipped, silently, for that task alone.
+        Adopting the whole row first brings the disk priority with it, and the
+        priority pass then runs on what is left.
         """
         with self.lock():
+            if self.fleet:
+                self.reconcile_concurrent_rows(registry)
             self.reconcile_priorities(registry)
             self._write_bytes(self._serialize(registry))
+            # The file and this registry now agree: every later "did THIS
+            # holder change that row?" is measured from here (`rebaseline`).
+            registry.rebaseline()
             registry.clear_priority_overrides()
+
+    def reconcile_concurrent_rows(self, registry: TaskRegistry) -> list[str]:
+        """Adopt every row on disk that another holder of this file has changed
+        and this registry has not. Returns the ids adopted.
+
+        THE LOST UPDATE A SECOND LANE MAKES, and it is not the priority one.
+        A lane holds its registry in memory for a whole round; a sibling lane
+        marking a task `in_progress`, completing one or quarantining one writes
+        that to the file, not to this object — so the next ordinary save here
+        (`mark_in_progress`, `mark_completed`, a park) writes the stale row back
+        and the transition is gone. Two lanes then read that task as dispatchable
+        and one task runs twice.
+
+        Three rules, and the middle one is the whole design:
+
+        * a row THIS registry changed since it loaded or last saved is this
+          caller's own and is kept (`changed_since_baseline`);
+        * a row it did not change is adopted from disk WHOLE — status, attempts,
+          blocked_reason, the lot — because the holder that wrote it is the one
+          that knows what it means, and adopting half a row is a state neither
+          writer intended;
+        * a row that is only on disk is a task another lane ADDED (a plan, a
+          recut) and is taken as well: dropping it would lose a whole task
+          rather than one field.
+
+        Nothing is ever adopted over a change made here, so this cannot undo the
+        caller's own work; the direction it protects is the neighbour's.
+
+        Held inside the mutex, and the caller's `save` holds it too — the whole
+        read-decide-write is one hold, because "read the file, decide, write it"
+        done outside one is how the update goes missing in the first place.
+
+        FAILS OPEN, exactly as `reconcile_priorities` does and for its reason: a
+        task file that will not parse, or a MERGED graph that would be cyclic
+        (each lane adding a task that depends on the other's), adopts nothing and
+        lets the save proceed. Refusing here would stop a completion being
+        recorded because somebody else's row is malformed, which is the worse of
+        the two failures.
+
+        PUBLIC and ungated — `save` calls it only when this store was built for a
+        fleet (`TaskStore.fleet`), which is what keeps a single-lane deployment's
+        persistence byte-identical, while a caller that has its OWN reason to
+        ask (`Orchestrator._claim_task_for_dispatch`, gated on its own reading of
+        the lane count) asks directly. A registry that was built by hand rather
+        than loaded has no baseline, so every row reads as its caller's own and
+        this adopts nothing whoever calls it.
+        """
+        with self.lock():
+            try:
+                disk = self.load()
+                if disk is None:
+                    return []
+                adopt = []
+                for task in disk.all_tasks():
+                    if registry.has(task.id):
+                        if registry.changed_since_baseline(task.id):
+                            continue
+                        if asdict(task) == asdict(registry.get(task.id)):
+                            continue
+                    adopt.append(task)
+                return registry.adopt_rows(adopt)
+            except (StateError, OSError, ValueError, TaskGraphError):
+                return []  # fail open — see above, and `save`
 
     def reconcile_priorities(self, registry: TaskRegistry) -> list[str]:
         """Copy the on-disk `priority` onto every in-memory task whose priority
         the caller has not itself changed since the last save. Returns the ids
         adopted, so a caller can log what an operator steered.
 
-        Priority ONLY. Nothing else on disk is trusted over the in-memory
-        registry, because nothing else on disk can have been written by the
-        operator path: `apply_priority` is the only immediate write, and it can
-        express nothing but this field.
+        Priority ONLY. This pass is about the OPERATOR's writer, and
+        `apply_priority` is the only immediate write it has, expressing nothing
+        but this field. The other writer a fleet adds — a sibling LANE, which
+        changes statuses — is `reconcile_concurrent_rows`' subject, and runs
+        before this one.
         """
         with self.lock():
             try:

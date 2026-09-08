@@ -1634,3 +1634,151 @@ def test_at_one_lane_no_scan_walks_past_lane_zero(tmp_path):
 
     assert dispatched == ["t1"]
     assert orch.state.policy_denials == 0
+
+
+# ---- 8. and the claim itself: the task file, at the moment it is taken ---------
+#
+# Every gate above answers from a plan taken a moment earlier. Between that
+# moment and the line that writes `in_progress` there is a window, and above one
+# lane a sibling can take the same task inside it: two lanes each opened a
+# session before either had written anything a scan could see, and neither
+# registry can see the other's memory. `_claim_task_for_dispatch` closes it by
+# doing the reconcile, the refusal and the mark inside ONE `task_file_mutex`
+# hold — the same lock every other writer of that file takes.
+#
+# The refusal is deliberately narrow: it asks only about a row this hold ADOPTED,
+# which is exactly "somebody moved this while this registry was in memory". A row
+# that already read `in_progress` when the lane loaded is the case section 6
+# leaves to policy and to the worker repo, and the last test here pins that it
+# still is.
+
+
+def loaded_lane(config: AutoloopConfig, tasks=(), lane_index: int = 0):
+    """`build_lane`, with the registry a real round holds: LOADED from the task
+    file rather than hand-built, which is what gives it a baseline to measure
+    another writer's row against."""
+    orch, dispatched = build_lane(config, tasks=tasks, lane_index=lane_index)
+    orch._registry = orch._task_store.load()
+    return orch, dispatched
+
+
+def a_neighbour_takes(config: AutoloopConfig, task_id: str) -> None:
+    """Another lane's dispatch, written the way that lane writes it: its own
+    store, its own registry, its own save."""
+    store = TaskStore(config.tasks_file)
+    theirs = store.load()
+    theirs.mark_in_progress(task_id)
+    store.save(theirs)
+
+
+def test_a_task_a_neighbour_took_mid_round_is_not_dispatched_a_second_time(tmp_path):
+    """THE claim. This lane's registry says t2 is `pending` because it loaded
+    before the neighbour took it; the directive names t2; the plan admits it,
+    because the plan reads that same stale registry. The dispatch is refused on
+    the row the claim's own hold adopts, and the task is left EXACTLY as it was —
+    `in_progress` for the lane that has it, nothing written, no attempt charged.
+
+    The last assertion is the other half, and it is why the reconcile is here
+    rather than only inside `save`: the dispatch that DOES go through writes this
+    lane's registry, and t2 must not go back to `pending` in it."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = loaded_lane(config, tasks=[a_task("t1"), a_task("t2")])
+    a_neighbour_takes(config, "t2")
+    assert orch._registry.get("t2").status == "pending", "the stale row this round holds"
+    before = config.tasks_file.read_bytes()
+
+    orch._dispatch_executor(implement("t2"))
+
+    assert dispatched == [], "the task the neighbour holds did not start"
+    assert config.tasks_file.read_bytes() == before, "the registry was not written"
+    assert not config.executions_dir.exists(), "no attempt was charged"
+    assert orch.state.policy_denials == 1
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+    assert "fleet_task_claimed_elsewhere" in transcript_types(config)
+    outbox = orch.state.outbox or ""
+    assert HOLD_IN_FLIGHT in outbox and "'t2'" in outbox
+    assert Phase(orch.state.phase) is Phase.READY, "corrected, never parked"
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"], "the lane is corrected, not wedged"
+    assert TaskStore(config.tasks_file).load().get("t2").status == "in_progress", (
+        "the dispatch that went through wrote this lane's stale copy of t2 back"
+    )
+
+
+def test_at_one_lane_the_claim_reads_nothing_and_refuses_nothing(tmp_path):
+    """The acceptance criterion at the third call site. Below two lanes there is
+    no second writer to reconcile against, so the claim does not read the file,
+    cannot refuse, and the dispatch is the one every existing test pins — with
+    the very same interleaving that refuses above."""
+    config = make_config(tmp_path, lanes=1)
+    orch, dispatched = loaded_lane(config, tasks=[a_task("t1"), a_task("t2")])
+    a_neighbour_takes(config, "t2")
+
+    orch._dispatch_executor(implement("t2"))
+
+    assert dispatched == ["t2"]
+    assert orch.state.policy_denials == 0
+
+
+def test_an_operator_quarantine_that_lands_mid_arc_is_refused_not_overwritten(tmp_path):
+    """The one status the session carve-out must NOT wave through. This lane
+    wrote t1's `in_progress` row itself, so a `revise` of it is its own arc — but
+    an operator has quarantined the task since, from another process, and
+    `policy._check_task_reference` passed a moment earlier on the row this
+    registry still held.
+
+    Two things would go wrong without the narrower carve-out, and the second is
+    the worse one: `mark_in_progress` RAISES on a quarantined row and nothing in
+    `Orchestrator.run`'s step loop catches `TaskGraphError`, so the round would
+    end by traceback; and before the reconciliation existed the stale in-memory
+    row simply marked it in progress again, writing over a decision the operator
+    has not made yet."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1")])
+    orch._registry = orch._task_store.load()
+    orch._registry.mark_in_progress("t1")
+    orch._task_store.save(orch._registry)
+    orch.state.current_task = {"task_id": "t1", "decision": "implement"}
+    quarantining = TaskStore(config.tasks_file)
+    theirs = quarantining.load()
+    theirs.block("t1", "answer this before it runs again")
+    quarantining.save(theirs)
+
+    orch._dispatch_executor(
+        Directive(
+            decision=Decision.REVISE,
+            reason="tighten the claim",
+            task_id="t1",
+            feedback="one test is asserting the fixture",
+        )
+    )
+
+    assert dispatched == [], "a quarantined arc does not continue"
+    on_disk = TaskStore(config.tasks_file).load().get("t1")
+    assert on_disk.status == "blocked", "the operator's quarantine was overwritten"
+    assert on_disk.blocked_reason == "answer this before it runs again"
+    assert orch.state.policy_denials == 1
+    assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
+    assert "blocked" in (orch.state.outbox or "")
+    assert Phase(orch.state.phase) is Phase.READY, "corrected, never parked"
+
+
+def test_a_row_already_in_progress_when_the_lane_loaded_is_left_to_policy(tmp_path):
+    """The bound on the refusal, and the reason it is narrow. Nothing moved under
+    this lane here — its registry read `in_progress` from the moment it loaded —
+    so this is the case section 6 pins as policy's question and the worker
+    repo's, not a second, weaker copy of a correctness check living in an
+    efficiency gate."""
+    config = make_config(tmp_path, lanes=2)
+    orch, dispatched = build_lane(config, tasks=[a_task("t1")])
+    a_neighbour_takes(config, "t1")
+    orch._registry = orch._task_store.load()  # this lane loads AFTER the neighbour
+
+    assert orch._registry.get("t1").status == "in_progress"
+
+    orch._dispatch_executor(implement("t1"))
+
+    assert dispatched == ["t1"]
+    assert orch.state.policy_denials == 0
