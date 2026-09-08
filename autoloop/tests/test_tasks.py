@@ -522,6 +522,12 @@ def test_a_persisted_context_ids_string_is_refused_rather_than_split():
 #: render a second stamp-shaped line in the CONTEXT block), a colon (same), a
 #: leading '-', a non-string, a duplicate, and the bare string that would
 #: otherwise be iterated per character.
+#:
+#: The TRAILING NEWLINE is the one that is not obvious and the one the anchor
+#: exists for: `$` matches before it, so `_ID_RE.match("ctx-01\n")` succeeds and
+#: the "no whitespace can reach the block" claim would have been false for the
+#: single character that actually breaks a line-oriented block. `fullmatch` is
+#: what refuses it.
 BAD_CONTEXT_IDS = [
     ["ctx 01"],
     ["ctx:01"],
@@ -529,6 +535,8 @@ BAD_CONTEXT_IDS = [
     [None],
     ["ctx-01", "ctx-01"],
     "ctx-01",
+    ["ctx-01\n"],
+    ["ctx-01\nctx-02"],
 ]
 
 

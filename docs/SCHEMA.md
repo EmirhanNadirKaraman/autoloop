@@ -57,11 +57,20 @@ throttled lane parks naming the file.
 ## Task
 
 `id`, `title`, `description`, `status`, `priority` (ascending; 1 outranks 2),
-`depends_on`, `approved_paths`, `validation`, `validation_cwd`, `created_at`,
-`completed_at`.
+`depends_on`, `approved_paths`, `context_ids`, `validation`, `validation_cwd`,
+`created_at`, `completed_at`.
 
 Status is one of `pending`, `in_progress`, `blocked`, `completed`, `retired`,
 `shipped_elsewhere`, `quarantined`. Only `completed` satisfies a dependency.
+
+`context_ids` (ctx-04) names the context records above that the task says it was
+written from. PROVENANCE, never authorization: `approved_paths` remains the whole
+of what a round may write, and `tasks.effective_approved_paths` never reads this
+field. Shape is checked (`tasks._ID_RE`, no duplicates) and existence is not —
+the registry never resolves a record. Absent from every file written before it
+existed, which loads as "cites no record", so `schema_version` stays 1 and there
+is no migration step; a hand-edited `null` normalises to `[]` and a bare string
+is refused rather than read as one id per character.
 
 ## Blocker record
 
