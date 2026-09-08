@@ -987,6 +987,47 @@ phase would be worse than reporting nothing.
   many others — and never one lane's task as if it were the system's. `—`
   keeps meaning unreadable and must not be borrowed for "several".
 
+**conc-09 landed that as `health.fleet_health` and `dashboard.lanes_status`.**
+Above one lane `health._judge` READS NO LANE'S STATE FILE AT ALL — `state.json`
+is lane 0's (`state.lane_paths`), so any phase on the fleet verdict could only
+ever be one lane's — and everything left in it is a fact about the whole loop:
+its lock, its blockers, its pause file, its transcript. `Health.phase` is
+therefore empty above one lane, and every lane carries its own in its own
+`LaneHealth` row, in `VERDICT_CODES`' existing words. The fleet's verdict is the
+most severe LANE that needs a person, by that tuple's own escalating order and
+never by position; a fleet-level fault — a stale lock, an open blocker, a loop
+that is not running — keeps its own code and names the lanes in its detail
+instead, which is `_with_held_sweep`'s precedence and its reason. A lane whose
+LEASE is dead reads `idle`, because nothing is running in it, conc-08 recovers
+it on the next tick, and an attention word there would turn the whole fleet red
+on every interrupted `run` — while a lane, a lease, a phase or a `lanes/`
+directory NOBODY CAN READ reads `unknown`, which does need a person and is never
+counted as a free slot. `FleetHealth` carries `cap`, `busy`, `at_cap` and `idle`
+as fields rather than properties, because "every lane busy" against "nothing to
+do" is the one answer this record exists to give and a cron wrapper must not
+have to re-derive it. `busy` is `orchestrator._lane_occupant`'s own predicate,
+borrowed rather than restated, so the report and the scheduler cannot disagree
+about the same fleet. The panel is `dashboard.lanes_status` /
+`render_lanes_text` / `lanes_json`, kept out of `collect` exactly as
+`projects_status` is and rendering `health`'s own rows rather than a second
+reading of the same files; it takes no lock, which is what makes it usable at
+all — the loop holds `LoopLock` for its whole run. At `lanes = 1` the whole pass
+is gated off before any read: `Health.fleet` is `None`, `to_json` omits the key,
+`_current_task` reads the loop's own state exactly as it always did, and the
+JSON, the text and the exit code are pinned against a literal snapshot of
+today's output.
+
+**Two readers conc-09 deliberately did not make lane-aware, stated rather than
+left to be discovered.** The dashboard's FRONT DOOR (`dashboard.collect` and the
+page it serves) still reads `state.json` for `session.phase`, the unit panel and
+live progress — lane 0's file above one lane — and `heartbeat.json` is ONE file
+per deployment that every lane overwrites with its own phase
+(`config.heartbeat_file`, `heartbeat.publish`). Both are a single string about a
+fleet, and neither is in this candidate's scope: Decision 7 puts the lanes panel
+beside the front door rather than inside it, and the heartbeat belongs to
+`heartbeat.py`. They are reached only at `lanes > 1`, which nothing ships with
+until conc-10, and that is where they belong.
+
 ### Decision 8 — a lane that dies mid-round
 
 Most of the recovery already exists per task and is extended per lane rather
