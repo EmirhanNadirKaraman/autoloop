@@ -16,6 +16,7 @@ from autoloop.errors import LockHeldError, StateCorruptError, StateError, TaskGr
 from autoloop.tasks import (
     LEDGER_PHASE_COMPLETE,
     LEDGER_PHASE_INTENT,
+    TRACKER_PATHS,
     StrandReport,
     Task,
     TaskRegistry,
@@ -378,6 +379,213 @@ def test_a_rejected_scope_leaves_the_registry_byte_identical():
         "duplicate_approved_path",
     )
     assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+# ---- context_ids: provenance that must never become authorization (ctx-04) --
+#
+# THE claim: a task can NAME the context it was written from, and naming it
+# widens nothing. The first three tests are the acceptance criteria a reviewer
+# should read first — they are written as attempts to widen a scope THROUGH the
+# new field, not as assertions about code shape, because "no derivation exists"
+# is only checkable by trying to make one.
+#
+# The rest pin the shape and persistence rules that keep the field from
+# becoming something else later: the bare string that splits per character, the
+# hand-edited `null`, the file written before the field existed.
+
+
+#: Ids that pass `_ID_RE`, spelled the way a real context record is
+#: (`context_records`' own fixtures use `good`, `typo`, `f1`, `x`).
+CITED = ["ctx-decision-01", "ctx-incident-02"]
+
+
+def scoped(*, cite=()):
+    """One task scoped to `autoloop/tasks.py`, citing `cite`. Two registries
+    built from this differ in exactly one field, which is what makes the
+    comparisons below about that field."""
+    reg = registry(task("a"))
+    reg.set_approved_paths("a", ["autoloop/tasks.py"])
+    if cite:
+        reg.set_context_ids("a", list(cite))
+    return reg
+
+
+def test_attaching_context_ids_does_not_change_effective_approved_paths():
+    """ACCEPTANCE. Byte-identical with and without the field set, asserted over
+    the serialised tuple rather than by eye — `effective_approved_paths` takes
+    the task's own scope and the reviewed tracker constant, and there is no
+    third argument a reference could arrive through."""
+    from autoloop.tasks import effective_approved_paths
+
+    without = effective_approved_paths(scoped().get("a").approved_paths)
+    with_ids = effective_approved_paths(scoped(cite=CITED).get("a").approved_paths)
+
+    assert json.dumps(with_ids) == json.dumps(without)
+    assert with_ids == tuple(sorted({"autoloop/tasks.py", *TRACKER_PATHS}))
+    # ...and the ids really are stored, so this is not passing because nothing
+    # was attached.
+    assert scoped(cite=CITED).get("a").context_ids == tuple(CITED)
+
+
+def test_no_context_id_reaches_unauthorized_paths():
+    """ACCEPTANCE, and the fail-open probe. `ctx-decision-01` is a legal id AND
+    a legal-looking file stem, so if anything anywhere folded the citation list
+    into the scope this is the shape that would slip through. Every one of them
+    must still be reported unauthorized."""
+    from autoloop.tasks import effective_approved_paths, unauthorized_paths
+
+    allowed = effective_approved_paths(scoped(cite=CITED).get("a").approved_paths)
+    claimed = {*CITED, "ctx-decision-01.py", "autoloop/orchestrator.py"}
+
+    assert unauthorized_paths(claimed, allowed) == claimed
+
+
+def test_a_records_own_source_paths_never_become_writable():
+    """The same probe through the REAL record type. A record's `source_paths`
+    are what a round may READ ABOUT; the registry never resolves a record at
+    all, so citing one cannot put its files in reach of a write."""
+    from autoloop.context_records import ContextRecord
+    from autoloop.tasks import deletable_paths, effective_approved_paths, unauthorized_paths
+
+    record = ContextRecord(
+        id="ctx-decision-01",
+        kind="decision",
+        source_paths=("autoloop/orchestrator.py", "autoloop/policy.py"),
+    )
+    reg = scoped(cite=[record.id])
+    scope = reg.get("a").approved_paths
+    allowed = effective_approved_paths(scope)
+
+    assert unauthorized_paths(set(record.source_paths), allowed) == set(record.source_paths)
+    # Deleting is the other verb that reads a scope, and it routes through the
+    # same `effective_approved_paths` — so it must refuse them too.
+    authorized, outside, _trackers = deletable_paths(record.source_paths, scope)
+    assert authorized == set()
+    assert outside == set(record.source_paths)
+
+
+def test_a_task_file_written_before_context_ids_existed_still_loads():
+    """Backward compatibility, same pattern as `approved_paths`/`decomposition`
+    and the reason `TASKS_SCHEMA_VERSION` stays 1: a missing key loads as
+    "cites no record", a hand-edited `null` is normalised to `()` rather than
+    becoming `None`, and `[]` is not malformed."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "old", "title": "T", "description": "d"},
+            {"id": "edited", "title": "T", "description": "d", "context_ids": None},
+            {"id": "empty", "title": "T", "description": "d", "context_ids": []},
+        ],
+    })
+    assert reg.get("old").context_ids == ()
+    assert reg.get("edited").context_ids == ()
+    assert reg.get("empty").context_ids == ()
+    # `None` must be a TUPLE afterwards, not merely falsy: every reader
+    # iterates and joins this field without a None check.
+    assert isinstance(reg.get("edited").context_ids, tuple)
+
+
+def test_context_ids_survive_the_task_file(tmp_path):
+    """A reference is provenance, and provenance that does not outlive the
+    process holding it is not a record. Through `TaskStore`, so the round trip
+    is the real one — `asdict` out, `from_dict` back."""
+    store = TaskStore(tmp_path / "tasks.json")
+    store.save(scoped(cite=CITED))
+
+    assert store.load().get("a").context_ids == tuple(CITED)
+    # Order is preserved, not sorted: it is the order whoever wrote the task
+    # named the records in.
+    store.save(scoped(cite=list(reversed(CITED))))
+    assert store.load().get("a").context_ids == tuple(reversed(CITED))
+
+
+def test_a_persisted_context_ids_string_is_refused_rather_than_split():
+    """`from_dict` bypasses `add_many`, so `_persisted_context_ids` is the ONLY
+    gate a stored or hand-edited row passes. `tuple("ctx01")` is five ids that
+    `_ID_RE` accepts one at a time — a mistake that would never be reported —
+    so the load FAILS CLOSED instead."""
+    with pytest.raises(StateCorruptError, match="context_ids"):
+        TaskRegistry.from_dict({
+            "schema_version": 1,
+            "tasks": [{"id": "t", "title": "T", "description": "d",
+                       "context_ids": "ctx01"}],
+        })
+    with pytest.raises(StateCorruptError, match="context_ids"):
+        TaskRegistry.from_dict({
+            "schema_version": 1,
+            "tasks": [{"id": "t", "title": "T", "description": "d",
+                       "context_ids": ["ctx-01", "ctx-01"]}],
+        })
+
+
+#: One per branch of `_validate_context_ids`: whitespace (which would let an id
+#: render a second stamp-shaped line in the CONTEXT block), a colon (same), a
+#: leading '-', a non-string, a duplicate, and the bare string that would
+#: otherwise be iterated per character.
+BAD_CONTEXT_IDS = [
+    ["ctx 01"],
+    ["ctx:01"],
+    ["-ctx-01"],
+    [None],
+    ["ctx-01", "ctx-01"],
+    "ctx-01",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_CONTEXT_IDS)
+def test_creation_and_mutation_reject_bad_context_ids_identically(bad):
+    """The `_validate_approved_paths` rule applied to the new field: one
+    validator, every caller. Comparing the MESSAGE is what makes it
+    load-bearing — a second implementation would word its refusal differently
+    long before it disagreed about what to accept."""
+    with pytest.raises(TaskGraphError) as created:
+        registry(Task(id="t1", title="T", description="d", context_ids=bad))
+    reg = registry(task("t1"))
+    with pytest.raises(TaskGraphError) as mutated:
+        reg.set_context_ids("t1", bad)
+    assert created.value.code == mutated.value.code
+    assert str(created.value) == str(mutated.value)
+
+
+def test_a_rejected_context_id_leaves_the_registry_byte_identical():
+    """Atomicity, over the whole serialised graph: the duplicate is the second
+    entry, so a validator that checked as it assigned would already have
+    written the first one."""
+    reg = scoped(cite=CITED)
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    expect_code(
+        lambda: reg.set_context_ids("a", ["ctx-99", "ctx-99"]), "duplicate_context_id"
+    )
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+def test_set_context_ids_replaces_rather_than_merges():
+    """REPLACES, like `set_approved_paths`: an operator who cannot remove a
+    reference cannot correct a mistaken one, and clearing to () is the legal
+    way to say "this task cites nothing"."""
+    reg = scoped(cite=CITED)
+    reg.set_context_ids("a", ["ctx-decision-01"])
+    assert reg.get("a").context_ids == ("ctx-decision-01",)
+    reg.set_context_ids("a", [])
+    assert reg.get("a").context_ids == ()
+
+
+def test_context_ids_cannot_be_edited_while_the_dispatch_is_in_flight():
+    """The same `_refuse_immutable` rule `approved_paths` takes. The ids were
+    rendered into the brief the running round was authored from, so a
+    correction now cannot reach it — and one rule with no exceptions is worth
+    more than an exemption for the field that happens to strand nothing."""
+    reg = scoped(cite=CITED)
+    reg.mark_in_progress("a")
+    expect_code(lambda: reg.set_context_ids("a", ["ctx-99"]), "task_in_progress")
+    assert reg.get("a").context_ids == tuple(CITED), "the refusal changed nothing"
+
+
+def test_an_unknown_task_is_refused_before_anything_is_validated():
+    """`get`'s own refusal, like every other mutator here: an id nobody knows
+    must name the task, not the field."""
+    expect_code(lambda: registry(task("a")).set_context_ids("ghost", ["ctx-01"]),
+                "task_unknown")
 
 
 def test_set_depends_on_replaces_and_redrives_the_derived_state():

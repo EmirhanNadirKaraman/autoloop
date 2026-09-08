@@ -61,9 +61,10 @@ merge, so a bad request is refused by the same gate a ChatGPT `plan` goes
 through, not by a second implementation that could drift from it.
 
 **Mutations (2026-08-16; `urgent` added 2026-08-22, `shipped_elsewhere`
-2026-08-23).** The vocabulary was `task` + `priority`. It is now `task` plus
-eight mutations: `priority`, `description`, `approved_paths`, `depends_on`,
-`block`, `unblock`, `urgent` and `shipped_elsewhere`. Four things keep that from
+2026-08-23, `context_ids` 2026-09-08).** The vocabulary was `task` +
+`priority`. It is now `task` plus nine mutations: `priority`, `description`,
+`approved_paths`, `depends_on`, `block`, `unblock`, `urgent`,
+`shipped_elsewhere` and `context_ids`. Four things keep that from
 being the "general edit-a-task request" the `priority`-only design was written
 to avoid:
 
@@ -94,11 +95,13 @@ to avoid:
    reached `apply_requests`, which consumed the fields it recognised and
    ignored the rest — the same silent drop, arrived at from the other side.
 2. **Nothing in flight can be edited.** `TaskRegistry._refuse_immutable`
-   refuses `description`, `approved_paths` and `depends_on` on an
-   `in_progress` task, because all three are what a dispatch that has ALREADY
-   STARTED is judged against, and each one strands the round in a state no
-   command can move it out of. It refuses `completed` and `retired` too:
-   those are records, not queue.
+   refuses `description`, `approved_paths`, `depends_on` and `context_ids` on
+   an `in_progress` task, because the first three are what a dispatch that has
+   ALREADY STARTED is judged against, and each one strands the round in a state
+   no command can move it out of. `context_ids` strands nothing and takes the
+   same guard anyway, so the rule has no exception to remember — see that
+   method. It refuses `completed` and `retired` too: those are records, not
+   queue.
 3. **Blocking is reversible, and only its own kind of block is.** `block` goes
    through `TaskRegistry.operator_block`, which records the hold's origin in
    `Task.hold_origin`, and `unblock` through `operator_unblock`, which releases
@@ -128,6 +131,16 @@ to avoid:
 The widening this is honest about: an inbox request can now change what an
 existing task is authorized to write, which `docs/SECURITY.md` S28 previously
 recorded as impossible. It is recorded there rather than left implied.
+
+`context_ids` is deliberately NOT a second instance of that widening, and the
+distinction is the reason it was safe to add a kind shaped exactly like
+`approved_paths`: it writes `Task.context_ids`, which neither
+`tasks.unauthorized_paths` nor `tasks.effective_approved_paths` reads. A
+request can therefore correct which records a task cites and cannot move one
+byte of what that task may write. Recorded under the same finding rather than
+as a parallel one, because the CLASS being tracked is "an inbox request rewrites
+a stored task field" and this is a member of it that happens to carry no
+authority.
 
 **Operator intake lives at the bottom of this file** (intake-02, 2026-08-25):
 a rough idea becomes a DRAFT through a question-and-answer exchange held in a
@@ -185,6 +198,13 @@ CREATION_FIELDS = frozenset(
         "validation",
         "validation_cwd",
         "approved_paths",
+        # PROVENANCE, not authorization: the context records the task was
+        # written from. It sits in the creation contract for the same reason
+        # `approved_paths` does — it is a field `apply_requests`' creation
+        # branch reads, and a creation route that could not name it would make
+        # `add-task --context-id` unreachable — but unlike `approved_paths` it
+        # widens nothing (`tasks.effective_approved_paths` never reads it).
+        "context_ids",
     }
 )
 
@@ -288,6 +308,26 @@ KIND_UNBLOCK = "unblock"
 #: — and a claim whose commits are not ancestors then reads as a disagreement on
 #: the dashboard, which is the point of re-checking rather than trusting.
 KIND_SHIPPED_ELSEWHERE = "shipped_elsewhere"
+#: Correct which context records an existing task CITES (ctx-04, 2026-09-08).
+#: Shaped exactly like `KIND_APPROVED_PATHS` — a list payload named after the
+#: `Task` field, replacing rather than merging, refused on a task whose dispatch
+#: is being judged against it (`TaskRegistry._refuse_immutable`) — because an
+#: operator correcting a reference is the same act as an operator correcting a
+#: scope, and giving it a second shape would mean a second rule to keep in step.
+#:
+#: What it is NOT is a second `approved_paths`. That kind changes what a task
+#: may WRITE, which is the widening the module docstring records above; this one
+#: changes what a task SAYS IT WAS WRITTEN FROM, and `Task.context_ids` reaches
+#: neither `tasks.unauthorized_paths` nor `tasks.effective_approved_paths`. The
+#: identical request shape carrying no authority at all is the point, not an
+#: oversight.
+#:
+#: A mutation kind at all — rather than creation-only — because a reference
+#: written at planning time is exactly the thing that turns out to be wrong: the
+#: record was superseded, or the right one was found later. Without a correction
+#: route the only fix would be a hand edit of `tasks.json`, which the escape
+#: detector parks the loop for (see the module docstring).
+KIND_CONTEXT_IDS = "context_ids"
 
 #: kind -> the ONE payload field it carries besides `kind` and `id`. `None`
 #: means the kind is the whole instruction (`unblock` names a task and says
@@ -308,6 +348,7 @@ MUTATION_PAYLOAD: dict[str, str | None] = {
     KIND_UNBLOCK: None,
     KIND_URGENT: "reason",
     KIND_SHIPPED_ELSEWHERE: "shipped_elsewhere",
+    KIND_CONTEXT_IDS: "context_ids",
 }
 
 #: The keys the `shipped_elsewhere` payload object carries — BOTH required,
@@ -432,7 +473,8 @@ def _check_mutation(kind: str, spec: dict) -> None:
         raise InboxError("a priority request needs an integer 'priority'")
     if kind in (KIND_DESCRIPTION, KIND_BLOCK, KIND_URGENT) and not isinstance(value, str):
         raise InboxError(f"a {kind} request needs {payload!r} as a string")
-    if kind in (KIND_APPROVED_PATHS, KIND_DEPENDS_ON) and not isinstance(value, list):
+    list_payloads = (KIND_APPROVED_PATHS, KIND_DEPENDS_ON, KIND_CONTEXT_IDS)
+    if kind in list_payloads and not isinstance(value, list):
         raise InboxError(
             f"a {kind} request needs {payload!r} as a list (use [] to clear it)"
         )
@@ -687,6 +729,13 @@ def _apply_mutation(registry, kind: str, spec: dict) -> str:
         task = registry.set_depends_on(task_id, spec.get("depends_on"))
         deps = ", ".join(task.depends_on) or "(none)"
         return f"{task.id} -> depends_on: {deps}"
+    if kind == KIND_CONTEXT_IDS:
+        task = registry.set_context_ids(task_id, spec.get("context_ids"))
+        cited = ", ".join(task.context_ids) or "(none)"
+        # Says what the field IS, because the line sits in the same report as
+        # `approved_paths:` and the two must not read as the same kind of act:
+        # this one moves no authorization.
+        return f"{task.id} -> context_ids (references only, no scope change): {cited}"
     if kind == KIND_BLOCK:
         task = registry.operator_block(task_id, spec.get("reason"))
         return f"{task.id} -> blocked: {task.blocked_reason}"
@@ -815,6 +864,15 @@ def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], l
                 validation=tuple(tuple(c) for c in spec.get("validation", ()) or ()),
                 validation_cwd=str(spec.get("validation_cwd", "") or ""),
                 approved_paths=tuple(spec.get("approved_paths", ()) or ()),
+                # UNCONVERTED, deliberately unlike every line above it. A
+                # `tuple()` here would turn the bare string `"ctx01"` into five
+                # one-character ids, each of which `tasks._ID_RE` accepts on its
+                # own — so the coercion that looks like tidying is the thing
+                # that makes the mistake unreportable. Handed over as it
+                # arrived, `_validate_context_ids` refuses it in the registry's
+                # own words, which is the doctrine `_apply_mutation` states for
+                # the mutation half of this module.
+                context_ids=spec.get("context_ids", ()) or (),
             )
             # One at a time: `add_many` is atomic per call, so batching would let
             # one bad request reject every good one queued alongside it.
