@@ -115,6 +115,59 @@ Readers are tolerant of missing keys (each has a default) and INTOLERANT of
 unreadable ones: a record that fails to decode raises rather than reading as
 absent, because "no blocker" and "a blocker we cannot read" must not look alike.
 
+### `planning_source_conflict` (ctx-06)
+
+One blocker code is written by TASK GENERATION rather than by a park:
+`planning_source_conflict`, recorded through `blockers.record_planning_conflict`
+when two of the sources planning reads disagree about one subject. It is a
+durable record and not a field in `state.json` precisely because this store
+already survives a `task_fatal` park and the session reset that follows one.
+
+Its fields carry the ordinary meanings with two conventions:
+
+* `task_id` is always `(loop)` — generation runs BEFORE the task it would
+  propose exists, so there is none to name.
+* `phase` is `planning:<identity>`, where the identity digests the subject and
+  both sides' (source, text). `BlockerStore.find_open` keys a record on
+  `(task_id, code, phase)` and a bump REPLACES `question` and `detail`, so a
+  constant phase would collapse two different disagreements into one record
+  carrying only the later one's account of who disagreed — which is the entire
+  content of the record. The digest is what makes one disagreement one record
+  and the same disagreement seen twice a recurrence.
+* `kind` is `task_fatal`, not a new kind: `_KIND_RANK` promotes an unrecognised
+  kind to `loop_fatal` rank, which would silently make a planning conflict the
+  `primary_blocker` that `health`, `heartbeat` and `status` report the loop as
+  stuck on.
+
+Like `stranded_after_environment_fault`, it is recorded WITHOUT parking and
+changes no task's status, so it is absent from `cli._RESOLUTION_PRECONDITIONS`
+(whose keys must all be codes a park emitter can raise).
+
+## Audit finding (audit agent output)
+
+`audit/findings.py`. Thirteen REQUIRED keys — `id`, `category`, `severity`,
+`confidence`, `affected_files`, `symbols`, `evidence`, `impact`,
+`proposed_action`, `dependencies`, `acceptance_criteria`, `validation_commands`,
+`safe_to_parallelize` — and, since ctx-06, five OPTIONAL ones:
+`current_behaviour`, `current_behaviour_citation`, `assumptions`,
+`open_questions`, `context_ids`. An unknown key is still rejected; a missing
+OPTIONAL key is not, so a report from an agent that has never heard of them is
+still valid.
+
+`current_behaviour` and `current_behaviour_citation` are a PAIR. Stating what
+the code does today without saying where it was read is an uncited repository
+claim: `audit/taskgen.generate_tasks` refuses it BY NAME and the finding becomes
+no task. An agent that cannot cite something writes it under `assumptions`
+instead, where it is carried as an assumption and never asserted as fact.
+
+`context_ids` are REFERENCES and assert nothing — the same rule
+`Task.context_ids` states. They are rendered into the task so a reader can go
+and check the records, and nothing believes one on their strength.
+
+All four free-text additions count towards `MAX_FINDING_CHARS`, the measured
+whole-finding budget; adding fields outside that sum would reopen the inflation
+path the bound was set for behind new field names.
+
 ## Audit intake ledger
 
 `<intake_dir>/audit_intake.json` — one object, keyed by the QUALIFIED finding id

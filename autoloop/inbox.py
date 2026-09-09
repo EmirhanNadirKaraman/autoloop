@@ -1583,6 +1583,499 @@ def repo_evidence(repo: Path, text: str) -> tuple[tuple[Evidence, ...], str]:
     )
 
 
+# ---- claims, precedence and conflicts (ctx-06) -----------------------------
+#
+# THE PRECEDENCE ORDER, stated once and then ENFORCED by the functions below
+# rather than described in prose somewhere a generator can ignore:
+#
+#   * the CURRENT OPERATOR REQUEST defines the requested intent;
+#   * ACCEPTED TASKS AND DECISIONS define the intended constraints;
+#   * CODE, TESTS AND CONFIGURATION describe current behaviour;
+#   * CONTEXT RECORDS help navigation and must be verified before being
+#     believed;
+#   * CHAT HISTORY AND MODEL MEMORY are never repository evidence.
+#
+# WHAT "ENFORCED" MEANS HERE, concretely, because an order that only orders is
+# a comment. Three of the five lines are refusals in `unsupported_claims`: a
+# claim about CURRENT BEHAVIOUR may not be supported by the operator's request
+# or by an accepted decision (line 3 outranks nobody on that question — those
+# two say what is WANTED, never what the code DOES); a claim resting on a
+# CONTEXT RECORD is refused until something in the tree has been read for it
+# (line 4's "verified before being believed"); and a source that names a model,
+# a chat or a memory is refused outright (line 5), which is `Evidence`'s own
+# docstring rule reaching the generator that would otherwise re-fabricate it.
+#
+# WHAT THE ORDER IS NEVER USED FOR: choosing. `detect_conflicts` ranks nothing
+# and drops nothing. When two sources disagree, the disagreement is returned
+# with BOTH sides intact and the caller records it or stops — picking the
+# higher-ranked source would be exactly the silent choice this whole section
+# exists to refuse.
+#
+# EXTENDS `Evidence`, does not replace it. A `Claim` is a sentence somebody
+# wants a generated task to carry; an `Evidence` is still the only thing that
+# can support one, still carries a `source` naming a reader, and still may
+# never be minted from something a model said.
+
+#: The source kinds, in precedence order. `SOURCE_MODEL` is deliberately NOT a
+#: member: it is not a lower tier of evidence, it is not evidence at all, and a
+#: rank would invite a caller to compare it with one that is.
+SOURCE_OPERATOR_REQUEST = "operator_request"
+SOURCE_ACCEPTED_DECISION = "accepted_decision"
+SOURCE_REPOSITORY = "repository"
+SOURCE_CONTEXT_RECORD = "context_record"
+SOURCE_MODEL = "model"
+
+SOURCE_PRECEDENCE = (
+    SOURCE_OPERATOR_REQUEST,
+    SOURCE_ACCEPTED_DECISION,
+    SOURCE_REPOSITORY,
+    SOURCE_CONTEXT_RECORD,
+)
+
+
+def source_rank(kind) -> int:
+    """Where `kind` sits in `SOURCE_PRECEDENCE`; LOWER is higher precedence.
+
+    Anything the order does not name — `SOURCE_MODEL`, an empty string, a value
+    from a future build, something that is not a string at all — ranks LAST,
+    which is the fail-closed direction: an unreadable provenance never
+    outranks a source somebody classified.
+
+    **Nothing in this module resolves a conflict with this function**, and that
+    is not an oversight. It exists so a caller can ORDER a report (a recorded
+    conflict reads best highest-authority-first) and so the tiers have one
+    spelling. Using it to pick a winner is the failure this task forbids.
+    """
+    try:
+        return SOURCE_PRECEDENCE.index(kind)
+    except (ValueError, TypeError):
+        return len(SOURCE_PRECEDENCE)
+
+
+#: The READERS an `Evidence.source` may name, and the tier each reading lands
+#: in. An allowlist, not a shape test: "does this look like a source" would
+#: admit any sentence a model wrote, which is the one thing `Evidence`'s
+#: docstring forbids. Every producer in this module already names one of these.
+#:
+#: `source` names the READER, never the location. The location — `path:line` —
+#: lives in the evidence TEXT, which is why an invented `autoloop/inbox.py:1545`
+#: cannot walk in through this table by being path-shaped.
+EVIDENCE_READERS: dict[str, str] = {
+    "git ls-files": SOURCE_REPOSITORY,
+    "git show": SOURCE_REPOSITORY,
+    "git ls-tree": SOURCE_REPOSITORY,
+    "git diff-tree": SOURCE_REPOSITORY,
+    "the checkout": SOURCE_REPOSITORY,
+    "tasks.json": SOURCE_ACCEPTED_DECISION,
+    "the task registry": SOURCE_ACCEPTED_DECISION,
+    "the draft file": SOURCE_OPERATOR_REQUEST,
+    "the operator's request": SOURCE_OPERATOR_REQUEST,
+    "the context record index": SOURCE_CONTEXT_RECORD,
+    "the audit report": SOURCE_REPOSITORY,
+}
+
+#: The readers whose CONTENT was written by a model, so that reading them tells
+#: you what an agent asserted and not what the tree contains. A claim citing one
+#: of these must carry a LOCATION in its own text (`has_location`) — the
+#: `path:line` a reviewer can open — and the renderer must attribute it ("as the
+#: audit cited") rather than assert it.
+#:
+#: `the audit report` is the whole of this set today, and it is the honest
+#: entry: `audit/findings.py` specifies `evidence` as "file:line references to
+#: what you saw", so a finding whose evidence names no location has cited
+#: nothing, whatever its confidence field says.
+LOCATION_REQUIRED_READERS = frozenset({"the audit report"})
+
+#: Sources that are REFUSED by name, with their own sentence, rather than
+#: falling through to "not a reader I know". A model, a chat, a memory and a
+#: recall are the four spellings of the same mistake, and an author who wrote
+#: one of them needs to be told which rule they hit — "unknown reader" sends
+#: them looking for a typo in a word that was never going to be accepted.
+MODEL_SOURCE_LABELS = frozenset({
+    "model", "the model", "llm", "assistant", "the assistant",
+    "agent", "the agent", "chatgpt", "claude", "codex",
+    "chat", "chat history", "the conversation", "conversation",
+    "memory", "model memory", "recall", "my analysis", "analysis",
+})
+
+#: A LOCATION inside the repository: `a.py`, `docs/AUTOLOOP.md`,
+#: `autoloop/inbox.py:1545`, `autoloop/tests/test_x.py:10-40`.
+#:
+#: The extension is `{2,6}` characters deliberately: at `{1,6}` the abbreviations
+#: `e.g` and `i.e` match, and an evidence line reading "e.g. it breaks" would
+#: then count as a citation — a check that passes on prose is the fail-open this
+#: whole section is about.
+_LOCATION_RE = re.compile(
+    r"(?<![\w/.-])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]{2,6}(?::\d+(?:-\d+)?)?(?![\w])"
+)
+
+
+def has_location(text) -> bool:
+    """True when `text` names somewhere a reviewer can go and look."""
+    return bool(_LOCATION_RE.search(str(text or "")))
+
+
+def evidence_reader(source) -> str:
+    """The canonical reader `source` names, or `""` when it names none.
+
+    `""` for an empty source, for a model/chat/memory label, for a path (a
+    location is not a reader), and for anything else this build has never heard
+    of. Fail-closed in the one direction that matters: an unrecognised source
+    supports nothing, so a claim resting on it is refused rather than believed.
+    """
+    key = " ".join(str(source or "").split()).strip().lower()
+    if not key or key in MODEL_SOURCE_LABELS:
+        return ""
+    return key if key in EVIDENCE_READERS else ""
+
+
+def reader_tier(source) -> str:
+    """Which precedence tier reading `source` puts a claim in; `""` for a source
+    that names no reader at all."""
+    return EVIDENCE_READERS.get(evidence_reader(source), "")
+
+
+#: What a claim is ABOUT, which decides which tier may settle it.
+CLAIM_INTENT = "intent"           # what is wanted
+CLAIM_CONSTRAINT = "constraint"   # what must not break
+CLAIM_BEHAVIOUR = "behaviour"     # what the code does today
+
+#: The tiers that may NOT support a claim about CURRENT BEHAVIOUR. Precedence
+#: line 3, enforced: the operator's request and an accepted decision each say
+#: what is wanted, and a generator that quoted either as proof of what the code
+#: does would have asserted a repository fact it never read.
+_NOT_BEHAVIOUR_EVIDENCE = frozenset({SOURCE_OPERATOR_REQUEST, SOURCE_ACCEPTED_DECISION})
+
+
+@dataclass(frozen=True)
+class Claim:
+    """One sentence a generated task wants to carry, with what backs it.
+
+    `source` has NO DEFAULT on purpose. Every other field here can be forgotten
+    harmlessly; provenance cannot — a default would decide, silently and for
+    every caller that omitted it, which precedence tier an unattributed sentence
+    belongs to, and there is no value for that which is safe in both the
+    "must it be cited" and the "may it be a party to a conflict" directions.
+
+    `citation` is an `Evidence` and nothing else, so the rule in that class's
+    docstring ("nothing a model said ever becomes an Evidence") is the same rule
+    here rather than a second one that could drift from it. `assumption` is the
+    OTHER way to be honest: say out loud that this is not known, and the claim
+    may stand. Silence is the only thing refused.
+    """
+
+    text: str
+    source: str
+    subject: str = ""
+    kind: str = CLAIM_BEHAVIOUR
+    citation: Evidence | None = None
+    assumption: str = ""
+    #: The repository paths this claim would put in scope. What makes a conflict
+    #: MATERIAL — see `SourceConflict.scope_impact`.
+    paths: tuple[str, ...] = ()
+    #: Whether this claim is ABOUT the repository. Defaults True, which is the
+    #: fail-closed direction: a claim nobody classified is held to the citation
+    #: rule rather than exempted from it.
+    repository_specific: bool = True
+
+    @property
+    def about_repository(self) -> bool:
+        """True for a claim that must be cited or assumed.
+
+        A caller may declare `repository_specific=False` for a sentence that
+        asserts nothing about this tree — but NOT for one that names a file in
+        it. That override is what an author reaches for to quiet a refusal, and
+        text carrying a location is exactly the text the refusal is for.
+        """
+        return self.repository_specific or has_location(self.text)
+
+    @property
+    def topic(self) -> str:
+        """What two claims must share to be compared at all.
+
+        The `subject` when there is one. Without one it falls back to the
+        claim's own normalised text, which means such a claim can only ever
+        collide with a verbatim repeat of itself — i.e. it is effectively out
+        of conflict detection. That is a REAL limit rather than a hidden one:
+        a caller that wants its sources compared has to say what they are
+        talking about, and `audit/taskgen.py` does (the finding's qualified id).
+        """
+        return _normalize(self.subject) or _normalize(self.text)
+
+    def describe(self) -> str:
+        """One line naming the claim, its source and what backs it — the text a
+        refusal or a conflict record quotes."""
+        backing = "no citation, no assumption"
+        if self.citation is not None:
+            backing = f"cited to {self.citation.source!r}"
+        elif self.assumption:
+            backing = f"assumed: {self.assumption}"
+        subject = self.subject or "(no subject)"
+        return f"[{self.source}] {subject}: {self.text} ({backing})"
+
+
+def unsupported_claims(claims) -> tuple[str, ...]:
+    """Why these claims may NOT be asserted. Empty means every one is supported.
+
+    Positive-only and fail-closed, exactly like `draft_blockers`: support is
+    never inferred from the absence of something. A claim is supported only by a
+    citation whose source NAMES A READER, or by an assumption stated out loud —
+    never by nobody having objected.
+
+    One line per refusal, each NAMING the claim it refuses, because the operator
+    reading it has to find the sentence in a description that may be forty lines
+    long. Every rule below is one line of the precedence order:
+
+      * a source naming a model, a chat or a memory is refused (line 5);
+      * a citation whose reader is unknown supports nothing (the `Evidence`
+        contract);
+      * a reader whose content is model-authored needs a LOCATION in the claim's
+        own text, so what is being trusted is a place a reviewer can open rather
+        than a sentence an agent wrote;
+      * a CURRENT BEHAVIOUR claim may not rest on the operator's request or on an
+        accepted decision (line 3);
+      * a claim resting on a CONTEXT RECORD needs something read from the tree
+        before it is believed (line 4);
+      * anything left with neither citation nor assumption is refused (the whole
+        claim of this task).
+    """
+    out: list[str] = []
+    for claim in claims:
+        name = claim.describe()
+        if not str(claim.text or "").strip():
+            out.append(f"a claim with no text was offered: {name}")
+            continue
+        if not claim.about_repository:
+            continue
+        citation = claim.citation
+        if citation is None:
+            if not str(claim.assumption or "").strip():
+                out.append(
+                    f"unsupported repository claim, refused: {name} — cite a "
+                    "reader that was actually run, or state it as an assumption"
+                )
+            continue
+        raw = " ".join(str(citation.source or "").split()).strip().lower()
+        if not raw or raw in MODEL_SOURCE_LABELS:
+            out.append(
+                f"a model assertion is not evidence, refused: {name} — "
+                f"{citation.source!r} names no reader; nothing a model said "
+                "ever becomes an Evidence"
+            )
+            continue
+        reader = evidence_reader(citation.source)
+        if not reader:
+            out.append(
+                f"citation names no reader this loop runs, refused: {name} — "
+                f"{citation.source!r} is not one of {sorted(EVIDENCE_READERS)}"
+            )
+            continue
+        if reader in LOCATION_REQUIRED_READERS and not has_location(citation.text):
+            out.append(
+                f"citation to {reader!r} carries no location, refused: {name} — "
+                "that reader's content is agent-authored, so the citation has to "
+                "name a path or path:line a reviewer can open, or the claim has "
+                "to be stated as an assumption instead of cited"
+            )
+            continue
+        tier = EVIDENCE_READERS[reader]
+        if claim.kind == CLAIM_BEHAVIOUR and tier in _NOT_BEHAVIOUR_EVIDENCE:
+            out.append(
+                f"a {tier} citation is not evidence of current behaviour, "
+                f"refused: {name} — code, tests and configuration describe what "
+                "the code does; a request and a decision say what is wanted"
+            )
+            continue
+        if claim.source == SOURCE_CONTEXT_RECORD and tier != SOURCE_REPOSITORY:
+            out.append(
+                f"a context record was believed without being verified, refused: "
+                f"{name} — context records help navigation; read the tree for "
+                "this one, or state it as an assumption"
+            )
+    return tuple(out)
+
+
+#: How a conflict bears on SCOPE, as three values rather than a boolean — the
+#: same anti-fail-open `context_resolver.py` states for staleness. A boolean
+#: `changes_scope` defaulting to False would satisfy "a conflict that changes
+#: scope stops generation" vacuously, by reporting every conflict it could not
+#: measure as harmless. `SCOPE_IMPACT_UNKNOWN` takes the STOPPING branch.
+SCOPE_CHANGED = "scope_changed"
+SCOPE_UNCHANGED = "scope_unchanged"
+SCOPE_IMPACT_UNKNOWN = "scope_impact_unknown"
+
+
+@dataclass(frozen=True)
+class SourceConflict:
+    """Two sources that disagree about one subject. NO winner is recorded.
+
+    Both sides are kept whole — the whole point is that a reader can see what
+    each source said and decide, which a resolved conflict cannot show.
+    """
+
+    subject: str
+    left: Claim
+    right: Claim
+
+    @property
+    def scope_impact(self) -> str:
+        """`SCOPE_CHANGED` / `SCOPE_UNCHANGED` / `SCOPE_IMPACT_UNKNOWN`.
+
+        Measured on the paths each side would put in scope. Unknown when EITHER
+        side names none: a source that said nothing about which files are
+        involved has not agreed about them, and reading its silence as agreement
+        is precisely the vacuous pass the tri-state exists to refuse.
+
+        A CONSTRAINT side is judged by COVERAGE, not by equality, and that is
+        what keeps this from firing on every ordinary pair. `CLAIM_CONSTRAINT`
+        is a scope somebody already accepted (a task's `approved_paths`), and a
+        wider accepted scope that already authorizes every file the other side
+        names is not a disagreement — the work fits inside it. What IS a
+        disagreement is the other direction: a file the work needs that the
+        accepted scope does not authorize, which is a task that cannot do what
+        it was filed for. `tasks.unauthorized_paths` answers that, and is the
+        SAME matcher the pre-commit gate and the post-commit ownership check use
+        — a second prefix rule here would drift from the one that actually
+        decides what a round may write.
+
+        With no constraint side (or two), coverage has no direction and equality
+        decides.
+        """
+        if not self.left.paths or not self.right.paths:
+            return SCOPE_IMPACT_UNKNOWN
+        from .tasks import unauthorized_paths
+
+        constraints = [c for c in (self.left, self.right) if c.kind == CLAIM_CONSTRAINT]
+        if len(constraints) == 1:
+            scope = constraints[0]
+            needed = self.left if scope is self.right else self.right
+            uncovered = unauthorized_paths(needed.paths, scope.paths)
+            return SCOPE_CHANGED if uncovered else SCOPE_UNCHANGED
+        left = tuple(sorted(set(self.left.paths)))
+        right = tuple(sorted(set(self.right.paths)))
+        return SCOPE_UNCHANGED if left == right else SCOPE_CHANGED
+
+    @property
+    def stops_generation(self) -> bool:
+        """True unless the conflict is POSITIVELY known not to change scope."""
+        return self.scope_impact != SCOPE_UNCHANGED
+
+    @property
+    def identity(self) -> str:
+        """A stable digest of THIS disagreement.
+
+        Over the subject and both sides' (source, text), so two different
+        conflicts are two records and one conflict seen twice is one record with
+        its recurrence bumped. Same reasoning as `blockers.refusal_identity`:
+        the durable store keys a record by a condition, and a digest is what
+        makes "this condition" mean this disagreement rather than "a conflict
+        happened".
+        """
+        parts = [
+            _normalize(self.subject),
+            self.left.source, _normalize(self.left.text),
+            self.right.source, _normalize(self.right.text),
+        ]
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+    def describe(self) -> str:
+        """The operator-facing sentence, NAMING BOTH SOURCES AND BOTH SCOPES.
+
+        The scopes are spelled out rather than left to `Claim.describe`, which
+        renders the sentence and what backs it. A conflict is DECIDED on the
+        paths, so a record quoting only the prose would name a scope
+        disagreement without saying which files each side named — leaving the
+        operator to re-derive the one thing the record exists to state.
+        """
+        return (
+            f"{self.subject or '(no subject)'}: {self.left.source} and "
+            f"{self.right.source} disagree ({self.scope_impact}). "
+            f"{self.left.source} says — {self.left.describe()} "
+            f"[scope: {', '.join(self.left.paths) or 'unstated'}]. "
+            f"{self.right.source} says — {self.right.describe()} "
+            f"[scope: {', '.join(self.right.paths) or 'unstated'}]. "
+            "No winner was chosen here; both sources are recorded as they stand."
+        )
+
+
+def detect_conflicts(claims) -> tuple[SourceConflict, ...]:
+    """Every disagreement among `claims`, in a stable order. Resolves NONE.
+
+    Two claims conflict when they share a `topic`, come from DIFFERENT sources,
+    and disagree — where "disagree" is judged by what they are each answering:
+    claims of the SAME `kind` are compared on their words and their scope, and
+    claims of different kinds ONLY on their scope. The loop body says why the
+    second rule is load-bearing rather than lenient.
+
+    THE DIFFERENT-SOURCE REQUIREMENT IS A REAL LIMIT, stated rather than left to
+    be discovered. Two claims from one tier are read as complementary sentences
+    by one author, not as a disagreement — which is what they almost always are
+    (a finding says what it saw AND what it wants AND what it assumed, all as
+    `repository`), and comparing them would report every finding as
+    self-contradictory and stop all generation. What it costs is that two
+    accepted decisions disagreeing with EACH OTHER is not detected here; a
+    conflict record names two sources, and that pair genuinely has only one.
+
+    A MODEL-sourced claim is compared like any other, and that is the
+    fail-closed direction rather than an endorsement of it: a model sentence
+    that contradicts the tree about scope is worth stopping for. It is refused
+    separately, and for a different reason, by `unsupported_claims`.
+
+    Ordered by (topic, precedence rank of each side, text) so a caller writing
+    durable records writes the same records for the same inputs — the property
+    `context_resolver` states for selection and for the same reason.
+    """
+    by_topic: dict[str, list[Claim]] = {}
+    for claim in claims:
+        if not str(claim.text or "").strip():
+            continue
+        by_topic.setdefault(claim.topic, []).append(claim)
+    out: list[SourceConflict] = []
+    for topic in sorted(by_topic):
+        group = sorted(
+            by_topic[topic],
+            key=lambda c: (source_rank(c.source), c.source, _normalize(c.text)),
+        )
+        for i, left in enumerate(group):
+            for right in group[i + 1:]:
+                if left.source == right.source:
+                    continue
+                candidate = SourceConflict(
+                    subject=left.subject or right.subject, left=left, right=right
+                )
+                if left.kind != right.kind:
+                    # TWO DIFFERENT QUESTIONS, so only their SCOPE is
+                    # comparable. This is not a softening — it is the one thing
+                    # that keeps a conflict from meaning "a finding exists". A
+                    # CONSTRAINT saying what must hold and a BEHAVIOUR saying
+                    # what the code does today differ in prose for every finding
+                    # ever written: that difference IS the defect being reported,
+                    # not two sources contradicting each other. Comparing their
+                    # words would report every finding as a source conflict and
+                    # stop all generation, which is how a guard gets switched
+                    # off. What they CAN disagree about is which files are
+                    # involved, and that is measured, not read.
+                    if candidate.scope_impact == SCOPE_UNCHANGED:
+                        continue
+                    out.append(candidate)
+                    continue
+                # AGREEING IS NOT THE SAME AS SAYING THE SAME WORDS. Two sources
+                # answering ONE question can write one sentence and mean
+                # different files — "fix the unreadable-file gate" over
+                # `policy.py` and over `inbox.py` is one sentence and two scopes
+                # — so identical prose is only agreement when the paths are not
+                # positively different. Skipping on the text alone was a hole in
+                # exactly the direction this section exists to close: the
+                # material case, dropped, because two authors worded it alike.
+                if (
+                    _normalize(left.text) == _normalize(right.text)
+                    and candidate.scope_impact != SCOPE_CHANGED
+                ):
+                    continue
+                out.append(candidate)
+    return tuple(out)
+
+
 # ---- the interview ---------------------------------------------------------
 
 

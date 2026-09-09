@@ -47,7 +47,13 @@ def good_findings(fid="f1", category="defect"):
                     "confidence": "confirmed",
                     "affected_files": ["a.py"],
                     "symbols": [],
-                    "evidence": "seen",
+                    # A LOCATION, which the schema has always asked `evidence`
+                    # for ("file:line references to what you saw"). ctx-06 makes
+                    # it load-bearing: a finding citing nowhere a reviewer can
+                    # open is refused and becomes no task, so a fixture reading
+                    # "seen" would make this whole end-to-end run assert on an
+                    # empty proposal. `test_audit_taskgen` owns the uncited case.
+                    "evidence": "a.py:12 seen",
                     "impact": "bad",
                     "proposed_action": "fix the thing",
                     "dependencies": [],
