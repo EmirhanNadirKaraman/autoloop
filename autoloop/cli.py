@@ -7737,11 +7737,29 @@ def _candidate_base_ancestry(config, record, git=None) -> tuple[str, str]:
 
 
 def _merge_window_blockers(
-    config, seen=None, git=None, *, obligations: list | None = None
+    config,
+    seen=None,
+    git=None,
+    *,
+    obligations: list | None = None,
+    holders: list | None = None,
 ) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
     the window is open.
+
+    **`holders` is the same list, keyed by WHO** — one
+    `{"task_id", "reason"}` per blocker, appended when the caller passes a list,
+    in the order the reasons themselves are produced. It exists because every
+    reason string here already names its task and no reader could get at it
+    without parsing prose the loop itself wrote, which is reading your own
+    output back as evidence. `dashboard.merge_window` passes one so the panel can
+    say WHICH task holds the window shut rather than only that something does
+    (ops-01). Out-param rather than a third return value for the reason
+    `obligations` is one: every existing caller keeps the two-tuple it already
+    unpacks. The EXECUTING-phase reason is a holder too, with an empty
+    `task_id` — a shut window with no holders listed reads as a bug in the
+    panel, and "a lane is mid-write" is a real answer to "who".
 
     THE single predicate for "may the branch head move". `auto_merge.py` calls
     this rather than re-deriving the same conditions: a second implementation
@@ -7872,6 +7890,15 @@ def _merge_window_blockers(
     reasons: list[str] = []
     notes: list[str] = []
 
+    def hold(task_id: str, reason: str) -> None:
+        """Record one blocker, and who holds it. The ONE place a reason is
+        appended, so `holders` cannot fall out of step with `reasons` by a
+        later edit adding a third `reasons.append` and forgetting the other
+        half."""
+        reasons.append(reason)
+        if holders is not None:
+            holders.append({"task_id": task_id, "reason": reason})
+
     # `state_dir` is routinely a RELATIVE path (`.autoloop` in the shipped
     # config), so it resolves against the caller's cwd. Run from anywhere but
     # the checkout — a sibling worktree, a cron wrapper with its own working
@@ -7880,10 +7907,12 @@ def _merge_window_blockers(
     # exists to prevent, arrived at by reading the wrong directory. Hit while
     # dry-running this very change from a worktree on 2026-08-04.
     if not config.state_dir.is_dir():
-        return [
+        hold(
+            "",
             f"state directory {config.state_dir} does not exist (resolved from "
-            f"{Path.cwd()}) — nothing could be read, so nothing can be called safe"
-        ], notes
+            f"{Path.cwd()}) — nothing could be read, so nothing can be called safe",
+        )
+        return reasons, notes
 
     _, registry = _load_tasks(config)
     executions = sorted(config.state_dir.glob("executions/*.json"))
@@ -8013,7 +8042,8 @@ def _merge_window_blockers(
                 "current approval until a new review has been asked for"
             )
             continue
-        reasons.append(
+        hold(
+            task_id,
             f"task {task_id} has a candidate ({candidate}) bound to base "
             f"{base} — {why_not}; "
             + (
@@ -8023,12 +8053,12 @@ def _merge_window_blockers(
                 # "cannot be shown to be", and the two must not read alike.
                 else f"{detail}, so it is treated as bound to the head and "
                 "merging would strand it"
-            )
+            ),
         )
 
     _, state = _load_state(config)
     if state is not None and Phase(state.phase) is Phase.EXECUTING:
-        reasons.append("a phase is executing — an agent may be mid-write")
+        hold("", "a phase is executing — an agent may be mid-write")
 
     return reasons, notes
 
