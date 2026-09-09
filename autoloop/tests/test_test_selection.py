@@ -642,7 +642,13 @@ FLOOR_AFTER = 16
 #: reader of it, because the rule is a CONJUNCTION and this file resolves no
 #: `__file__`. It spawns no interpreter either (its git comes from
 #: `gitrepo.py`), so 20 and 24 hold.
-SUITE_SIZE = 116
+#: 116 -> 117 when ctx-07 added `test_context_closeout.py` (2026-09-09), the
+#: DENOMINATOR again. It names no change-note tracker in any evaluated string —
+#: the one it spells is `TRACKER_PATHS`, the identifier, which holds paths rather
+#: than being one — resolves no `__file__` of its own (the source it reads is
+#: reached as an ATTRIBUTE, `sys.modules[...].__file__`, which is not an
+#: `ast.Name`), and its git comes from `gitrepo.py`, so 20 and 24 hold.
+SUITE_SIZE = 117
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
