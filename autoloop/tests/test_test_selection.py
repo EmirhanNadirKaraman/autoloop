@@ -642,7 +642,11 @@ FLOOR_AFTER = 16
 #: reader of it, because the rule is a CONJUNCTION and this file resolves no
 #: `__file__`. It spawns no interpreter either (its git comes from
 #: `gitrepo.py`), so 20 and 24 hold.
-SUITE_SIZE = 116
+#: 116 -> 117 when conc-12 added `test_lane_hold_scheduling.py` (2026-09-09), the
+#: DENOMINATOR again and for conc-10's reason: it names no document at all, it
+#: resolves no `__file__`, and it builds no repository and spawns no process —
+#: its only git is a three-method stub — so 20 and 24 hold.
+SUITE_SIZE = 117
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

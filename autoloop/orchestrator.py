@@ -452,6 +452,7 @@ from .health import (
     StrandedRound,
     current_round_age_seconds,
     dead_lane_survey,
+    fleet_lane_claims,
     round_ceiling_for,
     stranded_fault_rounds,
 )
@@ -1364,11 +1365,71 @@ HOLD_RATE_LIMITED = "fleet_rate_limited"
 #: from outside instead of asked from within.
 HOLD_LANE_RETIRED = "lane_outside_the_fleet"
 
+#: Every hold word this build knows, so `FleetPlan.hold_word` can CHECK what it
+#: read back rather than trusting a prefix. One tuple, listing the values
+#: themselves and never copies of their text — a copy agrees on the day it is
+#: written.
+ALL_HOLD_WORDS = (
+    HOLD_DRAINING,
+    HOLD_LANE_UNREADABLE,
+    HOLD_AT_CAP,
+    HOLD_SCOPE_CONFLICT,
+    HOLD_IN_FLIGHT,
+    HOLD_RATE_LIMITED,
+    HOLD_LANE_RETIRED,
+)
+
 #: The verdict code `Orchestrator._refused_outside_fleet_admission` denies a
 #: directive with, so a reader of the transcript — and a test — can tell a fleet
 #: hold from every other refused directive without matching on prose. The reason
 #: text carries one of the `HOLD_*` words above inside it.
 FLEET_HOLD_DENIAL_CODE = "fleet_admission_held"
+
+#: The holds that are PURE SCHEDULING and are therefore not charged to
+#: `policy.max_policy_denials` (conc-12). A denial budget bounds a REVIEWER that
+#: keeps proposing directives policy refuses; every one of these three is the
+#: supervisor declining to double-dispatch a task the fleet is already running,
+#: or to co-schedule two tasks that write the same file, or to open a round
+#: there is no lane for — decisions this loop makes about itself, which resolve
+#: on their own as soon as a lane finishes. Charging them there is what turned a
+#: 30-second overlap into `policy_denial_budget_exhausted`, which is loop_fatal
+#: and stopped every lane in the fleet (three times in ninety minutes,
+#: 2026-09-09).
+#:
+#: MATCHED ON THE HOLD WORD, never on the composed sentence: `plan` builds some
+#: of these reasons as `f"{HOLD_SCOPE_CONFLICT}: …"` and others bare, so a
+#: `startswith` on prose would flip this exemption silently the first time
+#: somebody reworded a message. The word travels beside the reason instead.
+#:
+#: The other holds are deliberately NOT here. A drain, an unreadable neighbour
+#: and a lane a lowered cap cut out are not "wait for the lane in front of you"
+#: — they are conditions with no admissible alternative to name at all, whose
+#: correction asks for `stop`, and a reviewer that ignores that is the reviewer
+#: `max_policy_denials` exists for. Widening this set is a separate decision
+#: with a separate argument; it is not implied by this one.
+FLEET_HOLDS_NOT_CHARGED = (HOLD_IN_FLIGHT, HOLD_SCOPE_CONFLICT, HOLD_AT_CAP)
+
+#: How many fleet holds in a row one session may collect before the ROUND ends
+#: at a clean boundary. Bounded rather than free, for the reason every corrective
+#: re-prompt in this loop is: a reviewer that keeps naming the same held task
+#: would otherwise trade messages forever. Its exhaustion is NOT a fault — the
+#: session stops exactly as it would if the reviewer had sent the `stop` the
+#: correction asked for, the lane is freed, and `cli._run_continuous` treats it
+#: as the clean boundary it is and selects again once the fleet has moved.
+#:
+#: Deliberately uncoupled from `policy.max_policy_denials`, and not a knob: it
+#: bounds a conversation about the loop's own scheduling, which no operator
+#: preference can improve.
+MAX_FLEET_HOLDS = 3
+
+#: `LoopState.stop_kind` for a round that ended because this lane collected
+#: `MAX_FLEET_HOLDS` holds. A word of its own, beside `"contract"`,
+#: `PREEMPTION_STOP_KIND` and `ABORT_STOP_KIND`, for the reason
+#: `LoopState.stop_kind` states in full: every reader gates on the POSITIVE
+#: value it wants, so this is a clean boundary to `cli._run_continuous`
+#: (`_is_fault_stop` is False) and is never mistaken for a reviewer's own
+#: `stop` by anything reading the transcript.
+FLEET_HOLD_STOP_KIND = "fleet_held"
 
 #: What `FleetPlan.throttled_until` carries when the fleet's throttle record
 #: exists and cannot be READ. A sentinel rather than an empty string, because
@@ -1537,6 +1598,27 @@ class FleetPlan:
             if held_id == task_id:
                 return reason
         return ""
+
+    def hold_word(self, task_id: str) -> str:
+        """The bare `HOLD_*` WORD behind `hold_reason(task_id)`, or `""` when
+        the task was admitted, is not READY, or was held for something this
+        build does not know a word for.
+
+        It exists so a CALLER can decide on the word instead of on the
+        sentence (conc-12: `FLEET_HOLDS_NOT_CHARGED`). The split is exact
+        rather than a guess about prose: `FleetSupervisor.plan` — the only
+        producer of these strings, forty lines below — composes each one as
+        either the word alone or `f"{word}: {detail}"`, and no `HOLD_*` value
+        contains a colon. The result is then CHECKED against the known words,
+        so a reason somebody composes differently one day answers `""` rather
+        than a plausible-looking prefix.
+
+        `""` is the CONSERVATIVE answer for its one caller: an unrecognised
+        hold is charged like an ordinary denial, so a new word added without
+        thinking about the accounting is bounded rather than exempt.
+        """
+        word = self.hold_reason(task_id).split(":", 1)[0].strip()
+        return word if word in ALL_HOLD_WORDS else ""
 
     def describe(self) -> str:
         """One line for the transcript and for an operator reading it."""
@@ -4228,6 +4310,11 @@ class Orchestrator:
         # reconciliation costs nothing and a budget park must not leave a task
         # unscheduled and unreported behind it (strand-01).
         self._reconcile_stranded_tasks()
+        # SECOND, and after the sweep rather than before it: the sweep can put a
+        # task back in the pool, and this decides what the pool may OFFER. At
+        # one lane it returns without reading anything, so the packet built
+        # below is the one the existing tests pin (conc-12).
+        self._refresh_lane_view()
         next_iteration = state.iteration + 1
         verdict = self._policy.check_iteration_budget(next_iteration)
         if not verdict.allowed:
@@ -7123,16 +7210,49 @@ class Orchestrator:
         # the streak standing, which is the same direction: nothing was acted on
         # there either.
         denials_before_dispatch = state.policy_denials
+        # THE SECOND COUNTER THIS TEST HAS TO WATCH (conc-12). A fleet hold no
+        # longer increments `policy_denials`, so without this a dispatch that
+        # was HELD would look exactly like one that was acted on and would zero
+        # a genuine denial streak — a reviewer alternating one refused directive
+        # with one held task would then never exhaust the budget, which is the
+        # fail-open policy-01 removed from the other side.
+        holds_before_dispatch = state.fleet_holds
         self._dispatch(directive)
-        if state.policy_denials and state.policy_denials == denials_before_dispatch:
-            # The directive was acted on, so the run of refused directives ends
-            # here. SAVED, because the dispatch has already written this state
-            # and an in-memory-only clear would let a restart resume a streak
-            # the reviewer has since broken. The truthiness test buys nothing
-            # but the redundant save in the ordinary case (the counter is
-            # already zero); correctness rests on the equality alone.
-            state.policy_denials = 0
-            self._store.save(state)
+        self._end_refusal_streak(denials_before_dispatch, holds_before_dispatch)
+
+    def _end_refusal_streak(self, denials_before: int, holds_before: int) -> None:
+        """Clear the consecutive-refusal counters if that dispatch ACTED on the
+        directive. Called by `_step_executing` alone, with the two values it
+        read immediately before `_dispatch`.
+
+        Its own method because the decision is subtle enough to state and to
+        test on its own (conc-12): "acted on" is defined as BOTH counters
+        standing still, and a version that watched only `policy_denials` would
+        read a fleet hold — which no longer touches that counter — as a round
+        that went through, and would zero a denial streak the reviewer really
+        did earn. That is policy-01's fail-open, arriving through the new
+        accounting instead of through the old clear-before-dispatch.
+
+        SAVED, because the dispatch has already written this state and an
+        in-memory-only clear would let a restart resume a streak the reviewer
+        has since broken. The truthiness test buys nothing but the redundant
+        save in the ordinary case (both counters are already zero);
+        correctness rests on the two equalities alone.
+        """
+        state = self.state
+        acted_on = (
+            state.policy_denials == denials_before
+            and state.fleet_holds == holds_before
+        )
+        if not acted_on or not (state.policy_denials or state.fleet_holds):
+            return
+        state.policy_denials = 0
+        state.fleet_holds = 0
+        # And the hint dies with the streak: it names an alternative to a hold
+        # that is over, and preferring it after this round would keep steering
+        # the queue for a condition that has cleared.
+        state.fleet_hold_alternative = ""
+        self._store.save(state)
 
     def _record_wanted_decision(self, directive: Directive, resp: LastResponse) -> None:
         """Count and record a `wanted_decision`, and do nothing else with it.
@@ -8660,6 +8780,75 @@ class Orchestrator:
             return 1
         return lanes
 
+    def _refresh_lane_view(self) -> None:
+        """Narrow what the next request may OFFER to what this lane may take,
+        and carry a hold's named alternative into it (conc-12).
+
+        Run at the top of `_step_ready`, which is the one place every request
+        passes through and the place `build_context` reads `next_ready()` from
+        — the roadmap summary and the `next ready:` brief the reviewer picks a
+        task out of. A lane that offers the reviewer a task another lane is
+        running gets that task proposed, and the proposal is then HELD; the
+        fleet does not die of the hold any more (`MAX_FLEET_HOLDS`), but it
+        still spends a full reviewer round on a question with a known answer.
+
+        Two sources, and neither is sufficient alone — the same pair
+        `FleetSupervisor.plan` unions, for the same reason:
+
+        * the neighbours' ROWS, adopted from the task file
+          (`reconcile_concurrent_rows`), because this registry has been in
+          memory for a whole round and a sibling's `mark_in_progress` landed on
+          disk rather than in this object;
+        * the neighbours' OWN state files (`fleet_occupants`), because a lane
+          writes its state file and the registry row at different moments, so a
+          task can be held by a lane while its row still reads `pending`.
+
+        **NOTHING AT ONE LANE**, before any file is read: the view stays empty,
+        `next_ready()` is the first element of `ready_in_dispatch_order()` it has
+        always been, and no single-lane deployment can be changed by a fleet it
+        does not have.
+
+        FAILS SOFT, deliberately, and this is the one place in the admission
+        story that may: it narrows an OFFER, and an offer that stays too wide
+        costs a hold, while the DISPATCH gate below it still fails closed
+        (`_refused_outside_fleet_admission` refuses on `HOLD_LANE_UNREADABLE`
+        rather than dispatching blind). So a fleet scan that raises leaves this
+        lane offering whatever it could still establish, recorded in the
+        transcript, instead of ending the round by traceback out of `_step_ready`
+        — which has no `except` around it and would take the lane down with no
+        park, no blocker and no heartbeat.
+        """
+        if self._fleet_lane_count() <= 1:
+            return
+        held: set[str] = set()
+        try:
+            if self._task_store is not None:
+                # The neighbour's writes, adopted before anything is offered.
+                # Fails open on its own account (a corrupt task file adopts
+                # nothing), which the occupant scan below then backs up.
+                self._task_store.reconcile_concurrent_rows(self._registry)
+            for occupant in fleet_occupants(self._config):
+                # This lane's own slot is not "elsewhere": a `revise` continues
+                # the arc it already holds, and excluding it here would take
+                # this lane's own task out of its own offer.
+                if occupant.lane_index == self.lane_index:
+                    continue
+                if occupant.task_id:
+                    held.add(occupant.task_id)
+        except Exception as exc:  # noqa: BLE001 - see the docstring's last para
+            self._log(
+                "lane_view_unreadable",
+                data={
+                    "lane": self.lane_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "detail": (
+                        "the offer was narrowed by whatever could be read; the "
+                        "dispatch gate still refuses a task the fleet holds"
+                    ),
+                },
+            )
+        self._registry.set_lane_view(held, self.state.fleet_hold_alternative)
+
     def _refused_outside_fleet_admission(
         self, directive: Directive, task: Task
     ) -> bool:
@@ -8758,12 +8947,19 @@ class Orchestrator:
             # instead of freeing the lane.
             return False
         alternative = ""
+        #: The bare `HOLD_*` word behind `reason`, carried BESIDE it rather than
+        #: parsed back out of it at the far end (conc-12) — it is what decides
+        #: whether this refusal spends the denial budget or the fleet's own hold
+        #: allowance, and an accounting rule that reads a sentence is one
+        #: rewording away from silently reversing itself.
+        hold_word = ""
         if self.lane_index >= lanes:
             # THE LOWERED CAP, and it is refused here rather than planned for:
             # `lane_occupants` walks `range(lanes)`, so this lane is absent from
             # its own occupant list and the exclusion below would drop nothing
             # — the plan would count a free slot that no longer exists and admit
             # into a lane the operator has already cut out of the fleet.
+            hold_word = HOLD_LANE_RETIRED
             reason = (
                 f"{HOLD_LANE_RETIRED}: lane {self.lane_id} is index "
                 f"{self.lane_index} in a fleet of {lanes}"
@@ -8819,6 +9015,7 @@ class Orchestrator:
                 reason = plan.hold_reason(task.id)
                 if not reason:
                     return False  # not scheduled by this plan at all — see above
+                hold_word = plan.hold_word(task.id)
                 # An urgent pin makes every other id unsendable (`_refused_ahead_
                 # of_urgent` runs first), so suggesting one would be a correction
                 # the very next directive is refused for.
@@ -8829,6 +9026,7 @@ class Orchestrator:
                     "fleet_admission_unreadable",
                     data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
                 )
+                hold_word = HOLD_LANE_UNREADABLE
                 reason = f"{HOLD_LANE_UNREADABLE}: the fleet's own state is unreadable"
         if alternative:
             instead = (
@@ -8840,6 +9038,16 @@ class Orchestrator:
                 "Nothing else may start in this lane right now: send `stop`, "
                 "which ends this round at a clean boundary and frees the lane."
             )
+        # THE ANSWER THIS REFUSAL COMPUTED, MADE STRUCTURAL (conc-12). The
+        # sentence above already names it, and the round that produced the
+        # evidence for this task re-proposed the held task anyway — because the
+        # next request's roadmap block still offered it, and a reviewer reads
+        # the block it is given. `_refresh_lane_view` feeds this into
+        # `next_ready()`, so the alternative is what the NEXT request offers
+        # rather than something the correction merely mentions. Assigned
+        # unconditionally, empty included: a hold with no alternative must clear
+        # a name a previous hold left behind rather than keep preferring it.
+        self.state.fleet_hold_alternative = alternative
         self._handle_policy_denial(
             directive,
             Verdict.deny(
@@ -8849,6 +9057,7 @@ class Orchestrator:
                 f"{instead} The task is untouched: it is still queued, nothing "
                 "was executed and no attempt was spent.",
             ),
+            hold=hold_word,
         )
         return True
 
@@ -9048,6 +9257,18 @@ class Orchestrator:
                 "attempt was spent. Send `stop`, which ends this round at a "
                 "clean boundary and frees this lane for something else.",
             ),
+            # A SCHEDULING HOLD ONLY WHEN A SIBLING REALLY TOOK IT (conc-12).
+            # `in_progress` is the duplicate-dispatch race this refusal exists
+            # for, and it is the supervisor's own `HOLD_IN_FLIGHT` reached one
+            # step later — accounted the same way, so it cannot exhaust the
+            # denial budget that stops every lane. Every OTHER adopted status
+            # here is a row an operator or an earlier round moved (completed,
+            # quarantined, retired, shipped elsewhere): the reviewer named a
+            # task it may not have, which is an ordinary refused directive and
+            # is charged like one. The reason text says `HOLD_IN_FLIGHT` for
+            # both because the WORD it reports is "somebody else holds this
+            # file's row"; the accounting asks a narrower question.
+            hold=HOLD_IN_FLIGHT if taken_elsewhere == "in_progress" else "",
         )
         return None
 
@@ -9848,6 +10069,27 @@ class Orchestrator:
         is the same answer the ceiling itself would give, one round earlier and
         without needing the reviewer to pick the task first.
 
+        **AND IT MUST NOT SWEEP A ROUND ANOTHER LANE IS RUNNING** (conc-12).
+        `current` below is THIS lane's claim, and it is the only one this
+        method used to make: above one lane a task the neighbour dispatched
+        satisfies every one of the predicate's four conditions — `in_progress`,
+        not this session's current task, an OPEN attempt, no published sha — so
+        this sweep RELEASED it to `pending` and saved, while its agent was still
+        executing. That is defect 1 of conc-12 measured rather than inferred: it
+        is why `autoloop tasks` read `0 IN PROGRESS` and `next_ready()` kept
+        returning ctx-06 for the whole time lane 1 was working on it, and why
+        the supervisor's `HOLD_IN_FLIGHT` backstop — which reads the LANES, not
+        the row — became the primary gate and fired on every selection.
+        `health.check` had already been given this answer for its own copy of
+        the predicate (`_lane_claims`, conc-09); the loop's own sweep never was,
+        which is exactly the drift a shared gatherer exists to prevent.
+
+        FAIL-CLOSED on a fleet it cannot read: a lane whose claim is unknown is
+        a lane that may be running any of these tasks, so the sweep is HELD for
+        this round and says so in the transcript rather than releasing rows it
+        cannot judge. Holding costs at most one round of a genuine strand
+        staying invisible; the other direction requeues a live round.
+
         Saves `tasks.json` only when something actually moved: this runs every
         round, and a file rewritten on each pass is noise in the escape
         detector's snapshot for no gain (the same rule
@@ -9856,12 +10098,36 @@ class Orchestrator:
         if self._execution_store is None:
             return
         current = (self.state.task_execution or {}).get("task_id") or ""
+        lanes = self._fleet_lane_count()
+        try:
+            # `()` at one lane, before any read — the acceptance criterion made
+            # structural at this call site too.
+            claims, lane_note = fleet_lane_claims(
+                self._config, lanes, exclude=self.lane_index
+            )
+        except Exception as exc:  # noqa: BLE001 - a sweep must not end the round
+            claims, lane_note = (), f"{type(exc).__name__}: {exc}"
+        if lane_note:
+            self._log(
+                "strand_sweep_held",
+                data={
+                    "lane": self.lane_id,
+                    "reason": lane_note,
+                    "detail": (
+                        "a lane's claim could not be read, so a task it is "
+                        "running cannot be told from one the environment "
+                        "stranded; nothing was requeued this round"
+                    ),
+                },
+            )
+            return
         strands = stranded_fault_rounds(
             self._registry,
             self._execution_store,
             current,
             current_round_age_seconds(self.state),
             round_ceiling_for(self._config),
+            lane_claims=claims,
         )
         if not strands:
             return
@@ -14782,6 +15048,7 @@ class Orchestrator:
         directive: Directive,
         verdict,
         binding: PostcommitBinding | None = None,
+        hold: str = "",
     ) -> bool:
         """`binding` is the binding the caller already resolved for this
         response, forwarded to `_carry_postcommit_forward` — see its docstring.
@@ -14790,21 +15057,45 @@ class Orchestrator:
         path) resolves none by construction and leaves it `None`, which is
         byte-for-byte the behaviour they had.
 
-        Returns True when a corrective re-prompt was queued and False when the
-        denial budget was exhausted and the run ENDED instead. Every caller but
-        one ignores it and is unaffected; `_dispatch`'s legacy-git branch reads
+        `hold` is the `HOLD_*` WORD when this refusal is a fleet SCHEDULING
+        decision rather than a refused directive (conc-12), and it is passed as
+        the word rather than inferred from `verdict.reason` for the reason
+        `FLEET_HOLDS_NOT_CHARGED` states: the sentences are composed, and a
+        match on prose is an exemption that silently flips when somebody
+        rewords one. A hold in that set charges `state.fleet_holds` and leaves
+        `state.policy_denials` UNTOUCHED — so it can never reach
+        `policy_denial_budget_exhausted`, which is loop_fatal and stops every
+        lane. Its own bound (`MAX_FLEET_HOLDS`) ends the ROUND at a clean
+        boundary instead: the same answer the correction asks the reviewer for.
+        Empty for every other caller, which behaves exactly as it always did.
+
+        Returns True when a corrective re-prompt was queued and False when a
+        budget was exhausted and the round ENDED instead. Every caller but one
+        ignores it and is unaffected; `_dispatch`'s legacy-git branch reads
         it, because writing a re-presented packet into the outbox of a session
         that has just stopped would hand that packet to whatever resumed it."""
         state = self.state
-        state.policy_denials += 1
+        charged = hold not in FLEET_HOLDS_NOT_CHARGED
+        if charged:
+            state.policy_denials += 1
+        else:
+            state.fleet_holds += 1
         self._log(
+            # The SAME event type either way — everything that greps the
+            # transcript for a refused directive keeps working — with the
+            # accounting alongside it, so a reader can tell a scheduling hold
+            # from a denied directive without parsing the reason.
             "policy_denied",
             data={
                 "decision": directive.decision.value,
                 "code": verdict.code,
                 "reason": verdict.reason,
+                "fleet_hold": hold,
+                "charged": charged,
             },
         )
+        if not charged:
+            return self._after_fleet_hold(directive, verdict)
         budget = self._policy.check_denial_budget(state.policy_denials)
         if not budget.allowed:
             state.last_response = None
@@ -14831,6 +15122,66 @@ class Orchestrator:
         # approval that answers the correction unpublishable in exactly the way
         # a parse error used to.
         self._carry_postcommit_forward(binding)
+        state.outbox = policy_denied_payload(directive.decision.value, verdict.reason)
+        state.last_response = None
+        state.phase = Phase.READY.value
+        self._store.save(state)
+        return True
+
+    def _after_fleet_hold(self, directive: Directive, verdict) -> bool:
+        """What follows a fleet SCHEDULING hold: the corrective re-prompt, or —
+        at `MAX_FLEET_HOLDS` — the end of this round at a CLEAN boundary
+        (conc-12). True when a re-prompt was queued.
+
+        **THE TERMINAL IS NOT A FAULT, and that is the whole of defect 2.**
+        `_to_fault_stop` writes a `loop_fatal` blocker, and a `loop_fatal`
+        blocker whose code is not lane-fatal stops every lane in the fleet
+        (`blockers.fatal_scope`) — so a supervisor declining to double-dispatch
+        one task took the whole fleet down three times in ninety minutes. There
+        is nothing here for a human to answer and nothing wrong with this lane:
+        the fleet is busy, and the correction has already asked the reviewer for
+        the one answer that helps. So the round ends exactly as it would have if
+        the reviewer had SENT that answer — `stopped`, with a stop kind of its
+        own, no blocker, no attempt, no quarantine — and `cli._run_continuous`
+        reads it as the clean boundary it is: the lane returns to the top, the
+        supervisor gets the first word on whether it opens another session, and
+        by then the neighbour has usually finished.
+
+        No binding is carried, and none exists to carry: both callers refuse a
+        dispatch BEFORE any packet is presented, so there is no reviewed
+        candidate whose approval this correction could orphan. The parameter is
+        therefore not offered rather than passed as `None`, so a future caller
+        with a binding has to think about it rather than inherit a silent drop.
+        """
+        state = self.state
+        if state.fleet_holds > MAX_FLEET_HOLDS:
+            state.last_response = None
+            state.outbox = None
+            state.outbox_diff = None
+            state.outbox_attachment = None
+            state.phase = Phase.STOPPED.value
+            state.stop_kind = FLEET_HOLD_STOP_KIND
+            state.stop_reason = (
+                f"the fleet held this lane's last {state.fleet_holds} directives "
+                f"(most recently: {verdict.reason}). The round ends here at a "
+                "clean boundary, which is what frees this lane; nothing was "
+                "executed, no attempt was spent and every task named is still "
+                "queued exactly as it was."
+            )
+            self._log(
+                "stopped",
+                data={
+                    "reason": state.stop_reason,
+                    # NOT `"fault"`. Everything that greps for `stopped` still
+                    # finds this; anything that cares reads the kind.
+                    "kind": FLEET_HOLD_STOP_KIND,
+                    "code": "fleet_hold_round_ended",
+                    "task_id": directive.task_id,
+                    "holds": state.fleet_holds,
+                },
+            )
+            self._store.save(state)
+            return False
         state.outbox = policy_denied_payload(directive.decision.value, verdict.reason)
         state.last_response = None
         state.phase = Phase.READY.value
