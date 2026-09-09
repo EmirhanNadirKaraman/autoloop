@@ -992,3 +992,324 @@ def test_add_task_context_id_round_trips_into_the_registry(tmp_path, monkeypatch
     task = registry.get("ctx-demo")
     assert task.context_ids == ("ctx-decision-01", "ctx-incident-02")
     assert task.approved_paths == ("autoloop/tasks.py",)
+
+
+# ---- claims, precedence and conflicts (ctx-06) ------------------------------
+#
+# The primitives `audit/taskgen.py` enforces the planning discipline with. Tested
+# here, as pure functions over values, because that is what they are: no
+# repository, no subprocess and no agent round can make any of these claims fail
+# for a different reason than the one being asserted.
+
+
+from autoloop.inbox import (  # noqa: E402 — grouped with the section it serves
+    CLAIM_BEHAVIOUR,
+    CLAIM_CONSTRAINT,
+    CLAIM_INTENT,
+    SCOPE_CHANGED,
+    SCOPE_IMPACT_UNKNOWN,
+    SCOPE_UNCHANGED,
+    SOURCE_ACCEPTED_DECISION,
+    SOURCE_CONTEXT_RECORD,
+    SOURCE_MODEL,
+    SOURCE_OPERATOR_REQUEST,
+    SOURCE_PRECEDENCE,
+    SOURCE_REPOSITORY,
+    Claim,
+    Evidence,
+    SourceConflict,
+    detect_conflicts,
+    evidence_reader,
+    has_location,
+    source_rank,
+    unsupported_claims,
+)
+
+
+def repo_claim(text="the gate returns True", **overrides):
+    base = dict(
+        source=SOURCE_REPOSITORY,
+        subject="s",
+        kind=CLAIM_BEHAVIOUR,
+        citation=Evidence(text="autoloop/policy.py:12", source="git show"),
+    )
+    base.update(overrides)
+    return Claim(text=text, **base)
+
+
+def test_a_model_is_never_a_source_of_evidence():
+    """`Evidence`'s own docstring rule, reaching the generator. Not a lower tier
+    of evidence — not evidence, and not in the precedence order at all."""
+    assert SOURCE_MODEL not in SOURCE_PRECEDENCE
+    for label in ("model", "the assistant", "chat history", "model memory", "Claude"):
+        assert evidence_reader(label) == "", label
+
+
+def test_an_unreadable_provenance_never_outranks_one_somebody_classified():
+    """Fail-closed ranking: unknown, empty and non-string all rank LAST."""
+    assert source_rank(SOURCE_OPERATOR_REQUEST) == 0
+    assert source_rank(SOURCE_REPOSITORY) < source_rank(SOURCE_CONTEXT_RECORD)
+    for unclassified in (SOURCE_MODEL, "", None, 7, ["repository"]):
+        assert source_rank(unclassified) == len(SOURCE_PRECEDENCE), unclassified
+
+
+def test_a_path_is_a_location_not_a_reader():
+    """The hole a shape test would leave: `source` names the READER, so an
+    invented `autoloop/inbox.py:1545` must not walk in by being path-shaped."""
+    assert evidence_reader("autoloop/inbox.py:1545") == ""
+    assert evidence_reader("git ls-files") == "git ls-files"
+    assert evidence_reader("  GIT LS-FILES  ") == "git ls-files", "normalised"
+    assert evidence_reader("something plausible") == ""
+    assert evidence_reader(None) == ""
+
+
+def test_prose_is_not_a_citation():
+    """`has_location` decides whether a citation names somewhere to look. It
+    must not be satisfiable by ordinary English — `e.g.` was the case that made
+    the extension bound `{2,6}` rather than `{1,6}`."""
+    for cited in ("a.py:12", "docs/AUTOLOOP.md", "autoloop/inbox.py:1545",
+                  "see autoloop/tests/test_x.py:10-40.", "it is in a.py."):
+        assert has_location(cited), cited
+    for prose in ("saw it", "e.g. it breaks", "i.e. the loop stops",
+                  "It fails. The next round repeats it.", "", None):
+        assert not has_location(prose), prose
+
+
+def test_an_uncited_repository_claim_is_refused_and_the_refusal_names_it():
+    [refusal] = unsupported_claims([repo_claim("the gate returns True", citation=None)])
+    assert "the gate returns True" in refusal
+    assert "no citation" in refusal
+
+
+def test_the_same_claim_with_an_assumption_stands():
+    assert unsupported_claims([
+        repo_claim(citation=None, assumption="not verified; assuming it still holds")
+    ]) == ()
+
+
+def test_readiness_is_never_inferred_from_an_empty_list():
+    """Positive-only, like `draft_blockers`: no claims means nothing to refuse,
+    which is not the same as anything having been supported."""
+    assert unsupported_claims([]) == ()
+    assert unsupported_claims([repo_claim(text="   ")])[0].startswith("a claim with no text")
+
+
+def test_the_guard_cannot_be_switched_off_by_declaring_a_claim_non_repository():
+    """`repository_specific=False` is the flag an author reaches for to quiet a
+    refusal, and text naming a file is exactly the text the refusal is for."""
+    quiet = repo_claim("rewrite autoloop/policy.py", citation=None,
+                       repository_specific=False)
+    assert unsupported_claims([quiet]), "a claim naming a file is a repository claim"
+    # The control: a sentence about nothing in this tree really is exempt.
+    assert unsupported_claims([
+        Claim(text="prefer the simpler wording", source=SOURCE_REPOSITORY,
+              repository_specific=False)
+    ]) == ()
+
+
+def test_what_the_operator_asked_for_is_not_evidence_of_what_the_code_does():
+    """Precedence line 3, enforced rather than described."""
+    [refusal] = unsupported_claims([
+        repo_claim(citation=Evidence(text="they asked for it",
+                                     source="the operator's request"))
+    ])
+    assert "not evidence of current behaviour" in refusal
+    # The same citation is fine for a claim about what is WANTED.
+    assert unsupported_claims([
+        repo_claim(kind=CLAIM_INTENT,
+                   citation=Evidence(text="they asked for it",
+                                     source="the operator's request"))
+    ]) == ()
+
+
+def test_a_context_record_is_not_believed_until_something_was_read():
+    """Precedence line 4. A record citing only itself is navigation, not
+    evidence; verified against the tree, or stated as an assumption, it stands."""
+    unverified = repo_claim(
+        source=SOURCE_CONTEXT_RECORD,
+        citation=Evidence(text="ctx-42 says so", source="the context record index"),
+    )
+    [refusal] = unsupported_claims([unverified])
+    assert "without being verified" in refusal
+
+    verified = repo_claim(
+        source=SOURCE_CONTEXT_RECORD,
+        citation=Evidence(text="autoloop/policy.py:12", source="git show"),
+    )
+    assert unsupported_claims([verified]) == ()
+
+
+def test_a_reader_whose_content_is_agent_authored_needs_a_location():
+    """The audit report is a real file, and what is inside it is a model's
+    sentence. The location is what a reviewer can check, so it is required."""
+    [refusal] = unsupported_claims([
+        repo_claim(citation=Evidence(text="I saw it", source="the audit report"))
+    ])
+    assert "no location" in refusal
+    assert unsupported_claims([
+        repo_claim(citation=Evidence(text="a.py:10 I saw it", source="the audit report"))
+    ]) == ()
+
+
+def scope_claim(source, paths, text, kind=CLAIM_BEHAVIOUR):
+    return Claim(
+        text=text, source=source, subject="the scope", kind=kind,
+        citation=Evidence(text="a.py:1", source="git show"), paths=paths,
+    )
+
+
+def test_a_conflict_keeps_both_sides_and_picks_no_winner():
+    left = scope_claim(SOURCE_REPOSITORY, ("a.py",), "the fix touches a.py")
+    right = scope_claim(SOURCE_ACCEPTED_DECISION, ("b.py",), "it touches b.py",
+                        kind=CLAIM_CONSTRAINT)
+
+    [conflict] = detect_conflicts([left, right])
+
+    assert {conflict.left.source, conflict.right.source} == {
+        SOURCE_REPOSITORY, SOURCE_ACCEPTED_DECISION
+    }
+    assert conflict.scope_impact == SCOPE_CHANGED
+    assert conflict.stops_generation is True
+    described = conflict.describe()
+    assert "a.py" in described and "b.py" in described
+    assert "No winner was chosen" in described
+
+
+def test_precedence_never_resolves_a_conflict():
+    """The order exists to say what settles what, never to pick a side. The
+    higher-ranked source does not make the disagreement go away."""
+    operator = scope_claim(SOURCE_OPERATOR_REQUEST, ("a.py",), "only a.py",
+                           kind=CLAIM_INTENT)
+    tree = scope_claim(SOURCE_REPOSITORY, ("b.py",), "b.py too")
+
+    assert len(detect_conflicts([operator, tree])) == 1
+    assert len(detect_conflicts([tree, operator])) == 1, "and order does not matter"
+
+
+def test_an_unmeasurable_scope_impact_stops_rather_than_passes():
+    """The tri-state, and the reason it is not a boolean: a `changes_scope`
+    defaulting to False would report every conflict it could not measure as
+    harmless, satisfying the rule vacuously."""
+    silent = scope_claim(SOURCE_OPERATOR_REQUEST, (), "the loop is too slow",
+                         kind=CLAIM_INTENT)
+    tree = scope_claim(SOURCE_REPOSITORY, ("a.py",), "a.py is the hot path")
+
+    [conflict] = detect_conflicts([silent, tree])
+    assert conflict.scope_impact == SCOPE_IMPACT_UNKNOWN
+    assert conflict.stops_generation is True
+
+
+def test_an_accepted_scope_that_covers_the_work_is_not_a_disagreement():
+    """Coverage, not equality — and through `tasks.unauthorized_paths`, the same
+    matcher the pre-commit gate uses, so the directory rule cannot drift.
+
+    A constraint and an observed behaviour are two different questions, so the
+    words are not compared at all: they differ for every finding ever written,
+    and that difference IS the defect being reported."""
+    wider = scope_claim(SOURCE_ACCEPTED_DECISION, ("autoloop/",),
+                        "scoped to autoloop/", kind=CLAIM_CONSTRAINT)
+    needed = scope_claim(SOURCE_REPOSITORY, ("autoloop/policy.py",), "policy.py changes")
+
+    assert detect_conflicts([wider, needed]) == ()
+
+    # The other direction IS a disagreement: a file the accepted scope cannot
+    # reach is a task that cannot do what it was filed for.
+    narrower = scope_claim(SOURCE_ACCEPTED_DECISION, ("autoloop/policy.py",),
+                           "scoped to policy.py", kind=CLAIM_CONSTRAINT)
+    two_files = scope_claim(SOURCE_REPOSITORY, ("autoloop/policy.py", "autoloop/cli.py"),
+                            "both files change")
+    [conflict] = detect_conflicts([narrower, two_files])
+    assert conflict.scope_impact == SCOPE_CHANGED
+    assert conflict.stops_generation is True
+
+
+def test_coverage_is_measured_even_where_no_conflict_is_reported():
+    """`scope_impact` is a property of the PAIR, and it is what the
+    different-kind rule consults before deciding there is nothing to report.
+    Asserted directly, because that pair is (rightly) not returned as a conflict
+    — so a coverage rule that had quietly become "always CHANGED" would still
+    leave `detect_conflicts` looking correct on the covered case."""
+    covered = SourceConflict(
+        subject="s",
+        left=scope_claim(SOURCE_ACCEPTED_DECISION, ("autoloop/",), "scoped",
+                         kind=CLAIM_CONSTRAINT),
+        right=scope_claim(SOURCE_REPOSITORY, ("autoloop/policy.py",), "changes"),
+    )
+
+    assert covered.scope_impact == SCOPE_UNCHANGED
+    assert covered.stops_generation is False
+
+
+def test_a_finding_is_not_reported_as_a_source_conflict():
+    """The noise that would switch this guard off. Every finding says the code
+    does X while an accepted decision says X must not happen — if that counted,
+    every finding would stop generation and the feature would be turned off
+    within a day."""
+    constraint = scope_claim(SOURCE_ACCEPTED_DECISION, ("a.py",),
+                             "the gate must stay closed", kind=CLAIM_CONSTRAINT)
+    observed = scope_claim(SOURCE_REPOSITORY, ("a.py",), "the gate is open")
+
+    assert detect_conflicts([constraint, observed]) == ()
+
+
+def test_one_source_saying_several_things_is_not_a_disagreement_with_itself():
+    """The limit stated in `detect_conflicts`: within one tier, two sentences
+    are complementary, not contradictory. Without this every finding — which
+    says what it saw AND what it wants AND what it assumed — reports itself as
+    self-contradictory and all generation stops."""
+    assert detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "the gate returns True"),
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "the fix adds a check"),
+    ]) == ()
+
+
+def test_one_sentence_can_still_be_two_scopes():
+    """Agreeing is not the same as saying the same words. Skipping on the text
+    alone dropped the MATERIAL case — one sentence, two file lists — because the
+    two authors happened to word it alike."""
+    same_words = "fix the unreadable-file gate"
+    [conflict] = detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, ("autoloop/policy.py",), same_words),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("autoloop/inbox.py",), same_words,
+                    kind=CLAIM_CONSTRAINT),
+    ])
+    assert conflict.scope_impact == SCOPE_CHANGED
+
+    # And the control, or this would report every agreement as a conflict: two
+    # sources answering ONE question in the same words, with nothing positively
+    # different about their scope, agree.
+    assert detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, (), same_words),
+        scope_claim(SOURCE_ACCEPTED_DECISION, (), same_words),
+    ]) == ()
+
+
+def test_claims_about_different_subjects_are_never_compared():
+    assert detect_conflicts([
+        Claim(text="alpha", source=SOURCE_REPOSITORY, subject="one"),
+        Claim(text="beta", source=SOURCE_ACCEPTED_DECISION, subject="two"),
+    ]) == ()
+
+
+def test_two_spellings_of_one_conflict_share_an_identity():
+    """The digest the durable record is keyed on: a re-wrap must not read as a
+    second, different disagreement, and two genuinely different ones must not
+    collapse into one record."""
+    a = detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "The fix touches a.py!"),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("b.py",), "it touches b.py",
+                    kind=CLAIM_CONSTRAINT),
+    ])[0]
+    b = detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "the fix touches   a.py"),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("b.py",), "it touches b.py",
+                    kind=CLAIM_CONSTRAINT),
+    ])[0]
+    c = detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "something else entirely"),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("b.py",), "it touches b.py",
+                    kind=CLAIM_CONSTRAINT),
+    ])[0]
+
+    assert a.identity == b.identity
+    assert a.identity != c.identity
