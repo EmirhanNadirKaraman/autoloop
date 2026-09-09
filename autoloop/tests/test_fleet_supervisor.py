@@ -957,7 +957,10 @@ def test_a_lane_may_not_dispatch_the_task_the_plan_held(tmp_path):
     assert orch._registry.get("t2").status == "pending"
     assert config.tasks_file.read_bytes() == before, "the registry was not written"
     assert not config.executions_dir.exists(), "no attempt was charged"
-    assert orch.state.policy_denials == 1
+    # conc-12: a scope conflict is a SCHEDULING hold, so it spends the fleet's
+    # own allowance and never the denial budget whose exhaustion is loop-fatal.
+    assert orch.state.policy_denials == 0
+    assert orch.state.fleet_holds == 1
     assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
     outbox = orch.state.outbox or ""
     assert HOLD_SCOPE_CONFLICT in outbox and "autoloop/cli.py" in outbox
@@ -1692,7 +1695,11 @@ def test_a_task_a_neighbour_took_mid_round_is_not_dispatched_a_second_time(tmp_p
     assert dispatched == [], "the task the neighbour holds did not start"
     assert config.tasks_file.read_bytes() == before, "the registry was not written"
     assert not config.executions_dir.exists(), "no attempt was charged"
-    assert orch.state.policy_denials == 1
+    # conc-12: a sibling holding the row is the supervisor's own in-flight hold,
+    # reached one step later, so it spends the fleet's allowance rather than the
+    # denial budget whose exhaustion stops every lane.
+    assert orch.state.policy_denials == 0
+    assert orch.state.fleet_holds == 1
     assert denial_codes(config) == [FLEET_HOLD_DENIAL_CODE]
     assert "fleet_task_claimed_elsewhere" in transcript_types(config)
     outbox = orch.state.outbox or ""

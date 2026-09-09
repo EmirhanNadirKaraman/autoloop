@@ -885,13 +885,24 @@ def _session_task_id(state) -> str:
     return task_id if isinstance(task_id, str) else ""
 
 
-def _lane_claims(config, lanes: int) -> tuple[tuple[tuple[str, float | None], ...], str]:
-    """What every lane ABOVE ZERO says it is working, as `(task_id, age)` pairs
-    — or `(), note` when a lane could not be read (conc-09).
+def fleet_lane_claims(
+    config, lanes: int, exclude: int = 0
+) -> tuple[tuple[tuple[str, float | None], ...], str]:
+    """What every lane BUT `exclude` says it is working, as `(task_id, age)`
+    pairs — or `(), note` when a lane could not be read (conc-09, generalised
+    by conc-12).
 
-    Lane 0 is deliberately absent: `_strand_survey` already reads it through
-    `config.state_file`, which IS lane 0's state file (`state.lane_paths`), and
-    a second read of the same file is a second chance to disagree with itself.
+    ONE gatherer, two askers, and the only difference between them is which
+    lane's claim the CALLER already holds. `_strand_survey` reads lane 0
+    through `config.state_file` — which IS lane 0's state file
+    (`state.lane_paths`) — and passes it as the scalar claim, so it excludes 0
+    here; `orchestrator._reconcile_stranded_tasks` runs INSIDE a lane and holds
+    that lane's own claim, so it excludes its own index. A second walk written
+    for the second asker is how one of them quietly stops exempting a live
+    round, which is exactly the failure conc-12 was filed for.
+
+    Re-reading the excluded lane's file would be a second chance to disagree
+    with itself, which is why it is skipped rather than merged.
 
     **The `lanes <= 1` gate is the first statement, before any read**, exactly as
     `fleet_health` makes it and for its reason: `_retired_lane_indices` will
@@ -927,7 +938,9 @@ def _lane_claims(config, lanes: int) -> tuple[tuple[tuple[str, float | None], ..
             "is running cannot be established"
         )
     claims: list[tuple[str, float | None]] = []
-    for index in (*range(1, lanes), *retired):
+    for index in (*range(lanes), *retired):
+        if index == exclude:
+            continue
         paths = lane_paths(state_dir, index)
         try:
             state = StateStore(paths.state_file).load()
@@ -937,6 +950,13 @@ def _lane_claims(config, lanes: int) -> tuple[tuple[tuple[str, float | None], ..
             continue  # no session in that lane: nothing claimed, nothing to say
         claims.append((_session_task_id(state), current_round_age_seconds(state)))
     return tuple(claims), ""
+
+
+def _lane_claims(config, lanes: int) -> tuple[tuple[tuple[str, float | None], ...], str]:
+    """`fleet_lane_claims` with lane 0 excluded — `_strand_survey`'s caller,
+    kept under its own name because that is the one this file's own tests
+    substitute for."""
+    return fleet_lane_claims(config, lanes, exclude=0)
 
 
 def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:

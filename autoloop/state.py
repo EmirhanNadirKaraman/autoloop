@@ -154,6 +154,15 @@ if TYPE_CHECKING:
 # safe one: an empty id clears NOTHING (`orchestrator._end_fleet_throttle`), so
 # the worst it costs is a record left to expire on its own deadline, never a
 # window erased out from under the fleet.
+# NOT bumped for the fleet-hold accounting either (`LoopState.fleet_holds` /
+# `fleet_hold_alternative`, conc-12). Same shape again: two new fields defaulting
+# to 0 and `""`, and both defaults are the truth rather than a guess for a state
+# file written before they existed — that session charged its holds to
+# `policy_denials`, which is the very accounting this replaces, and it recorded
+# no alternative because nothing computed one. The direction is the safe one
+# too: 0 means the whole hold allowance is intact (a lane that would have been
+# refused is merely re-prompted), and an empty alternative PREFERS NOTHING, so
+# the queue's own head answers exactly as it does today.
 SCHEMA_VERSION = 3
 
 
@@ -658,6 +667,26 @@ class LoopState:
     #: let a directive refused INSIDE `_dispatch` zero the counter it was about
     #: to spend, and with it the budget (policy-01).
     policy_denials: int = 0
+    #: Consecutive directives THIS session lost to a fleet SCHEDULING hold
+    #: (conc-12) — `already_in_flight`, `scope_conflict`, `fleet_at_cap`. Its
+    #: own counter, and that is the whole point: a hold is the supervisor
+    #: declining to double-dispatch, not a reviewer proposing something policy
+    #: refuses, so it must not spend `policy_denials` above and must never
+    #: reach `policy_denial_budget_exhausted`, which is loop-fatal and took
+    #: every lane down with it. Bounded by `orchestrator.MAX_FLEET_HOLDS`,
+    #: whose exhaustion ends the ROUND at a clean boundary — the same answer
+    #: the hold's own correction asks the reviewer for. Cleared beside
+    #: `policy_denials` by `_step_executing` once a directive is acted on.
+    #: Always 0 at one lane, where no hold is ever raised.
+    fleet_holds: int = 0
+    #: The admissible task the last fleet hold NAMED, or `""`. Read by
+    #: `Orchestrator._refresh_lane_view` so the next request offers that task
+    #: instead of the held one — the denial already computed the answer, and a
+    #: re-prompt that does not carry it re-proposes the held task (the fixed
+    #: point `postcommit-01` closed for approvals). A HINT, never an
+    #: authorization: `TaskRegistry.set_lane_view` validates it against the
+    #: offerable queue and ignores an id that has since moved.
+    fleet_hold_alternative: str = ""
     outbox: str | None = None
     #: The raw patch text embedded in `outbox`, when that payload is a review
     #: packet whose diff is too large for one chat message. `None` for every
