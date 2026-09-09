@@ -278,6 +278,31 @@ class TaskExecution:
     pending_fault_code: str = ""
     presented_report_sha256: str = ""
     review_request_id: str = ""
+    #: The digest of the CONTEXT PACKET this round was cut with
+    #: (`context_packet.render_context_packet`), written by the loop BEFORE the
+    #: agent ran and carried into the review packet so the reviewer sees the
+    #: same artifact the worker was given.
+    #:
+    #: RE-WRITTEN EVERY ROUND, deliberately, and that is what makes it correct
+    #: after a base move: `_rebase_execution_if_stale` can change
+    #: `task_base_sha` between rounds, and a packet is cut from THAT round's
+    #: base, so a digest carried forward would name an artifact describing a
+    #: commit the round never worked against. The earlier round's digest is not
+    #: lost — it is inside the review packet that was sent for it, which is the
+    #: place a reviewer looks for what THAT round was given.
+    #:
+    #: LOOP-WRITTEN, never read back off anything an agent produced: it is
+    #: assigned from the loop's own render (`context_packet.record_round_packet`)
+    #: and never from an `ExecutionOutcome` field or a report. Same rule as
+    #: `presented_report_sha256` above — a digest an agent could supply would be
+    #: an echo wearing evidence's clothes.
+    #:
+    #: Empty on every record written before this field existed, on an AUDIT
+    #: round (which is not cut from a task's context), and on a round dispatched
+    #: by an embedder that renders no packet. Empty means "no packet is
+    #: recorded for this round", which is what `packet._format_context_packet`
+    #: renders nothing for — never "the packet was fine".
+    context_packet_sha256: str = ""
     intended_remote: str = ""
     intended_remote_ref: str = ""
     #: The candidate sha CONFIRMED to be on `intended_remote_ref`, and when.

@@ -3129,6 +3129,7 @@ def _agent_prompt(
     cleanup_paths: tuple[str, ...] = (),
     advisory_brief: str = "",
     revert_enabled: bool = False,
+    context_packet: str = "",
 ) -> str:
     parts = [
         "You are a write-capable coding subagent inside an automated "
@@ -3206,6 +3207,23 @@ def _agent_prompt(
         parts.append(cleanup)
     if feedback:
         parts.append(f"Revision feedback from the previous review round: {feedback}")
+    if context_packet:
+        # LAST, and after every instruction this prompt gives — which is the
+        # same ordering rule `context.render_context` states for the CONTEXT
+        # block and `packet._format_context_packet` for the review packet
+        # (docs/SECURITY.md S33). This is the only section carrying text nobody
+        # in this package wrote (a record's title, its invariant, the paths it
+        # names), so keeping every loop-authored instruction ABOVE it means a
+        # record cannot displace, precede or appear to amend one — including the
+        # ground rules, the scope list and the revise feedback.
+        #
+        # It displaces nothing: the unconditional sections are untouched, the
+        # adversarial instruction still names the scope list "below" and still
+        # sits immediately above it, and the cleanup-then-feedback adjacency is
+        # unchanged. Rendered only when a packet was actually supplied — an
+        # embedder with no reader wired gets exactly the prompt it got before
+        # this existed, rather than a heading with nothing under it.
+        parts.append(context_packet)
     # Empties are dropped rather than joined, because one section is allowed to
     # render nothing: `_delete_instruction` returns "" for a task with no
     # approved paths (its fail-closed branch), and an unfiltered join would put
@@ -3882,6 +3900,7 @@ class ImplementExecutor:
         validation_env: ValidationEnv | None = None,
         cleanup_paths_for: Callable[[str], tuple[str, ...]] | None = None,
         revert_authority=None,
+        context_packet_for: Callable[[str], str] | None = None,
         advisory_max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
         advisory_zero_call_returns: int = ADVISORY_ZERO_CALL_RETURNS,
         abort_file: Path | None = None,
@@ -3975,6 +3994,40 @@ class ImplementExecutor:
         # the capability, and every `REVERT-OUT-OF-SCOPE:` line is ignored and
         # reported as ignored. Same fail-closed default as `cleanup_paths_for`.
         self._revert_authority = revert_authority
+        # THIS ROUND'S CONTEXT PACKET, as text, read by task id (ctx-05).
+        # `context_packet.ContextPacketStore.text_for` in a wired run: the
+        # orchestrator renders the packet from the task's own worker repository
+        # at `TaskExecution.task_base_sha`, stamps its digest onto the execution
+        # record and stores it BEFORE this executor is called, so what this
+        # reads back is the artifact the digest already names.
+        #
+        # Injected as a callable, exactly like `cleanup_paths_for` and
+        # `revert_authority` above, so this module keeps knowing nothing about
+        # where loop state lives. None — every direct `execute()` test, and any
+        # embedder that has not wired one — means NO packet section in the
+        # prompt at all, which is the fail-closed default: a round is told less,
+        # never told something invented. It grants nothing either way; a context
+        # packet is data, and `tasks.effective_approved_paths` below is still
+        # the whole of what this round may write.
+        #
+        # NOT WIRED IN PRODUCTION YET, and stated here rather than left to be
+        # discovered: `cli._build_executor` is the only construction site and
+        # ctx-05 could not touch that file, so this reads `None` in a real run
+        # and the prompt carries no packet section.
+        #
+        # THE EDIT IS ONE KEYWORD, IN `cli._build_executor`, on the
+        # `ImplementExecutor(...)` call it already makes:
+        # `context_packet_for=ContextPacketStore(config.context_packets_dir)
+        # .text_for`. That function takes the `AutoloopConfig` as its first
+        # parameter, so nothing has to be threaded from `_build_orchestrator`
+        # the way `cleanup_paths_for` and `revert_authority` are — those come
+        # from the caller because they need the `TaskExecutionStore`, and this
+        # one needs only a path the config already answers for.
+        #
+        # Everything on the other side of it is live — the packet is rendered,
+        # hashed onto the execution record and shown to the reviewer on every
+        # implement/revise round.
+        self._context_packet_for = context_packet_for
         # How many advisory runs ONE round may pay for. A constructor override
         # rather than a config key: a key would have to be read in `cli.py` and
         # threaded through from there, and a setting nothing reads is worse than
@@ -4071,6 +4124,24 @@ class ImplementExecutor:
             return tuple(self._cleanup_paths_for(task.id) or ())
         except Exception:
             return ()
+
+    def _round_context_packet(self, task: Task) -> str:
+        """This round's context packet, as text, or `""`.
+
+        Fail-closed at both ends, exactly like `_recorded_cleanup_paths` above:
+        no injected reader means no section, and a reader that raises — a
+        missing file, an unreadable one, a stored packet whose bytes do not hash
+        to the digest it carries — yields `""` rather than propagating. The
+        consequence of an empty answer is that the round is told LESS; the
+        consequence of guessing would be a round told something the loop never
+        rendered, under a digest the reviewer is about to be shown.
+        """
+        if self._context_packet_for is None:
+            return ""
+        try:
+            return self._context_packet_for(task.id) or ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _apply_recorded_cleanup(
@@ -4611,12 +4682,20 @@ class ImplementExecutor:
         # — no recorded paths means no request can be authorized anyway, and no
         # base sha means there is nothing to restore FROM.
         revert_base_sha = self._revert_base_sha(task)
+        # Read BEFORE the agent runs, like the two above, and for a stricter
+        # reason: this is the round's own context packet, and the loop rendered
+        # and stamped it onto the execution record before this executor was
+        # called. Reading it here — rather than at any later point — is what
+        # keeps "the packet the agent was given" and "the digest the reviewer is
+        # shown" the same artifact.
+        context_packet_text = self._round_context_packet(task)
         base_prompt = _agent_prompt(
             task,
             feedback,
             cleanup_paths,
             rendezvous.brief() if offered else "",
             bool(cleanup_paths) and bool(revert_base_sha),
+            context_packet_text,
         )
         spec = AgentSpec(domain=task.id, title=task.title, prompt=base_prompt)
         reports: list[str] = []

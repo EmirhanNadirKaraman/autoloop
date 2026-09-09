@@ -16,6 +16,7 @@ rewrites.
 | `tasks.json` | object | The task registry: id, status, priority, `depends_on`, `approved_paths`. |
 | `transcript.jsonl` | one JSON object per line | Append-only event log. A partial final line is expected and tolerated. |
 | `executions/<task>.json` | object | Per-task execution record: branch, base sha, candidate sha, review round, attempt ledger. |
+| `context-packets/<task>.json` | object | The context packet the task's CURRENT round was cut with. Replaced per round. |
 | `blockers/` | one file per blocker | Open and resolved blockers, with the code that raised them. |
 | `pending_upgrade.json` | object | A merge that changed loop code, and whether the handoff happened. |
 | `wanted_decisions.json` | object | `{verb: count}` — the verbs reviewers said they WOULD have used, `none` included. Evidence for a human; enforces nothing, so an unreadable file is read as empty and rewritten. |
@@ -166,6 +167,39 @@ window shut, exactly as a live, worker-backed or published one does.
 Nothing archives an orphaned record automatically. `release` and `discard` both
 require a task id the registry knows, so retiring one is still a move into
 `executions/archive/` by hand.
+
+## Context packet
+
+`context-packets/<task>.json`, one per task, written by
+`context_packet.ContextPacketStore` at `AutoloopConfig.context_packets_dir` —
+under the state directory, beside `executions/`, and NEVER inside the checkout:
+`escape_detector` snapshots the observed checkout with an exclusion list that is
+empty by measurement, so a packet written into the tree would be reported as
+`checkout_escape_detected`.
+
+`task_id`, `task_base_sha`, `worker_repo`, `digest`, `rendered_at`, `text`.
+
+`text` is the packet, and `digest` covers exactly it — nothing else in the
+envelope, and `rendered_at` deliberately sits OUTSIDE it, because two renders of
+one repository state have to produce the same bytes. A file whose stored
+`digest` does not cover its own `text` is UNREADABLE, not "close enough": it is
+neither served to a prompt nor shown to a reviewer. Absent and unreadable both
+read as "no packet" — unlike an execution record, which raises — because the
+binding artifact is `TaskExecution.context_packet_sha256` next door, and the
+review packet reports the difference rather than substituting anything.
+
+REPLACED PER ROUND, never accumulated. `orchestrator._dispatch_task_postcommit`
+renders one for every implement/revise round from the task's OWN worker
+repository at `TaskExecution.task_base_sha` — below every path that can still
+move that base, above the agent — so a revise round after
+`_rebase_execution_if_stale` is cut from the base it now names. Each earlier
+round's digest survives inside the review packet that was sent for it. An AUDIT
+round renders none, and its record's digest stays empty.
+
+The packet is DATA. Nothing parses it, no gate reads it, and
+`tasks.effective_approved_paths` is never handed a context reference. It is
+rendered strictly after every stamp line, in the agent prompt and in the review
+packet alike; see `docs/SECURITY.md` S33 for the two controls.
 
 ## Context record
 
