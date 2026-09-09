@@ -5,6 +5,11 @@
                             [--continuous] [--max-steps N]
     python -m autoloop status | tasks | doctor | next-task | blockers [--all]
                                                                (read-only, no lock)
+    python -m autoloop context explain --task <id> [--packet]
+                            (why that task's round got the context it got:
+                             selected / rejected / stale / contradictory
+                             records and the packet digest. Read-only, no lock —
+                             safe while a round is running)
     python -m autoloop answer <blocker-id> "<text>"
     python -m autoloop discard <task-id> --reason "<text>"
                             (a QUARANTINED task: retires BOTH halves of its
@@ -36,7 +41,8 @@ Locking: run / resume / reset / answer / retire / release / discard /
 merge-backlog take
 the single-instance lock on the state directory (fail closed against a live
 process; `unlock` is the only stale-lock recovery, and it refuses live locks).
-status / tasks / doctor / next-task / blockers / pause / abort / merge-window /
+status / tasks / doctor / next-task / blockers / context explain / pause / abort /
+merge-window /
 shipped-report stay available while locked — they only report. `abort` is in
 that list for the same reason `pause` is, and it is the whole point of it: it
 writes one flag file outside the checkout and touches no state, no registry and
@@ -88,6 +94,11 @@ from .audit.markdown import MarkdownPolicy
 from .blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, lane_id, load_config as _read_config_file
+from .context_packet import (
+    ContextPacketStore,
+    explanation_lines,
+    render_packet_with_resolution,
+)
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
 from . import health, heartbeat
@@ -4758,6 +4769,115 @@ def _cmd_blockers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_context_explain(args: argparse.Namespace) -> int:
+    """WHY did one task get the context it got? Read-only, no lock (ctx-08).
+
+    Read-only in the same sense `_cmd_blockers` is, and safe for the same
+    reason: it takes no lock and writes nothing — not into the checkout, not
+    into the state directory. Every git call it makes goes through the same
+    three read-only plumbing commands the resolver already uses (`rev-parse`,
+    `ls-tree`, `diff-tree`), none of which touches an index or a ref, so it is
+    usable while a round is running. That is the only moment an operator
+    actually asks this question.
+
+    **IT CALLS THE RESOLVER; IT DOES NOT REIMPLEMENT ONE.** The selection it
+    prints comes out of `context_packet.render_packet_with_resolution` — the one
+    function the dispatch path itself renders each round's packet with — at that
+    round's own base, through that round's own worker repository, with the same
+    `[context] max_records` budget. A diagnostic that can disagree with the loop
+    is worse than none, which is the argument `context.MERGE_WINDOW_LABEL`
+    already makes for sourcing its line by calling `_merge_window_blockers`
+    rather than deciding the merge window a second time.
+
+    **THE ROUND THE EXECUTION RECORD NAMES**, and no other. The base, the worker
+    repository and the review round are read off `TaskExecution`, because that
+    is what "the context it GOT" means; a task that has never been dispatched
+    has no such round, and this refuses rather than inventing a base to resolve
+    against — an answer about a dispatch that never happened is a fabricated
+    verdict, which is the same call `context_resolver` makes for a revision it
+    cannot read.
+
+    Exit codes, stated because an unstated one gets parsed anyway: **0** = the
+    question was answered, **1** = it could not be. A digest that does NOT match
+    the recorded one is a 0: it is information this command exists to surface,
+    not a failure of the command.
+    """
+    config = load_config(args.config)
+    task_id = args.task
+    _task_store, registry = _load_tasks(config)
+    if not registry.has(task_id):
+        print(
+            f"error: no task {task_id!r} in the roadmap — nothing to explain. "
+            "`python3 -B -m autoloop tasks` lists the ids."
+        )
+        return 1
+    task = registry.get(task_id)
+    try:
+        execution = TaskExecutionStore(config.executions_dir).load(task_id)
+    except StateCorruptError as exc:
+        # FAIL CLOSED on the provenance record. Reading a corrupt record as
+        # absent would answer this question about a round whose base, worker and
+        # digest are exactly what could not be read.
+        print(f"error: task {task_id}'s execution record is unreadable ({exc})")
+        return 1
+    if execution is None:
+        print(
+            f"error: no execution record for {task_id} — no round has been "
+            "dispatched for it, so there is no context it got. This command "
+            "explains the round the record names; it does not invent a base to "
+            "resolve against."
+        )
+        return 1
+    worker = str(execution.worktree_path or "")
+    # `Path("")` is `Path(".")`, so an empty worktree path would silently run
+    # git in whatever directory the operator happens to be standing in — the
+    # observed checkout, most likely — and render a packet from the wrong
+    # repository under this task's name. Refused, loudly, with the reason.
+    if not worker or not Path(worker).is_dir():
+        print(
+            f"error: task {task_id}'s worker repository "
+            f"({worker or '(none recorded)'}) is not a directory this command "
+            "can read, so its base commit cannot be resolved. A quarantined or "
+            "released round leaves the record naming a worker that has moved."
+        )
+        return 1
+    try:
+        render = render_packet_with_resolution(
+            task,
+            execution,
+            GitGateway(Path(worker), PolicyEngine(config.policy)),
+            # NO RECORD INDEX IS WIRED INTO THIS LOOP, and this passes the same
+            # `None` the dispatch does (`orchestrator._context_record_index`
+            # answers `None` while `Orchestrator(context_records=...)` is unset,
+            # which is every production run today). The packet then SAYS the
+            # index is unwired and reports every cited id as unresolved. Reading
+            # some other directory here — one the round never saw — is exactly
+            # the disagreement this command must not be able to produce.
+            None,
+            max_records=config.context.max_records,
+        )
+    except (GitError, OSError) as exc:
+        # The render answers rather than raising for everything git can REFUSE.
+        # What is left is the worker repository disappearing between the check
+        # above and this call, which reaches `subprocess` as an `OSError` and
+        # would otherwise be a traceback out of a read-only command.
+        print(
+            f"error: task {task_id}'s context could not be resolved in "
+            f"{worker} ({type(exc).__name__}: {exc}) — nothing was explained, "
+            "because every verdict would have been invented."
+        )
+        return 1
+    for line in explanation_lines(
+        render,
+        task=task,
+        execution=execution,
+        stored=ContextPacketStore(config.context_packets_dir).load(task_id),
+        include_packet_text=args.packet,
+    ):
+        print(line)
+    return 0
+
+
 #: Blocker codes whose condition lives in the ENVIRONMENT, not in an answer.
 #: Text alone must never clear these: the operator saying "fixed it" is not
 #: evidence that it is fixed, and resolving on a promise would send the loop
@@ -9232,6 +9352,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     intake.set_defaults(func=_cmd_intake)
+
+    # ---- context: why did this task get the context it got? (ctx-08) --------
+    # Read-only and lock-free, exactly like `blockers` and `merge-window`: it
+    # reports what the dispatch path resolved and writes nothing anywhere, so it
+    # is usable while a round is running — which is when the question is asked.
+    context_p = sub.add_parser(
+        "context",
+        help=(
+            "explain the context ONE task's round was given: which records were "
+            "selected and why, which were rejected, which are stale or "
+            "contradictory, and the packet digest (read-only, no lock)"
+        ),
+    )
+    context_sub = context_p.add_subparsers(dest="context_cmd", required=True)
+    context_explain = context_sub.add_parser(
+        "explain",
+        help="why this task got the context it got (read-only, no lock)",
+    )
+    add_config(context_explain)
+    context_explain.add_argument(
+        "--task", required=True, help="the task id whose round to explain"
+    )
+    context_explain.add_argument(
+        "--packet",
+        action="store_true",
+        help=(
+            "also print the packet's own text in full — by default only its "
+            "digest is shown, and the bounds section says so"
+        ),
+    )
+    context_explain.set_defaults(func=_cmd_context_explain)
 
     blockers = sub.add_parser(
         "blockers", help="list open operator-facing blockers (read-only, no lock)"

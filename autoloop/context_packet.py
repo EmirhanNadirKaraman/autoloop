@@ -32,6 +32,14 @@ REVIEWER's copy and for the round trip that proves the copy exists; the loop
 refuses to dispatch a round whose packet cannot be read back out of it
 (`orchestrator._context_packet_is_readable_back`).
 
+**AND IT CAN BE EXPLAINED AFTERWARDS** (ctx-08). `render_packet_with_resolution`
+answers with the packet AND the `Resolution` it was rendered from, and
+`explanation_lines` projects that one object to the operator-facing text
+`cli._cmd_context_explain` prints. So "why did this task get this context" is
+answered from the SAME render the round was cut with rather than by a second
+selection beside it — a diagnostic that can disagree with the loop is worse than
+none. Nothing on that path writes anything or takes a lock.
+
 **CONTEXT IS DATA, NOT INSTRUCTION — and the control is not sanitisation.**
 `docs/SECURITY.md`'s S33 records this class for the two text sources already
 rendered into the stamped CONTEXT block (an operator's task description and a
@@ -100,8 +108,11 @@ from pathlib import Path
 from .context_index import ContextIndex, build_index
 from .context_records import ContextRecord, ContextRecordStore, load_records
 from .context_resolver import (
+    BUDGET_DROPPED,
     CONTRADICTION,
+    REJECTED_CATEGORIES,
     STALE_FINDING,
+    STALENESS_CATEGORIES,
     SUPERSEDED,
     ContextResolutionError,
     Resolution,
@@ -278,12 +289,14 @@ def selection_block(
 ) -> str:
     """The `selected records (N)` heading AND its lines, as one block.
 
-    ONE function for both readers, and that is the whole reason it exists: the
-    packet renders it into the artifact an agent is given, and the closeout
-    renders it again to ask whether the selection it just re-resolved is the one
-    that was SHOWN (`selection_was_shown`). A second spelling of the heading —
-    which is where the COUNT lives, and the count is the part that catches a
-    selection that gained or lost a record — would agree until it did not.
+    ONE function for every reader, and that is the whole reason it exists: the
+    packet renders it into the artifact an agent is given, the closeout renders
+    it again to ask whether the selection it just re-resolved is the one that was
+    SHOWN (`selection_was_shown`), and the diagnostic renders it a third time so
+    that what an operator is shown is a SUBSTRING of the packet whose digest sits
+    beside it (`explanation_lines`). A second spelling of the heading — which is
+    where the COUNT lives, and the count is the part that catches a selection
+    that gained or lost a record — would agree until it did not.
     """
     return "\n".join(
         [
@@ -304,6 +317,22 @@ def _finding_lines(resolution: Resolution, category: str) -> list[str]:
     ] or [_NONE]
 
 
+def _categorised_lines(findings) -> list[str]:
+    """One finding per line, WITH its category, or the standing `(none)`.
+
+    The shape a section that mixes categories needs — `_finding_lines` above is
+    for a section whose heading already names the one category it holds, and a
+    line that dropped the category out of a mixed section would report that a
+    record was rejected without saying whether it was superseded, unknown or
+    dropped by the budget.
+    """
+    return [
+        f"  {finding.category} — {_one_line(finding.subject) or '(none)'} — "
+        f"{_one_line(finding.detail)}"
+        for finding in findings
+    ] or [_NONE]
+
+
 def _question_lines(resolution: Resolution) -> list[str]:
     """Everything the resolution reported that is not one of the three named
     sections — the questions it could not answer.
@@ -315,12 +344,9 @@ def _question_lines(resolution: Resolution) -> list[str]:
     filter that silently passes what it does not recognise.
     """
     named = {STALE_FINDING, SUPERSEDED, CONTRADICTION}
-    return [
-        f"  {finding.category} — {_one_line(finding.subject) or '(none)'} — "
-        f"{_one_line(finding.detail)}"
-        for finding in resolution.findings
-        if finding.category not in named
-    ] or [_NONE]
+    return _categorised_lines(
+        [finding for finding in resolution.findings if finding.category not in named]
+    )
 
 
 def _unresolvable_lines(task: Task, reason: str) -> list[str]:
@@ -340,6 +366,51 @@ def _unresolvable_lines(task: Task, reason: str) -> list[str]:
     return lines
 
 
+@dataclass(frozen=True)
+class PacketRender:
+    """ONE render: the packet, and the RESOLUTION it was rendered from.
+
+    Why it exists (ctx-08). A reader that has to EXPLAIN a packet — which
+    records were selected and why, which were rejected and why — needs the
+    `Resolution` the render already computed. Resolving a second time to get it
+    would be a second selection beside the one the round was given, and a
+    diagnostic that can disagree with the loop is worse than none: two
+    resolutions agree until the day a record directory changes between them, and
+    then the operator is told something no round ever saw. So the render answers
+    with both, and `explanation_lines` below is a pure function of THIS object.
+
+    `resolution` is `None` for exactly the case `render_packet_with_resolution`
+    describes — a base commit that could not be read, so nothing was selected
+    and nothing was verified against anything. `resolution_error` then carries
+    the one-line reason, which is the same sentence the packet's own
+    `unresolved questions` section states.
+
+    `entries` and `rev` are carried because `selection_block` takes exactly
+    those two arguments: a reader holding this object can re-render the packet's
+    own selection block byte for byte rather than spelling a second one.
+    """
+
+    packet: ContextPacket
+    resolution: Resolution | None
+    resolution_error: str
+    #: The tree listing the object ids were read from, or `None` when the tree
+    #: could not be listed at all. Never `{}` for that case — an empty listing
+    #: and an unread one are different facts and are reported differently.
+    entries: dict[str, tuple[str, str, str]] | None
+    entries_error: str
+    #: Was a record index wired in at all? `False` is "no record directory is
+    #: wired into this loop", which is NOT the same fact as "the directory is
+    #: empty" — see the `records_line` below, which says which.
+    index_wired: bool
+    #: The `context_records:` line the packet carries, verbatim. Shared rather
+    #: than re-derived, so the packet and its explanation cannot describe one
+    #: index in two ways.
+    records_line: str
+    #: The revision the selection was resolved against: the round's own base.
+    rev: str
+    tree: str
+
+
 def render_context_packet(
     task: Task,
     execution: TaskExecution,
@@ -348,11 +419,37 @@ def render_context_packet(
     *,
     max_records: int,
 ) -> ContextPacket:
-    """Render THE packet for one round. Pure given its inputs the way
+    """THE packet for one round — `render_packet_with_resolution().packet`.
+
+    The name every caller that only wants the artifact keeps using. It is a
+    reader of the one render below and never a second rendering: two functions
+    that both built a packet would be two sets of bytes under one digest label,
+    which is the failure this whole module is written against.
+    """
+    return render_packet_with_resolution(
+        task, execution, worktree_git, index, max_records=max_records
+    ).packet
+
+
+def render_packet_with_resolution(
+    task: Task,
+    execution: TaskExecution,
+    worktree_git: GitGateway,
+    index: ContextIndex | None = None,
+    *,
+    max_records: int,
+) -> PacketRender:
+    """Render THE packet for one round, and answer with the SELECTION it was
+    rendered from (`PacketRender`). Pure given its inputs the way
     `context_resolver.resolve_context` is: a task, an execution record, a
     gateway, an index and a budget in; a value out. It reads no config, writes
     nothing, and takes its revision from `execution.task_base_sha` rather than
     from anything about the current checkout.
+
+    THE ONE PLACE A PACKET IS BUILT. `render_context_packet` above is a reader
+    of this, and so is `cli._cmd_context_explain` — which is what makes the
+    diagnostic's answer the dispatch's own answer rather than a second opinion
+    about it.
 
     `index=None` means NO RECORD INDEX IS WIRED INTO THIS LOOP YET — ctx-03
     fixed the record SHAPE and deliberately not its location, and nothing has
@@ -488,12 +585,22 @@ def render_context_packet(
         ]
     lines += ["", f"unresolved questions ({len(questions)}):", *(questions or [_NONE])]
     text = "\n".join(lines)
-    return ContextPacket(
-        task_id=task.id,
-        task_base_sha=base_sha,
-        worker_repo=str(execution.worktree_path),
-        text=text,
-        digest=packet_digest(text),
+    return PacketRender(
+        packet=ContextPacket(
+            task_id=task.id,
+            task_base_sha=base_sha,
+            worker_repo=str(execution.worktree_path),
+            text=text,
+            digest=packet_digest(text),
+        ),
+        resolution=resolution,
+        resolution_error=resolution_error,
+        entries=entries,
+        entries_error=entries_error,
+        index_wired=wired,
+        records_line=records_line,
+        rev=base_sha,
+        tree=tree,
     )
 
 
@@ -507,6 +614,284 @@ def prompt_section(packet: ContextPacket) -> str:
     `packet_digest(text) == digest` and nothing else.
     """
     return f"{packet.text}\n{DIGEST_LABEL}: {packet.digest}"
+
+
+# ===========================================================================
+# EXPLAINING ONE ROUND'S PACKET — read-only, and never a second selection.
+# ===========================================================================
+#
+# ONE CLAIM (ctx-08): an operator can ask why a task got the context it got and
+# get an answer that is CHECKABLE — which records were selected and why, which
+# were rejected and why, which are stale or contradictory, and the digest of the
+# packet those answers came out of.
+#
+# **It is rendered from a `PacketRender`, and from nothing else.** No resolving
+# here, no index read here, no git call here: this is a pure function of the one
+# render the dispatch path itself performs, so the explanation cannot describe a
+# selection the packet does not carry. `cli._cmd_context_explain` is the caller
+# and it does the same — one render, one resolution, one digest.
+#
+# **The record sections are the PACKET'S OWN BYTES.** `selection_block` is
+# called, not re-spelled, exactly as the closeout calls it
+# (`selection_was_shown`): the block this prints is a substring of the packet
+# whose digest is printed beside it, which is a stronger statement than any two
+# renderings agreeing. The count lives in that heading, and a second spelling of
+# a count is how two renderings start disagreeing about a record.
+
+#: The sections a rejection can be reported under, and the heading each carries.
+#: Spelled once because the tests assert on them and an operator greps them.
+EXPLAIN_SELECTED_HEADING = "selected records"
+EXPLAIN_REJECTED_HEADING = "rejected records"
+EXPLAIN_STALE_HEADING = "stale or unverified records"
+EXPLAIN_CONTRADICTORY_HEADING = "contradictory records"
+EXPLAIN_OTHER_HEADING = "other findings"
+EXPLAIN_DIGEST_HEADING = "digest"
+EXPLAIN_BOUNDS_HEADING = "bounds — what this command did NOT print"
+
+
+def _digest_lines(
+    render: PacketRender, execution: TaskExecution, stored: ContextPacket | None
+) -> list[str]:
+    """The three digests, and whether they agree — the checkable half.
+
+    NOTHING HERE READS AS AGREEMENT WHEN IT IS NOT ONE, which is the whole point
+    of separating the three:
+
+    * `rendered now` is what the dispatch path would produce for this task at
+      this base at this moment;
+    * `recorded` is what the loop wrote onto the execution record when it
+      actually dispatched the round. Empty is NOT a match — an audit round
+      records none and a task that never ran a write-capable round has none, and
+      both are said rather than shown as a blank;
+    * `stored` is the reviewer's copy. `ContextPacketStore.load` answers `None`
+      for ABSENT and for UNREADABLE alike (a file whose bytes do not hash to its
+      own recorded digest is refused exactly like a missing one), so this
+      reports both together rather than claiming to know which.
+
+    A DIFFERENCE IS NOT A DEFECT, and saying so is what stops this command
+    crying wolf: `review_round` is rendered INTO the packet, so a re-render
+    after a revise verdict and before the next dispatch legitimately differs;
+    so does one taken after the base moved, after the record directory changed,
+    or against a worker repository that has since been quarantined. The line
+    names those causes instead of implying tampering.
+    """
+    rendered = render.packet.digest
+    lines = [
+        f"  rendered now: {rendered}",
+        "    — the packet the dispatch path would produce for this task at "
+        f"{render.rev or '(no base recorded)'} right now",
+    ]
+    recorded = execution.context_packet_sha256
+    if not recorded:
+        lines += [
+            "  recorded on the execution record: (none)",
+            "    — no write-capable round has recorded a packet digest for this "
+            "task: an audit round records none, and a task that has never been "
+            "dispatched has none. NOT a match with the render above.",
+        ]
+    elif recorded == rendered:
+        lines += [
+            f"  recorded on the execution record: {recorded}",
+            "    — MATCHES the render above: the selection printed here is the "
+            "one this round was given.",
+        ]
+    else:
+        lines += [
+            f"  recorded on the execution record: {recorded}",
+            "    — DIFFERS from the render above. That is information, not "
+            "necessarily a fault: review_round is rendered into the packet and "
+            f"now reads {execution.review_round}, the base may have moved, the "
+            "record directory may have changed, or this worker repository may "
+            "no longer be readable. The lines above say which of those applies.",
+        ]
+    if stored is None:
+        lines += [
+            "  stored packet file: (absent or unreadable)",
+            "    — this store cannot tell those two apart: a file whose bytes do "
+            "not hash to its own recorded digest is refused exactly like a "
+            "missing one, so neither is reported as the other.",
+        ]
+    else:
+        agrees = "MATCHES" if stored.digest == rendered else "DIFFERS from"
+        lines += [
+            f"  stored packet file: {stored.digest}",
+            f"    — {agrees} the render above; this is the copy a reviewer is "
+            "shown.",
+        ]
+    return lines
+
+
+def _bounds_lines(render: PacketRender, *, packet_text_printed: bool) -> list[str]:
+    """WHAT WAS NOT PRINTED, said out loud. NO SILENT CAPS.
+
+    Two different bounds, kept apart because they have different owners and
+    different repairs:
+
+    * what this COMMAND withheld — the packet's own text, unless `--packet` was
+      given. It is the one thing here that is bounded at all, and the line says
+      how big it is and how to see it;
+    * what the RESOLVER dropped — `[context] max_records`. Each dropped record
+      already has its own `budget_dropped` finding in the rejected section
+      above, so the bound is named AND its victims are listed; a count with no
+      names would be the silent cap this rule exists against.
+
+    Everything else is printed in full: every selected record, every source
+    path, every finding. That sentence is here so that adding a truncation later
+    means editing a claim rather than quietly falsifying one.
+    """
+    text = render.packet.text
+    lines = [f"{EXPLAIN_BOUNDS_HEADING}:"]
+    if packet_text_printed:
+        lines.append(
+            f"  the packet's own text ({len(text.splitlines())} lines, "
+            f"{len(text)} characters) IS printed below, in full."
+        )
+    else:
+        lines.append(
+            f"  the packet's own text ({len(text.splitlines())} lines, "
+            f"{len(text)} characters) is not reproduced here — pass --packet to "
+            "print it in full. Its digest is above."
+        )
+    resolution = render.resolution
+    dropped = () if resolution is None else resolution.findings_of(BUDGET_DROPPED)
+    if resolution is None:
+        lines.append(
+            "  the resolver never ran, so it dropped nothing: the reason is on "
+            "the resolution line above."
+        )
+    elif dropped:
+        lines.append(
+            f"  the resolver's own budget (max_records={resolution.max_records}) "
+            f"dropped {len(dropped)} record(s); every one of them is named in "
+            f"the {EXPLAIN_REJECTED_HEADING} section above."
+        )
+    else:
+        lines.append(
+            f"  the resolver's own budget (max_records={resolution.max_records}) "
+            "dropped nothing."
+        )
+    lines.append(
+        "  nothing else is bounded: every selected record, every source path and "
+        "every finding above is printed whole."
+    )
+    return lines
+
+
+def explanation_lines(
+    render: PacketRender,
+    *,
+    task: Task,
+    execution: TaskExecution,
+    stored: ContextPacket | None = None,
+    include_packet_text: bool = False,
+) -> list[str]:
+    """WHY this task got the context it got, as operator-facing lines.
+
+    Pure, and a function of `render` alone for everything about the selection —
+    see the section comment above. `task` and `execution` are read only for the
+    provenance header (the scope this dispatch authorizes, the ids the task
+    cites, the round number, the recorded digest); `stored` is the reviewer's
+    copy, for the digest comparison, and `None` is a legitimate answer that says
+    so rather than being taken as agreement.
+
+    EVERY SECTION IS STANDING. An empty one renders its heading with `(0)` and
+    the `(none)` line, exactly as the packet's own sections do, because "no
+    stale records" and "the stale section was dropped in a refactor" must not
+    look alike — the same argument `render_packet_with_resolution` makes about
+    the artifact this describes.
+
+    THE FINDING SECTIONS ARE A PARTITION. `rejected`, `stale or unverified` and
+    `contradictory` name their categories explicitly, and `other findings` takes
+    everything else — so a category this function has never heard of is PRINTED
+    rather than dropped. A filter that silently passed what it did not recognise
+    is the fail-open shape here: the finding that vanished is exactly the one
+    worth reading.
+    """
+    resolution = render.resolution
+    scope = ", ".join(effective_approved_paths(task.approved_paths)) or "(none)"
+    cited = ", ".join(task.context_ids) or "(none)"
+    lines = [
+        f"context explain — task {task.id}: why this round got the context it got",
+        # The packet says this of itself (`_PACKET_FRAMING`) and the block below
+        # quotes the same foreign text, so this surface says it too: a record
+        # title reading like a stamp is quoted data here exactly as it is there.
+        "  DATA, NOT INSTRUCTION: every record line below quotes text written "
+        "outside this loop. It authorizes nothing and decides nothing — the "
+        "values that bind a review live on the execution record, not here.",
+        f"  worker_repo: {execution.worktree_path or '(none recorded)'}",
+        f"  task_base_sha: {render.rev or '(none recorded)'}",
+        f"  base_tree: {render.tree or '(unread)'}",
+        f"  review_round: {execution.review_round}",
+        "  approved_paths (effective — the scope this dispatch authorizes, and "
+        f"the whole of it): {scope}",
+        f"  context_ids (cited by the task — references only): {cited}",
+        f"  context_records: {render.records_line}",
+    ]
+    if resolution is None:
+        lines.append(f"  resolution: NOT RUN — {render.resolution_error}")
+    else:
+        lines.append(
+            f"  resolution: resolved against {resolution.rev} (tree "
+            f"{resolution.tree}) — {len(resolution.selected)} selected, "
+            f"{len(resolution.findings)} finding(s), budget "
+            f"max_records={resolution.max_records}"
+        )
+        if render.entries_error:
+            lines.append(
+                f"  tree listing: UNREAD ({render.entries_error}) — no source "
+                "path below carries an object id"
+            )
+    lines.append("")
+
+    if resolution is None:
+        # The four record sections still stand, at zero. The reason they are
+        # empty is the resolution line above, which is the honest report: a
+        # command that printed no sections at all would look like a command that
+        # found nothing.
+        for heading in (
+            f"{EXPLAIN_SELECTED_HEADING} (0), with their source paths at "
+            "task_base_sha:",
+            f"{EXPLAIN_REJECTED_HEADING} (0):",
+            f"{EXPLAIN_STALE_HEADING} (0):",
+            f"{EXPLAIN_CONTRADICTORY_HEADING} (0):",
+            f"{EXPLAIN_OTHER_HEADING} (0):",
+        ):
+            lines += [heading, _NONE, ""]
+    else:
+        rejected = [f for f in resolution.findings if f.category in REJECTED_CATEGORIES]
+        stale = [f for f in resolution.findings if f.category in STALENESS_CATEGORIES]
+        contradictory = list(resolution.findings_of(CONTRADICTION))
+        claimed = {*REJECTED_CATEGORIES, *STALENESS_CATEGORIES, CONTRADICTION}
+        other = [f for f in resolution.findings if f.category not in claimed]
+        lines += [
+            # THE PACKET'S OWN BLOCK, called rather than re-spelled.
+            *selection_block(resolution, render.entries, render.rev).split("\n"),
+            "",
+            f"{EXPLAIN_REJECTED_HEADING} ({len(rejected)}) — referenced and NOT "
+            "selected, with the reason:",
+            *_categorised_lines(rejected),
+            "",
+            f"{EXPLAIN_STALE_HEADING} ({len(stale)}) — a record whose own source "
+            "paths moved under it, or whose freshness could not be established "
+            "at all:",
+            *_categorised_lines(stale),
+            "",
+            f"{EXPLAIN_CONTRADICTORY_HEADING} ({len(contradictory)}) — one source "
+            "path, two active records asserting different invariants; recorded, "
+            "not resolved:",
+            *_categorised_lines(contradictory),
+            "",
+            f"{EXPLAIN_OTHER_HEADING} ({len(other)}) — every category none of the "
+            "sections above claims, printed rather than dropped:",
+            *_categorised_lines(other),
+            "",
+        ]
+
+    lines += [f"{EXPLAIN_DIGEST_HEADING}:", *_digest_lines(render, execution, stored), ""]
+    lines += _bounds_lines(render, packet_text_printed=include_packet_text)
+    if include_packet_text:
+        lines += ["", "packet text (the bytes the digest above covers):", render.packet.text]
+    return lines
 
 
 class ContextPacketStore:

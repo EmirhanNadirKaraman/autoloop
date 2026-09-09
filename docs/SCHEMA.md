@@ -389,3 +389,28 @@ Exactly two fields ever move, and only at a task's completion
 
 Nothing else is rewritten, and nothing is deleted. A record the loop cannot
 update in scope is named in a follow-up task rather than written anyway.
+
+## Context explanation (ctx-08)
+
+Not a stored artifact: `python3 -B -m autoloop context explain --task <id>`
+renders it on demand and writes nothing. It is a `context_packet.PacketRender` —
+ONE render, carrying both the packet and the `context_resolver.Resolution` it
+was rendered from — projected to text by `context_packet.explanation_lines`.
+Both are read-only functions of the render, so an explanation cannot describe a
+selection the packet does not carry; resolving a second time to produce it is
+exactly the divergence the command must not be able to have.
+
+`PacketRender`: `packet`, `resolution` (`None` when the base could not be read),
+`resolution_error`, `entries` (the tree listing the object ids came from,
+`None` when it could not be listed at all — never `{}`), `entries_error`,
+`index_wired`, `records_line`, `rev`, `tree`.
+
+The rendered sections are `selected records` (the packet's own
+`selection_block`, called and not re-spelled), `rejected records`
+(`context_resolver.REJECTED_CATEGORIES`), `stale or unverified records`
+(`STALENESS_CATEGORIES` — both halves of the tri-state that are not `fresh`),
+`contradictory records`, `other findings` (the partition remainder, so a
+category no reader knows yet is printed rather than filtered away), `digest`
+(rendered now / on the execution record / in the stored packet file, each said
+to agree or not) and `bounds` (what was not printed). See `docs/AUTOLOOP.md`,
+"Asking why a task got the context it got".

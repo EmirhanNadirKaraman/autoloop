@@ -531,7 +531,12 @@ DOCS_ONLY_SELECTED = 20
 #: identifier, not a path), and the module source it reads is reached as the
 #: ATTRIBUTE `sys.modules[...].__file__`, which is not the `ast.Name` the rule
 #: looks for. It spawns nothing of its own either, so the same 20 hold.
-SUITE_SIZE = 118
+#: 118 -> 119 when ctx-08 added `test_context_diagnostics.py` (2026-09-09), the
+#: DENOMINATOR again and for ctx-07's reason: it names no change-note tracker in
+#: any evaluated string, resolves no `__file__`, and spawns nothing of its own
+#: (its git comes from `gitrepo.py`), so it is neither a reader nor on the opaque
+#: frontier and the same 20 hold.
+SUITE_SIZE = 119
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
