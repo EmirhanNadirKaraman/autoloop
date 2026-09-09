@@ -261,7 +261,12 @@ def _format_context_packet(execution: TaskExecution, packet_text: str) -> str:
       digest is not the packet the worker was given, and showing it under that
       digest would be exactly the forgery the digest exists to catch;
     * no text was available — the digest is shown and the absence is stated,
-      never rendered as a clean packet.
+      never rendered as a clean packet. This one no longer covers a write that
+      failed at dispatch: such a round is refused before any agent runs
+      (`orchestrator._context_packet_is_readable_back`). What is left for it is
+      loss BETWEEN dispatch and review — the file removed, the state directory
+      replaced, a lane reset — which is exactly when a reviewer most needs to be
+      told rather than shown something plausible.
 
     The section is placed strictly AFTER every identifier line of the review
     packet (`task_id`, `base_sha`, `candidate_sha`, `review_round`), and the

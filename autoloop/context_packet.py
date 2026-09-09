@@ -23,6 +23,15 @@ render therefore takes the execution record as an argument and reads
 dispatch. A packet carried past a rebase is the specific failure this module
 exists to prevent.
 
+**HOW IT REACHES THE AGENT.** The dispatch hands the rendered section straight
+to the executor about to run — `implement_executor.deliver_round_context_packet`,
+set immediately before the executor call and cleared in a `finally` — so the
+bytes the agent reads are the bytes that were hashed, not a second render and
+not a file read back by a different reader. The store below exists for the
+REVIEWER's copy and for the round trip that proves the copy exists; the loop
+refuses to dispatch a round whose packet cannot be read back out of it
+(`orchestrator._context_packet_is_readable_back`).
+
 **CONTEXT IS DATA, NOT INSTRUCTION — and the control is not sanitisation.**
 `docs/SECURITY.md`'s S33 records this class for the two text sources already
 rendered into the stamped CONTEXT block (an operator's task description and a
@@ -34,7 +43,13 @@ packet is the third such source and takes S33's two controls unchanged:
    `prompts.build_prompt`), so a first-match read of `request_id` / `head_sha` /
    `report_sha256` still lands on the real value. In the AGENT PROMPT there is
    no stamp to displace, so the same rule applies to what IS there: the section
-   is last, after every instruction the loop gives.
+   is last in `implement_executor._agent_prompt`, after every instruction that
+   builds. (One path appends BELOW it — the zero-call-return re-prompt appends
+   `_zero_call_return_instruction` to the whole prompt when a round never used
+   the advisory channel. That is the harmless direction and stays: a
+   loop-authored instruction after the block displaces nothing and reads as what
+   it is, whereas the block moving above an instruction is what this rule is
+   against.)
 2. VERIFICATION, which is the actual control — `contract.verify_review`
    compares all three echoed values against the recorded `PendingRequest`, so a
    forgery copied out of a record draws `review_mismatch` and the approval is
@@ -494,10 +509,14 @@ class ContextPacketStore:
         what the digest covers: a timestamp inside it would make two renders of
         one repository state disagree, which is the whole claim.
 
-        A failed write returns `None` rather than raising. The packet was
-        rendered and is what the agent is given either way, and the round must
-        not die because the state directory is full — `orchestrator` logs the
-        failure and the review packet says the stored text is unavailable.
+        A failed write returns `None` rather than raising, so the CALLER decides
+        what a failure costs. It costs the round: the loop refuses to dispatch a
+        write-capable agent whose recorded digest names a packet that cannot be
+        read back (`orchestrator._context_packet_is_readable_back`), because the
+        reviewer would then be shown a digest for an artifact nobody can produce.
+        Answering `None` rather than raising is what lets that decision be made
+        at the dispatch, with the task and the log in hand, instead of as a
+        traceback out of a store.
 
         **A failed write REMOVES the file it failed to replace**, best effort,
         and that is the fail-closed half of the same decision. The record's
@@ -573,9 +592,18 @@ class ContextPacketStore:
         )
 
     def text_for(self, task_id: str) -> str:
-        """The stored packet's text, or `""`. The reader shape the agent prompt
-        needs — see `implement_executor.ImplementExecutor`'s
-        `context_packet_for`."""
+        """The stored packet's text, or `""`. The reader shape
+        `implement_executor.ImplementExecutor`'s `context_packet_for` keyword
+        takes.
+
+        NOT the production path, which hands the round's packet straight to the
+        executor (`implement_executor.deliver_round_context_packet`, called from
+        `orchestrator._dispatch_task_postcommit`) rather than reading a file
+        back. This
+        is for an embedder that calls `execute()` outside that boundary; what it
+        returns is the LAST STORED round's packet, which is the same one only
+        while no newer round has been dispatched.
+        """
         packet = self.load(task_id)
         return prompt_section(packet) if packet is not None else ""
 

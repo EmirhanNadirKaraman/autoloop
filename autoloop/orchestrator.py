@@ -381,7 +381,18 @@ from .config import (
     lane_observed_checkout,
 )
 from .context import build_context, render_context
-from .context_packet import ContextPacketStore, record_round_packet
+from .context_packet import ContextPacketStore, prompt_section, record_round_packet
+# THE ROUND BOUNDARY'S DELIVERY HOP for the context packet (ctx-05). Imported BY
+# NAME, at module import, on purpose: this loop's single `TaskExecutor` is
+# `cli._DispatchingExecutor` in production — a router forwarding `execute` and
+# nothing else — so the packet cannot be handed over as a constructor keyword or
+# set as an attribute on `self._executor`. A `getattr(self._executor, ...)` hop
+# would have found nothing there and quietly delivered nothing; this one fails at
+# process start if it is ever renamed away. See that function's own comment.
+from .implement_executor import (
+    clear_round_context_packet,
+    deliver_round_context_packet,
+)
 from .conversation import (
     SendOutcome,
     SubmitResult,
@@ -9225,6 +9236,84 @@ class Orchestrator:
         packet = self._context_packets().load(execution.task_id)
         return packet.text if packet is not None else ""
 
+    def _context_packet_is_readable_back(
+        self, task: Task, execution: TaskExecution, stored_at: Path | None
+    ) -> bool:
+        """Did this round's packet reach the store as the record's digest names
+        it? Parks and returns `False` when it did not — the caller must then
+        return WITHOUT dispatching.
+
+        **FAIL CLOSED, and this is the one place that can be.** The digest is on
+        the execution record before this runs, and the review packet is built
+        from that record: a round dispatched with the digest recorded and no
+        readable packet behind it would show a reviewer
+        `context_packet_sha256: …` for an artifact nobody can produce, which is
+        the ECHO shape this whole mechanism exists to make impossible — evidence
+        of context that was never evidenced. Refusing the round costs one dispatch
+        and an operator's attention; proceeding costs the reviewer's ability to
+        check the round at all.
+
+        THE READ IS A ROUND TRIP, not a look at the return value of the write.
+        `save` answering a path means the bytes were written; `load` returning a
+        packet whose digest matches the record means they can be read BACK and
+        that they still hash to what the record claims. That is the property the
+        reviewer depends on, so it is the one checked here rather than the weaker
+        one next to it.
+
+        TASK-FATAL, and deliberately the NARROWER of the two. The causes left
+        after `save`'s own replace-and-retry — a state directory that is not
+        writable, a full disk, a permission change — are environmental, and the
+        argument `_prepare_write_capable_worker` makes for `primary_checkout_dirty`
+        would make this loop-fatal too. It is not, for one reason: every
+        `loop_fatal` code has to be classified lane- or fleet-fatal in
+        `blockers.LANE_FATAL_CODES` / `FLEET_FATAL_CODES` (conc-07), that file is
+        outside this task's approved scope, and an unclassified `loop_fatal` park
+        is a park nobody reasoned about — which `test_fault_isolation` fails on,
+        correctly. `task_fatal` needs no such entry, sets this task aside and
+        leaves the lane working; the fail-closed property this method exists for
+        is untouched either way, because the round does not run. Promoting it is
+        one entry in that table and a `kind=`, for a round that may touch it.
+
+        `escape_detector` is why the file cannot simply be written somewhere
+        else: the state directory is the only writable place that is not inside
+        the observed checkout.
+        """
+        digest = execution.context_packet_sha256
+        stored = (
+            self._context_packets().load(execution.task_id)
+            if stored_at is not None
+            else None
+        )
+        if digest and stored is not None and stored.digest == digest:
+            return True
+        self._log(
+            "context_packet_unavailable",
+            data={
+                "task_id": task.id,
+                "digest": digest,
+                "stored": str(stored_at) if stored_at is not None else "",
+                "read_back": stored.digest if stored is not None else "",
+            },
+        )
+        self._to_needs_user(
+            f"task {task.id}: this round's context packet could not be stored "
+            f"and read back from {self._config.context_packets_dir} — refusing "
+            "to start a write-capable agent. The digest the reviewer would be "
+            "shown names a packet nothing can produce, so the round would be "
+            "unreviewable; no agent was run and no attempt was charged. The "
+            "cause is almost certainly that directory rather than this task, so "
+            "expect the next write-capable task to meet it too.",
+            kind="task_fatal",
+            code="context_packet_unavailable",
+            task_id=task.id,
+            detail=(
+                f"digest={digest or '(none)'} "
+                f"stored={stored_at if stored_at is not None else '(write failed)'} "
+                f"read_back={stored.digest if stored is not None else '(unreadable)'}"
+            ),
+        )
+        return False
+
     def _open_attempt(self, execution: TaskExecution) -> None:
         """Charge one dispatch and record it as OPEN.
 
@@ -10401,6 +10490,13 @@ class Orchestrator:
         # which is the discipline `packet.build_review_packet_with_diff` states
         # verbatim and the reason the blob ids below are the ones this task's own
         # repository holds at its own base.
+        #
+        # WHAT THE AGENT IS GIVEN is this same object, handed over at the
+        # executor call below (`deliver_round_context_packet`) — not read back
+        # out of the store by the executor, and not rebuilt there. One render,
+        # one digest, one set of bytes: the reviewer's copy is the same artifact
+        # by construction rather than by two renderings agreeing.
+        context_packet_section = ""
         if not is_audit:
             packet, stored_at = record_round_packet(
                 task,
@@ -10422,14 +10518,21 @@ class Orchestrator:
                     "task_base_sha": execution.task_base_sha,
                     "review_round": execution.review_round,
                     "digest": packet.digest,
-                    # Named when the write failed, because the round carries on
-                    # either way: the digest is on the record and the agent gets
-                    # the text, so the only casualty is the reviewer's copy —
-                    # which the review packet then says is unavailable rather
-                    # than substituting anything for it.
+                    # Empty when the write failed — and the round then does not
+                    # start at all (the check below). Logged before that park so
+                    # the transcript carries the render that was refused rather
+                    # than only the refusal.
                     "stored": str(stored_at) if stored_at is not None else "",
                 },
             )
+            # FAIL CLOSED. No agent runs for a round whose recorded digest names
+            # a packet the reviewer could not be shown — see
+            # `_context_packet_is_readable_back` for why that is worse than not
+            # running at all. Placed above `_open_attempt`, so a refused round
+            # charges no attempt.
+            if not self._context_packet_is_readable_back(task, execution, stored_at):
+                return
+            context_packet_section = prompt_section(packet)
         # M1 finding #3 (bounded attempts): charged and PERSISTED before the
         # executor ever runs, not after a commit — so a crash, a restart, or a
         # validation failure that never reaches `commit_and_capture` all consume
@@ -10470,23 +10573,46 @@ class Orchestrator:
         # payload construction below are the loop writing down what happened,
         # and folding them in would report bookkeeping as agent time.
         execute_watch = self._stopwatch()
-        if self._worker_repos is not None and not is_audit:
-            # M1 finding #1 (escape detection): bracket the write-capable
-            # call with a filesystem snapshot of the PRIMARY checkout. See
-            # `escape_detector.py`'s module docstring for the full threat
-            # model and why this is detection, checked before commit/review,
-            # never prevention.
-            outcome = self._execute_with_escape_detection(directive, task)
-            execute_watch.stop()
-            if outcome is None:
-                # Escape detected, already parked. A TASK attempt: the agent
-                # wrote outside its worker repository, which is the work
-                # misbehaving, not the environment failing it.
-                self._finalise_attempt(execution, ATTEMPT_TASK, "checkout_escape_detected")
-                return
-        else:
-            outcome = self._executor.execute(directive, task)
-            execute_watch.stop()
+        # THE PACKET IS HANDED OVER HERE, adjacent to the call it is for, and
+        # taken back in the `finally` — so its lifetime is provably one dispatch.
+        # Adjacency is the argument: rendering happens well above (below the
+        # rebase, which is the claim), and the statements in between —
+        # `_open_attempt`, two saves, `environment.snapshot` — are exactly where
+        # a later early return would leak a binding past this block if the two
+        # were one statement. `_round_context_packet` matches on the task id as a
+        # second lock, so neither failure alone can serve a packet to a round it
+        # was not cut for.
+        #
+        # `""` for an audit unit, which renders none: an empty delivery is a
+        # delivery, and it OVERWRITES whatever the previous dispatch on this
+        # thread left, which a skipped call would not.
+        deliver_round_context_packet(task.id, context_packet_section)
+        try:
+            if self._worker_repos is not None and not is_audit:
+                # M1 finding #1 (escape detection): bracket the write-capable
+                # call with a filesystem snapshot of the PRIMARY checkout. See
+                # `escape_detector.py`'s module docstring for the full threat
+                # model and why this is detection, checked before commit/review,
+                # never prevention.
+                outcome = self._execute_with_escape_detection(directive, task)
+                execute_watch.stop()
+                if outcome is None:
+                    # Escape detected, already parked. A TASK attempt: the agent
+                    # wrote outside its worker repository, which is the work
+                    # misbehaving, not the environment failing it.
+                    self._finalise_attempt(
+                        execution, ATTEMPT_TASK, "checkout_escape_detected"
+                    )
+                    return
+            else:
+                outcome = self._executor.execute(directive, task)
+                execute_watch.stop()
+        finally:
+            # ALWAYS, including the escape-detection return above and any
+            # exception out of the executor: a packet left in the slot is a
+            # packet a later round on this thread could be given for a base it no
+            # longer has, which is the failure this whole artifact is against.
+            clear_round_context_packet()
         state.last_validation = outcome.validation or "(none)"
         # `request_id` at last: the review request whose directive dispatched
         # this round. Without it `directive` -> `executed` could not be paired

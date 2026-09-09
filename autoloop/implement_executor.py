@@ -3123,6 +3123,70 @@ _DECOMPOSITION_HEADER = (
 )
 
 
+#: THE ROUND BOUNDARY'S DELIVERY SLOT for this round's context packet (ctx-05).
+#:
+#: **Why a module function and not a constructor keyword.** The orchestrator
+#: holds exactly ONE `TaskExecutor` (`Orchestrator._executor`), and in production
+#: that object is `cli._DispatchingExecutor` — a router that forwards `execute`
+#: and nothing else. So neither of the two obvious seams reaches the executor
+#: that actually builds the prompt: a constructor keyword can only be set by
+#: `cli._build_executor`, and an attribute set on `self._executor` lands on the
+#: router, not on the `ImplementExecutor` it wraps. `context_packet_for` below is
+#: the constructor-keyword seam and is exactly why the prompt half was dark.
+#:
+#: **It cannot switch itself off silently, which is the whole reason for this
+#: shape.** `orchestrator.py` imports `deliver_round_context_packet` BY NAME at
+#: module import, so renaming or deleting it is an `ImportError` when the process
+#: starts — not a `getattr` that quietly finds nothing and a prompt that quietly
+#: carries no packet. A duck-typed hop through the router would have been the
+#: same defect one layer out.
+#:
+#: **Thread-local because lanes are threads.** A fleet runs several lanes in one
+#: process (`cli._ORCHESTRATOR_SETUP_LOCK` exists for exactly that), and dispatch
+#: → `execute()` → prompt build is one synchronous call chain on the dispatching
+#: thread. A process-wide dict would let one lane's round read another lane's
+#: packet; a per-thread slot is one lane's round and nothing else.
+#:
+#: **It lives for one dispatch.** The orchestrator sets it immediately before the
+#: executor call and clears it in a `finally` (`_dispatch_executor`), and the
+#: read below matches on task id as a second lock — so a packet can never be
+#: served to a round it was not cut for, whichever of the two fails.
+_ROUND_CONTEXT_PACKET = threading.local()
+
+
+def deliver_round_context_packet(task_id: str, section: str) -> None:
+    """Hand the packet rendered for `task_id`'s round to the executor about to
+    run it. Called by `orchestrator._dispatch_task_postcommit` immediately before
+    the executor call, and by nothing else.
+
+    `section` is the rendered `context_packet.prompt_section(...)` — the hashed
+    text plus its digest line — so what the agent reads and what the reviewer is
+    shown are the same bytes under the same digest.
+    """
+    _ROUND_CONTEXT_PACKET.value = (str(task_id), section or "")
+
+
+def clear_round_context_packet() -> None:
+    """Empty the slot. The `finally` half of the delivery above: after this, no
+    prompt on this thread carries a packet until one is delivered again."""
+    _ROUND_CONTEXT_PACKET.value = None
+
+
+def delivered_round_context_packet(task_id: str) -> str:
+    """What was delivered for `task_id`'s round, or `""`.
+
+    Fail-closed on the task id: a slot holding another task's packet answers
+    `""` rather than that packet. A round told nothing is told less than it could
+    have been; a round told the WRONG task's packet is told something false,
+    under a digest its reviewer is about to be shown for a different render.
+    """
+    entry = getattr(_ROUND_CONTEXT_PACKET, "value", None)
+    if not entry:
+        return ""
+    delivered_for, section = entry
+    return section if delivered_for == str(task_id) else ""
+
+
 def _agent_prompt(
     task: Task,
     feedback: str | None,
@@ -3994,39 +4058,27 @@ class ImplementExecutor:
         # the capability, and every `REVERT-OUT-OF-SCOPE:` line is ignored and
         # reported as ignored. Same fail-closed default as `cleanup_paths_for`.
         self._revert_authority = revert_authority
-        # THIS ROUND'S CONTEXT PACKET, as text, read by task id (ctx-05).
-        # `context_packet.ContextPacketStore.text_for` in a wired run: the
-        # orchestrator renders the packet from the task's own worker repository
-        # at `TaskExecution.task_base_sha`, stamps its digest onto the execution
-        # record and stores it BEFORE this executor is called, so what this
-        # reads back is the artifact the digest already names.
+        # A SECOND, OPTIONAL reader for this round's context packet, by task id
+        # (ctx-05) — `context_packet.ContextPacketStore.text_for` in shape.
         #
-        # Injected as a callable, exactly like `cleanup_paths_for` and
-        # `revert_authority` above, so this module keeps knowing nothing about
-        # where loop state lives. None — every direct `execute()` test, and any
-        # embedder that has not wired one — means NO packet section in the
-        # prompt at all, which is the fail-closed default: a round is told less,
-        # never told something invented. It grants nothing either way; a context
-        # packet is data, and `tasks.effective_approved_paths` below is still
-        # the whole of what this round may write.
+        # THE PRODUCTION PATH IS NOT THIS. A real round is handed its packet by
+        # the round boundary itself (`deliver_round_context_packet`, read in
+        # `_round_context_packet`), because the orchestrator's single
+        # `TaskExecutor` is `cli._DispatchingExecutor` in production and a
+        # constructor keyword can only be set in `cli._build_executor` — the
+        # module this task may not touch. That is exactly why this keyword alone
+        # left the prompt half dark.
         #
-        # NOT WIRED IN PRODUCTION YET, and stated here rather than left to be
-        # discovered: `cli._build_executor` is the only construction site and
-        # ctx-05 could not touch that file, so this reads `None` in a real run
-        # and the prompt carries no packet section.
-        #
-        # THE EDIT IS ONE KEYWORD, IN `cli._build_executor`, on the
-        # `ImplementExecutor(...)` call it already makes:
-        # `context_packet_for=ContextPacketStore(config.context_packets_dir)
-        # .text_for`. That function takes the `AutoloopConfig` as its first
-        # parameter, so nothing has to be threaded from `_build_orchestrator`
-        # the way `cleanup_paths_for` and `revert_authority` are — those come
-        # from the caller because they need the `TaskExecutionStore`, and this
-        # one needs only a path the config already answers for.
-        #
-        # Everything on the other side of it is live — the packet is rendered,
-        # hashed onto the execution record and shown to the reviewer on every
-        # implement/revise round.
+        # It stays because it costs one line and answers a different question:
+        # an embedder that calls `execute()` directly, outside
+        # `orchestrator._dispatch_task_postcommit`, has no round boundary to
+        # deliver from and can wire a reader instead. None — every direct
+        # `execute()` test, and any
+        # embedder that has not wired one — means NO packet section from THIS
+        # source, which is the fail-closed default: a round is told less, never
+        # told something invented. It grants nothing either way; a context packet
+        # is data, and `tasks.effective_approved_paths` below is still the whole
+        # of what this round may write.
         self._context_packet_for = context_packet_for
         # How many advisory runs ONE round may pay for. A constructor override
         # rather than a config key: a key would have to be read in `cli.py` and
@@ -4128,14 +4180,27 @@ class ImplementExecutor:
     def _round_context_packet(self, task: Task) -> str:
         """This round's context packet, as text, or `""`.
 
-        Fail-closed at both ends, exactly like `_recorded_cleanup_paths` above:
-        no injected reader means no section, and a reader that raises — a
-        missing file, an unreadable one, a stored packet whose bytes do not hash
-        to the digest it carries — yields `""` rather than propagating. The
-        consequence of an empty answer is that the round is told LESS; the
-        consequence of guessing would be a round told something the loop never
-        rendered, under a digest the reviewer is about to be shown.
+        TWO SOURCES, and the delivered one wins. What the round boundary handed
+        over (`deliver_round_context_packet`) is THIS round's packet, rendered
+        from this task's worker repository at the base this dispatch is cut from
+        and already stamped onto the execution record — that is the production
+        path, and it is why the prompt half is no longer dark. The injected
+        `context_packet_for` reader stays underneath it for an embedder that
+        wires one and never goes through `orchestrator._dispatch_task_postcommit`;
+        it reads the stored file, which can only ever be an EARLIER round's if
+        the two disagree.
+
+        Fail-closed at every end, exactly like `_recorded_cleanup_paths` above:
+        nothing delivered and no injected reader means no section, and a reader
+        that raises — a missing file, an unreadable one, a stored packet whose
+        bytes do not hash to the digest it carries — yields `""` rather than
+        propagating. The consequence of an empty answer is that the round is told
+        LESS; the consequence of guessing would be a round told something the
+        loop never rendered, under a digest the reviewer is about to be shown.
         """
+        delivered = delivered_round_context_packet(task.id)
+        if delivered:
+            return delivered
         if self._context_packet_for is None:
             return ""
         try:
