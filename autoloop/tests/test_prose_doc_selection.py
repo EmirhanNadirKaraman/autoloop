@@ -525,7 +525,13 @@ DOCS_ONLY_SELECTED = 20
 #: resolves no `__file__`, and it builds no repository and spawns nothing — its
 #: only git is a three-method stub — so it is neither a reader nor on the opaque
 #: frontier and the same 20 hold.
-SUITE_SIZE = 117
+#: 116 -> 117 when ctx-07 added `test_context_closeout.py` (2026-09-09), the
+#: DENOMINATOR again, and this one does not even reach ctx-05's conjunction: it
+#: spells no change-note tracker in any evaluated string (`TRACKER_PATHS` is the
+#: identifier, not a path), and the module source it reads is reached as the
+#: ATTRIBUTE `sys.modules[...].__file__`, which is not the `ast.Name` the rule
+#: looks for. It spawns nothing of its own either, so the same 20 hold.
+SUITE_SIZE = 118
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

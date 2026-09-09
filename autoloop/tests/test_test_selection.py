@@ -646,7 +646,13 @@ FLOOR_AFTER = 16
 #: DENOMINATOR again and for conc-10's reason: it names no document at all, it
 #: resolves no `__file__`, and it builds no repository and spawns no process —
 #: its only git is a three-method stub — so 20 and 24 hold.
-SUITE_SIZE = 117
+#: 116 -> 117 when ctx-07 added `test_context_closeout.py` (2026-09-09), the
+#: DENOMINATOR again. It names no change-note tracker in any evaluated string —
+#: the one it spells is `TRACKER_PATHS`, the identifier, which holds paths rather
+#: than being one — resolves no `__file__` of its own (the source it reads is
+#: reached as an ATTRIBUTE, `sys.modules[...].__file__`, which is not an
+#: `ast.Name`), and its git comes from `gitrepo.py`, so 20 and 24 hold.
+SUITE_SIZE = 118
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
