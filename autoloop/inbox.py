@@ -1766,6 +1766,21 @@ class Claim:
 
     text: str
     source: str
+    #: WHO within the tier said this — a task id, a finding id, a record id.
+    #:
+    #: The tier alone is too coarse to decide "is this one author elaborating or
+    #: two authors disagreeing", and `detect_conflicts` needs that distinction in
+    #: BOTH directions: one finding says what it saw AND what it wants AND what
+    #: it assumed (elaboration, and comparing those stops all generation), while
+    #: two ACCEPTED TASKS can scope one piece of work to two different file sets
+    #: (a real disagreement, and suppressing it hides exactly the conflict this
+    #: task exists to surface).
+    #:
+    #: Defaults to `""`, which means "unattributed" and groups every such claim
+    #: in a tier under ONE author — the conservative direction for a caller that
+    #: has not been updated, since it can only suppress a comparison, never
+    #: manufacture one.
+    author: str = ""
     subject: str = ""
     kind: str = CLAIM_BEHAVIOUR
     citation: Evidence | None = None
@@ -1804,14 +1819,21 @@ class Claim:
 
     def describe(self) -> str:
         """One line naming the claim, its source and what backs it — the text a
-        refusal or a conflict record quotes."""
+        refusal or a conflict record quotes.
+
+        The AUTHOR is rendered beside the tier whenever there is one, because a
+        record that says two `accepted_decision`s disagree without naming WHICH
+        two leaves the operator to go and find them: the tier is the same on both
+        sides of exactly the conflict the author field exists to detect.
+        """
         backing = "no citation, no assumption"
         if self.citation is not None:
             backing = f"cited to {self.citation.source!r}"
         elif self.assumption:
             backing = f"assumed: {self.assumption}"
         subject = self.subject or "(no subject)"
-        return f"[{self.source}] {subject}: {self.text} ({backing})"
+        who = f"{self.source}: {self.author}" if self.author else self.source
+        return f"[{who}] {subject}: {self.text} ({backing})"
 
 
 def unsupported_claims(claims) -> tuple[str, ...]:
@@ -1964,17 +1986,23 @@ class SourceConflict:
     def identity(self) -> str:
         """A stable digest of THIS disagreement.
 
-        Over the subject and both sides' (source, text), so two different
+        Over the subject and both sides' (source, author, text), so two different
         conflicts are two records and one conflict seen twice is one record with
         its recurrence bumped. Same reasoning as `blockers.refusal_identity`:
         the durable store keys a record by a condition, and a digest is what
         makes "this condition" mean this disagreement rather than "a conflict
         happened".
+
+        The AUTHOR is in the digest because without it two disagreements WITHIN
+        one tier can collide: three accepted tasks scoping one subject produce
+        two conflicts whose (source, text) pairs are identical whenever two of
+        those tasks word their scope alike, and the second record would then
+        overwrite the first one's account of who disagreed.
         """
         parts = [
             _normalize(self.subject),
-            self.left.source, _normalize(self.left.text),
-            self.right.source, _normalize(self.right.text),
+            self.left.source, self.left.author, _normalize(self.left.text),
+            self.right.source, self.right.author, _normalize(self.right.text),
         ]
         return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
@@ -1987,12 +2015,19 @@ class SourceConflict:
         disagreement without saying which files each side named — leaving the
         operator to re-derive the one thing the record exists to state.
         """
+        def side(claim: Claim) -> str:
+            # Source AND author, because the two sides of a within-tier conflict
+            # carry the SAME source: "accepted_decision and accepted_decision
+            # disagree" names neither of the two tasks the operator has to go and
+            # reconcile.
+            return f"{claim.source}: {claim.author}" if claim.author else claim.source
+
         return (
-            f"{self.subject or '(no subject)'}: {self.left.source} and "
-            f"{self.right.source} disagree ({self.scope_impact}). "
-            f"{self.left.source} says — {self.left.describe()} "
+            f"{self.subject or '(no subject)'}: {side(self.left)} and "
+            f"{side(self.right)} disagree ({self.scope_impact}). "
+            f"{side(self.left)} says — {self.left.describe()} "
             f"[scope: {', '.join(self.left.paths) or 'unstated'}]. "
-            f"{self.right.source} says — {self.right.describe()} "
+            f"{side(self.right)} says — {self.right.describe()} "
             f"[scope: {', '.join(self.right.paths) or 'unstated'}]. "
             "No winner was chosen here; both sources are recorded as they stand."
         )
@@ -2001,29 +2036,33 @@ class SourceConflict:
 def detect_conflicts(claims) -> tuple[SourceConflict, ...]:
     """Every disagreement among `claims`, in a stable order. Resolves NONE.
 
-    Two claims conflict when they share a `topic`, come from DIFFERENT sources,
+    Two claims conflict when they share a `topic`, come from DIFFERENT AUTHORS,
     and disagree — where "disagree" is judged by what they are each answering:
     claims of the SAME `kind` are compared on their words and their scope, and
     claims of different kinds ONLY on their scope. The loop body says why the
     second rule is load-bearing rather than lenient.
 
-    THE DIFFERENT-SOURCE REQUIREMENT IS A REAL LIMIT, stated rather than left to
-    be discovered. Two claims from one tier are read as complementary sentences
-    by one author, not as a disagreement — which is what they almost always are
-    (a finding says what it saw AND what it wants AND what it assumed, all as
-    `repository`), and comparing them would report every finding as
-    self-contradictory and stop all generation. What it costs is that two
-    accepted decisions disagreeing with EACH OTHER is not detected here; a
-    conflict record names two sources, and that pair genuinely has only one.
+    THE UNIT OF DISAGREEMENT IS THE AUTHOR, NOT THE TIER, and that distinction is
+    the whole of this function's precision. One author saying several things is
+    ELABORATING: a finding says what it saw AND what it wants AND what it
+    assumed, all as `repository`, and comparing those sentences reports every
+    finding as self-contradictory and stops all generation. Two authors inside
+    ONE tier saying different things is a DISAGREEMENT: two accepted tasks can
+    scope one piece of work to two different file sets, and that is precisely the
+    conflict an operator has to settle — suppressing it because both carry
+    `source='accepted_decision'` hid the case this detector exists for.
+    `Claim.author` is what separates the two, and an unattributed claim
+    (`author=""`) groups with the other unattributed claims of its tier, which
+    can only suppress a comparison and never manufacture one.
 
     A MODEL-sourced claim is compared like any other, and that is the
     fail-closed direction rather than an endorsement of it: a model sentence
     that contradicts the tree about scope is worth stopping for. It is refused
     separately, and for a different reason, by `unsupported_claims`.
 
-    Ordered by (topic, precedence rank of each side, text) so a caller writing
-    durable records writes the same records for the same inputs — the property
-    `context_resolver` states for selection and for the same reason.
+    Ordered by (topic, precedence rank of each side, author, text) so a caller
+    writing durable records writes the same records for the same inputs — the
+    property `context_resolver` states for selection and for the same reason.
     """
     by_topic: dict[str, list[Claim]] = {}
     for claim in claims:
@@ -2034,11 +2073,15 @@ def detect_conflicts(claims) -> tuple[SourceConflict, ...]:
     for topic in sorted(by_topic):
         group = sorted(
             by_topic[topic],
-            key=lambda c: (source_rank(c.source), c.source, _normalize(c.text)),
+            key=lambda c: (source_rank(c.source), c.source, c.author, _normalize(c.text)),
         )
         for i, left in enumerate(group):
             for right in group[i + 1:]:
-                if left.source == right.source:
+                if (left.source, left.author) == (right.source, right.author):
+                    # ONE AUTHOR, elaborating on its own subject. Not the tier —
+                    # see the docstring: two authors sharing a tier are compared,
+                    # because two accepted tasks scoping one job differently is a
+                    # disagreement somebody has to settle.
                     continue
                 candidate = SourceConflict(
                     subject=left.subject or right.subject, left=left, right=right

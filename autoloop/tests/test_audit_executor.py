@@ -95,13 +95,15 @@ def ok_command(argv, **kwargs):
     return Proc()
 
 
-def build_executor(repo, tmp_path, runner=None, validation=(("ruff", "check", "."),)):
+def build_executor(
+    repo, tmp_path, runner=None, validation=(("ruff", "check", "."),), registry=None
+):
     git = GitGateway(repo, PolicyEngine(PolicyConfig()))
     return AuditExecutor(
         git=git,
         agent_runner=runner or FakeRunner(),
         markdown=MarkdownPolicy(repo),
-        registry=TaskRegistry(),
+        registry=registry if registry is not None else TaskRegistry(),
         run_dir_base=tmp_path / "runs",
         validation_commands=validation,
         max_parallel_agents=2,
@@ -438,3 +440,72 @@ def test_an_audit_unit_id_is_not_in_the_roadmap_namespace():
     assert is_audit_unit("audit-0001"), "a unit minted before the rename still counts"
     assert not is_audit_unit("t1")
     assert not is_audit_unit("brw-19c")
+
+
+# ---- planning discipline on the PRODUCTION path (ctx-06) -------------------
+#
+# `AuditExecutor.execute` is the only caller of `generate_tasks` that ships, so
+# the discipline is worth exactly what it is worth THERE. These two drive the
+# real executor rather than calling the generator directly: a guard that holds
+# in `test_audit_taskgen.py` and is bypassed by the wiring is a guard nobody has.
+
+
+def audited_registry(*tasks):
+    return TaskRegistry(list(tasks))
+
+
+def written_report(repo):
+    [report] = [p for p in (repo / "docs").iterdir() if p.name.startswith("AUDIT_")]
+    return report.read_text(encoding="utf-8")
+
+
+def test_the_audit_path_stops_rather_than_proposing_a_task_over_a_conflict(repo, tmp_path):
+    """A real audit run whose finding disagrees with an accepted task about which
+    files the work touches. The run must not quietly propose the task anyway, and
+    the operator's REPORT — not an object in memory — must name both sources."""
+    from autoloop.tasks import Task
+
+    runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
+    registry = audited_registry(
+        Task(
+            id="already",
+            title="t",
+            description="covers security_paths:f1",
+            approved_paths=("b.py",),          # the finding needs a.py
+        )
+    )
+    outcome = build_executor(repo, tmp_path, runner, registry=registry).execute(
+        audit_directive(), None
+    )
+
+    # NOTHING was proposed, and the artifact a `plan` decision is adopted from is
+    # empty rather than quietly holding a task nobody reconciled.
+    [run_dir] = (tmp_path / "runs").iterdir()
+    assert json.loads((run_dir / "proposed_tasks.json").read_text()) == []
+    assert "0 tasks proposed" in outcome.summary
+
+    report = written_report(repo)
+    assert "generation stopped" in report
+    assert "accepted_decision" in report and "repository" in report
+    assert "a.py" in report and "b.py" in report
+    assert "No winner was chosen" in report
+    # And the honesty this path currently owes the operator: on the audit route
+    # `generate_tasks` is called with no blocker store (`audit/executor.py`), so
+    # the conflict has no durable record — which the report SAYS rather than
+    # leaving an operator to hunt for a blocker that was never filed.
+    assert "NO DURABLE RECORD EXISTS" in report
+
+
+def test_an_ordinary_audit_run_still_proposes_its_tasks(repo, tmp_path):
+    """The control, without which the test above is satisfied by a generator that
+    stopped on everything. Same run, same finding, a registry that says nothing
+    about it: the task is proposed and no conflict is reported."""
+    runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
+    outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+
+    [run_dir] = (tmp_path / "runs").iterdir()
+    assert [t["id"] for t in json.loads((run_dir / "proposed_tasks.json").read_text())] == [
+        "au-001"
+    ]
+    assert "1 tasks proposed" in outcome.summary
+    assert "generation stopped" not in written_report(repo)

@@ -19,19 +19,34 @@ system beside them:
     through `blockers.BlockerStore` (a park record, not a field in
     `state.json`, so it survives a set-aside and a reset and can be answered
     later). A conflict that changes SCOPE stops generation; one that provably
-    does not is recorded and generation continues.
+    does not is recorded and generation continues — and "recorded" means the
+    durable record EXISTS. A conflict that could not be written is stopped on
+    too, because "recorded and continued" with no record is the fail-open this
+    discipline is for.
 
 WHICH TIERS ARE ACTUALLY FED, said plainly, because "represented" and "wired"
 are different and only one of them is a guarantee:
 
   * ACCEPTED TASKS AND DECISIONS — fed, from the `registry` this function has
-    always taken (`_accepted_scope_claims`).
+    always taken (`_accepted_scope_claims`), one claim per task so two accepted
+    tasks can disagree with each other and not merely with the finding.
   * CODE, TESTS AND CONFIGURATION — fed, as the findings themselves.
   * the CURRENT OPERATOR REQUEST and CONTEXT RECORDS — represented, not wired:
     there is no operator-request record and no context-record index in this loop
     yet, so a caller that has one passes it as `sources`. That is a stated gap,
     not a silent one — the same distinction `inbox.repo_evidence` draws between
     "nothing was read" and "nothing was found".
+
+**THE PRODUCTION CALLER PASSES NEITHER `sources` NOR A STORE, TODAY.**
+`audit/executor.py:803` calls `generate_tasks(reconciled, self._registry)`, and
+`AuditExecutor` has no blocker store to give it — so on the audit path the two
+unwired tiers are absent and no conflict gets a durable record. That is why an
+unrecorded conflict STOPS: the one thing this module can guarantee from inside
+its own file is that the audit never proposes a task out of sources it knows
+disagree while quietly failing to file the record an operator would answer. The
+remaining half — passing a real `BlockerStore` and the operator's request down
+from `cli.py` through `AuditExecutor.__init__` — is an edit to the executor,
+which is outside ctx-06's approved paths and is reported rather than made.
 
 THE SEAM WITH intake-01 is unmoved: promotion, deduplication against the tree
 and the registry, and the outcome ledger are `inbox.promote_finding`'s. This
@@ -213,14 +228,46 @@ def _description(finding: Finding, task: dict, conflicts: tuple = ()) -> str:
     return "\n".join(lines)
 
 
+def _mentions(qualified_id: str) -> re.Pattern:
+    """Matches the finding id where it is WRITTEN, not where it is contained.
+
+    `d1:f1` must not match inside `d1:f11`, and the plain `in` test that this
+    replaces did exactly that — manufacturing a conflict between two sources that
+    were never talking about the same finding, which is worse than no record at
+    all because an operator has to go and disprove it.
+
+    The two guards are deliberately asymmetric:
+
+      * AFTER the id, only a word character or a hyphen disqualifies, so an id
+        ending a sentence (`covers d1:f1.`) or introducing one (`d1:f1: scoped
+        to …`) still matches, while `d1:f11` and `d1:f1-b` do not;
+      * BEFORE it, `:` and `.` disqualify as well, so `sec:d1:f1` is not read as
+        a mention of `d1:f1` — a longer id that merely ENDS with this one is a
+        different finding.
+    """
+    return re.compile(rf"(?<![\w:.-]){re.escape(qualified_id)}(?![\w-])")
+
+
 def _accepted_scope_claims(finding: Finding, registry: TaskRegistry) -> list[Claim]:
     """What the ACCEPTED TASKS AND DECISIONS already say this finding's scope is.
 
-    Matched on the finding's QUALIFIED id and on that alone. A bare finding id
-    is often two or three characters (`f1`, `sec-01`), and substring-matching one
-    of those against every description in the registry would manufacture
-    conflicts out of coincidence — a conflict record that names two sources which
-    were never talking about the same thing is worse than no record.
+    Matched on the finding's QUALIFIED id and on that alone, at a word boundary
+    (`_mentions`). A bare finding id is often two or three characters (`f1`,
+    `sec-01`), and substring-matching one of those against every description in
+    the registry would manufacture conflicts out of coincidence — a conflict
+    record that names two sources which were never talking about the same thing
+    is worse than no record.
+
+    ONE CLAIM PER TASK, each carrying that task's id as its `author`, so two
+    accepted tasks that scope one finding differently are compared with EACH
+    OTHER and not merely with the finding. Sharing a tier is not agreeing, and
+    `detect_conflicts` can only see that if the claims say who made them.
+
+    The claim's TEXT deliberately does not name the task. Two tasks that scope
+    the work identically would then differ in words while agreeing in substance,
+    and the word comparison would report a conflict between two sources that
+    agree. The id belongs to the author field and to the citation, both of which
+    reach the operator through `Claim.describe`.
 
     Retired tasks are skipped: a retired task is not an accepted constraint, it
     is a withdrawn one, and holding a generation up over a decision somebody
@@ -232,17 +279,19 @@ def _accepted_scope_claims(finding: Finding, registry: TaskRegistry) -> list[Cla
     question, off the same registry, and the seam intake-01 owns is untouched.
     """
     out: list[Claim] = []
+    mention = _mentions(finding.qualified_id)
     for task in registry.all_tasks():
         if task.status == "retired":
             continue
         haystack = f"{task.id}\n{task.title}\n{task.description}"
-        if finding.qualified_id not in haystack:
+        if not mention.search(haystack):
             continue
         scope = ", ".join(task.approved_paths) or "(no path — undispatchable)"
         out.append(
             Claim(
-                text=f"task {task.id} scopes this work to {scope}",
+                text=f"this work is scoped to {scope}",
                 source=SOURCE_ACCEPTED_DECISION,
+                author=task.id,
                 subject=scope_subject(finding.qualified_id),
                 kind=CLAIM_CONSTRAINT,
                 citation=Evidence(
@@ -256,30 +305,38 @@ def _accepted_scope_claims(finding: Finding, registry: TaskRegistry) -> list[Cla
 
 def _record_conflicts(
     conflicts, blocker_store, now: str, proposal: TaskGraphProposal
-) -> None:
-    """Persist every conflict through `BlockerStore`, and SAY what happened.
+) -> list:
+    """Persist every conflict through `BlockerStore`. Returns the ones with NO
+    durable record, and says what happened to each either way.
 
-    Called AFTER the stop decision has already been made, never as part of
-    making it. A store that raises must not be able to skip a stop — that is the
-    fail-open this ordering exists to prevent: the alarm would go unrecorded and
-    generation would carry on as though nothing had disagreed.
+    THE ORDERING INVARIANT, restated because it changed: the scope-based stop is
+    computed by the caller BEFORE this runs, and what this returns can only ADD a
+    stop, never cancel one. A store that fails therefore cannot talk generation
+    into proceeding — the direction the old "record after deciding" split existed
+    to protect, kept, while an unrecordable conflict now also stops.
+
+    TOTAL BY CONSTRUCTION. The store is caller-supplied, so the exception net is
+    wide on purpose: anything a store raises becomes an UNRECORDED conflict —
+    which stops — rather than an exception escaping `generate_tasks` and taking
+    down the audit report that would have told the operator what disagreed. A
+    narrower net reads as more disciplined and fails in the worse direction.
 
     One record per `SourceConflict.identity`, which is what keeps two different
     disagreements from collapsing into one record whose text is whichever was
     written last (`blockers.planning_conflict_phase` states that in full).
     """
     from ..blockers import record_planning_conflict
-    from ..errors import StateCorruptError, StateError
 
     if not conflicts:
-        return
+        return []
     if blocker_store is None:
         proposal.record_notes.append(
             f"{len(conflicts)} source conflict(s) were NOT recorded durably: this "
-            "generation was given no blocker store. The conflicts are reported "
-            "here and in the task descriptions only."
+            "generation was given no blocker store, so there is nothing for an "
+            "operator to list or answer later."
         )
-        return
+        return list(conflicts)
+    unrecorded = []
     for conflict in conflicts:
         try:
             blocker = record_planning_conflict(
@@ -299,16 +356,18 @@ def _record_conflicts(
                 ),
                 now=now,
             )
-        except (OSError, StateError, StateCorruptError) as exc:
+        except Exception as exc:  # noqa: BLE001 — see TOTAL BY CONSTRUCTION above
+            unrecorded.append(conflict)
             proposal.record_notes.append(
                 f"conflict {conflict.identity} could NOT be recorded durably "
-                f"({exc}) — it still stopped or was reported, but no blocker "
-                "record exists to answer"
+                f"({type(exc).__name__}: {exc}) — no blocker record exists to "
+                "answer, so generation stops on it rather than continuing"
             )
         else:
             proposal.record_notes.append(
                 f"conflict {conflict.identity} recorded as {blocker.id}"
             )
+    return unrecorded
 
 
 def generate_tasks(
@@ -326,9 +385,12 @@ def generate_tasks(
     DETECTED between claims that name the same subject, so such a claim has to
     use `findings.scope_subject(finding.qualified_id)` to be compared with the
     finding's own scope claim; that function exists to be the one spelling.
-    `blocker_store` is where a conflict is durably recorded; without one,
-    conflicts are still detected, still stop generation and still reported, and
-    `record_notes` says the durable record was not made.
+    `blocker_store` is where a conflict is durably recorded. Without one — which
+    is every production audit today, see the module docstring — a detected
+    conflict has no record an operator could ever list or answer, so it STOPS
+    generation whatever its scope impact, `record_notes` says why, and the
+    stop is written into `skipped`, which is the field the audit report renders.
+    A non-scope conflict continues only when its record was actually made.
 
     Both are keyword-only with defaults, so every existing caller is unchanged:
     with no `sources` the tiers that ARE fed (the findings, and the registry
@@ -379,26 +441,62 @@ def generate_tasks(
         claims += _accepted_scope_claims(finding, registry)
     conflicts = list(detect_conflicts(claims))
     proposal.conflicts = conflicts
-    stopping = [c for c in conflicts if c.stops_generation]
 
-    # THE STOP IS DECIDED HERE, before anything is written. `_record_conflicts`
-    # below can fail without changing this line's answer.
-    if stopping:
+    # THE SCOPE STOP IS DECIDED HERE, before anything is written, so a store that
+    # fails cannot talk generation into proceeding.
+    stopping = {id(c) for c in conflicts if c.stops_generation}
+    unrecorded = {id(c) for c in _record_conflicts(conflicts, blocker_store, now, proposal)}
+
+    # A CONFLICT NOBODY CAN LOOK UP LATER IS NOT A CONFLICT THAT WAS HANDLED.
+    # "Record it and continue" is only honest when the record exists: this task's
+    # requirement is a DURABLE, operator-facing record, and a note in a proposal
+    # object that the audit report does not even render is neither. So an
+    # unrecorded conflict joins the stop rather than being waved through — the
+    # fail-open this would otherwise be is precisely "the alarm did not fire and
+    # nothing said so". Recording can only ADD to `halting`, never remove from
+    # it, so the ordering above still holds.
+    halting = [c for c in conflicts if id(c) in stopping | unrecorded]
+
+    if halting:
+        scope_stops = [c for c in halting if id(c) in stopping]
+        record_stops = [c for c in halting if id(c) not in stopping]
+        why = []
+        if scope_stops:
+            why.append(f"{len(scope_stops)} bear(s) on SCOPE")
+        if record_stops:
+            why.append(f"{len(record_stops)} could not be recorded durably")
         proposal.stopped = (
-            f"{len(stopping)} source conflict(s) bear on SCOPE, so no task was "
-            "generated and no source was preferred over another: "
-            + " | ".join(c.describe() for c in stopping)
+            f"{len(halting)} source conflict(s) stopped generation "
+            f"({'; '.join(why)}), so no task was generated and no source was "
+            "preferred over another: "
+            + " | ".join(c.describe() for c in halting)
         )
-        for conflict in stopping:
-            proposal.skipped.append(
-                (
-                    conflict.subject or "(no subject)",
-                    "generation stopped — " + conflict.describe(),
+        for conflict in halting:
+            # Into `skipped`, which is the ONE field of this proposal that
+            # `audit/report.py` renders — so the disagreement, and the absence of
+            # a record for it, reach the operator's report rather than living in
+            # an object nobody prints.
+            if id(conflict) in stopping:
+                reason = "generation stopped — " + conflict.describe()
+            else:
+                reason = (
+                    "generation stopped — this conflict does not change scope, "
+                    "but no durable record of it could be made, so it was not "
+                    "passed over silently: " + conflict.describe()
                 )
-            )
-        _record_conflicts(conflicts, blocker_store, now, proposal)
+            if id(conflict) in unrecorded:
+                # SAID IN THE REPORT, not only in `record_notes`, which nothing
+                # renders. An operator told a conflict stopped generation will go
+                # looking for the blocker to answer, and has to be told in the
+                # same breath that there is none to find.
+                reason += (
+                    " NO DURABLE RECORD EXISTS for this conflict — `python -m "
+                    "autoloop blockers` will not list it; whether that is a "
+                    "generation with no store or a store that failed to write is "
+                    "in this proposal's record notes."
+                )
+            proposal.skipped.append((conflict.subject or "(no subject)", reason))
         return proposal
-    _record_conflicts(conflicts, blocker_store, now, proposal)
 
     by_subject: dict[str, list[SourceConflict]] = {}
     for conflict in conflicts:

@@ -1151,9 +1151,9 @@ def test_a_reader_whose_content_is_agent_authored_needs_a_location():
     ]) == ()
 
 
-def scope_claim(source, paths, text, kind=CLAIM_BEHAVIOUR):
+def scope_claim(source, paths, text, kind=CLAIM_BEHAVIOUR, author=""):
     return Claim(
-        text=text, source=source, subject="the scope", kind=kind,
+        text=text, source=source, author=author, subject="the scope", kind=kind,
         citation=Evidence(text="a.py:1", source="git show"), paths=paths,
     )
 
@@ -1253,14 +1253,69 @@ def test_a_finding_is_not_reported_as_a_source_conflict():
 
 
 def test_one_source_saying_several_things_is_not_a_disagreement_with_itself():
-    """The limit stated in `detect_conflicts`: within one tier, two sentences
-    are complementary, not contradictory. Without this every finding — which
-    says what it saw AND what it wants AND what it assumed — reports itself as
+    """The limit stated in `detect_conflicts`: ONE AUTHOR saying two things is
+    elaborating, not contradicting. Without this every finding — which says what
+    it saw AND what it wants AND what it assumed — reports itself as
     self-contradictory and all generation stops."""
     assert detect_conflicts([
         scope_claim(SOURCE_REPOSITORY, ("a.py",), "the gate returns True"),
         scope_claim(SOURCE_REPOSITORY, ("a.py",), "the fix adds a check"),
     ]) == ()
+    # And with the author said out loud, which is what `Finding.claims` does.
+    assert detect_conflicts([
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "the gate returns True", author="d1:f1"),
+        scope_claim(SOURCE_REPOSITORY, ("a.py",), "the fix adds a check", author="d1:f1"),
+    ]) == ()
+
+
+def test_two_authors_in_one_tier_can_disagree():
+    """The hole the different-SOURCE rule left: two ACCEPTED TASKS scoping one
+    piece of work to two different file sets share a tier, so every pair of them
+    was suppressed — hiding exactly the disagreement an operator has to settle.
+    The unit is the author, not the tier."""
+    one = scope_claim(SOURCE_ACCEPTED_DECISION, ("a.py",), "scoped to a.py",
+                      kind=CLAIM_CONSTRAINT, author="task-one")
+    two = scope_claim(SOURCE_ACCEPTED_DECISION, ("b.py",), "scoped to b.py",
+                      kind=CLAIM_CONSTRAINT, author="task-two")
+
+    [conflict] = detect_conflicts([one, two])
+
+    assert conflict.scope_impact == SCOPE_CHANGED
+    assert conflict.stops_generation is True
+    # BOTH tasks named: the tier is identical on both sides, so a record that
+    # printed only the source would name neither of the two to go and reconcile.
+    described = conflict.describe()
+    assert "task-one" in described and "task-two" in described
+
+
+def test_two_authors_in_one_tier_agreeing_is_not_a_conflict():
+    """The control for the test above, and the noise that would switch the guard
+    off: two accepted tasks that scope one job the same way agree, however many
+    of them there are."""
+    assert detect_conflicts([
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("a.py",), "scoped to a.py",
+                    kind=CLAIM_CONSTRAINT, author="task-one"),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("a.py",), "scoped to a.py",
+                    kind=CLAIM_CONSTRAINT, author="task-two"),
+    ]) == ()
+
+
+def test_two_within_tier_conflicts_do_not_collide_on_one_identity():
+    """The digest keys the durable record, and within one tier both sides carry
+    the same source — so without the author two disagreements whose texts happen
+    to coincide would file as ONE record, and the second would overwrite the
+    first one's account of who disagreed."""
+    conflicts = detect_conflicts([
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("a.py",), "scoped narrowly",
+                    kind=CLAIM_CONSTRAINT, author="task-one"),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("b.py",), "scoped narrowly",
+                    kind=CLAIM_CONSTRAINT, author="task-two"),
+        scope_claim(SOURCE_ACCEPTED_DECISION, ("c.py",), "scoped narrowly",
+                    kind=CLAIM_CONSTRAINT, author="task-three"),
+    ])
+
+    assert len(conflicts) == 3
+    assert len({c.identity for c in conflicts}) == 3
 
 
 def test_one_sentence_can_still_be_two_scopes():
