@@ -196,6 +196,21 @@ move that base, above the agent — so a revise round after
 round's digest survives inside the review packet that was sent for it. An AUDIT
 round renders none, and its record's digest stays empty.
 
+THE AGENT IS HANDED THE RENDER, not this file. The same dispatch passes the
+rendered section to the executor about to run
+(`implement_executor.deliver_round_context_packet`, set immediately before the
+executor call and cleared in a `finally`), because the loop's single
+`TaskExecutor` is `cli._DispatchingExecutor` in production and forwards nothing
+else. This file is the REVIEWER's copy, and the round trip through it is a
+precondition: a round whose packet cannot be written and read back at the digest
+its record carries does not start at all — no agent, no attempt charged, a
+`context_packet_unavailable` task-fatal park naming the directory that failed
+(task-fatal rather than loop-fatal only because every loop-fatal code must be
+classified in `blockers.LANE_FATAL_CODES`/`FLEET_FATAL_CODES`, which ctx-05 could
+not edit).
+A digest in front of a reviewer for an artifact nobody can produce is evidence
+of context that was never evidenced, which is worse than not running.
+
 The packet is DATA. Nothing parses it, no gate reads it, and
 `tasks.effective_approved_paths` is never handed a context reference. It is
 rendered strictly after every stamp line, in the agent prompt and in the review
