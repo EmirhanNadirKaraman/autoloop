@@ -115,6 +115,107 @@ Readers are tolerant of missing keys (each has a default) and INTOLERANT of
 unreadable ones: a record that fails to decode raises rather than reading as
 absent, because "no blocker" and "a blocker we cannot read" must not look alike.
 
+### `planning_source_conflict` (ctx-06)
+
+One blocker code is written by TASK GENERATION rather than by a park:
+`planning_source_conflict`, recorded through `blockers.record_planning_conflict`
+when two of the sources planning reads disagree about one subject. It is a
+durable record and not a field in `state.json` precisely because this store
+already survives a `task_fatal` park and the session reset that follows one.
+
+Its fields carry the ordinary meanings with two conventions:
+
+* `task_id` is always `(loop)` — generation runs BEFORE the task it would
+  propose exists, so there is none to name.
+* `phase` is `planning:<identity>`, where the identity digests the subject and
+  both sides' (source, author, text). `BlockerStore.find_open` keys a record on
+  `(task_id, code, phase)` and a bump REPLACES `question` and `detail`, so a
+  constant phase would collapse two different disagreements into one record
+  carrying only the later one's account of who disagreed — which is the entire
+  content of the record. The digest is what makes one disagreement one record
+  and the same disagreement seen twice a recurrence. The AUTHOR is in it because
+  two sides of a WITHIN-TIER conflict carry the same source: three accepted
+  tasks scoping one subject produce disagreements whose (source, text) pairs
+  coincide whenever two of them word their scope alike.
+* `kind` is `task_fatal`, not a new kind: `_KIND_RANK` promotes an unrecognised
+  kind to `loop_fatal` rank, which would silently make a planning conflict the
+  `primary_blocker` that `health`, `heartbeat` and `status` report the loop as
+  stuck on.
+
+Like `stranded_after_environment_fault`, it is recorded WITHOUT parking and
+changes no task's status, so it is absent from `cli._RESOLUTION_PRECONDITIONS`
+(whose keys must all be codes a park emitter can raise).
+
+**A conflict with no record of this kind stops generation.** "Recorded, and
+generation continues" is only a true sentence when the record exists, so
+`audit/taskgen.generate_tasks` treats a conflict it could not write — no store
+given, or the store raised — exactly as it treats one that bears on scope, and
+says so in the proposal's `skipped`, which is what the audit report renders.
+
+WHERE THE STORE COMES FROM ON THE SHIPPING PATH. `audit/executor.py:803` calls
+`generate_tasks(reconciled, self._registry)` and passes nothing else, and that
+signature is not ctx-06's to change, so the planning inputs travel ON the
+registry: `cli._build_executor` attaches an `inbox.PlanningSources` — a
+`BlockerStore` over `config.blockers_dir`, a lazy `inbox.TreeReader` over the
+checkout, the operator's intake drafts as a source provider, and a note naming
+the tier nothing reads — and `generate_tasks` reads it through
+`inbox.planning_sources_of`. So a real audit records its conflicts and continues
+past one that provably does not change scope; the stop above is the degenerate
+case (a store that failed, or a caller that built an executor without the seam)
+rather than the normal one. An attribute rather than a module-level global
+deliberately: a global one caller installs is a global a failing test leaves
+behind for every later test in its process.
+
+## Audit finding (audit agent output)
+
+`audit/findings.py`. Thirteen REQUIRED keys — `id`, `category`, `severity`,
+`confidence`, `affected_files`, `symbols`, `evidence`, `impact`,
+`proposed_action`, `dependencies`, `acceptance_criteria`, `validation_commands`,
+`safe_to_parallelize` — and, since ctx-06, five OPTIONAL ones:
+`current_behaviour`, `current_behaviour_citation`, `assumptions`,
+`open_questions`, `context_ids`. An unknown key is still rejected; a missing
+OPTIONAL key is not, so a report from an agent that has never heard of them is
+still valid.
+
+`current_behaviour` and `current_behaviour_citation` are a PAIR. Stating what
+the code does today without saying where it was read is an uncited repository
+claim: `audit/taskgen.generate_tasks` refuses it BY NAME and the finding becomes
+no task. An agent that cannot cite something writes it under `assumptions`
+instead, where it is carried as an assumption and never asserted as fact.
+
+AND THE CITATION IS CHECKED. A `path:line` is free to type, so for a claim about
+what the code does TODAY the cited location must be one `inbox.TreeReader` saw in
+a real `git ls-files`; a path the checkout does not have, and a citation no
+reader was available to check, are both refused (in different words — "nothing
+was read" is not "not there"). The check is bounded to that reader and to claims
+about current state: `proposed_action` and `impact` say what should become true
+and may legitimately name a file this change will create.
+
+`context_ids` are REFERENCES and assert nothing — the same rule
+`Task.context_ids` states. They are rendered into the task so a reader can go
+and check the records, and nothing believes one on their strength.
+
+All four free-text additions count towards `MAX_FINDING_CHARS`, the measured
+whole-finding budget; adding fields outside that sum would reopen the inflation
+path the bound was set for behind new field names.
+
+**HOW FAR THE OPTIONAL FIELDS TRAVEL, stated because the honest answer is "not
+everywhere".** They reach `generate_tasks` on the direct path
+(`parse_findings` → `reconcile` → `generate_tasks`) and are rendered into the
+proposed task's description. They do NOT survive two hops, and neither file is
+ctx-06's to change:
+
+* `audit/reconcile.py:185` rebuilds a `Finding` field by field when it folds a
+  duplicate, so a MERGED finding loses its `current_behaviour`, citation,
+  assumptions, open questions and context ids. The direction is safe — a folded
+  finding can lose a cited claim and cannot gain an uncited one, pinned by
+  `test_audit_taskgen.py::test_a_merged_finding_still_asserts_nothing_uncited` —
+  but the fresh-session context the fields exist to carry is gone.
+* `audit/report.py` does not render them into the Markdown report, so the
+  report → intake round trip (`inbox.parse_audit_findings` →
+  `inbox.AuditFinding`) never sees them. That path is intake-01's promotion
+  route, not this one; nothing on it claims to enforce the citation contract.
+
 ## Audit intake ledger
 
 `<intake_dir>/audit_intake.json` — one object, keyed by the QUALIFIED finding id
