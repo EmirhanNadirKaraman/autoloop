@@ -11,10 +11,16 @@ Both are enforced here, on `inbox`'s existing primitives — `Evidence`, `Claim`
 system beside them:
 
   * every REPOSITORY CLAIM a finding makes (`Finding.claims`) must carry a
-    citation naming a real reader or a stated assumption. One that carries
-    neither is REFUSED, the finding becomes no task, and the refusal names the
-    claim — in `TaskGraphProposal.skipped`, which `audit/report.py` already
+    citation naming a real reader or a stated assumption — and where that reader
+    is the audit report, whose content an agent wrote, the cited location must be
+    one a `TreeReader` actually saw. A claim carrying neither, or citing a path
+    nobody has, is REFUSED, the finding becomes no task, and the refusal names
+    the claim — in `TaskGraphProposal.skipped`, which `audit/report.py` already
     renders for the operator.
+  * a claim that is NOT supported is never restated in a generated task, whoever
+    made it. An unsupported source is still compared and still recorded (dropping
+    it would hide the disagreement), but the description carries the refusal in
+    place of the sentence — `inbox.describe_conflict_for_task`.
   * a disagreement between two sources about one subject is RECORDED durably
     through `blockers.BlockerStore` (a park record, not a field in
     `state.json`, so it survives a set-aside and a reset and can be answered
@@ -30,23 +36,37 @@ are different and only one of them is a guarantee:
   * ACCEPTED TASKS AND DECISIONS — fed, from the `registry` this function has
     always taken (`_accepted_scope_claims`), one claim per task so two accepted
     tasks can disagree with each other and not merely with the finding.
-  * CODE, TESTS AND CONFIGURATION — fed, as the findings themselves.
-  * the CURRENT OPERATOR REQUEST and CONTEXT RECORDS — represented, not wired:
-    there is no operator-request record and no context-record index in this loop
-    yet, so a caller that has one passes it as `sources`. That is a stated gap,
-    not a silent one — the same distinction `inbox.repo_evidence` draws between
-    "nothing was read" and "nothing was found".
+  * CODE, TESTS AND CONFIGURATION — fed, as the findings themselves, and their
+    citations are checked against a real `git ls-files` of the checkout.
+  * the CURRENT OPERATOR REQUEST — fed, from the operator's own intake drafts
+    (`inbox.draft_scope_claims`), which is the one artifact in this loop carrying
+    an operator's words before they become an accepted decision.
+  * CONTEXT RECORDS — NOT fed, and this is the one gap left. No context-record
+    index is wired into this loop at any call site (`context_packet.py` says the
+    same of the packet, and `docs/SCHEMA.md` records that ctx-03 fixed the record
+    SHAPE and deliberately not its location). It is a STATED gap: the wiring
+    layer passes that sentence down as a note and the generator renders it, so a
+    reader of an audit report is told the tier said nothing because nothing reads
+    it — never left to infer agreement from silence. One argument away: a caller
+    that has an index adds its claims through the same provider.
 
-**THE PRODUCTION CALLER PASSES NEITHER `sources` NOR A STORE, TODAY.**
-`audit/executor.py:803` calls `generate_tasks(reconciled, self._registry)`, and
-`AuditExecutor` has no blocker store to give it — so on the audit path the two
-unwired tiers are absent and no conflict gets a durable record. That is why an
-unrecorded conflict STOPS: the one thing this module can guarantee from inside
-its own file is that the audit never proposes a task out of sources it knows
-disagree while quietly failing to file the record an operator would answer. The
-remaining half — passing a real `BlockerStore` and the operator's request down
-from `cli.py` through `AuditExecutor.__init__` — is an edit to the executor,
-which is outside ctx-06's approved paths and is reported rather than made.
+**HOW PRODUCTION GETS THEM, since `audit/executor.py:803` calls
+`generate_tasks(reconciled, self._registry)` and hands this function nothing
+else.** That signature is not ctx-06's to change — the executor is outside this
+task's approved paths — so the inputs ride on the object the CLI's wiring layer
+already chooses and the executor already passes: `cli._build_executor` attaches
+an `inbox.PlanningSources` to the registry (a blocker store on
+`config.blockers_dir`, a lazy `TreeReader` over the checkout, the intake-draft
+provider, and the context-record note), and `generate_tasks` reads it through
+`inbox.planning_sources_of`. Explicit keyword arguments still win, so every
+existing caller and every test that states its own inputs is unchanged.
+
+That is what makes "record it and continue" real on the audit path rather than a
+branch nothing reaches: with a store present, a conflict that provably does not
+change scope is filed and generation carries on. An unrecorded conflict still
+STOPS — see `_record_conflicts` — because "recorded and continued" with no record
+is the fail-open this discipline exists for, but that branch is now the
+degenerate case (a store that failed) rather than the normal one.
 
 THE SEAM WITH intake-01 is unmoved: promotion, deduplication against the tree
 and the registry, and the outcome ledger are `inbox.promote_finding`'s. This
@@ -75,7 +95,11 @@ from ..inbox import (
     Claim,
     Evidence,
     SourceConflict,
+    describe_conflict_for_task,
     detect_conflicts,
+    mention_pattern,
+    planning_sources_of,
+    resolve_tree,
     unsupported_claims,
 )
 from ..tasks import TaskRegistry
@@ -153,7 +177,7 @@ def _stated(values) -> tuple[str, ...]:
     return tuple(v.strip() for v in values if str(v).strip())
 
 
-def _description(finding: Finding, task: dict, conflicts: tuple = ()) -> str:
+def _description(finding: Finding, task: dict, conflicts: tuple = (), tree=None) -> str:
     """The task description, carrying everything a FRESH SESSION needs.
 
     The contract, in order: verified current behaviour WITH its citation;
@@ -167,7 +191,18 @@ def _description(finding: Finding, task: dict, conflicts: tuple = ()) -> str:
     a description that stated it as verified fact would be the loop asserting a
     repository fact it never read, which is the whole thing this task forbids.
     A line with no citation never reaches here at all; `unsupported_claims`
-    refuses the finding first.
+    refuses the finding first, and for a claim about CURRENT BEHAVIOUR that
+    refusal now includes a citation whose location no tree read confirmed.
+
+    EVERY SENTENCE BELOW TRACES TO A CLAIM THAT WENT THROUGH THAT GATE —
+    `evidence`, `proposed_action`, `impact`, `current_behaviour` and each
+    assumption are all in `Finding.claims`, and a conflict is rendered through
+    `inbox.describe_conflict_for_task`, which withholds any side that did not.
+    The deliberate exception is `open_questions`: a question asserts nothing, and
+    it is rendered under a heading that says it is unsettled. The property is
+    worth stating because it is what a future field can break silently — a line
+    added here with no claim behind it is a repository statement no refusal ever
+    looked at.
     """
     # BLANK IS ABSENT, judged exactly as `Finding.claims` judges it. The two
     # have to agree: `claims` skips a whitespace-only `current_behaviour`, so a
@@ -194,9 +229,14 @@ def _description(finding: Finding, task: dict, conflicts: tuple = ()) -> str:
         f"Desired behaviour (scope): {finding.proposed_action}",
         "Non-goals: nothing beyond the scope above — no drive-by refactors, "
         "no changes to files outside the expected list without re-approval.",
-        f"Impact if unfixed: {finding.impact}",
-        f"Evidence the audit cited: {finding.evidence}",
     ]
+    if finding.impact.strip():
+        # BLANK IS ABSENT here too, for the reason the behaviour line above gives
+        # and for one more: `Finding.claims` emits no claim for an impact nobody
+        # wrote, so a heading printed anyway would be a line in the task that no
+        # refusal had ever looked at.
+        lines.append(f"Impact if unfixed, as the audit stated it: {finding.impact}")
+    lines.append(f"Evidence the audit cited: {finding.evidence}")
     if symbols:
         lines.append("Evidence symbols: " + ", ".join(symbols))
     if context_ids:
@@ -224,28 +264,31 @@ def _description(finding: Finding, task: dict, conflicts: tuple = ()) -> str:
         # the durable record, because the round that works this task is the one
         # that needs to know two sources disagreed about it — and no winner was
         # picked for it.
-        lines.append(f"Recorded source conflict (no winner chosen): {conflict.describe()}")
+        #
+        # RENDERED THROUGH THE PROJECTION, not through `SourceConflict.describe`.
+        # A `sources` claim is a party to a conflict whatever backs it (dropping
+        # an uncited one would hide the disagreement), and a task description is
+        # read by a fresh session that cannot tell a quoted source from a fact —
+        # so an unsupported side's SENTENCE is withheld here while both sources,
+        # both scopes and the rule it failed are named. The verbatim account is
+        # in the durable record, which is written for an operator.
+        lines.append(
+            "Recorded source conflict (no winner chosen): "
+            + describe_conflict_for_task(conflict, tree=tree)
+        )
     return "\n".join(lines)
 
 
 def _mentions(qualified_id: str) -> re.Pattern:
     """Matches the finding id where it is WRITTEN, not where it is contained.
 
-    `d1:f1` must not match inside `d1:f11`, and the plain `in` test that this
-    replaces did exactly that — manufacturing a conflict between two sources that
-    were never talking about the same finding, which is worse than no record at
-    all because an operator has to go and disprove it.
-
-    The two guards are deliberately asymmetric:
-
-      * AFTER the id, only a word character or a hyphen disqualifies, so an id
-        ending a sentence (`covers d1:f1.`) or introducing one (`d1:f1: scoped
-        to …`) still matches, while `d1:f11` and `d1:f1-b` do not;
-      * BEFORE it, `:` and `.` disqualify as well, so `sec:d1:f1` is not read as
-        a mention of `d1:f1` — a longer id that merely ENDS with this one is a
-        different finding.
+    `inbox.mention_pattern` holds the rule and the reasoning; this name stays
+    because the two call sites below read better with it. ONE spelling, because
+    the registry and the operator's drafts are asked the same question ("does
+    this text name that finding") and two patterns would answer it differently —
+    which is a conflict found against one source and missed against the other.
     """
-    return re.compile(rf"(?<![\w:.-]){re.escape(qualified_id)}(?![\w-])")
+    return mention_pattern(qualified_id)
 
 
 def _accepted_scope_claims(finding: Finding, registry: TaskRegistry) -> list[Claim]:
@@ -370,43 +413,96 @@ def _record_conflicts(
     return unrecorded
 
 
+def _provided_sources(sources, planning, supported) -> tuple[tuple, tuple[str, ...]]:
+    """`(claims, notes)` from the caller's `sources` or the wired provider.
+
+    AN EXPLICIT ARGUMENT WINS, including an explicitly empty one: a test or a
+    caller that states its own sources is saying what the tiers are, and a
+    provider silently adding more would make that statement untrue. `None` — the
+    default — means "use whatever this deployment wired", which is how the audit
+    path gets the operator's drafts without `audit/executor.py` knowing they
+    exist.
+
+    TOTAL, like `_record_conflicts` and for the same reason: the provider is
+    caller-supplied, and anything it raises becomes a NOTE saying the tier was
+    not read, rather than an exception ending a generation that has findings to
+    report. A tier that could not be read is reported, never counted as agreement
+    — the whole point of `repo_evidence`'s "nothing was read" sentence, applied
+    one level up.
+    """
+    if sources is not None:
+        return tuple(sources), ()
+    provider = planning.provider
+    if provider is None:
+        return (), ()
+    try:
+        produced, notes = provider(supported)
+        claims = tuple(produced)
+        notes = tuple(str(note) for note in notes)
+        # SHAPE-CHECKED HERE, not left to explode downstream. Anything that is
+        # not a `Claim` reaches `unsupported_claims` as an object with no `.text`
+        # and takes the whole generation down with an `AttributeError` — a
+        # provider returning the wrong shape has to read as a tier that was not
+        # read, which is the same answer as a provider that raised.
+        wrong = [c for c in claims if not isinstance(c, Claim)]
+        if wrong:
+            raise TypeError(f"{len(wrong)} of {len(claims)} entries are not Claims")
+    except Exception as exc:  # noqa: BLE001 — a broken provider must not end the run
+        return (), (
+            f"the wired source provider failed ({type(exc).__name__}: {exc}): "
+            "NOTHING WAS READ from the tiers it feeds, so any disagreement they "
+            "hold with this audit is UNKNOWN rather than absent.",
+        )
+    return claims, notes
+
+
 def generate_tasks(
     reconciled: ReconciledAudit,
     registry: TaskRegistry,
     *,
-    sources=(),
+    sources=None,
     blocker_store=None,
+    tree=None,
     now: str = "",
 ) -> TaskGraphProposal:
     """Findings → a proposed task graph, with ctx-06's planning discipline.
 
-    `sources` are extra `inbox.Claim`s from the tiers this loop has no live feed
-    for — the operator's request and the context records. A conflict is only
-    DETECTED between claims that name the same subject, so such a claim has to
-    use `findings.scope_subject(finding.qualified_id)` to be compared with the
-    finding's own scope claim; that function exists to be the one spelling.
-    `blocker_store` is where a conflict is durably recorded. Without one — which
-    is every production audit today, see the module docstring — a detected
-    conflict has no record an operator could ever list or answer, so it STOPS
-    generation whatever its scope impact, `record_notes` says why, and the
-    stop is written into `skipped`, which is the field the audit report renders.
-    A non-scope conflict continues only when its record was actually made.
+    EVERY INPUT BELOW HAS TWO ROUTES: the keyword argument, and the
+    `inbox.PlanningSources` the deployment attached to `registry` (see the module
+    docstring for why the seam is there and not in a signature this task may not
+    change). The keyword wins wherever it is given, so a caller that states its
+    inputs — every test in `test_audit_taskgen.py` — is unaffected by what a
+    deployment wired.
 
-    Both are keyword-only with defaults, so every existing caller is unchanged:
-    with no `sources` the tiers that ARE fed (the findings, and the registry
-    passed as the second argument) are still compared with each other.
+    `sources` are `inbox.Claim`s from the tiers that are not the findings and not
+    the registry: the operator's request today, a context-record index when one
+    is wired. A conflict is only DETECTED between claims that name the same
+    subject, so such a claim has to use `findings.scope_subject(qualified_id)` to
+    be compared with the finding's own scope claim; that function exists to be
+    the one spelling.
 
-    A `sources` claim is a PARTY to a conflict and is never asserted by a
-    generated task, so it is deliberately not held to the citation rule: an
-    uncited operator sentence that contradicts the tree is exactly what has to
-    be recorded, and refusing it here would DROP it — turning the fail-closed
-    direction into a fail-open one. What it is backed by travels with it into
-    the record, through `Claim.describe`.
+    `blocker_store` is where a conflict is durably recorded, and `tree` is the
+    `inbox.TreeReader` a model-authored citation is checked against. Both absent
+    means both refusals: a citation that cannot be verified is refused, and a
+    conflict that cannot be recorded stops generation, because "we could not
+    check" must never produce the same outcome as "we checked".
+
+    A `sources` claim is a PARTY to a conflict whatever backs it, and it is
+    VALIDATED but never dropped. Dropping an uncited operator sentence that
+    contradicts the tree would hide exactly the disagreement worth recording —
+    fail-closed turned fail-open — so the refusal is reported into `skipped`, the
+    claim still travels into the comparison and the durable record, and
+    `inbox.describe_conflict_for_task` is what keeps its words out of any task
+    description.
     """
     from ..state import utcnow_iso
 
     proposal = TaskGraphProposal()
     now = now or utcnow_iso()
+    planning = planning_sources_of(registry)
+    if blocker_store is None:
+        blocker_store = planning.blocker_store
+    tree = resolve_tree(tree if tree is not None else planning.tree)
     promotable = sorted(
         reconciled.promotable(),
         key=lambda f: (
@@ -422,20 +518,39 @@ def generate_tasks(
     # and does not have to be unwound afterwards.
     supported: list[Finding] = []
     for finding in promotable:
-        refusals = unsupported_claims(finding.claims())
+        refusals = unsupported_claims(finding.claims(), tree=tree)
         if refusals:
             proposal.skipped.append(
                 (
                     finding.qualified_id,
-                    "refused — a repository claim with no citation and no stated "
-                    "assumption: " + "; ".join(refusals),
+                    "refused — a repository claim with no citation, no verified "
+                    "location and no stated assumption: " + "; ".join(refusals),
                 )
             )
             continue
         supported.append(finding)
 
+    # ---- what the other tiers say, and what backs it ----------------------
+    source_claims, source_notes = _provided_sources(sources, planning, supported)
+    for note in (*planning.notes, *source_notes):
+        # SAID IN THE REPORT, not only in `record_notes`, which nothing renders.
+        # A tier with no producer, a draft that would not open, a reader that
+        # answered with nothing — each is a thing this generation did NOT compare,
+        # and an operator reading a clean proposal has to be able to tell that
+        # apart from a comparison that found nothing to report.
+        proposal.record_notes.append(note)
+        proposal.skipped.append(("(planning sources)", note))
+    for refusal in unsupported_claims(source_claims, tree=tree):
+        proposal.skipped.append(
+            (
+                "(planning sources)",
+                "an unsupported source claim was NOT asserted and NOT dropped — "
+                "it is compared and recorded, and no task repeats it: " + refusal,
+            )
+        )
+
     # ---- do the sources disagree? -----------------------------------------
-    claims = list(sources)
+    claims = list(source_claims)
     for finding in supported:
         claims += list(finding.claims())
         claims += _accepted_scope_claims(finding, registry)
@@ -539,6 +654,7 @@ def generate_tasks(
             finding,
             task,
             conflicts=tuple(by_subject.get(scope_subject(finding.qualified_id), ())),
+            tree=tree,
         )
         if unresolved:
             description += (

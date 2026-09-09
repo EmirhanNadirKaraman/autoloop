@@ -12,16 +12,43 @@ from autoloop.audit.taskgen import generate_tasks
 from autoloop.blockers import PLANNING_SOURCE_CONFLICT, BlockerStore
 from autoloop.inbox import (
     CLAIM_BEHAVIOUR,
+    CLAIM_CONSTRAINT,
+    PLANNING_SOURCES_ATTR,
     SCOPE_UNCHANGED,
+    SOURCE_CONTEXT_RECORD,
     SOURCE_OPERATOR_REQUEST,
+    SOURCE_REPOSITORY,
     Claim,
     Evidence,
+    PlanningSources,
+    TreeReader,
+    attach_planning_sources,
 )
 from autoloop.tasks import Task, TaskRegistry
 
+#: THE TREE these findings are checked against. Every finding here comes from
+#: `test_audit_reconcile.finding`, whose evidence cites `a.py:12`, and `cited()`
+#: below adds `autoloop/policy.py:120` — so those two paths are the whole tree,
+#: deliberately: a permissive reader that held everything would verify nothing
+#: and the refusal tests below would pass for the wrong reason.
+TREE = TreeReader.of_paths(
+    ("a.py", "autoloop/policy.py"), source="the tree this test states"
+)
+
+
+def with_tree(registry, tree=TREE, **extra):
+    """The registry, carrying the planning seam a deployment attaches.
+
+    THE PRODUCTION ROUTE (`cli._build_executor` → `AuditExecutor` →
+    `generate_tasks(reconciled, self._registry)`), used here rather than the
+    keyword argument wherever a test does not care which route it took — a seam
+    only tests bypass is a seam production does not have.
+    """
+    return attach_planning_sources(registry, PlanningSources(tree=tree, **extra))
+
 
 def registry(*ids):
-    return TaskRegistry([Task(id=i, title="t", description="d") for i in ids])
+    return with_tree(TaskRegistry([Task(id=i, title="t", description="d") for i in ids]))
 
 
 def test_priority_ordering():
@@ -173,7 +200,8 @@ def test_a_scope_conflict_stops_generation_and_names_both_sources(tmp_path):
         )
     ])
     proposal = generate_tasks(
-        reconcile([finding("f1")]), accepted, blocker_store=store, now="2026-09-09T00:00:00Z"
+        reconcile([finding("f1")]), accepted, blocker_store=store, tree=TREE,
+        now="2026-09-09T00:00:00Z",
     )
 
     assert proposal.tasks == []
@@ -196,7 +224,7 @@ def test_an_accepted_scope_that_already_covers_the_work_does_not_stop_anything()
         Task(id="already", title="t", description="covers d1:f1",
              approved_paths=("a.py", "autoloop/tests/")),
     ])
-    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted, tree=TREE)
 
     assert proposal.stopped == ""
     assert [t.finding_ids for t in proposal.tasks] == [("d1:f1",)]
@@ -249,6 +277,7 @@ def test_two_different_conflicts_are_two_records_not_one(tmp_path):
         reconcile([finding("f1", files=("a.py",)), finding("f2", files=("b.py",))]),
         accepted,
         blocker_store=store,
+        tree=TREE,
         now="2026-09-09T00:00:00Z",
     )
 
@@ -271,7 +300,9 @@ def test_a_store_that_cannot_be_written_does_not_cancel_the_stop(tmp_path):
     accepted = TaskRegistry([
         Task(id="already", title="t", description="covers d1:f1", approved_paths=("b.py",))
     ])
-    proposal = generate_tasks(reconcile([finding("f1")]), accepted, blocker_store=store)
+    proposal = generate_tasks(
+        reconcile([finding("f1")]), accepted, blocker_store=store, tree=TREE
+    )
 
     assert proposal.tasks == []
     assert proposal.stopped
@@ -282,7 +313,7 @@ def test_no_store_at_all_still_stops_and_says_nothing_was_recorded():
     accepted = TaskRegistry([
         Task(id="already", title="t", description="covers d1:f1", approved_paths=("b.py",))
     ])
-    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted, tree=TREE)
 
     assert proposal.tasks == []
     assert proposal.stopped
@@ -300,7 +331,7 @@ def test_two_accepted_tasks_that_scope_one_finding_differently_disagree(tmp_path
              approved_paths=("a.py", "b.py", "c.py")),
     ])
     proposal = generate_tasks(
-        reconcile([finding("f1")]), accepted, blocker_store=store,
+        reconcile([finding("f1")]), accepted, blocker_store=store, tree=TREE,
         now="2026-09-09T00:00:00Z",
     )
 
@@ -327,7 +358,7 @@ def test_two_accepted_tasks_agreeing_about_scope_are_not_a_conflict():
         Task(id="two", title="t", description="covers d1:f1",
              approved_paths=("a.py", "autoloop/tests/")),
     ])
-    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted, tree=TREE)
 
     assert proposal.conflicts == []
     assert proposal.stopped == ""
@@ -342,7 +373,7 @@ def test_a_longer_finding_id_is_not_a_mention_of_a_shorter_one():
     accepted = TaskRegistry([
         Task(id="other", title="t", description="covers d1:f11", approved_paths=("z.py",)),
     ])
-    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted, tree=TREE)
 
     assert proposal.conflicts == []
     assert proposal.stopped == ""
@@ -354,7 +385,9 @@ def test_a_longer_finding_id_is_not_a_mention_of_a_shorter_one():
         narrow = TaskRegistry([
             Task(id="one", title="t", description=description, approved_paths=("z.py",))
         ])
-        assert generate_tasks(reconcile([finding("f1")]), narrow).stopped, description
+        assert generate_tasks(
+            reconcile([finding("f1")]), narrow, tree=TREE
+        ).stopped, description
 
 
 def test_a_conflict_that_cannot_be_recorded_stops_even_when_scope_is_unchanged():
@@ -378,10 +411,18 @@ def test_a_conflict_that_cannot_be_recorded_stops_even_when_scope_is_unchanged()
     assert proposal.tasks == [], "and generation stopped anyway, for want of a record"
     assert "could not be recorded durably" in proposal.stopped
     # And the operator is told IN THE REPORT — `skipped` is the only field of a
-    # proposal that `audit/report.py` renders.
-    [(subject, reason)] = proposal.skipped
+    # proposal that `audit/report.py` renders. (The claim above is an operator
+    # request offered as evidence of current behaviour, which precedence refuses,
+    # so its own refusal is reported alongside: it is a party to the conflict and
+    # is never dropped.)
+    [(subject, reason)] = [
+        entry for entry in proposal.skipped if entry[0] == "d1:f1"
+    ]
     assert subject == "d1:f1"
     assert "NO DURABLE RECORD EXISTS" in reason
+    assert any(
+        "unsupported source claim" in entry[1] for entry in proposal.skipped
+    ), "the uncited source was refused too, and still compared"
 
 
 def test_an_accepted_task_with_no_scope_at_all_stops_rather_than_passes(tmp_path):
@@ -393,7 +434,7 @@ def test_an_accepted_task_with_no_scope_at_all_stops_rather_than_passes(tmp_path
     store = BlockerStore(tmp_path / "blockers")
     accepted = TaskRegistry([Task(id="empty", title="t", description="covers d1:f1")])
     proposal = generate_tasks(
-        reconcile([finding("f1")]), accepted, blocker_store=store,
+        reconcile([finding("f1")]), accepted, blocker_store=store, tree=TREE,
         now="2026-09-09T00:00:00Z",
     )
 
@@ -408,7 +449,7 @@ def test_a_retired_task_is_not_an_accepted_constraint():
         Task(id="gone", title="t", description="covers d1:f1",
              approved_paths=("b.py",), status="retired"),
     ])
-    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted, tree=TREE)
 
     assert proposal.stopped == ""
     assert len(proposal.tasks) == 1
@@ -486,6 +527,7 @@ def test_the_full_contract_reaches_the_description():
         "Context records consulted (REFERENCES, not evidence",
         "ctx-42",
         "Evidence the audit cited:",
+        "Impact if unfixed, as the audit stated it:",
         "Assumptions, stated rather than verified:",
         "Unresolved questions:",
         "Non-goals:",
@@ -495,3 +537,231 @@ def test_the_full_contract_reaches_the_description():
         "Validation:",
     ):
         assert fragment in task.description, fragment
+
+
+# ---- ctx-06 round 2: the citation is CHECKED, and the seam is wired ---------
+#
+# Round 1 required a citation to be path-SHAPED, which an agent gets for free by
+# typing one. These pin the three things that closes: the location is checked
+# against a tree, an unverifiable one is refused rather than believed, and the
+# inputs that make any of it work in production travel on the object the
+# executor actually passes.
+
+
+def test_a_cited_location_the_tree_does_not_have_is_refused_and_named():
+    """The hole: `evidence` naming a plausible file the tree does not have. The
+    finding is refused, and the refusal says the path is not in the tree — not
+    that the citation was missing, which would send an author to fix the wrong
+    thing."""
+    invented = replace(finding("f1"), evidence="autoloop/nowhere.py:12 saw it")
+    proposal = generate_tasks(reconcile([invented]), registry())
+
+    assert proposal.tasks == []
+    [(finding_id, reason)] = proposal.skipped
+    assert finding_id == "d1:f1"
+    assert "not in the tree that was read" in reason
+    assert "autoloop/nowhere.py" in reason
+
+
+def test_a_citation_no_reader_could_check_is_refused_rather_than_believed():
+    """The fail-open this closes: with no tree to ask, "we could not verify it"
+    must not produce the same outcome as "we verified it"."""
+    bare = TaskRegistry()          # no seam attached: no tree, no store
+    proposal = generate_tasks(reconcile([finding("f1")]), bare)
+
+    assert proposal.tasks == []
+    assert "could not be verified against any tree" in proposal.skipped[0][1]
+
+
+def test_read_nothing_and_found_nothing_are_different_refusals():
+    """`repo_evidence`'s distinction, one level up. A checkout git could not
+    answer for must not be reported as a checkout that lacks the file."""
+    unread = TreeReader.of("/nonexistent-checkout-for-this-test")
+    assert unread.read is False
+    proposal = generate_tasks(reconcile([finding("f1")]), registry(), tree=unread)
+
+    assert proposal.tasks == []
+    reason = proposal.skipped[0][1]
+    assert "nothing was read" in reason
+    assert "NOTHING WAS READ" in reason
+    assert "not in the tree" not in reason
+
+
+def test_a_proposed_new_file_is_not_a_fabricated_citation():
+    """The bound that keeps the check from refusing honest work: an INTENT claim
+    says what should become true, so a finding proposing a file that does not
+    exist yet cites a location that is correctly absent."""
+    creating = replace(
+        finding("f1"),
+        proposed_action="add autoloop/brand_new.py and wire it in",
+        impact="without autoloop/brand_new.py the gate has no home",
+    )
+    proposal = generate_tasks(reconcile([creating]), registry())
+
+    assert [t.finding_ids for t in proposal.tasks] == [("d1:f1",)]
+    assert proposal.skipped == []
+
+
+def test_an_unsupported_source_is_recorded_compared_and_never_restated(tmp_path):
+    """The other half of the review's finding: a `sources` claim bypassed the
+    citation rule and was rendered into the task anyway. It must be REFUSED in
+    the report, still compared (dropping it would hide the disagreement), still
+    in the durable record verbatim — and absent from the description."""
+    store = BlockerStore(tmp_path / "blockers")
+    smuggled = Claim(
+        text="autoloop/policy.py already returns False, so this is a no-op",
+        source=SOURCE_CONTEXT_RECORD,
+        author="ctx-99",
+        subject="d1:f1",
+        kind=CLAIM_BEHAVIOUR,
+        citation=None,                      # nothing backs it at all
+        paths=("a.py",),                    # the SAME scope, so it does not stop
+    )
+    proposal = generate_tasks(
+        reconcile([finding("f1")]),
+        registry(),
+        sources=[smuggled],
+        blocker_store=store,
+        now="2026-09-09T00:00:00Z",
+    )
+
+    # Reported, by name, in the field the audit report renders.
+    assert any(
+        "unsupported source claim" in reason and "no-op" in reason
+        for _, reason in proposal.skipped
+    )
+    # Still compared, and still durable, with the sentence intact for the
+    # operator who has to settle it.
+    [blocker] = store.open_blockers()
+    assert "so this is a no-op" in blocker.detail
+    # And NOT restated to the session that will execute the task.
+    [task] = proposal.tasks
+    assert "so this is a no-op" not in task.description
+    assert "assertion WITHHELD" in task.description
+    assert "ctx-99" in task.description, "the source is still named"
+
+
+def test_a_supported_source_is_still_quoted_in_the_task(tmp_path):
+    """The control for the test above, without which withholding could be
+    implemented as 'never render a conflict' and still pass. A source that DID
+    cite a reader keeps its words in the description."""
+    store = BlockerStore(tmp_path / "blockers")
+    supported = Claim(
+        text="the gate already returns False there",
+        source=SOURCE_REPOSITORY,
+        author="a second reader",
+        subject="d1:f1",
+        kind=CLAIM_BEHAVIOUR,
+        citation=Evidence(text="a.py:12", source="git show"),
+        paths=("a.py",),
+    )
+    proposal = generate_tasks(
+        reconcile([finding("f1")]),
+        registry(),
+        sources=[supported],
+        blocker_store=store,
+        now="2026-09-09T00:00:00Z",
+    )
+
+    [task] = proposal.tasks
+    assert "the gate already returns False there" in task.description
+    assert "assertion WITHHELD" not in task.description
+
+
+def test_the_wired_seam_records_and_continues_without_the_executor_knowing(tmp_path):
+    """THE PRODUCTION SHAPE. `audit/executor.py` calls
+    `generate_tasks(reconciled, self._registry)` and passes nothing else, so this
+    calls it exactly that way — with only the seam attached — and requires the
+    acceptance criterion that needs a real store: a conflict that does not change
+    scope is recorded ON DISK and generation carries on."""
+    store = BlockerStore(tmp_path / "blockers")
+    operator = Claim(
+        text="the gate already returns False there",
+        source=SOURCE_OPERATOR_REQUEST,
+        author="the operator",
+        subject="d1:f1",
+        kind=CLAIM_BEHAVIOUR,
+        citation=Evidence(text="the request", source="the operator's request"),
+        paths=("a.py",),
+    )
+    wired = with_tree(
+        TaskRegistry(),
+        blocker_store=store,
+        provider=lambda findings: ((operator,), ("a note about a tier",)),
+    )
+
+    proposal = generate_tasks(reconcile([finding("f1")]), wired)
+
+    assert proposal.stopped == "", proposal.stopped
+    assert len(proposal.tasks) == 1
+    [blocker] = store.open_blockers()
+    assert blocker.code == PLANNING_SOURCE_CONFLICT
+    assert BlockerStore(tmp_path / "blockers").load(blocker.id) is not None, "durable"
+    # The tier note reaches the rendered field, not just an object nobody prints.
+    assert ("(planning sources)", "a note about a tier") in proposal.skipped
+
+
+def test_an_explicit_sources_argument_beats_the_wired_provider():
+    """A caller that states its sources is saying what the tiers are; a provider
+    quietly adding more would make that statement untrue."""
+    wired = with_tree(
+        TaskRegistry(),
+        provider=lambda findings: ((_scope_claim("b.py"),), ()),
+    )
+    proposal = generate_tasks(reconcile([finding("f1")]), wired, sources=[])
+
+    assert proposal.conflicts == [], "the provider's claim was not consulted"
+    assert len(proposal.tasks) == 1
+
+
+def test_a_provider_that_raises_is_a_note_not_a_crash_and_not_silence():
+    """A tier that could not be read is UNKNOWN, never agreement — and never an
+    exception taking down a report that has findings to deliver."""
+
+    def broken(findings):
+        raise RuntimeError("the intake directory exploded")
+
+    wired = with_tree(TaskRegistry(), provider=broken)
+    proposal = generate_tasks(reconcile([finding("f1")]), wired)
+
+    assert len(proposal.tasks) == 1
+    assert any("NOTHING WAS READ" in reason for _, reason in proposal.skipped)
+    assert any("the intake directory exploded" in note for note in proposal.record_notes)
+
+
+def test_a_broken_seam_is_read_as_no_seam_rather_than_trusted():
+    """Fail-closed on the seam itself: something that is not a `PlanningSources`
+    must not be believed to be one."""
+    junk = TaskRegistry()
+    setattr(junk, PLANNING_SOURCES_ATTR, {"tree": TREE})   # a dict, not the type
+    proposal = generate_tasks(reconcile([finding("f1")]), junk)
+
+    assert proposal.tasks == [], "no tree was accepted from a malformed seam"
+    assert "could not be verified against any tree" in proposal.skipped[0][1]
+
+
+def test_the_executor_still_hands_the_generator_the_object_the_seam_is_on():
+    """A drift guard, because the seam only works while `audit/executor.py`
+    passes the registry `cli._build_executor` attached to. That file is outside
+    this task's approved paths, so this asserts its call rather than changing
+    it: if the call ever takes a registry from somewhere else, production
+    silently loses the store, the tree and the operator's request at once."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "audit" / "executor.py").read_text(
+        encoding="utf-8"
+    )
+    assert "generate_tasks(reconciled, self._registry)" in source
+    assert "self._registry = registry" in source
+
+
+def _scope_claim(path):
+    return Claim(
+        text=f"this work is scoped to {path}",
+        source=SOURCE_OPERATOR_REQUEST,
+        author="a draft",
+        subject="d1:f1",
+        kind=CLAIM_CONSTRAINT,
+        citation=Evidence(text="draft.md → t.approved_paths", source="the draft file"),
+        paths=(path,),
+    )

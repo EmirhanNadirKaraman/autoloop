@@ -151,11 +151,20 @@ generation continues" is only a true sentence when the record exists, so
 `audit/taskgen.generate_tasks` treats a conflict it could not write — no store
 given, or the store raised — exactly as it treats one that bears on scope, and
 says so in the proposal's `skipped`, which is what the audit report renders.
-WHERE THAT BITES TODAY: `audit/executor.py:803` calls the generator with no
-blocker store, so on the shipping audit path no `planning_source_conflict`
-record is ever written and any detected conflict stops that run's generation.
-Passing a store down from `cli.py` through `AuditExecutor.__init__` is the
-remaining half of the wiring and is not ctx-06's to make.
+
+WHERE THE STORE COMES FROM ON THE SHIPPING PATH. `audit/executor.py:803` calls
+`generate_tasks(reconciled, self._registry)` and passes nothing else, and that
+signature is not ctx-06's to change, so the planning inputs travel ON the
+registry: `cli._build_executor` attaches an `inbox.PlanningSources` — a
+`BlockerStore` over `config.blockers_dir`, a lazy `inbox.TreeReader` over the
+checkout, the operator's intake drafts as a source provider, and a note naming
+the tier nothing reads — and `generate_tasks` reads it through
+`inbox.planning_sources_of`. So a real audit records its conflicts and continues
+past one that provably does not change scope; the stop above is the degenerate
+case (a store that failed, or a caller that built an executor without the seam)
+rather than the normal one. An attribute rather than a module-level global
+deliberately: a global one caller installs is a global a failing test leaves
+behind for every later test in its process.
 
 ## Audit finding (audit agent output)
 
@@ -173,6 +182,14 @@ the code does today without saying where it was read is an uncited repository
 claim: `audit/taskgen.generate_tasks` refuses it BY NAME and the finding becomes
 no task. An agent that cannot cite something writes it under `assumptions`
 instead, where it is carried as an assumption and never asserted as fact.
+
+AND THE CITATION IS CHECKED. A `path:line` is free to type, so for a claim about
+what the code does TODAY the cited location must be one `inbox.TreeReader` saw in
+a real `git ls-files`; a path the checkout does not have, and a citation no
+reader was available to check, are both refused (in different words — "nothing
+was read" is not "not there"). The check is bounded to that reader and to claims
+about current state: `proposed_action` and `impact` say what should become true
+and may legitimately name a file this change will create.
 
 `context_ids` are REFERENCES and assert nothing — the same rule
 `Task.context_ids` states. They are rendered into the task so a reader can go
