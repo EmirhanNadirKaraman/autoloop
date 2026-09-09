@@ -636,7 +636,13 @@ FLOOR_AFTER = 16
 #: names is `docs/AUTOLOOP.md`, it resolves no `__file__`, and its only
 #: concurrency is `threading` — no repository, no subprocess and no interpreter
 #: literal anywhere in it — so 20 and 24 hold.
-SUITE_SIZE = 115
+#: 115 -> 116 when ctx-05 added `test_context_packet.py` (2026-09-09), the
+#: DENOMINATOR again. It spells `CLAUDE.md` in an evaluated string — the scope
+#: line a context packet renders unions the trackers in — and is still not a
+#: reader of it, because the rule is a CONJUNCTION and this file resolves no
+#: `__file__`. It spawns no interpreter either (its git comes from
+#: `gitrepo.py`), so 20 and 24 hold.
+SUITE_SIZE = 116
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

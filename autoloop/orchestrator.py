@@ -381,6 +381,7 @@ from .config import (
     lane_observed_checkout,
 )
 from .context import build_context, render_context
+from .context_packet import ContextPacketStore, record_round_packet
 from .conversation import (
     SendOutcome,
     SubmitResult,
@@ -7537,7 +7538,10 @@ class Orchestrator:
             # refusal.
             worktree_git.tree_of(execution.candidate_sha)
             packet_text, packet_diff = build_review_packet_with_diff(
-                execution, worktree_git, self._registry.get(task_id)
+                execution,
+                worktree_git,
+                self._registry.get(task_id),
+                self._context_packet_text(execution),
             )
         except (GitError, TemplateError, OSError):
             return None
@@ -9186,6 +9190,41 @@ class Orchestrator:
         """
         return TRACKER_PATHS
 
+    def _context_packets(self) -> ContextPacketStore:
+        """The round context-packet store, resolved through the ONE accessor
+        that decides where those files live (`AutoloopConfig.
+        context_packets_dir` — under the state directory, beside `executions/`,
+        never inside the checkout).
+
+        Built per call rather than held, exactly like the `GitGateway`s this
+        method's neighbours build: the store is a path and two file operations,
+        and a second copy of the location — computed once at construction from a
+        config that a `reset` or a lane switch can re-resolve — is the drift
+        `config.resolve_state_dir`'s docstring is written against.
+        """
+        return ContextPacketStore(self._config.context_packets_dir)
+
+    def _context_packet_text(self, execution: TaskExecution) -> str:
+        """The stored text of the context packet `execution`'s digest names, or
+        `""`.
+
+        THE RECORD LEADS. A record carrying no digest gets no read at all — the
+        packet section of a review packet exists exactly when the loop recorded
+        one, so a stale file left by an older round can never be shown for a
+        round that had none. Where a digest IS recorded, the store returns the
+        text only when the file's own bytes hash to the digest it carries
+        (`ContextPacketStore.load`), and `packet._format_context_packet` then
+        checks that text against THIS record's digest before rendering it.
+
+        `""` for absent and for unreadable alike, because the caller does not
+        act on the difference: the review packet says the text is unavailable
+        and shows the digest, which is the honest report for both.
+        """
+        if not execution.context_packet_sha256:
+            return ""
+        packet = self._context_packets().load(execution.task_id)
+        return packet.text if packet is not None else ""
+
     def _open_attempt(self, execution: TaskExecution) -> None:
         """Charge one dispatch and record it as OPEN.
 
@@ -10342,6 +10381,55 @@ class Orchestrator:
                 return  # already parked
             worktree_git = refreshed
 
+        # THIS ROUND'S CONTEXT PACKET (ctx-05), rendered HERE and nowhere else.
+        #
+        # The placement is the claim. It is below every path that can still move
+        # `execution.task_base_sha` — `_rebase_execution_if_stale` above, and
+        # `_prepare_write_capable_worker`, which may have rebuilt the worker
+        # this reads from — so a revise round after a base move is cut from THAT
+        # round's base rather than from the one an earlier round used. And it is
+        # above `_execute_with_escape_detection`, so the packet exists, is
+        # hashed and is on the record BEFORE any agent runs.
+        #
+        # AUDIT-EXEMPT (see `is_audit` above): an audit unit is synthetic, cites
+        # no context records and has no declared scope, so a packet for one would
+        # be a heading over nothing. Its record keeps an empty digest, which
+        # `packet._format_context_packet` renders as no section at all — an audit
+        # packet is byte-identical to what it was before this existed.
+        #
+        # `worktree_git` is the WORKER's gateway, never the main checkout's,
+        # which is the discipline `packet.build_review_packet_with_diff` states
+        # verbatim and the reason the blob ids below are the ones this task's own
+        # repository holds at its own base.
+        if not is_audit:
+            packet, stored_at = record_round_packet(
+                task,
+                execution,
+                worktree_git,
+                self._context_packets(),
+                # No record index: ctx-03 fixed the record SHAPE and deliberately
+                # not its location, and nothing has named a directory since. The
+                # packet SAYS so and reports every cited id as unresolved rather
+                # than resolving it to silence — see
+                # `context_packet.render_context_packet`.
+                None,
+                max_records=self._config.context.max_records,
+            )
+            self._log(
+                "context_packet_rendered",
+                data={
+                    "task_id": task.id,
+                    "task_base_sha": execution.task_base_sha,
+                    "review_round": execution.review_round,
+                    "digest": packet.digest,
+                    # Named when the write failed, because the round carries on
+                    # either way: the digest is on the record and the agent gets
+                    # the text, so the only casualty is the reviewer's copy —
+                    # which the review packet then says is unavailable rather
+                    # than substituting anything for it.
+                    "stored": str(stored_at) if stored_at is not None else "",
+                },
+            )
         # M1 finding #3 (bounded attempts): charged and PERSISTED before the
         # executor ever runs, not after a commit — so a crash, a restart, or a
         # validation failure that never reaches `commit_and_capture` all consume
@@ -13367,7 +13455,7 @@ class Orchestrator:
         # same code, with the same message, exactly as it always has.
         try:
             packet_text, packet_diff = build_review_packet_with_diff(
-                execution, worktree_git, task
+                execution, worktree_git, task, self._context_packet_text(execution)
             )
         except DiffTooLargeError as exc:
             blocked = self._ask_reviewer_to_split(execution, worktree_git, state, task, exc)
@@ -13527,7 +13615,9 @@ class Orchestrator:
                 "rewrite it smaller, or retire it."
             )
         try:
-            packet_text = build_stat_only_review_packet(execution, worktree_git, task)
+            packet_text = build_stat_only_review_packet(
+                execution, worktree_git, task, self._context_packet_text(execution)
+            )
         except GitError as stat_exc:
             return (
                 "No split was offered: the stat-only packet could not be built "
@@ -13867,7 +13957,7 @@ class Orchestrator:
         )
         try:
             packet_text, packet_diff = build_review_packet_with_diff(
-                execution, worktree_git, task
+                execution, worktree_git, task, self._context_packet_text(execution)
             )
         except (GitError, OSError) as exc:
             # BROADLY, `DiffTooLargeError` included: the split the round would
@@ -16599,7 +16689,10 @@ class Orchestrator:
             return self._refuse_rebuild(code, f"task '{task_id}' is not in the registry")
         try:
             packet_text, packet_diff = build_review_packet_with_diff(
-                execution, worktree_git, self._registry.get(task_id)
+                execution,
+                worktree_git,
+                self._registry.get(task_id),
+                self._context_packet_text(execution),
             )
         except (GitError, TemplateError, OSError) as exc:
             # NOT the archive path. A packet that will not render (an oversized

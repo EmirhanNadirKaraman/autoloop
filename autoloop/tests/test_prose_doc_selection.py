@@ -513,7 +513,14 @@ DOCS_ONLY_SELECTED = 20
 #: for conc-07's reason: `docs/AUTOLOOP.md` is the only document it names, it
 #: resolves no `__file__`, and it builds no repository and spawns nothing — its
 #: only concurrency is `threading`. The same 20 hold; the DENOMINATOR only.
-SUITE_SIZE = 115
+#: 115 -> 116 when ctx-05 added `test_context_packet.py` (2026-09-09), the
+#: DENOMINATOR again. It DOES spell `CLAUDE.md` in an evaluated string — the
+#: scope line a context packet renders unions the trackers in — but the reader
+#: rule is a CONJUNCTION: it resolves no `__file__`, so it cannot address the
+#: checkout it lives in and is not a reader of that tracker. It spawns nothing
+#: either (its git comes from `gitrepo.py`), so it is not on the opaque frontier
+#: and the same 20 hold.
+SUITE_SIZE = 116
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
