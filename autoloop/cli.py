@@ -110,8 +110,11 @@ from .inbox import (
     MAX_WORK_SUGGESTIONS,
     InboxError,
     IntakeError,
+    PlanningSources,
     TaskInbox,
+    TreeReader,
     apply_requests,
+    attach_planning_sources,
     audit_finding_suggestions,
     decline_finding,
     promote_finding,
@@ -131,6 +134,7 @@ from .inbox import (
     open_blocker_suggestions,
     plan_step,
     provider_asker,
+    draft_claims_provider,
     read_draft,
     ready_task_suggestions,
     record_decline,
@@ -482,6 +486,62 @@ def _recorded_out_of_scope_paths(execution_store: TaskExecutionStore):
     return read
 
 
+#: What the CONTEXT RECORD tier gets to say in this deployment, because it has
+#: no producer to say anything else (ctx-06).
+#:
+#: `context_packet.render_context_packet` says the same of the packet it renders,
+#: and `docs/SCHEMA.md` records why: ctx-03 fixed the record SHAPE and
+#: deliberately not its location, so nothing in this loop names a directory to
+#: read records from. Said OUT LOUD, into the audit report, rather than left as
+#: an empty tier — a generator that compared nothing and a generator that
+#: compared a tier which agreed must not look alike to a reviewer. This is the
+#: same "nothing was read is not nothing was found" distinction `repo_evidence`
+#: draws, one tier up.
+CONTEXT_TIER_UNWIRED_NOTE = (
+    "the CONTEXT RECORD tier was not compared: no context record index is wired "
+    "into this loop (ctx-03 fixed the record shape and not its location), so "
+    "whether a record disagrees with this audit is UNKNOWN, not absent."
+)
+
+
+def _planning_sources(config: AutoloopConfig, repo_root: Path) -> PlanningSources:
+    """The planning inputs the audit's task generator cannot derive for itself.
+
+    THE PRODUCTION HALF of ctx-06. `audit/executor.py` calls
+    `taskgen.generate_tasks(reconciled, self._registry)` and hands it nothing
+    else, so what a generation can verify, record and compare is decided HERE, in
+    the wiring layer, and travels on the registry object this module already
+    chooses and hands the executor (`inbox.attach_planning_sources`, which
+    explains why the seam is an attribute rather than a global).
+
+    Four inputs, each answering a failure the discipline would otherwise have:
+
+      * `blocker_store` — a real `BlockerStore` on `config.blockers_dir`, so a
+        conflict that does not change scope is RECORDED and generation continues.
+        Without it every conflict stops the audit, which is fail-closed but is
+        also the acceptance criterion this task was asked for going unmet.
+      * `tree` — a LAZY `TreeReader` over the checkout. Lazy because a
+        `git ls-files` run once at process start would verify an audit's
+        citations against a tree that has moved on; this reads when a generation
+        actually asks.
+      * `provider` — the operator's own intake drafts, the one artifact carrying
+        an operator's words before they are an accepted decision.
+      * `notes` — what was NOT compared, in the report, in words.
+
+    Nothing here is authorization: `tasks.effective_approved_paths` reads none of
+    it, and a claim from a draft can stop a generation but can never widen what
+    any task may write.
+    """
+    return PlanningSources(
+        provider=draft_claims_provider(
+            intake_dir_for(config.workers_root, config.state_dir)
+        ),
+        blocker_store=BlockerStore(config.blockers_dir),
+        tree=lambda: TreeReader.of(repo_root),
+        notes=(CONTEXT_TIER_UNWIRED_NOTE,),
+    )
+
+
 def _build_executor(
     config: AutoloopConfig,
     args,
@@ -526,6 +586,13 @@ def _build_executor(
         command=config.audit.agent_command,
         timeout_seconds=config.audit.audit_agent_timeout_seconds,
     )
+    # The planning seam (ctx-06), attached to the registry BEFORE the executor is
+    # built with it: `AuditExecutor.execute` passes exactly this object to
+    # `taskgen.generate_tasks`, which is the only route by which a production
+    # audit gets a place to record a source conflict, a tree to verify a cited
+    # location against, and the operator's own request to compare with. See
+    # `_planning_sources` for what each one prevents.
+    attach_planning_sources(registry, _planning_sources(config, git.repo_root))
     audit_executor = AuditExecutor(
         git=git,
         agent_runner=audit_runner,

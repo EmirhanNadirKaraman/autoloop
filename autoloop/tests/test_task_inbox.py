@@ -1141,14 +1141,26 @@ def test_a_context_record_is_not_believed_until_something_was_read():
 
 def test_a_reader_whose_content_is_agent_authored_needs_a_location():
     """The audit report is a real file, and what is inside it is a model's
-    sentence. The location is what a reviewer can check, so it is required."""
-    [refusal] = unsupported_claims([
-        repo_claim(citation=Evidence(text="I saw it", source="the audit report"))
-    ])
+    sentence. The location is what a reviewer can check, so it is required —
+    and, since round 2, it must be a location a tree read actually CONFIRMS.
+    A `path:line` is free to type; the tree is what makes it a citation."""
+    from autoloop.inbox import TreeReader as _TreeReader
+
+    tree = _TreeReader.of_paths(("a.py",), source="this test")
+    [refusal] = unsupported_claims(
+        [repo_claim(citation=Evidence(text="I saw it", source="the audit report"))],
+        tree=tree,
+    )
     assert "no location" in refusal
+    assert unsupported_claims(
+        [repo_claim(citation=Evidence(text="a.py:10 I saw it", source="the audit report"))],
+        tree=tree,
+    ) == ()
+    # And the same cited claim with NO reader to check it against is refused
+    # rather than believed — "we could not verify" must not equal "verified".
     assert unsupported_claims([
         repo_claim(citation=Evidence(text="a.py:10 I saw it", source="the audit report"))
-    ]) == ()
+    ])
 
 
 def scope_claim(source, paths, text, kind=CLAIM_BEHAVIOUR, author=""):
@@ -1368,3 +1380,260 @@ def test_two_spellings_of_one_conflict_share_an_identity():
 
     assert a.identity == b.identity
     assert a.identity != c.identity
+
+
+# ---- the citation is CHECKED, not just shaped (ctx-06, round 2) -------------
+#
+# `has_location` proves a citation is path-SHAPED, which an agent gets for free
+# by typing `autoloop/inbox.py:1545` about a file it never opened. These pin what
+# closes that: a tree read, three distinguishable outcomes, and a projection that
+# keeps an unsupported sentence out of a generated task.
+
+
+from autoloop.inbox import (  # noqa: E402 — grouped with the section it serves
+    PLANNING_SOURCES_ATTR,
+    DraftTask,
+    IntakeDraft,
+    PlanningSources,
+    TreeReader,
+    attach_planning_sources,
+    cited_locations,
+    claim_problem,
+    describe_conflict_for_task,
+    draft_scope_claims,
+    planning_sources_of,
+    render_draft,
+    resolve_tree,
+)
+
+TREE = TreeReader.of_paths(("autoloop/policy.py", "a.py"), source="this test")
+
+
+def report_claim(cited: str, **overrides):
+    """A claim backed by the AUDIT REPORT — the reader whose content a model
+    wrote, and the only one the tree check applies to."""
+    base = dict(
+        source=SOURCE_REPOSITORY,
+        subject="s",
+        kind=CLAIM_BEHAVIOUR,
+        citation=Evidence(text=cited, source="the audit report"),
+    )
+    base.update(overrides)
+    return Claim(text="the gate returns True", **base)
+
+
+def test_a_location_is_read_out_of_a_citation_not_merely_detected():
+    assert cited_locations("a.py:12 and docs/AUTOLOOP.md say so") == (
+        "a.py", "docs/AUTOLOOP.md"
+    )
+    assert cited_locations("saw it") == ()
+    assert cited_locations(None) == ()
+
+
+def test_a_tree_holds_a_basename_but_never_invents_one():
+    assert TREE.holds("autoloop/policy.py")
+    assert TREE.holds("policy.py:120"), "agents cite basenames constantly"
+    assert not TREE.holds("my-policy.py"), "a tail is not a suffix"
+    assert not TREE.holds("autoloop/nowhere.py")
+    assert not TREE.holds("")
+
+
+def test_a_path_shaped_string_is_not_a_citation_the_tree_confirms():
+    """The review's finding, at its narrowest: a plausible path an agent typed
+    is refused, and the refusal says the tree does not have it."""
+    problem = claim_problem(report_claim("autoloop/nowhere.py:12"), tree=TREE)
+    assert problem is not None
+    assert "not in the tree that was read" in problem.reason
+    assert "autoloop/nowhere.py" in problem.remedy
+    # The control, or this would be "refuse everything".
+    assert claim_problem(report_claim("autoloop/policy.py:12"), tree=TREE) is None
+
+
+def test_one_real_location_is_enough_because_a_symbol_looks_like_a_path():
+    """`Finding.claims` cites `evidence` PLUS `symbols`, and a dotted symbol
+    matches the location pattern while naming no file. An all-must-resolve rule
+    would refuse honest findings for naming a method."""
+    assert claim_problem(
+        report_claim("a.py:12 in TreeReader.holds"), tree=TREE
+    ) is None
+
+
+def test_no_reader_and_no_tree_are_different_refusals_and_neither_passes():
+    """The fail-open this closes: "could not check" must not equal "checked"."""
+    missing = claim_problem(report_claim("a.py:12"), tree=None)
+    assert missing is not None and "any tree" in missing.reason
+
+    unread = claim_problem(
+        report_claim("a.py:12"), tree=TreeReader(note="git did not answer")
+    )
+    assert unread is not None
+    assert "nothing was read" in unread.reason
+    assert "not in the tree" not in unread.reason, "found-nothing is a different fact"
+
+
+def test_an_intent_claim_may_name_a_file_that_does_not_exist_yet():
+    """The bound: a proposed change names the file it will CREATE, and refusing
+    that would report honest work as fabrication."""
+    assert claim_problem(
+        report_claim("add autoloop/brand_new.py", kind=CLAIM_INTENT), tree=TREE
+    ) is None
+    # And a mechanical reader is not tree-checked either: `tasks.json` names
+    # paths a task will create, and its text was written by the reader itself.
+    assert claim_problem(
+        report_claim("t1.approved_paths = autoloop/brand_new.py",
+                     citation=Evidence(text="t1.approved_paths = autoloop/brand_new.py",
+                                       source="tasks.json"),
+                     kind=CLAIM_CONSTRAINT),
+        tree=TREE,
+    ) is None
+
+
+def test_an_unsupported_claim_is_never_restated_in_a_task_description():
+    """A `sources` claim is a party to a conflict whatever backs it — but a task
+    description is read by a session that cannot tell a quoted source from a
+    fact, so the sentence does not go there."""
+    smuggled = Claim(
+        text="autoloop/policy.py already returns False", source=SOURCE_CONTEXT_RECORD,
+        author="ctx-99", subject="s", kind=CLAIM_BEHAVIOUR, paths=("a.py",),
+    )
+    conflict = SourceConflict(
+        subject="s", left=smuggled,
+        right=scope_claim(SOURCE_REPOSITORY, ("a.py",), "it returns True",
+                          author="d1:f1"),
+    )
+
+    rendered = describe_conflict_for_task(conflict, tree=TREE)
+    assert "already returns False" not in rendered
+    assert "assertion WITHHELD" in rendered
+    assert "ctx-99" in rendered, "the source is still named"
+    assert "a.py" in rendered, "and so is the scope it claimed"
+    assert "it returns True" in rendered, "the supported side is untouched"
+    # The RECORD still carries both sides verbatim — that is what an operator
+    # settling the disagreement has to read.
+    assert "already returns False" in conflict.describe()
+
+
+def test_the_seam_is_read_fail_closed():
+    """Anything that is not a `PlanningSources` reads as absent, which refuses
+    and stops rather than proceeding with none of the discipline."""
+    class Carrier:
+        pass
+
+    empty = planning_sources_of(Carrier())
+    assert empty.tree is None and empty.blocker_store is None and empty.provider is None
+
+    junk = Carrier()
+    setattr(junk, PLANNING_SOURCES_ATTR, {"tree": TREE})
+    assert planning_sources_of(junk).tree is None
+
+    carrier = attach_planning_sources(Carrier(), PlanningSources(tree=TREE))
+    assert planning_sources_of(carrier).tree is TREE
+    with pytest.raises(InboxError):
+        attach_planning_sources(Carrier(), {"tree": TREE})
+
+
+def test_a_tree_reader_that_fails_reads_as_having_read_nothing():
+    """Never `None`, which would be indistinguishable from "no reader was
+    configured", and never an exception into the middle of a generation."""
+    def boom():
+        raise OSError("git is gone")
+
+    failed = resolve_tree(boom)
+    assert failed.read is False and "git is gone" in failed.note
+    assert resolve_tree(lambda: TREE) is TREE
+    assert resolve_tree(None) is None
+    assert resolve_tree("a tree, honest").read is False
+
+
+def test_a_tree_read_from_a_directory_that_is_not_a_checkout_read_nothing():
+    reader = TreeReader.of("/nonexistent-checkout-for-this-test")
+    assert reader.read is False
+    assert "NOTHING WAS READ" in reader.note
+    assert reader.holds("a.py") is False
+
+
+# ---- the operator's own request, as a source (ctx-06, round 2) --------------
+
+
+def write_draft(intake_dir, slug, idea, paths=("a.py",), task_id="t1"):
+    intake_dir.mkdir(parents=True, exist_ok=True)
+    draft = IntakeDraft(
+        slug=slug, idea=idea,
+        tasks=(DraftTask(id=task_id, title="t", approved_paths=tuple(paths)),),
+    )
+    path = intake_dir / f"{slug}.md"
+    path.write_text(render_draft(draft), encoding="utf-8")
+    return path
+
+
+class FakeFinding:
+    def __init__(self, qualified_id):
+        self.qualified_id = qualified_id
+
+
+def test_a_draft_that_names_a_finding_is_an_operator_request_claim(tmp_path):
+    write_draft(tmp_path / "intake", "idea", "tidy up d1:f1", paths=("a.py", "b.py"))
+
+    claims, notes = draft_scope_claims(tmp_path / "intake", [FakeFinding("d1:f1")])
+
+    [claim] = claims
+    assert claim.source == SOURCE_OPERATOR_REQUEST
+    assert claim.author == "draft:idea:t1"
+    assert claim.paths == ("a.py", "b.py")
+    assert claim.subject == "d1:f1"
+    assert notes == ()
+    # And it is SUPPORTED — the draft file is a reader, and the operator wrote it.
+    assert claim_problem(claim, tree=TREE) is None
+
+
+def test_a_draft_naming_a_longer_id_is_not_a_mention_of_a_shorter_one(tmp_path):
+    write_draft(tmp_path / "intake", "idea", "tidy up d1:f11")
+    claims, _ = draft_scope_claims(tmp_path / "intake", [FakeFinding("d1:f1")])
+    assert claims == ()
+
+
+def test_a_draft_with_no_scope_is_passed_over_out_loud(tmp_path):
+    """It stated no scope to compare — which is not agreement, and must not stop
+    every audit for as long as a half-finished draft sits in the directory."""
+    write_draft(tmp_path / "intake", "idea", "tidy up d1:f1", paths=())
+
+    claims, notes = draft_scope_claims(tmp_path / "intake", [FakeFinding("d1:f1")])
+
+    assert claims == ()
+    assert notes and "no approved_paths" in notes[0]
+
+
+def test_a_draft_with_no_task_yet_is_passed_over_out_loud(tmp_path):
+    """The other silent path: a draft that names the finding and has not been
+    through `intake ask`/`plan` proposes nothing, so it stated no scope. An
+    operator reading a clean proposal must be able to tell that from agreement."""
+    intake = tmp_path / "intake"
+    intake.mkdir()
+    (intake / "idea.md").write_text("about d1:f1\n", encoding="utf-8")
+
+    claims, notes = draft_scope_claims(intake, [FakeFinding("d1:f1")])
+
+    assert claims == ()
+    assert notes and "proposes no task yet" in notes[0]
+
+
+def test_an_unreadable_intake_is_a_note_not_a_silence(tmp_path):
+    """"The operator asked for nothing" and "we could not read what they asked
+    for" are different facts, and only one of them is agreement."""
+    intake = tmp_path / "intake"
+    intake.mkdir()
+    # Bytes that are not UTF-8: deterministic on every platform, unlike a
+    # permission bit, which does nothing when the suite runs as root.
+    (intake / "idea.md").write_bytes(b"\xff\xfe not text about d1:f1")
+
+    claims, notes = draft_scope_claims(intake, [FakeFinding("d1:f1")])
+
+    assert claims == ()
+    assert notes and "could not be read" in notes[0]
+
+
+def test_no_findings_asks_the_drafts_nothing(tmp_path):
+    write_draft(tmp_path / "intake", "idea", "tidy up d1:f1")
+    assert draft_scope_claims(tmp_path / "intake", []) == ((), ())
+    # A directory that does not exist is no drafts, not an error.
+    assert draft_scope_claims(tmp_path / "nothing-here", [FakeFinding("d1:f1")]) == ((), ())

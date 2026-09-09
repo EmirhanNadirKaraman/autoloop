@@ -211,6 +211,21 @@ class Finding:
         accepting it would make the citation check pass for every finding ever
         written — a guard that cannot fail, which is the fail-open this exists to
         close. `evidence` and `symbols` are where a location has to appear.
+
+        AND THE LOCATION IS CHECKED, not merely required: `inbox.claim_problem`
+        asks a `TreeReader` whether the cited path is one a real `git ls-files`
+        returned, so a finding that types a plausible `autoloop/nowhere.py:12` is
+        refused by name. That check is bounded to the BEHAVIOUR claims below —
+        what the code does today — because the intent claim may legitimately name
+        a file this change is about to create.
+
+        EVERY SENTENCE `taskgen._description` RENDERS IS ONE OF THESE, which is
+        the property that makes the refusal worth anything: `evidence`,
+        `proposed_action`, `impact`, `current_behaviour` and each `assumption`
+        appear below, so a repository statement cannot reach a task description
+        without having passed the gate. `open_questions` are the one deliberate
+        exception, and they are not an exception to the rule: a question asserts
+        nothing, and it is rendered under a heading that says it is unsettled.
         """
         from ..inbox import (
             CLAIM_BEHAVIOUR,
@@ -249,6 +264,17 @@ class Finding:
             # to the citation rule — unless it names a file, and then
             # `Claim.about_repository` flips and the report citation answers for
             # it. Both directions are covered without a special case.
+            #
+            # THE SENTENCE IS ITS OWN CITATION HERE, and that reads like an echo
+            # until you ask what the citation is FOR. It records WHERE this
+            # sentence was read — the audit report — and not corroboration of it,
+            # because an intention has nothing in the tree to corroborate: the
+            # file it names may be one this change will create. What stops the
+            # echo mattering is that nothing downstream treats an INTENT claim as
+            # an observation: `taskgen._description` renders it as "Desired
+            # behaviour", and the tree check in `inbox.claim_problem` is bounded
+            # to `CLAIM_BEHAVIOUR` precisely so a want is never graded as a
+            # sighting.
             Claim(
                 text=self.proposed_action,
                 source=SOURCE_REPOSITORY,
@@ -260,6 +286,36 @@ class Finding:
                 repository_specific=False,
             ),
         ]
+        # WHAT IT COSTS. Rendered into the task ("Impact if unfixed"), so it is a
+        # claim rather than free text — the rule is that every sentence a
+        # description carries went through the gate, and a field exempted because
+        # nobody thought of it is exactly how the next hole opens.
+        #
+        # An INTENT claim, like the action above and self-cited for the same
+        # reason: an impact is what WOULD happen, a consequence that has not
+        # happened yet cannot be read out of the tree, and the citation records
+        # where the sentence was read rather than corroborating it. It is refused
+        # if it names a file with nothing backing it, and rendered attributed
+        # ("as the audit stated it") either way.
+        #
+        # BLANK IS ABSENT, judged as every optional field here is judged: an
+        # `impact` nobody wrote is a sentence the description does not render
+        # (`taskgen._description` drops the line), and turning it into a no-text
+        # claim would refuse the whole finding for a field that says nothing
+        # rather than for one that asserts something uncited.
+        if self.impact.strip():
+            out.append(
+                Claim(
+                    text=self.impact,
+                    source=SOURCE_REPOSITORY,
+                    author=author,
+                    subject=f"{subject}#impact",
+                    kind=CLAIM_INTENT,
+                    citation=Evidence(text=self.impact, source=report),
+                    paths=self.affected_files,
+                    repository_specific=False,
+                )
+            )
         if self.current_behaviour.strip():
             # THE PAIR. With a citation this is the verified current behaviour a
             # fresh session needs; without one it is an uncited repository claim,
