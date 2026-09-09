@@ -4780,12 +4780,25 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
     usable while a round is running. That is the only moment an operator
     actually asks this question.
 
-    **IT CALLS THE RESOLVER; IT DOES NOT REIMPLEMENT ONE.** The selection it
-    prints comes out of `context_packet.render_packet_with_resolution` — the one
-    function the dispatch path itself renders each round's packet with — at that
-    round's own base, through that round's own worker repository, with the same
-    `[context] max_records` budget. A diagnostic that can disagree with the loop
-    is worse than none, which is the argument `context.MERGE_WINDOW_LABEL`
+    **THE ANSWER IS THE ROUND'S OWN BYTES.** The loop stamps the digest of the
+    packet it rendered onto the `TaskExecution` when it dispatches a round, and
+    stores the text beside it. That digest is the anchor this command reports
+    against: the answer is the stored packet that hashes to it, or a re-render
+    that reproduces it, and `context_packet.provenance_verdict` says which was
+    available. It is NOT "whatever a fresh resolution produces now" — the record
+    directory can change between the dispatch and the question, and a loop
+    embedded with its own record store (`Orchestrator(context_records=...)`,
+    which no config names and this command therefore cannot see) resolved against
+    a directory this process cannot read.
+
+    **IT CALLS THE RESOLVER; IT DOES NOT REIMPLEMENT ONE.** The re-resolution it
+    prints beside the recorded packet comes out of
+    `context_packet.render_packet_with_resolution` — the one function the
+    dispatch path itself renders each round's packet with — at that round's own
+    base, through that round's own worker repository, with the same
+    `[context] max_records` budget. It is promoted from comparison to answer only
+    when its digest equals the recorded one. A diagnostic that can disagree with
+    the loop is worse than none, which is the argument `context.MERGE_WINDOW_LABEL`
     already makes for sourcing its line by calling `_merge_window_blockers`
     rather than deciding the merge window a second time.
 
@@ -4797,10 +4810,19 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
     verdict, which is the same call `context_resolver` makes for a revision it
     cannot read.
 
-    Exit codes, stated because an unstated one gets parsed anyway: **0** = the
-    question was answered, **1** = it could not be. A digest that does NOT match
-    the recorded one is a 0: it is information this command exists to surface,
-    not a failure of the command.
+    **A WORKER THAT HAS MOVED IS NOT A REFUSAL.** A released or quarantined round
+    leaves the record naming a directory that is gone; the recorded packet still
+    answers the question, so this states that no re-resolution was performed and
+    explains from the stored bytes. What it does NOT do is resolve anyway: git is
+    never run for a worker path this cannot confirm is a directory, because
+    `Path("")` is `Path(".")` and resolving there would describe whatever
+    repository the operator happens to be standing in under this task's name.
+
+    Exit codes, stated because an unstated one gets parsed anyway: **0** = an
+    explanation was printed, **1** = there was nothing to explain (no such task,
+    an unreadable or absent execution record, or neither a recorded packet nor a
+    possible re-render). A digest that does NOT match is a 0: it is information
+    this command exists to surface, not a failure of the command.
     """
     config = load_config(args.config)
     task_id = args.task
@@ -4828,50 +4850,64 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
             "resolve against."
         )
         return 1
+    stored = ContextPacketStore(config.context_packets_dir).load(task_id)
     worker = str(execution.worktree_path or "")
+    render = None
+    re_render_error = ""
     # `Path("")` is `Path(".")`, so an empty worktree path would silently run
     # git in whatever directory the operator happens to be standing in — the
     # observed checkout, most likely — and render a packet from the wrong
-    # repository under this task's name. Refused, loudly, with the reason.
+    # repository under this task's name. No git runs at all in that case.
     if not worker or not Path(worker).is_dir():
-        print(
-            f"error: task {task_id}'s worker repository "
-            f"({worker or '(none recorded)'}) is not a directory this command "
-            "can read, so its base commit cannot be resolved. A quarantined or "
-            "released round leaves the record naming a worker that has moved."
+        re_render_error = (
+            f"the worker repository this round ran in ({worker or '(none recorded)'}) "
+            "is not a directory this command can read, so nothing was resolved "
+            "against it. A released or quarantined round leaves the record naming "
+            "a worker that has moved; resolving somewhere else instead would "
+            "describe the wrong repository under this task's name."
         )
-        return 1
-    try:
-        render = render_packet_with_resolution(
-            task,
-            execution,
-            GitGateway(Path(worker), PolicyEngine(config.policy)),
-            # NO RECORD INDEX IS WIRED INTO THIS LOOP, and this passes the same
-            # `None` the dispatch does (`orchestrator._context_record_index`
-            # answers `None` while `Orchestrator(context_records=...)` is unset,
-            # which is every production run today). The packet then SAYS the
-            # index is unwired and reports every cited id as unresolved. Reading
-            # some other directory here — one the round never saw — is exactly
-            # the disagreement this command must not be able to produce.
-            None,
-            max_records=config.context.max_records,
-        )
-    except (GitError, OSError) as exc:
-        # The render answers rather than raising for everything git can REFUSE.
-        # What is left is the worker repository disappearing between the check
-        # above and this call, which reaches `subprocess` as an `OSError` and
-        # would otherwise be a traceback out of a read-only command.
+    else:
+        try:
+            render = render_packet_with_resolution(
+                task,
+                execution,
+                GitGateway(Path(worker), PolicyEngine(config.policy)),
+                # NO RECORD INDEX IS WIRED INTO THIS COMMAND, and none can be:
+                # no config names a record directory, so there is nothing here to
+                # read. That is exactly why this re-render is a COMPARISON and the
+                # recorded packet is the answer — a loop embedded with
+                # `Orchestrator(context_records=...)` dispatched against a
+                # directory this process cannot see, and presenting a `None`-index
+                # re-resolution as that round's selection would be the
+                # disagreement this command must not be able to produce.
+                None,
+                max_records=config.context.max_records,
+            )
+        except (GitError, OSError) as exc:
+            # The render answers rather than raising for everything git can
+            # REFUSE. What is left is the worker repository disappearing between
+            # the check above and this call, which reaches `subprocess` as an
+            # `OSError` and would otherwise be a traceback out of a read-only
+            # command. Reported as the reason no comparison exists, not as a
+            # failure to explain: the recorded packet is unaffected by it.
+            re_render_error = (
+                f"resolving in {worker} failed ({type(exc).__name__}: {exc}), so "
+                "no comparison was rendered"
+            )
+    if render is None and stored is None:
         print(
-            f"error: task {task_id}'s context could not be resolved in "
-            f"{worker} ({type(exc).__name__}: {exc}) — nothing was explained, "
-            "because every verdict would have been invented."
+            f"error: nothing to explain for {task_id}: this store holds no "
+            "readable context packet for it, and no re-resolution was possible "
+            f"({re_render_error}). Every line of an answer would have been "
+            "invented."
         )
         return 1
     for line in explanation_lines(
         render,
         task=task,
         execution=execution,
-        stored=ContextPacketStore(config.context_packets_dir).load(task_id),
+        stored=stored,
+        re_render_error=re_render_error,
         include_packet_text=args.packet,
     ):
         print(line)
