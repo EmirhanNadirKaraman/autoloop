@@ -255,3 +255,36 @@ reported by name rather than dropped. Staleness is a TRI-STATE — `fresh`,
 `stale`, `unknown` — because a record whose commit no longer resolves has not
 been shown to be fine, and reporting it as fresh is the one answer that would
 make the alarm silent.
+
+### Who WRITES a record (ctx-07)
+
+`context_records.ContextRecordStore` — a directory, plus `repo_prefix`, the
+repository path those files have. Both are the CALLER's to name and neither is
+decided in the package: `repo_prefix` is what makes a record file's scope
+askable at all, so a store that cannot state one (`""`) is a store in which every
+record is outside every task's `approved_paths`, which is the fail-closed
+answer an unwired loop gets. The DIRECTORY may not be inside the observed
+checkout — the loop cannot commit what it writes there, and the next dispatch
+refuses to start against the dirty tree it would leave — so the files live
+outside it and the prefix says what they are called in it. `record_to_mapping` writes every field, including
+the empty ones, and a record that does not read back through
+`record_from_mapping` as itself is never written over one that loads today.
+
+Exactly two fields ever move, and only at a task's completion
+(`docs/AUTOLOOP.md`, "Reading a context closeout in the transcript"):
+
+* `last_verified_commit` advances to the commit a completed round published,
+  for a `feature` or `incident` record whose own `source_paths` that change
+  altered and whose own file is inside that task's `approved_paths`. It says the
+  paths were part of a change that passed post-commit validation and review at
+  that commit — not that the invariant was re-proved;
+* `superseded_by` is set by `context_records.superseded_record`, which returns a
+  NEW record and leaves the old one's every other field alone. The old record
+  stays in its own file; the successor gets its own. Deleting it deletes the
+  reason it was made, which is the rule `docs/SECURITY.md` keeps for a resolved
+  finding. A successor that is empty, padded, or the record itself is refused,
+  because `context_resolver` reports a self-succession as dangling and leaves
+  nothing to read instead.
+
+Nothing else is rewritten, and nothing is deleted. A record the loop cannot
+update in scope is named in a follow-up task rather than written anyway.

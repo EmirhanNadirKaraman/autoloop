@@ -1,0 +1,1027 @@
+"""ctx-07: a completed task leaves the project context true, or files the ONE
+narrow task that will — and never widens its own scope to do either.
+
+THE CLAIM, and what each section pins of it: at completion the loop classifies
+the published change against the context records THAT ROUND'S PACKET SELECTED,
+updates only the records whose own files fall inside the task's own
+`approved_paths`, and for everything else files ONE narrow follow-up task
+through the inbox that depends on the completed task.
+
+§1 is the record FILE — writing one, reading it back, and superseding without
+rewriting. §2 is the four questions, as a pure classification over stated
+records: it builds no repository, because "does this record's path appear in
+this set of changed paths" is a claim about two sets and a real commit would be
+dead weight. §3 is question four's bar, off the loop's own attempt ledger.
+§4 files the follow-up through the real inbox gate and the real registry, since
+a request that shape-checks in a test and is refused on drain is a follow-up
+nobody ever reads. §5 and §6 need real git: "the records the packet SELECTED" is
+a claim about bytes a round was actually given, and §6 drives the whole push
+path that grades it. §7 is the scope rule, asserted twice — once on what the
+registry holds afterwards, once on what this code path can even reach.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+from pathlib import Path
+
+from gitrepo import make_repo_from_template, run_git
+
+from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.context_index import build_index, load_index
+from autoloop.context_packet import (
+    FOLLOW_UP_SUFFIX,
+    LESSON_MIN_OCCURRENCES,
+    CloseoutPlan,
+    classify_closeout,
+    follow_up_id_for,
+    follow_up_request,
+    plan_round_closeout,
+    render_context_packet,
+    repeated_failure,
+    selection_was_shown,
+)
+from autoloop.context_records import (
+    ContextRecord,
+    ContextRecordError,
+    ContextRecordStore,
+    load_records,
+    record_from_mapping,
+    record_to_mapping,
+    superseded_record,
+)
+from autoloop.context_resolver import (
+    DANGLING_SUPERSESSION,
+    STALENESS_UNKNOWN,
+    SUPERSEDED,
+    SelectedRecord,
+    resolve_context,
+)
+from autoloop.contract import Decision, Directive
+from autoloop.executor import ExecutionOutcome
+from autoloop.git_gateway import GitGateway
+from autoloop.inbox import TaskInbox, apply_requests, check_request_shape
+from autoloop.manifest import ManifestStore
+from autoloop.orchestrator import Orchestrator
+from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.state import LastResponse, LoopState, StateStore
+from autoloop.tasks import TRACKER_PATHS, Task, TaskRegistry, TaskStore
+from autoloop.transcript import TranscriptLogger
+from autoloop.worktask import (
+    ATTEMPT_FAULT,
+    ATTEMPT_PENDING,
+    ATTEMPT_TASK,
+    REASON_SENT_FOR_REVIEW,
+    IntentStore,
+    TaskExecution,
+    TaskExecutionStore,
+    format_attempt,
+)
+from autoloop.worktree import WorktreeManager
+
+URL = "https://chatgpt.com/c/test-conversation"
+
+MAX_RECORDS = 25
+
+#: The published commit every pure test verifies against. A full sha, because
+#: that is what `TaskExecution.published_sha` holds.
+PUBLISHED = "b" * 40
+
+#: Where a record file is called from, in the tests that use a store.
+PREFIX = "docs/context"
+
+
+def record(record_id="feat", kind="feature", **kwargs) -> ContextRecord:
+    fields = {
+        "title": "feature.py greets exactly once",
+        "invariant": "feature.py greets exactly once",
+        "source_paths": ("feature.py",),
+        "last_verified_commit": "a" * 40,
+    }
+    fields.update(kwargs)
+    return ContextRecord(id=record_id, kind=kind, **fields)
+
+
+def chosen(*records: ContextRecord) -> tuple[SelectedRecord, ...]:
+    """`resolve_context`'s output shape, stated rather than resolved — §2 is
+    about the classification, and a resolution there would be a second thing
+    that could fail."""
+    return tuple(
+        SelectedRecord(record=item, reason="seed", depth=0, staleness=STALENESS_UNKNOWN)
+        for item in records
+    )
+
+
+def sources_of(*records: ContextRecord) -> dict[str, str]:
+    return {item.id: f"{item.id}.json" for item in records}
+
+
+def store_at(tmp_path, prefix=PREFIX, name="records") -> ContextRecordStore:
+    return ContextRecordStore(tmp_path / name, prefix)
+
+
+def unit(paths=("feature.py", "docs/context/"), cite=("feat",), task_id="t1") -> Task:
+    return Task(
+        id=task_id,
+        title=f"Title {task_id}",
+        description="desc",
+        approved_paths=tuple(paths),
+        context_ids=tuple(cite),
+    )
+
+
+def plan_for(
+    tmp_path,
+    *records: ContextRecord,
+    task=None,
+    changed=("feature.py",),
+    published=PUBLISHED,
+    ledger=(),
+    store=None,
+):
+    store = store or store_at(tmp_path)
+    return classify_closeout(
+        task or unit(),
+        chosen(*records),
+        store,
+        changed_paths=frozenset(changed),
+        published_sha=published,
+        sources=sources_of(*records),
+        known_record_ids=frozenset(item.id for item in records),
+        known_filenames=frozenset(f"{item.id}.json" for item in records),
+        attempt_ledger=ledger,
+    )
+
+
+# =============================================================================
+# 1. THE RECORD FILE — written, read back, and superseded rather than rewritten
+# =============================================================================
+
+
+def test_a_record_round_trips_through_the_mapping_it_is_written_as():
+    """The write format is the read format. A field this dropped would be a
+    field an update silently deleted from every record it touched."""
+    full = record(
+        related_ids=("other",), superseded_by="successor", last_verified_commit="c" * 40
+    )
+    empty = ContextRecord(id="bare", kind="lesson")
+    for item in (full, empty):
+        assert record_from_mapping(record_to_mapping(item)) == item
+    # Every field is present even when empty, so a record file SAYS it names no
+    # successor rather than leaving a reader to infer it.
+    assert set(record_to_mapping(empty)) == {
+        "id",
+        "kind",
+        "title",
+        "invariant",
+        "source_paths",
+        "related_ids",
+        "last_verified_commit",
+        "superseded_by",
+    }
+
+
+def test_a_written_record_loads_back_as_itself(tmp_path):
+    store = store_at(tmp_path)
+    written = store.write(record(), "feat.json")
+
+    assert written == store.directory / "feat.json"
+    loaded, problems = load_records(store.directory)
+    assert problems == ()
+    assert [item.record for item in loaded] == [record()]
+
+
+def test_a_record_the_loader_would_refuse_is_never_written(tmp_path):
+    """The fail-closed half of `write`: a record that would come back as a
+    `RecordProblem` must not replace one that loads today, because that update
+    deletes the claim while reporting success."""
+    store = store_at(tmp_path)
+    store.write(record(), "feat.json")
+    before = (store.directory / "feat.json").read_text(encoding="utf-8")
+
+    assert store.write(ContextRecord(id="feat", kind="not-a-kind"), "feat.json") is None
+    assert (store.directory / "feat.json").read_text(encoding="utf-8") == before
+
+
+def test_a_write_addresses_nothing_but_a_file_in_its_own_directory(tmp_path):
+    store = store_at(tmp_path)
+    for name in ("../escape.json", "nested/feat.json", ".hidden.json", "feat", ""):
+        assert store.path_for(name) is None
+        assert store.write(record(), name) is None
+        assert store.repo_path_for(name) == ""
+    assert not store.directory.exists()  # nothing was created on the way
+
+
+def test_a_store_with_no_usable_repository_prefix_can_name_no_path(tmp_path):
+    """`repo_path_for` is what the scope check is asked about, so an unusable
+    prefix must answer `""` — which every caller reads as out of scope — rather
+    than a path `unauthorized_paths` could never match."""
+    assert store_at(tmp_path, prefix="docs/context/").repo_path_for("feat.json") == (
+        "docs/context/feat.json"
+    )
+    for bad in ("", "   ", "/abs/docs", "docs/../context", "docs\\context"):
+        assert store_at(tmp_path, prefix=bad).repo_path_for("feat.json") == ""
+
+
+def test_supersede_leaves_the_old_record_present_with_a_resolvable_successor(tmp_path):
+    """SUPERSEDE, DO NOT REWRITE — asserted where it is observable: on disk,
+    through the index, and through a real resolution."""
+    store = store_at(tmp_path)
+    old = record("dec-01", kind="decision", invariant="the loop pushes by sha")
+    successor = record("dec-02", kind="decision", invariant="the loop pushes by ref")
+    store.write(superseded_record(old, successor.id), "dec-01.json")
+    store.write(successor, "dec-02.json")
+
+    index = load_index(store.directory)
+    assert index.get("dec-01").superseded_by == "dec-02"
+    assert index.get("dec-01").invariant == old.invariant  # the reason survives
+    assert index.get("dec-02") is not None
+
+    resolution = resolve_context(
+        index, ("dec-01",), _NoGit(), max_records=MAX_RECORDS, rev="HEAD"
+    )
+    assert [f.subject for f in resolution.findings_of(SUPERSEDED)] == ["dec-01"]
+    assert resolution.findings_of(DANGLING_SUPERSESSION) == ()
+    assert resolution.selected == ()
+
+
+def test_supersede_refuses_a_successor_nobody_could_follow():
+    old = record("dec-01", kind="decision")
+    for bad in ("", "  ", " dec-02", "dec-01"):
+        try:
+            superseded_record(old, bad)
+        except ContextRecordError:
+            continue
+        raise AssertionError(f"{bad!r} was accepted as a successor")
+    assert old.superseded_by == ""  # and the original is untouched throughout
+
+
+class _NoGit:
+    """A gateway for a resolution that never reaches a real tree: the one seed
+    is superseded, so it is never selected and no record's paths are ever
+    compared against a commit."""
+
+    def tree_of(self, rev):
+        return f"tree-of-{rev}"
+
+    def tree_entries(self, tree):
+        return {}
+
+    def changed_paths(self, a, b):
+        return set()
+
+
+# =============================================================================
+# 2. THE FOUR QUESTIONS
+# =============================================================================
+
+
+def test_a_touched_feature_record_in_scope_advances_to_the_published_commit(tmp_path):
+    plan = plan_for(tmp_path, record())
+
+    assert [update.record.id for update in plan.updates] == ["feat"]
+    assert plan.updates[0].record.last_verified_commit == PUBLISHED
+    assert plan.updates[0].repo_path == "docs/context/feat.json"
+    assert plan.updates[0].filename == "feat.json"
+    assert plan.follow_up == ()
+
+
+def test_the_record_the_plan_started_from_is_not_mutated(tmp_path):
+    original = record()
+    plan = plan_for(tmp_path, original)
+
+    assert original.last_verified_commit == "a" * 40
+    assert plan.updates[0].record is not original
+
+
+def test_a_touched_incident_record_in_scope_advances_too(tmp_path):
+    plan = plan_for(tmp_path, record("inc-01", kind="incident"))
+
+    assert [update.record.id for update in plan.updates] == ["inc-01"]
+    assert plan.updates[0].record.last_verified_commit == PUBLISHED
+
+
+def test_a_record_whose_paths_the_change_did_not_touch_is_left_alone(tmp_path):
+    plan = plan_for(tmp_path, record(source_paths=("elsewhere.py",)))
+
+    assert plan.updates == ()
+    assert plan.follow_up == ()  # nothing concrete to change, so nothing is filed
+
+
+def test_a_record_naming_no_source_paths_is_never_verified(tmp_path):
+    """It asserts nothing about files, so nothing about files can have altered
+    it — and advancing its verification commit would be a claim nobody made."""
+    plan = plan_for(tmp_path, record(source_paths=()))
+
+    assert plan.updates == ()
+    assert plan.follow_up == ()
+
+
+def test_a_touched_record_outside_scope_is_never_written_and_becomes_the_follow_up(
+    tmp_path,
+):
+    plan = plan_for(tmp_path, record(), task=unit(paths=("feature.py",)))
+
+    assert plan.updates == ()
+    assert [item.record_id for item in plan.follow_up] == ["feat"]
+    assert plan.follow_up[0].repo_path == "docs/context/feat.json"
+    assert "outside the completed task's approved paths" in plan.follow_up[0].reason
+
+
+def test_a_task_with_no_approved_paths_writes_no_record(tmp_path):
+    """`effective_approved_paths` returns `()` for an unscoped task, under which
+    every path is unauthorized — the same fail-closed answer it already gets for
+    every other kind of write, and NOT the vacuous "nothing to compare"."""
+    plan = plan_for(tmp_path, record(), task=unit(paths=()))
+
+    assert plan.updates == ()
+    assert [item.record_id for item in plan.follow_up] == ["feat"]
+
+
+def test_a_touched_decision_is_never_rewritten_even_in_scope(tmp_path):
+    """Question three is the one the loop may not answer: a successor is a claim
+    somebody has to author, and rewriting the old record deletes the reason."""
+    plan = plan_for(tmp_path, record("dec-01", kind="decision"))
+
+    assert plan.updates == ()
+    assert [item.record_id for item in plan.follow_up] == ["dec-01"]
+    assert "never authors a successor" in plan.follow_up[0].reason
+
+
+def test_a_touched_lesson_is_never_rewritten_even_in_scope(tmp_path):
+    plan = plan_for(tmp_path, record("les-01", kind="lesson"))
+
+    assert plan.updates == ()
+    assert [item.record_id for item in plan.follow_up] == ["les-01"]
+
+
+def test_no_published_commit_verifies_nothing_and_erases_no_verification(tmp_path):
+    """THE fail-open case. A record advanced to an empty commit is not "left
+    unknown": `context_resolver` reads it as never verified, so the write would
+    DELETE the commit the record already carried."""
+    plan = plan_for(tmp_path, record(), published="")
+
+    assert plan.updates == ()
+    assert plan.follow_up == ()
+    assert plan.notes and "no published commit" in plan.notes[0]
+
+
+def test_a_record_already_carrying_the_published_commit_is_not_rewritten(tmp_path):
+    plan = plan_for(tmp_path, record(last_verified_commit=PUBLISHED))
+
+    assert plan.updates == ()
+    assert plan.follow_up == ()
+
+
+def test_a_record_this_store_cannot_name_a_file_for_is_out_of_scope(tmp_path):
+    """The source file is what a record is written to, so a record the loader
+    reported under no name is one nothing may write over."""
+    plan = classify_closeout(
+        unit(),
+        chosen(record()),
+        store_at(tmp_path),
+        changed_paths=frozenset({"feature.py"}),
+        published_sha=PUBLISHED,
+        sources={},
+        known_record_ids=frozenset({"feat"}),
+        known_filenames=frozenset(),
+    )
+
+    assert plan.updates == ()
+    assert [item.repo_path for item in plan.follow_up] == [""]
+
+
+# =============================================================================
+# 3. QUESTION FOUR — a lesson, on ctx-02's bar and no lower
+# =============================================================================
+
+
+def ledger(*outcomes, budget=ATTEMPT_TASK):
+    return tuple(
+        format_attempt(i, budget, outcome) for i, outcome in enumerate(outcomes, start=1)
+    )
+
+
+def test_one_mistake_is_not_a_lesson(tmp_path):
+    plan = plan_for(tmp_path, ledger=ledger("post_commit_verification_failed"))
+
+    assert plan.updates == ()
+    assert any("no lesson qualified" in note for note in plan.notes)
+
+
+def test_a_round_that_qualifies_for_no_lesson_creates_none(tmp_path):
+    """Three reviews and an open round: an outcome that is not a failure never
+    counts, and a round with no outcome yet has no mistake to repeat."""
+    entries = ledger(*([REASON_SENT_FOR_REVIEW] * 3)) + ledger(
+        "dispatched", budget=ATTEMPT_PENDING
+    )
+    assert repeated_failure(entries) == ("", 0)
+    assert plan_for(tmp_path, ledger=entries).updates == ()
+
+
+def test_the_same_mistake_more_than_once_is_a_lesson(tmp_path):
+    entries = ledger(
+        "post_commit_verification_failed",
+        REASON_SENT_FOR_REVIEW,
+        "post_commit_verification_failed",
+    )
+    assert repeated_failure(entries) == (
+        "post_commit_verification_failed",
+        LESSON_MIN_OCCURRENCES,
+    )
+
+    plan = plan_for(tmp_path, ledger=entries)
+    lesson = plan.updates[0].record
+    assert lesson.kind == "lesson"
+    assert lesson.id == "lesson-t1-post_commit_verification_failed"
+    assert lesson.last_verified_commit == PUBLISHED
+    # It asserts nothing checkable and about no file, so it can contradict no
+    # record a person wrote and can never be reported as verified-by-nobody.
+    assert lesson.invariant == ""
+    assert lesson.source_paths == ()
+    assert "2 times" in lesson.title
+
+
+def test_a_redo_is_judged_on_what_the_round_achieved():
+    """`origin>outcome` is read through `attempt_outcome`: two fault-opened
+    rounds that both reached the reviewer are two reviews, not two mistakes."""
+    entries = ledger(
+        f"browser_session_lost>{REASON_SENT_FOR_REVIEW}",
+        f"browser_session_lost>{REASON_SENT_FOR_REVIEW}",
+        budget=ATTEMPT_FAULT,
+    )
+    assert repeated_failure(entries) == ("", 0)
+
+
+def test_a_lesson_that_already_exists_is_not_written_a_second_time(tmp_path):
+    entries = ledger("review_packet_build_failed", "review_packet_build_failed")
+    existing = "lesson-t1-review_packet_build_failed"
+    plan = classify_closeout(
+        unit(),
+        (),
+        store_at(tmp_path),
+        changed_paths=frozenset(),
+        published_sha=PUBLISHED,
+        sources={},
+        known_record_ids=frozenset({existing}),
+        known_filenames=frozenset(),
+        attempt_ledger=entries,
+    )
+
+    assert plan.updates == ()
+    assert any("already exists" in note for note in plan.notes)
+
+
+def test_a_lesson_whose_file_is_out_of_scope_is_filed_and_not_written(tmp_path):
+    entries = ledger("review_packet_build_failed", "review_packet_build_failed")
+    plan = plan_for(tmp_path, task=unit(paths=("feature.py",)), ledger=entries)
+
+    assert plan.updates == ()
+    assert [item.record_id for item in plan.follow_up] == [
+        "lesson-t1-review_packet_build_failed"
+    ]
+
+
+# =============================================================================
+# 4. THE FOLLOW-UP — one per completed task, through the ordinary gates
+# =============================================================================
+
+
+def registry_with(*tasks) -> TaskRegistry:
+    return TaskRegistry(list(tasks))
+
+
+def test_exactly_one_follow_up_names_the_records_and_the_files_it_would_touch(tmp_path):
+    task = unit(paths=("feature.py",))
+    plan = plan_for(tmp_path, record(), record("dec-01", kind="decision"), task=task)
+
+    request = follow_up_request(task, plan, PUBLISHED)
+
+    assert request["id"] == f"t1{FOLLOW_UP_SUFFIX}"
+    assert request["depends_on"] == ["t1"]
+    assert request["approved_paths"] == [
+        "docs/context/dec-01.json",
+        "docs/context/feat.json",
+    ]
+    assert request["context_ids"] == ["dec-01", "feat"]
+    assert "feat" in request["description"] and "dec-01" in request["description"]
+    # Shape-checked by the gate `TaskInbox.submit` uses, not by this test's idea
+    # of the shape.
+    assert check_request_shape(request) == "task"
+
+
+def test_the_follow_up_reaches_the_registry_through_the_ordinary_gates(tmp_path):
+    """A request that shape-checks and is then refused on drain is a follow-up
+    nobody ever reads, so the merge itself is what this asserts."""
+    task = unit(paths=("feature.py",))
+    plan = plan_for(tmp_path, record(), task=task)
+    request = follow_up_request(task, plan, PUBLISHED)
+
+    registry = registry_with(task)
+    added, applied, refused = apply_requests(registry, [request])
+
+    assert refused == []
+    assert added == [f"t1{FOLLOW_UP_SUFFIX} (priority 100)"]
+    filed = registry.get(f"t1{FOLLOW_UP_SUFFIX}")
+    assert filed.depends_on == ("t1",)
+    assert filed.approved_paths == ("docs/context/feat.json",)
+    assert filed.context_ids == ("feat",)
+    # The narrow scope is the record file and NOTHING the completed task owned.
+    assert "feature.py" not in filed.approved_paths
+
+
+def test_nothing_to_change_files_nothing(tmp_path):
+    assert follow_up_request(unit(), CloseoutPlan(), PUBLISHED) is None
+
+
+def test_no_follow_up_is_filed_when_no_record_file_can_be_named(tmp_path):
+    """A creation with no `approved_paths` is accepted by the registry and can
+    never be dispatched, so an unnameable follow-up is reported instead of
+    parked in the queue forever."""
+    task = unit(paths=("feature.py",))
+    plan = plan_for(tmp_path, record(), task=task, store=store_at(tmp_path, prefix=""))
+
+    assert plan.follow_up != ()
+    assert follow_up_request(task, plan, PUBLISHED) is None
+
+
+def test_a_record_id_the_task_graph_cannot_hold_is_named_in_prose_only(tmp_path):
+    """Record ids are a broader shape than task ids. ONE unusable entry in
+    `context_ids` gets the whole request refused on drain — which loses the
+    follow-up while the round reports having filed it."""
+    odd = record("a record with spaces")
+    task = unit(paths=("feature.py",), cite=())
+    plan = plan_for(tmp_path, odd, record(), task=task)
+    request = follow_up_request(task, plan, PUBLISHED)
+
+    assert request["context_ids"] == ["feat"]
+    assert "a record with spaces" in request["description"]
+    assert check_request_shape(request) == "task"
+    assert apply_requests(registry_with(task), [request])[2] == []
+
+
+def test_a_task_id_with_no_room_for_the_suffix_gets_no_follow_up_id():
+    assert follow_up_id_for("t1") == f"t1{FOLLOW_UP_SUFFIX}"
+    assert follow_up_id_for("x" * 64) == ""
+    assert follow_up_id_for("") == ""
+
+
+# =============================================================================
+# 5. BOUND TO THE ROUND'S OWN PACKET
+# =============================================================================
+
+
+def gateway(root) -> GitGateway:
+    return GitGateway(Path(root), PolicyEngine(PolicyConfig()))
+
+
+def worker_repo(tmp_path, name="worker") -> Path:
+    root = tmp_path / name
+    root.mkdir(parents=True, exist_ok=True)
+    make_repo_from_template(root, branch="main", files=(("feature.py", "one\n"),))
+    return root
+
+
+def commit(repo: Path, rel: str, body: str, message: str) -> str:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", message)
+    return run_git(repo, "rev-parse", "HEAD").strip()
+
+
+def rendered_round(tmp_path):
+    """A real base, a real published commit, and the packet the round was
+    given — everything §5 needs to ask whether the two agree."""
+    repo = worker_repo(tmp_path)
+    base = run_git(repo, "rev-parse", "HEAD").strip()
+    published = commit(repo, "feature.py", "two\n", "the change")
+    store = store_at(tmp_path)
+    store.write(record(), "feat.json")
+    execution = TaskExecution(
+        task_id="t1",
+        task_branch="autoloop/t1",
+        worktree_path=str(repo),
+        task_base_sha=base,
+        published_sha=published,
+    )
+    packet = render_context_packet(
+        unit(),
+        execution,
+        gateway(repo),
+        load_index(store.directory),
+        max_records=MAX_RECORDS,
+    )
+    return repo, store, execution, packet
+
+
+def test_the_selection_the_packet_showed_is_the_one_classified(tmp_path):
+    repo, store, execution, packet = rendered_round(tmp_path)
+
+    plan, refusal = plan_round_closeout(
+        unit(), execution, gateway(repo), store, packet.text, max_records=MAX_RECORDS
+    )
+
+    assert refusal == ""
+    assert [update.record.id for update in plan.updates] == ["feat"]
+    assert plan.updates[0].record.last_verified_commit == execution.published_sha
+
+
+def test_a_record_directory_that_changed_under_the_loop_refuses_the_closeout(tmp_path):
+    """The re-resolution is only the round's selection while the directory it
+    reads is the directory the packet was cut from. A record added since is a
+    record no round was ever shown."""
+    repo, store, execution, packet = rendered_round(tmp_path)
+    # The SEED LIST is untouched — the task still cites `feat` and nothing else —
+    # so the only thing that moved is the directory: `feat` now relates a second
+    # record in, and the resolver follows that edge.
+    store.write(record("feat-2", source_paths=("feature.py",)), "feat-2.json")
+    store.write(record(related_ids=("feat-2",)), "feat.json")
+
+    plan, refusal = plan_round_closeout(
+        unit(), execution, gateway(repo), store, packet.text, max_records=MAX_RECORDS
+    )
+
+    assert plan.updates == ()
+    assert "not the one this round's packet showed" in refusal
+
+
+def test_a_round_whose_packet_cannot_be_read_back_classifies_nothing(tmp_path):
+    repo, store, execution, _ = rendered_round(tmp_path)
+
+    plan, refusal = plan_round_closeout(
+        unit(), execution, gateway(repo), store, "", max_records=MAX_RECORDS
+    )
+
+    assert plan.updates == ()
+    assert "could not be read back" in refusal
+
+
+def test_an_empty_selection_is_confirmed_by_the_same_comparison(tmp_path):
+    """The trivial case stays honest: the heading carries the COUNT, so a packet
+    that showed no record and a packet that showed three are not both matched by
+    an empty block."""
+    repo, store, execution, packet = rendered_round(tmp_path)
+    empty = resolve_context(
+        build_index(()), (), gateway(repo), max_records=MAX_RECORDS, rev=execution.task_base_sha
+    )
+
+    assert not selection_was_shown(packet.text, empty, None, execution.task_base_sha)
+
+
+def test_a_base_that_no_longer_resolves_refuses_rather_than_classifying(tmp_path):
+    repo, store, execution, packet = rendered_round(tmp_path)
+    execution.task_base_sha = "0" * 40
+
+    plan, refusal = plan_round_closeout(
+        unit(), execution, gateway(repo), store, packet.text, max_records=MAX_RECORDS
+    )
+
+    assert plan.updates == ()
+    assert "could not be read" in refusal
+
+
+# =============================================================================
+# 6. THROUGH THE PUSH PATH — the loop's own completion, end to end
+# =============================================================================
+
+
+def ok_validation(argv, **kwargs):
+    class Proc:
+        returncode = 0
+        stdout = "All checks passed!\n"
+        stderr = ""
+
+    return Proc()
+
+
+class WritingExecutor:
+    """Writes `files` into the worktree for `task.id` and reports them as the
+    round's changed paths — `test_postcommit_flow.py`'s double, in the shape
+    this file needs and nothing more."""
+
+    def __init__(self, worktrees_root, files):
+        self.worktrees_root = Path(worktrees_root)
+        self.files = dict(files)
+        self.calls = 0
+
+    def execute(self, directive, task):
+        self.calls += 1
+        wt = self.worktrees_root / task.id
+        for rel, content in self.files.items():
+            target = wt / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return ExecutionOutcome(
+            status="ok",
+            summary="wrote the files",
+            details="details",
+            validation="placeholder",
+            changed_paths=tuple(self.files),
+        )
+
+
+def build_round(
+    tmp_path,
+    approved_paths,
+    records=(("feat", "feature.py"),),
+    wire=True,
+    records_dir=None,
+):
+    """One orchestrator on a real repository, with a record store and an inbox
+    wired — the linked-worktree shape `test_postcommit_flow.build_postcommit`
+    uses, plus the two things ctx-07 adds.
+
+    The store sits OUTSIDE the checkout by default and says what its files are
+    CALLED in it (`repo_prefix`), which is the arrangement the loop supports: a
+    record written into the observed tree is an uncommitted file the loop cannot
+    commit, and the next dispatch refuses to start against a dirty tree.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    make_repo_from_template(repo_root, branch="main", files=(("README.md", "hello\n"),))
+
+    git = gateway(repo_root)
+    worktrees = WorktreeManager(git, tmp_path / "worktrees")
+    execution_store = TaskExecutionStore(tmp_path / "executions")
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=PolicyConfig(implement_enabled=True),
+        state_dir=tmp_path / "state",
+    )
+    store = StateStore(config.state_file)
+    state = LoopState.new(URL)
+    store.save(state)
+
+    record_store = ContextRecordStore(records_dir or (tmp_path / "records"), PREFIX)
+    for record_id, path in records:
+        record_store.write(record(record_id, source_paths=(path,)), f"{record_id}.json")
+
+    task = unit(paths=approved_paths, cite=tuple(r for r, _ in records))
+    registry = TaskRegistry([task])
+    task_store = TaskStore(config.tasks_file)
+    task_store.save(registry)
+    inbox = TaskInbox(tmp_path / "inbox")
+
+    def no_client():
+        raise AssertionError("no browser client expected in this test")
+
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=git,
+        executor=WritingExecutor(tmp_path / "worktrees", {"feature.py": "two\n"}),
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=no_client,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=ManifestStore(config.manifests_dir),
+        worktrees=worktrees,
+        execution_store=execution_store,
+        intent_store=IntentStore(tmp_path / "intents"),
+        validation_runner=ok_validation,
+        task_inbox=inbox,
+        context_records=record_store if wire else None,
+    )
+    return orch, repo_root, worktrees, execution_store, task, record_store, inbox
+
+
+def push_the_round(orch, repo_root, tmp_path, task):
+    """Implement, review, approve — and return the execution record the push
+    left behind."""
+    orch._dispatch_executor(
+        Directive(decision=Decision.IMPLEMENT, reason="do it", task_id=task.id)
+    )
+    orch._step_ready()
+    req = orch.state.pending_request
+    resp = LastResponse(
+        request_id=req.request_id,
+        raw="{}",
+        received_at="now",
+        head_sha=req.head_sha,
+        base_sha=req.base_sha,
+        report_sha256=req.report_sha256,
+        postcommit=req.postcommit,
+    )
+    bare = tmp_path / "bare.git"
+    run_git(tmp_path, "init", "-q", "--bare", str(bare))
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+    orch._dispatch_task_push(Directive(decision=Decision.PUSH, reason="approved"), resp)
+    return resp
+
+
+def test_a_completed_round_in_scope_advances_the_record_to_the_published_commit(tmp_path):
+    """THE CLAIM on the real path: the loop pushes, marks the task completed,
+    and the record its packet selected now names the commit that published."""
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path, approved_paths=("feature.py", "docs/context/")
+    )
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    execution = execution_store.load(task.id)
+    assert execution.published_sha != ""
+    stored = load_index(record_store.directory).get("feat")
+    assert stored.last_verified_commit == execution.published_sha
+    assert stored.invariant == record().invariant  # nothing else was rewritten
+    assert inbox.pending() == []  # nothing was left over to file
+
+
+def test_a_completed_round_out_of_scope_files_one_follow_up_and_writes_nothing(tmp_path):
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path, approved_paths=("feature.py",)
+    )
+    before = (record_store.directory / "feat.json").read_bytes()
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    execution = execution_store.load(task.id)
+    assert (record_store.directory / "feat.json").read_bytes() == before
+
+    queued = inbox.pending()
+    assert len(queued) == 1
+    spec = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert spec["id"] == f"{task.id}{FOLLOW_UP_SUFFIX}"
+    assert spec["depends_on"] == [task.id]
+    assert spec["approved_paths"] == ["docs/context/feat.json"]
+    assert spec["context_ids"] == ["feat"]
+    assert execution.published_sha in spec["description"]
+
+
+def test_the_closeout_is_idempotent_when_the_push_path_is_re_entered(tmp_path):
+    """Crash recovery re-enters the push path, so the closeout runs twice for
+    one completed task. The second one must write nothing new and file nothing
+    new — the id is derived from the task, and the queue is asked as well as the
+    registry."""
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path, approved_paths=("feature.py",)
+    )
+    push_the_round(orch, repo_root, tmp_path, task)
+    after_first = (record_store.directory / "feat.json").read_bytes()
+    assert len(inbox.pending()) == 1
+
+    worktree_git = GitGateway(worktrees.path_for(task.id), PolicyEngine(PolicyConfig()))
+    orch._close_out_context(task.id, worktree_git)
+
+    assert len(inbox.pending()) == 1
+    assert (record_store.directory / "feat.json").read_bytes() == after_first
+
+
+def test_an_unwired_loop_says_so_in_the_transcript_and_writes_nothing(tmp_path):
+    """Production today. "No record directory is wired into this loop" and "the
+    closeout stopped working" must not look alike."""
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path, approved_paths=("feature.py", "docs/context/"), wire=False
+    )
+    entries: list[tuple[str, dict]] = []
+    orch._log = lambda event, *args, **kwargs: entries.append(
+        (event, kwargs.get("data") or {})
+    )
+    before = (record_store.directory / "feat.json").read_bytes()
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    skipped = [data for event, data in entries if event == "context_closeout_skipped"]
+    assert skipped and skipped[0]["reason"] == "no_context_record_store"
+    assert (record_store.directory / "feat.json").read_bytes() == before
+    assert inbox.pending() == []
+
+
+def test_a_store_inside_the_observed_checkout_is_refused_before_any_write(tmp_path):
+    """The trap this guard exists for: a record written into the observed tree
+    is a file the loop cannot commit, and the NEXT write-capable dispatch parks
+    the whole loop `primary_checkout_dirty` over it. Refused loudly here rather
+    than honoured once and paid for on the next round."""
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path,
+        approved_paths=("feature.py", "docs/context/"),
+        records_dir=tmp_path / "repo" / "docs" / "context",
+    )
+    # Committed, so the round can start at all: an UNTRACKED record file already
+    # makes the observed checkout dirty, which is the same park arriving one
+    # round earlier.
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "the records")
+    entries: list[tuple[str, dict]] = []
+    orch._log = lambda event, *args, **kwargs: entries.append(
+        (event, kwargs.get("data") or {})
+    )
+    before = (record_store.directory / "feat.json").read_bytes()
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    refused = [data for event, data in entries if event == "context_closeout_refused"]
+    assert refused and "inside the observed checkout" in refused[0]["reason"]
+    assert (record_store.directory / "feat.json").read_bytes() == before
+    assert inbox.pending() == []
+
+
+def test_a_closeout_that_cannot_write_still_owes_the_update(tmp_path):
+    """A failed write is not a completed one: the record joins the follow-up
+    rather than becoming a line nobody acts on."""
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path, approved_paths=("feature.py", "docs/context/")
+    )
+    original = record_store.write
+    record_store.write = lambda record_, filename: None
+
+    push_the_round(orch, repo_root, tmp_path, task)
+    record_store.write = original
+
+    queued = inbox.pending()
+    assert len(queued) == 1
+    spec = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert spec["context_ids"] == ["feat"]
+    assert "the write failed" in spec["description"]
+
+
+# =============================================================================
+# 7. THE SCOPE IS NEVER WIDENED
+# =============================================================================
+
+
+def test_a_closeout_widens_neither_the_task_scope_nor_the_trackers(tmp_path):
+    """The acceptance criterion, asserted where it is observable rather than by
+    reading the code: after a round that needed an out-of-scope context edit,
+    the completed task's own scope and the universal trackers are what they
+    were."""
+    trackers_before = TRACKER_PATHS
+    orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
+        tmp_path, approved_paths=("feature.py",)
+    )
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    assert orch._registry.get(task.id).approved_paths == ("feature.py",)
+    assert TRACKER_PATHS == trackers_before
+    # AFTER the round, off disk: the persisted registry never gained the record
+    # path either. Read rather than byte-compared against the pre-state, because
+    # `_mark_task_completed` legitimately rewrites the status in the same file.
+    assert "docs/context" not in orch._config.tasks_file.read_text(encoding="utf-8")
+    # The record file the follow-up names is authorized on the FOLLOW-UP, and on
+    # nothing that already existed.
+    assert inbox.pending()
+
+
+#: What MOVES an existing task's scope in this package: the registry mutator,
+#: the inbox kind that reaches it, and the universal grant. None of the three may
+#: be reachable from the closeout — "just add the path" is the widening this
+#: whole path exists to refuse.
+SCOPE_MOVERS = ("set_approved_paths", "KIND_APPROVED_PATHS", "TRACKER_PATHS")
+
+
+def _referenced_names(tree) -> set[str]:
+    """Every identifier the code REFERS TO — names and attributes alike.
+
+    Off the AST rather than the text, for the reason `validation._code_strings`
+    reads its own scan that way: this file's prose says `TRACKER_PATHS` several
+    times to explain why it must not be touched, and a grep over the source
+    cannot tell an explanation from a call.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+    return names
+
+
+def _function_named(tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"no function named {name!r}")
+
+
+def test_no_closeout_path_can_reach_a_scope_mutation():
+    """A drift guard over the code this path is made of.
+
+    Read through `__module__` rather than by opening a path, for the reason
+    `test_tasks.py`'s own source-reading test states: the static selector
+    narrows a round to the tests that reach the modules it changed, and a file
+    opened by name mentions nothing it can see.
+    """
+    from autoloop import context_packet as context_packet_module
+
+    closeout = ast.parse(
+        Path(sys.modules[context_packet_module.__name__].__file__).read_text(
+            encoding="utf-8"
+        )
+    )
+    orchestrator = ast.parse(
+        Path(sys.modules[Orchestrator.__module__].__file__).read_text(encoding="utf-8")
+    )
+
+    reachable = _referenced_names(closeout)
+    for method in ("_close_out_context", "_file_context_follow_up"):
+        reachable |= _referenced_names(_function_named(orchestrator, method))
+
+    assert not reachable & set(SCOPE_MOVERS), sorted(reachable & set(SCOPE_MOVERS))
+    # And the only scope question any of it asks is the shared matcher's.
+    assert "unauthorized_paths" in _referenced_names(closeout)

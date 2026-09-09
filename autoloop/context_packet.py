@@ -94,23 +94,39 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .context_index import ContextIndex, build_index
+from .context_records import ContextRecord, ContextRecordStore, load_records
 from .context_resolver import (
     CONTRADICTION,
     STALE_FINDING,
     SUPERSEDED,
     ContextResolutionError,
     Resolution,
+    SelectedRecord,
     resolve_context,
 )
 from .errors import GitError
 from .git_gateway import GitGateway
+from .inbox import KIND_TASK
 from .state import utcnow_iso
-from .tasks import Task, effective_approved_paths
-from .worktask import TaskExecution
+from .tasks import (
+    Task,
+    effective_approved_paths,
+    is_valid_approved_path,
+    is_valid_context_id,
+    unauthorized_paths,
+)
+from .worktask import (
+    ATTEMPT_FAULT,
+    ATTEMPT_TASK,
+    REASON_SENT_FOR_REVIEW,
+    TaskExecution,
+    attempt_outcome,
+    split_attempt,
+)
 
 #: The label the digest is rendered under, in the agent prompt and in the
 #: review packet. ONE spelling, so the two renderings cannot drift apart and a
@@ -192,11 +208,18 @@ def packet_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _selection_lines(
+def selection_lines(
     resolution: Resolution, entries: dict[str, tuple[str, str, str]] | None, rev: str
 ) -> list[str]:
     """The selected records, each with its source paths AND their blob object
     ids AT `rev`.
+
+    PUBLIC because the closeout at the bottom of this module renders it a second
+    time and looks for the result INSIDE the packet this round was actually
+    given (`selection_was_shown`). That is what turns "the records this round's
+    packet selected" from an assertion into a comparison, and it only works
+    while both sides are these exact bytes — a second, nearly-identical renderer
+    would compare two things that agree until the day they do not.
 
     The oid is what makes a selection a claim about a TREE rather than about a
     filename: two rounds cutting the same record at two commits carry different
@@ -250,10 +273,31 @@ def _selection_lines(
     return lines or [_NONE]
 
 
+def selection_block(
+    resolution: Resolution, entries: dict[str, tuple[str, str, str]] | None, rev: str
+) -> str:
+    """The `selected records (N)` heading AND its lines, as one block.
+
+    ONE function for both readers, and that is the whole reason it exists: the
+    packet renders it into the artifact an agent is given, and the closeout
+    renders it again to ask whether the selection it just re-resolved is the one
+    that was SHOWN (`selection_was_shown`). A second spelling of the heading —
+    which is where the COUNT lives, and the count is the part that catches a
+    selection that gained or lost a record — would agree until it did not.
+    """
+    return "\n".join(
+        [
+            f"selected records ({len(resolution.selected)}), with their source "
+            "paths at task_base_sha:",
+            *selection_lines(resolution, entries, rev),
+        ]
+    )
+
+
 def _finding_lines(resolution: Resolution, category: str) -> list[str]:
     """One finding per line. `subject` goes through `_one_line` too: for a
     CONTRADICTION it is a SOURCE PATH, which is foreign text for the same reason
-    the paths in `_selection_lines` are."""
+    the paths in `selection_lines` are."""
     return [
         f"  {_one_line(finding.subject)} — {_one_line(finding.detail)}"
         for finding in resolution.findings_of(category)
@@ -431,9 +475,7 @@ def render_context_packet(
                 "object id",
             )
         lines += [
-            f"selected records ({len(resolution.selected)}), with their source "
-            "paths at task_base_sha:",
-            *_selection_lines(resolution, entries, base_sha),
+            *selection_block(resolution, entries, base_sha).split("\n"),
             "",
             f"stale records ({len(resolution.findings_of(STALE_FINDING))}):",
             *_finding_lines(resolution, STALE_FINDING),
@@ -639,3 +681,629 @@ def record_round_packet(
     )
     execution.context_packet_sha256 = packet.digest
     return packet, store.save(packet)
+
+
+# ===========================================================================
+# CLOSEOUT — what a COMPLETED round owes the records its packet selected.
+# ===========================================================================
+#
+# ONE CLAIM (ctx-07): at completion the loop classifies the published change
+# against the context records THAT ROUND'S PACKET SELECTED, updates only the
+# records whose own files fall inside the task's own `approved_paths`, and for
+# everything else files ONE narrow follow-up task through the inbox that depends
+# on the completed task.
+#
+# **Why it lives in this module.** The first half of that sentence is a fact
+# about the PACKET: "the records that round's packet selected" is not "whatever
+# the record directory holds now", and the only way to say it exactly is to
+# re-render the packet's own selection block and look for it inside the bytes
+# the round was actually given (`selection_was_shown`). Putting the classifier
+# one function away from the renderer is what keeps those two the same bytes.
+# `inbox.py` makes the same argument for keeping operator intake beside
+# `check_request_shape`.
+#
+# **THE SCOPE RULE IS BINARY, AND IT IS THE SAME RULE EVERY WRITE GETS.** A
+# record's own file is a repository path (`ContextRecordStore.repo_path_for`),
+# and whether this task may write it is `tasks.unauthorized_paths` over
+# `tasks.effective_approved_paths` — the single matcher the pre-commit gate and
+# the post-commit ownership check already share. So there are exactly two
+# outcomes for a record that needs attention: written in scope, or named in the
+# follow-up. There is no third, and "add the path to `approved_paths`" is not
+# one: nothing here writes `Task.approved_paths` or `tasks.TRACKER_PATHS`, and
+# `test_context_closeout.py` reads this module's source to keep it that way.
+#
+# **NOTHING HERE READS A MODEL.** Not the agent's report, not the reviewer's
+# feedback, not the task description. Every input is something the loop itself
+# recorded: the packet it rendered, the commit it pushed, the paths git says
+# changed, the attempt ledger it wrote. Text that was GIVEN to a model and read
+# back is not evidence the model produced, and a closeout that took "this
+# supersedes decision D" from a report would be exactly that echo.
+#
+# **AND IT NEVER AUTHORS A CLAIM.** The only field it ever advances on an
+# existing record is `last_verified_commit`, which is a fact about which commit
+# the record's paths were last checked against. It does not rewrite an
+# `invariant`, does not compose a decision's successor, and does not delete
+# anything — see `_QUESTIONS` below for what each of the four questions is
+# allowed to conclude.
+
+#: The kinds whose answer to "did this change touch you?" the loop can settle by
+#: itself. Both are records whose claim is about FILES, so a change that
+#: published over those files either leaves the claim standing at a new commit
+#: or does not — and `last_verified_commit` is the field that says which.
+VERIFIABLE_KINDS: tuple[str, ...] = ("feature", "incident")
+
+#: How many times one failure outcome must appear in a task's own attempt ledger
+#: before the round has established a LESSON. TWO, and that is ctx-02's bar
+#: quoted rather than a threshold picked here: "the same mistake has now
+#: happened MORE THAN ONCE". A single mistake is not a lesson, and treating one
+#: as a lesson is how a context directory fills with records nobody prunes.
+LESSON_MIN_OCCURRENCES = 2
+
+#: The suffix a follow-up task's id carries. One per completed task, derived
+#: from its id and nothing else, so a closeout that runs twice for one task
+#: (crash recovery re-enters the push path — see
+#: `orchestrator._mark_task_completed`) proposes the SAME id both times and the
+#: second one is refused as an existing task rather than filed again.
+FOLLOW_UP_SUFFIX = "-context"
+
+
+@dataclass(frozen=True)
+class RecordUpdate:
+    """One record the closeout will WRITE, and where.
+
+    `record` is the record as it will be stored — already updated, so nothing
+    downstream re-applies a rule. `filename` is the file it was LOADED from, not
+    a name derived from its id: writing a record loaded from `feature-one.json`
+    into `<id>.json` would leave two files declaring one id, which
+    `context_index` then indexes under neither. That is an update that deletes a
+    record while reporting success.
+    """
+
+    record: ContextRecord
+    filename: str
+    repo_path: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CloseoutItem:
+    """One record that needs attention and that this round did not write.
+
+    `repo_path` is `""` when the store cannot name a repository path for the
+    record at all, which is itself a reason the round may not write it.
+    """
+
+    record_id: str
+    repo_path: str
+    reason: str
+
+    @property
+    def order_key(self) -> tuple[str, str]:
+        return (self.record_id, self.repo_path)
+
+
+@dataclass(frozen=True)
+class CloseoutPlan:
+    """What a completed round decided about its context records.
+
+    `notes` is never decoration: it carries every reason the plan did LESS than
+    it might have (no published commit, an id that cannot be spelled, a lesson
+    that did not qualify), so a closeout that wrote nothing and a closeout that
+    was never asked cannot look alike in the transcript.
+    """
+
+    updates: tuple[RecordUpdate, ...] = ()
+    follow_up: tuple[CloseoutItem, ...] = ()
+    notes: tuple[str, ...] = ()
+
+
+def selection_was_shown(
+    packet_text: str,
+    resolution: Resolution,
+    entries: dict[str, tuple[str, str, str]] | None,
+    rev: str,
+) -> bool:
+    """Is `resolution` the selection the packet `packet_text` ACTUALLY SHOWED?
+
+    The check that makes the claim's first clause a comparison rather than an
+    assertion. A closeout re-resolves the round's seeds against the round's own
+    base, which is deterministic given the same index — but the index is a
+    DIRECTORY, and a directory can have changed since the round was dispatched.
+    Rendering the same block and finding it inside the stored packet proves the
+    two selections are identical, count and all, without parsing anything out of
+    the packet.
+
+    Deliberately a containment test on loop-rendered bytes and NOT a parse: the
+    packet holds record titles, invariants and paths written outside this
+    package, and a reader that parsed them back out would be reading foreign
+    text as structure. Here the foreign text only ever has to MATCH.
+
+    An empty selection is confirmed by the same comparison, on the heading's
+    `(0)` and the standing `(none)` line — and a plan built from it is empty
+    anyway, so the trivial case stays honest without being special.
+    """
+    return selection_block(resolution, entries, rev) in packet_text
+
+
+def repeated_failure(attempt_ledger) -> tuple[str, int]:
+    """`(outcome, times)` for the failure this task hit MOST OFTEN, or `("", 0)`
+    when no outcome reaches `LESSON_MIN_OCCURRENCES`.
+
+    THE evidence for question four, and the only kind this module will accept
+    for it: the loop's own `TaskExecution.attempt_ledger`, which it wrote itself
+    at every round's exit. A reviewer's prose naming a reusable pattern is the
+    other qualifying bar ctx-02 states, and it is deliberately NOT read here —
+    that text was produced by a model about a packet the loop gave it, and
+    turning it into a stored record is the echo this whole section refuses.
+
+    Only SETTLED entries count (`ATTEMPT_TASK` / `ATTEMPT_FAULT`): an entry still
+    carrying an OPEN label is a round that never reached one of its own exits, so
+    it has no outcome to be a mistake yet. `REASON_SENT_FOR_REVIEW` is not a
+    failure at all — it is the outcome the accounting exists to recognise — and
+    it is read through `attempt_outcome`, so a redo's `origin>outcome` is judged
+    on what the round ACHIEVED rather than on the fault that forced it.
+
+    Ties are broken by name, so the answer is total and two runs over one ledger
+    agree.
+    """
+    counts: dict[str, int] = {}
+    for entry in attempt_ledger or ():
+        _, budget, reason = split_attempt(str(entry))
+        if budget not in (ATTEMPT_TASK, ATTEMPT_FAULT):
+            continue
+        outcome = attempt_outcome(reason).strip()
+        if not outcome or outcome == REASON_SENT_FOR_REVIEW:
+            continue
+        counts[outcome] = counts.get(outcome, 0) + 1
+    if not counts:
+        return "", 0
+    best = sorted(counts, key=lambda name: (-counts[name], name))[0]
+    return (best, counts[best]) if counts[best] >= LESSON_MIN_OCCURRENCES else ("", 0)
+
+
+def follow_up_id_for(task_id: str) -> str:
+    """The id the follow-up for `task_id` gets, or `""` when it cannot have one.
+
+    Derived and never generated: a stamp or a counter would file a second task
+    every time the push path is re-entered, which crash recovery does by design.
+
+    Checked with `tasks.is_valid_context_id`, which is the NARROWER of this
+    package's two spellings of the same `_ID_RE` slug rule (it is a `fullmatch`,
+    so it also refuses the trailing newline `depends_on`'s `match` would let
+    through). An id that passes the narrow test passes the broad one, so this
+    answers "may the registry hold a task called that" without a second copy of
+    the rule — and a `task_id` already at the 64-character ceiling simply gets no
+    follow-up id, which the caller reports rather than truncating into a
+    collision with someone else's task.
+    """
+    candidate = f"{task_id}{FOLLOW_UP_SUFFIX}"
+    return candidate if is_valid_context_id(candidate) else ""
+
+
+def _touched(record: ContextRecord, changed: frozenset[str]) -> list[str]:
+    """The record's OWN source paths that this change altered, sorted.
+
+    The whole trigger. A record whose paths the change did not touch is left
+    alone and earns no follow-up line: "a follow-up per round is how a queue
+    stops being read", so only a record with something concrete to answer for
+    reaches the plan at all. A record naming NO source paths is therefore never
+    reached either — it asserts nothing about files, so nothing about files can
+    have altered it, and advancing its verification commit would be a claim
+    nobody checked.
+    """
+    return sorted(set(record.source_paths) & changed)
+
+
+def classify_closeout(
+    task: Task,
+    selected: tuple[SelectedRecord, ...],
+    store: ContextRecordStore,
+    *,
+    changed_paths,
+    published_sha: str,
+    sources,
+    known_record_ids=frozenset(),
+    known_filenames=frozenset(),
+    attempt_ledger=(),
+) -> CloseoutPlan:
+    """THE four questions, answered for one completed round. Pure: records and
+    paths in, a plan out — it writes nothing, submits nothing and reads no file.
+
+    * **Does the change alter a documented feature invariant?** A selected
+      `feature` record whose own source paths this change altered. In scope, its
+      `last_verified_commit` advances to the published commit.
+    * **Does it resolve a qualifying incident?** The same test over a selected
+      `incident` record, and the same answer. "Qualifying" is the concrete half:
+      the incident's own files were altered by a change that a reviewer approved
+      and that published.
+    * **Does it introduce or supersede a decision?** Never answered here. A
+      supersession needs a SUCCESSOR, and the successor is a claim somebody has
+      to author (`context_records.superseded_record` is the operation, and it is
+      what the follow-up uses). A selected `decision` whose files this change
+      altered is therefore always a follow-up line and is NEVER rewritten in
+      place — rewriting one would delete the reason it was made, which is the
+      rule `docs/SECURITY.md` keeps for a resolved finding.
+    * **Does it establish a reusable lesson?** Only on ctx-02's bar, measured off
+      the loop's own attempt ledger by `repeated_failure`: the SAME failure
+      outcome, more than once. A clean round establishes nothing and this
+      creates nothing, which is the answer that keeps the directory prunable. An
+      EXISTING `lesson` record the change touched is a follow-up line for the
+      same reason a decision is — whether a lesson still applies is not a
+      question about files, and restating one is authoring.
+
+    WHAT AN ADVANCE MEANS, stated because it would otherwise overclaim: the
+    record's paths were part of a change that passed post-commit validation and
+    review at this commit. It does NOT mean the invariant was re-proved — the
+    validation a round runs may have been narrowed to the tests its changed paths
+    reach (`validation.select_validation_commands`) — and no field here says it
+    was.
+
+    Everything is fail-closed on absence. No published commit, no repository path
+    for a record's file, an empty scope: each of those makes the record
+    unwritable rather than writable, and each is reported.
+    """
+    scope = effective_approved_paths(task.approved_paths)
+    changed = frozenset(changed_paths or ())
+    notes: list[str] = []
+    updates: list[RecordUpdate] = []
+    items: list[CloseoutItem] = []
+
+    if not published_sha:
+        # The ONE input whose absence must never be papered over. Writing an
+        # empty `last_verified_commit` does not mean "unknown, leave it": the
+        # resolver reads a record with no commit as STALENESS_UNKNOWN forever,
+        # so the write would DELETE the commit the record already carried.
+        return CloseoutPlan(
+            notes=(
+                "this round records no published commit, so no record was "
+                "verified and no follow-up was filed — advancing a record to an "
+                "empty commit would erase the one it already carries and report "
+                "it as never verified",
+            )
+        )
+
+    def repo_path_of(record_id: str) -> tuple[str, str]:
+        """`(filename, repo_path)` for a loaded record. Both `""` when the store
+        cannot address it, which is read everywhere below as out of scope."""
+        filename = str(sources.get(record_id, "") or "")
+        if not filename:
+            return "", ""
+        return filename, store.repo_path_for(filename)
+
+    def in_scope(repo_path: str) -> bool:
+        # `unauthorized_paths` over the EFFECTIVE list, i.e. the same call the
+        # ownership check makes about this task's commit. An empty `scope` makes
+        # `effective_approved_paths` return `()`, under which every path is
+        # unauthorized — so an unscoped task writes no record, which is the
+        # answer it already gets for every other kind of write.
+        return bool(repo_path) and not unauthorized_paths({repo_path}, scope)
+
+    for item in selected:
+        record = item.record
+        touched = _touched(record, changed)
+        if not touched:
+            continue
+        altered = ", ".join(_one_line(path) for path in touched)
+        filename, repo_path = repo_path_of(record.id)
+        where = repo_path or "(this store can name no repository path for it)"
+        if record.kind not in VERIFIABLE_KINDS:
+            items.append(
+                CloseoutItem(
+                    record.id,
+                    repo_path,
+                    f"a {record.kind} record whose own source paths this change "
+                    f"altered ({altered}); the loop never authors a successor or "
+                    "a restatement, so this needs a round that can — the record "
+                    f"file is {where}",
+                )
+            )
+            continue
+        if not in_scope(repo_path):
+            items.append(
+                CloseoutItem(
+                    record.id,
+                    repo_path,
+                    f"a {record.kind} record whose own source paths this change "
+                    f"altered ({altered}), and whose record file {where} is "
+                    "outside the completed task's approved paths — so it was not "
+                    "written, and the scope was not widened to write it",
+                )
+            )
+            continue
+        if record.last_verified_commit == published_sha:
+            # Already carries this commit: the closeout ran twice for one push
+            # (crash recovery re-enters it). Writing it again would be harmless
+            # and reporting it as an update would not.
+            continue
+        updates.append(
+            RecordUpdate(
+                record=replace(record, last_verified_commit=published_sha),
+                filename=filename,
+                repo_path=repo_path,
+                reason=(
+                    f"its source paths {altered} were part of the change "
+                    f"published as {published_sha}, which passed post-commit "
+                    "validation and review at that commit"
+                ),
+            )
+        )
+
+    lesson, note = _lesson_for(
+        task,
+        published_sha=published_sha,
+        attempt_ledger=attempt_ledger,
+        store=store,
+        known_record_ids=known_record_ids,
+        known_filenames=known_filenames,
+        related=tuple(update.record.id for update in updates),
+    )
+    if note:
+        notes.append(note)
+    if lesson is not None:
+        filename = store.filename_for(lesson.id)
+        repo_path = store.repo_path_for(filename)
+        if in_scope(repo_path):
+            updates.append(
+                RecordUpdate(
+                    record=lesson,
+                    filename=filename,
+                    repo_path=repo_path,
+                    reason=f"a new lesson record: {_one_line(lesson.title)}",
+                )
+            )
+        else:
+            items.append(
+                CloseoutItem(
+                    lesson.id,
+                    repo_path,
+                    "this round established a lesson and the file it belongs in "
+                    f"({repo_path or 'unnameable in this store'}) is outside the "
+                    f"completed task's approved paths: {_one_line(lesson.title)}",
+                )
+            )
+    return CloseoutPlan(
+        updates=tuple(updates),
+        follow_up=tuple(sorted(items, key=lambda entry: entry.order_key)),
+        notes=tuple(notes),
+    )
+
+
+def _lesson_for(
+    task: Task,
+    *,
+    published_sha: str,
+    attempt_ledger,
+    store: ContextRecordStore,
+    known_record_ids,
+    known_filenames,
+    related: tuple[str, ...],
+) -> tuple[ContextRecord | None, str]:
+    """`(lesson, note)` — the record question four earns, or `None` and why not.
+
+    Its CONTENT is derived and never composed: the outcome slug and the count
+    come from the ledger, the commit from the push. Nothing in the title is a
+    judgement, because a judgement is the thing this module may not make.
+
+    `invariant` is deliberately EMPTY. An invariant is a checkable assertion
+    about source paths, the loop has none to make here, and
+    `context_resolver._report_contradictions` skips a record that asserts none —
+    so an empty invariant is also the reading that can never contradict a record
+    a person wrote. `source_paths` is empty for the same reason and one more: a
+    record asserting about no files is reported FRESH rather than as a claim
+    whose verification nobody performed.
+    """
+    outcome, times = repeated_failure(attempt_ledger)
+    if not outcome:
+        return None, (
+            "no lesson qualified: no single failure outcome appears "
+            f"{LESSON_MIN_OCCURRENCES} times in this task's attempt ledger, and "
+            "one mistake is not a lesson"
+        )
+    lesson_id = f"lesson-{task.id}-{outcome}"
+    if not is_valid_context_id(lesson_id):
+        return None, (
+            f"a lesson qualified ({outcome} x{times}) but {lesson_id!r} is not a "
+            "usable record id, so nothing was created and nothing was filed "
+            "under it"
+        )
+    if lesson_id in set(known_record_ids):
+        return None, (
+            f"a lesson qualified ({outcome} x{times}) and record {lesson_id!r} "
+            "already exists, so it was not written a second time"
+        )
+    filename = store.filename_for(lesson_id)
+    if not filename or filename in set(known_filenames):
+        return None, (
+            f"a lesson qualified ({outcome} x{times}) but the file it belongs in "
+            f"({filename or 'unnameable'}) is already taken in this store, so "
+            "nothing was written over it"
+        )
+    return (
+        ContextRecord(
+            id=lesson_id,
+            kind="lesson",
+            title=(
+                f"task {task.id}: {outcome} occurred {times} times before the "
+                f"change published as {published_sha[:12]}"
+            ),
+            related_ids=related,
+            last_verified_commit=published_sha,
+        ),
+        "",
+    )
+
+
+def follow_up_request(task: Task, plan: CloseoutPlan, published_sha: str) -> dict | None:
+    """The ONE inbox creation request a completed round files, or `None`.
+
+    `None` for nothing to say, and `None` for nothing this loop could name: a
+    creation request carrying no `approved_paths` is accepted by the registry and
+    then never dispatched (`effective_approved_paths` returns `()` for an empty
+    scope), so filing one would put a task in the queue that no round can ever
+    take. The caller reports that case instead — an unactionable row in the queue
+    is how a queue stops being read.
+
+    Shaped for `inbox.CREATION_FIELDS` exactly, because that set is exact and a
+    key outside it is refused rather than ignored — there is no field here for a
+    reason, an origin or a note, so everything this has to say is said in the
+    DESCRIPTION, which is also the only place with no shape rule to lose an id or
+    a path to.
+
+    `depends_on` is the completed task, which is what makes the follow-up READY
+    the moment its parent is `completed` (`tasks.SATISFIES_DEPENDENCY`) and never
+    before: a record update that overtook the commit it describes would name a
+    commit the base does not have.
+
+    `context_ids` carries PROVENANCE and no authority — `inbox.py` states, and
+    `test_tasks.py` pins, that neither `unauthorized_paths` nor
+    `effective_approved_paths` ever reads it. `approved_paths` is what this task
+    may write, and it is exactly the record files named below: a narrow scope
+    naming the files, never the completed task's scope widened by one entry.
+    """
+    if not plan.follow_up:
+        return None
+    follow_up_id = follow_up_id_for(task.id)
+    if not follow_up_id:
+        return None
+    paths = sorted(
+        {
+            item.repo_path
+            for item in plan.follow_up
+            if item.repo_path and is_valid_approved_path(item.repo_path)
+        }
+    )
+    if not paths:
+        return None
+    # Only the ids this field can hold. A record id is a broader shape than a
+    # task id (`context_records._require_clean_string` takes any unpadded
+    # string), and ONE unusable entry gets the whole request refused on drain —
+    # which loses the follow-up while this round reports having filed it. Every
+    # id is named in the description either way, where nothing constrains it.
+    cited = sorted({item.record_id for item in plan.follow_up if is_valid_context_id(item.record_id)})
+    lines = [
+        f"Context records that task {task.id} left needing attention when it "
+        f"published {published_sha}. It did not write them, and it did not widen "
+        "its own approved paths to write them — that is the rule this task "
+        "exists to carry out, not a limitation to work around.",
+        "",
+        "Each line names the record and the file that holds it:",
+    ]
+    lines += [
+        f"- {_one_line(item.record_id)} — "
+        f"{_one_line(item.repo_path) or '(no repository path)'} — "
+        f"{_one_line(item.reason)}"
+        for item in plan.follow_up
+    ]
+    lines += [
+        "",
+        "Update each record IN ITS OWN FILE. A decision that changed is "
+        "SUPERSEDED, never rewritten: set the old record's superseded_by to the "
+        "successor's id, leave the old record in place, and add the successor as "
+        "its own record — deleting it deletes the reason it was made.",
+    ]
+    spec: dict = {
+        "kind": KIND_TASK,
+        "id": follow_up_id,
+        "title": f"Update the context records task {task.id} could not write in scope",
+        "description": "\n".join(lines),
+        "depends_on": [task.id],
+        "approved_paths": paths,
+    }
+    if cited:
+        spec["context_ids"] = cited
+    return spec
+
+
+def plan_round_closeout(
+    task: Task,
+    execution: TaskExecution,
+    worktree_git: GitGateway,
+    store: ContextRecordStore,
+    packet_text: str,
+    *,
+    max_records: int,
+) -> tuple[CloseoutPlan, str]:
+    """`(plan, refusal)` for one completed round. The refusal is `""` when the
+    plan was made, and names the reason when it was not.
+
+    EVERY step is fail-closed, and the order is the point. The selection is
+    re-resolved from the round's own base with the same budget the packet used,
+    and then CONFIRMED against the packet the round was actually given: a record
+    directory that changed under the loop, a base that no longer resolves or a
+    packet that cannot be read back all end here as a refusal that writes
+    nothing and files nothing. A closeout that guessed at the selection would be
+    writing verification commits onto records this round never saw.
+
+    A refusal is not an exception: the caller runs on a path where a push has
+    already landed (`orchestrator._dispatch_task_push`), and every failure there
+    is a log rather than a park.
+    """
+    base_sha = execution.task_base_sha
+    if not base_sha:
+        return CloseoutPlan(), "the execution record names no task_base_sha"
+    if not packet_text:
+        return CloseoutPlan(), (
+            "this round's context packet could not be read back at the digest "
+            "its execution record carries, so the selection it was given cannot "
+            "be confirmed"
+        )
+    loaded, problems = load_records(store.directory)
+    index = build_index(loaded, problems)
+    try:
+        tree = worktree_git.tree_of(base_sha)
+    except GitError as exc:
+        return CloseoutPlan(), (
+            f"the base commit {base_sha} could not be read in this worker "
+            f"repository ({_one_line(exc)})"
+        )
+    try:
+        resolution = resolve_context(
+            index, task.context_ids, worktree_git, max_records=max_records, rev=base_sha
+        )
+    except (ContextResolutionError, ValueError) as exc:
+        return CloseoutPlan(), f"the selection could not be resolved ({_one_line(exc)})"
+    entries: dict[str, tuple[str, str, str]] | None = None
+    if any(item.record.source_paths for item in resolution.selected):
+        # The same condition, and the same tolerance of a failed listing, as
+        # `render_context_packet` — the block below has to be the block that was
+        # rendered, including the case where no oid could be read.
+        try:
+            entries = worktree_git.tree_entries(tree)
+        except GitError:
+            entries = None
+    if not selection_was_shown(packet_text, resolution, entries, base_sha):
+        return CloseoutPlan(), (
+            "the selection resolved now is not the one this round's packet "
+            "showed, so nothing was classified against it — the record "
+            "directory has changed since the round was dispatched"
+        )
+    try:
+        changed = worktree_git.commit_range_paths(base_sha, execution.published_sha)
+    except GitError as exc:
+        return CloseoutPlan(), (
+            f"the published change {execution.published_sha} could not be "
+            f"compared against {base_sha} ({_one_line(exc)})"
+        )
+    plan = classify_closeout(
+        task,
+        resolution.selected,
+        store,
+        changed_paths=changed,
+        published_sha=execution.published_sha,
+        # A DUPLICATED id is deliberately absent, so no record under one can be
+        # named a file — and a record with no file is out of scope everywhere
+        # below. `context_index` already excludes such an id from `by_id`, so
+        # nothing under it can be selected either; this is the second lock, and
+        # it is the one that matters if that ever changes: "the last of the two
+        # files wins" is exactly the silent choice the index refuses to make.
+        sources={
+            entry.record.id: entry.source
+            for entry in loaded
+            if not index.is_duplicated(entry.record.id)
+        },
+        known_record_ids=frozenset(index.by_id) | frozenset(index.duplicate_ids),
+        known_filenames=frozenset(entry.source for entry in loaded)
+        | frozenset(problem.source for problem in problems),
+        attempt_ledger=execution.attempt_ledger,
+    )
+    return plan, ""

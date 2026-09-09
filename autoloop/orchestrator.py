@@ -381,7 +381,16 @@ from .config import (
     lane_observed_checkout,
 )
 from .context import build_context, render_context
-from .context_packet import ContextPacketStore, prompt_section, record_round_packet
+from .context_index import ContextIndex, load_index
+from .context_packet import (
+    CloseoutItem,
+    CloseoutPlan,
+    ContextPacketStore,
+    follow_up_request,
+    plan_round_closeout,
+    prompt_section,
+    record_round_packet,
+)
 # THE ROUND BOUNDARY'S DELIVERY HOP for the context packet (ctx-05). Imported BY
 # NAME, at module import, on purpose: this loop's single `TaskExecutor` is
 # `cli._DispatchingExecutor` in production — a router forwarding `execute` and
@@ -510,7 +519,7 @@ from .state import (
     stop_repetition_file,
     utcnow_iso,
 )
-from .inbox import apply_requests
+from .inbox import InboxError, apply_requests
 from .tasks import (
     TRACKER_PATHS,
     Task,
@@ -3224,6 +3233,7 @@ class Orchestrator:
         validation_runner=None,
         validation_env=None,
         task_inbox=None,
+        context_records=None,
         publisher: Publisher | None = None,
         worker_repos=None,
         publisher_url_snapshot: str | None = None,
@@ -3320,6 +3330,17 @@ class Orchestrator:
         #: (`inbox.TaskInbox`). Optional: `None` (most tests) simply means
         #: nothing is drained, exactly as before this existed.
         self._task_inbox = task_inbox
+        #: Where this loop's CONTEXT RECORDS live, and what those files are
+        #: called in the repository (`context_records.ContextRecordStore`).
+        #: `None` means NO RECORD DIRECTORY IS WIRED INTO THIS LOOP — which is
+        #: every production run today, and deliberately so: ctx-03 fixed the
+        #: record shape and left the location to a later round, `cli` passes
+        #: nothing here, and `context_packet.render_context_packet` is handed the
+        #: matching `index=None` at every dispatch. The two must stay in step —
+        #: a closeout resolving records a packet never selected would be
+        #: verifying claims no round was shown. `_close_out_context` says so in
+        #: the transcript rather than skipping quietly.
+        self._context_records = context_records
         #: monotonic timestamp of the last browser restart, for the cooldown.
         self._last_browser_restart = None
         #: True once this episode has already spent its ONE restart on an
@@ -9215,6 +9236,24 @@ class Orchestrator:
         """
         return ContextPacketStore(self._config.context_packets_dir)
 
+    def _context_record_index(self) -> ContextIndex | None:
+        """The index of this loop's context records, or `None` when no record
+        store is wired into it (ctx-07).
+
+        THE one place a record directory is read for a dispatch, so the packet a
+        round is given and the closeout that grades that round are looking at the
+        same directory by construction rather than by two callers agreeing.
+        `None` is not an empty index and is not rendered as one — see
+        `context_packet.render_context_packet`, which reports "no index is wired"
+        distinctly from "a directory somebody named and put nothing in".
+
+        Re-read per dispatch rather than cached: a record file is an ordinary
+        file in a repository somebody may have just merged, and a cached index
+        would hand a round a selection the tree no longer holds.
+        """
+        store = self._context_records
+        return load_index(store.directory) if store is not None else None
+
     def _context_packet_text(self, execution: TaskExecution) -> str:
         """The stored text of the context packet `execution`'s digest names, or
         `""`.
@@ -10503,12 +10542,21 @@ class Orchestrator:
                 execution,
                 worktree_git,
                 self._context_packets(),
-                # No record index: ctx-03 fixed the record SHAPE and deliberately
-                # not its location, and nothing has named a directory since. The
-                # packet SAYS so and reports every cited id as unresolved rather
-                # than resolving it to silence — see
-                # `context_packet.render_context_packet`.
-                None,
+                # The index this loop's record store holds, or `None` when no
+                # store is wired — which is every production run today, because
+                # ctx-03 fixed the record SHAPE and deliberately not its
+                # location and `cli` names no directory. The packet then SAYS so
+                # and reports every cited id as unresolved rather than resolving
+                # it to silence (`context_packet.render_context_packet`).
+                #
+                # ONE accessor for both halves, deliberately: the closeout at
+                # completion re-resolves this same selection and confirms it
+                # against the packet these bytes went into
+                # (`context_packet.selection_was_shown`). Two sources of "which
+                # records exist" would disagree on the first round that had any,
+                # and the closeout would then refuse every task forever while
+                # looking configured.
+                self._context_record_index(),
                 max_records=self._config.context.max_records,
             )
             self._log(
@@ -14455,6 +14503,15 @@ class Orchestrator:
         # has already shipped. Dropping the entries makes that a refusal.
         self._forget_sent_postcommits_for_task(state, binding.task_id)
         self._mark_task_completed(binding.task_id)
+        # AFTER the completion, and before the merge: the follow-up this may file
+        # DEPENDS on this task, and a dependency is satisfied by `completed`
+        # (`tasks.SATISFIES_DEPENDENCY`) — filed above a registry that still says
+        # `in_progress`, it would be a task waiting on a status the loop had not
+        # written yet. Like `_mark_task_completed` and
+        # `_auto_merge_after_completion` on either side of it, it never raises
+        # and never parks: the push has landed, and a bookkeeping problem must
+        # not undo work that is already durable.
+        self._close_out_context(binding.task_id, worktree_git)
         self._log(
             "task_pushed",
             data={
@@ -14596,6 +14653,196 @@ class Orchestrator:
             )
             return
         self._log("task_completed", data={"task_id": task_id})
+
+    def _close_out_context(self, task_id: str, worktree_git: GitGateway) -> None:
+        """Leave the project context TRUE, or file the one narrow task that will
+        (ctx-07).
+
+        Called once, from `_dispatch_task_push`, immediately after
+        `_mark_task_completed`. What it does is `context_packet`'s to decide —
+        this method does the three things a decision cannot do for itself: it
+        assembles the loop's own evidence, it writes what the plan says may be
+        written, and it queues at most ONE follow-up.
+
+        **The scope rule is not re-implemented here, and must not be.**
+        `classify_closeout` asks `tasks.unauthorized_paths` over
+        `tasks.effective_approved_paths`, which is the same matcher the
+        pre-commit gate and the post-commit ownership check use, so a record
+        outside this task's approved paths is not written by this method and is
+        not written by widening anything either. Nothing on this path assigns
+        `Task.approved_paths` or touches `TRACKER_PATHS`.
+
+        **Never raises, and never parks.** It sits between two methods that
+        already carry that rule for the same reason — the push has landed, and
+        the loop must not turn bookkeeping into a refusal of work that is already
+        durable. Every exit logs, including the ones that do nothing: a closeout
+        that was skipped, refused, or ran and found nothing to change must be
+        three distinguishable lines in the transcript, because the alarm that
+        never fires is the failure this whole roadmap item is about.
+        """
+        try:
+            store = self._context_records
+            if store is None:
+                # The ordinary production answer today. Logged rather than
+                # returned silently: "no record directory is wired into this
+                # loop" and "the closeout stopped working" must not look alike.
+                self._log(
+                    "context_closeout_skipped",
+                    data={"task_id": task_id, "reason": "no_context_record_store"},
+                )
+                return
+            if self._store_is_inside_the_observed_checkout(store):
+                # NOTHING IS WRITTEN INSIDE THE CHECKOUT — port-01's rule, and
+                # the same one `context_packet`'s module docstring states for the
+                # packet store. A record file written into the observed tree is
+                # an uncommitted file the loop cannot commit, and the NEXT
+                # write-capable dispatch refuses to start against a dirty
+                # observed checkout (`primary_checkout_dirty`, loop-fatal). So a
+                # store wired there is refused here, loudly, instead of being
+                # honoured once and parking the whole loop afterwards.
+                self._log(
+                    "context_closeout_refused",
+                    data={
+                        "task_id": task_id,
+                        "reason": (
+                            "the context record store is inside the observed "
+                            "checkout, where nothing this loop writes may live — "
+                            "the next dispatch would refuse to start against the "
+                            "dirty tree it would leave"
+                        ),
+                        "directory": str(store.directory),
+                    },
+                )
+                return
+            if self._execution_store is None or not self._registry.has(task_id):
+                self._log(
+                    "context_closeout_skipped",
+                    data={"task_id": task_id, "reason": "no_execution_record_or_task"},
+                )
+                return
+            execution = self._execution_store.load(task_id)
+            if execution is None or not execution.published_sha:
+                self._log(
+                    "context_closeout_skipped",
+                    data={"task_id": task_id, "reason": "no_published_commit"},
+                )
+                return
+            task = self._registry.get(task_id)
+            plan, refusal = plan_round_closeout(
+                task,
+                execution,
+                worktree_git,
+                store,
+                # The packet as the round's own record names it: absent unless
+                # the digest on the record is the digest of the stored bytes
+                # (`_context_packet_text`). A closeout cannot confirm a selection
+                # against a packet it cannot read, and `plan_round_closeout`
+                # refuses on an empty one.
+                self._context_packet_text(execution),
+                max_records=self._config.context.max_records,
+            )
+            if refusal:
+                self._log(
+                    "context_closeout_refused",
+                    data={"task_id": task_id, "reason": refusal},
+                )
+                return
+            written: list[str] = []
+            unwritten: list[CloseoutItem] = []
+            for update in plan.updates:
+                if store.write(update.record, update.filename) is None:
+                    # A write that failed is still a record needing attention,
+                    # so it JOINS the follow-up rather than becoming a line
+                    # nobody acts on.
+                    unwritten.append(
+                        CloseoutItem(
+                            update.record.id,
+                            update.repo_path,
+                            "this round was authorized to write this record and "
+                            f"the write failed ({update.repo_path}) — the update "
+                            "it needed is still owed",
+                        )
+                    )
+                    continue
+                written.append(update.repo_path or update.filename)
+            items = tuple(plan.follow_up) + tuple(unwritten)
+            filed, skipped = self._file_context_follow_up(
+                task, items, execution.published_sha
+            )
+            self._log(
+                "context_closeout",
+                data={
+                    "task_id": task_id,
+                    "published_sha": execution.published_sha,
+                    "updated": written,
+                    "needs_attention": [item.record_id for item in items],
+                    "follow_up_task": filed,
+                    "follow_up_skipped": skipped,
+                    "notes": list(plan.notes),
+                },
+            )
+        except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
+            self._log(
+                "context_closeout_error",
+                data={"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
+
+    def _store_is_inside_the_observed_checkout(self, store) -> bool:
+        """Would writing a record land inside the tree the loop watches?
+
+        FAIL CLOSED: a path this cannot resolve answers `True`, i.e. "do not
+        write". The cost of a wrong `True` is a closeout that reports a refusal;
+        the cost of a wrong `False` is a file in the observed checkout that the
+        next write-capable dispatch parks the whole loop over. Those are not
+        comparable, and this is the same asymmetry `_prepare_write_capable_worker`
+        applies to the dirty check it protects.
+        """
+        try:
+            observed = Path(self._observation_git().repo_root).expanduser().resolve()
+            return Path(store.directory).expanduser().resolve().is_relative_to(observed)
+        except (OSError, ValueError, AttributeError):
+            return True
+
+    def _file_context_follow_up(
+        self, task: Task, items: tuple[CloseoutItem, ...], published_sha: str
+    ) -> tuple[str, str]:
+        """Queue THE follow-up for `items`. Returns `(filed_id, skipped_reason)`,
+        exactly one of which is non-empty.
+
+        AT MOST ONE, and at most one EVER for a given completed task: the id is
+        derived from the task's (`follow_up_request`), so the crash-recovery
+        re-entry `_mark_task_completed` documents proposes the same id a second
+        time and is refused here — by the registry for one already merged, and by
+        `TaskInbox.pending_creation_ids` for one still queued, which is the
+        question the registry cannot answer.
+
+        Through `TaskInbox.submit` and nothing else, so the request meets
+        `check_request_shape` on the way in and `TaskRegistry.add_many` on the
+        way out — the same two gates an operator's own creation passes. A refusal
+        by either is reported and dropped: this method is downstream of a landed
+        push and has nothing it may escalate to.
+        """
+        request = follow_up_request(task, CloseoutPlan(follow_up=items), published_sha)
+        if request is None:
+            if not items:
+                return "", "nothing_to_file"
+            # Items exist and none of them can be named as a repository path — a
+            # store with no repository prefix, or a task id with no room for the
+            # suffix. Filing anyway would create a task with no `approved_paths`,
+            # which the registry accepts and the loop can never dispatch.
+            return "", "no_dispatchable_follow_up_could_be_named"
+        if self._task_inbox is None:
+            return "", "no_task_inbox"
+        follow_up_id = str(request["id"])
+        if self._registry.has(follow_up_id):
+            return "", "already_filed"
+        if follow_up_id in self._task_inbox.pending_creation_ids():
+            return "", "already_queued"
+        try:
+            self._task_inbox.submit(request)
+        except (InboxError, OSError) as exc:
+            return "", f"submit_failed: {exc}"
+        return follow_up_id, ""
 
     def _dispatch_changeset_push(self, directive: Directive, resp: LastResponse) -> None:
         """Publish an operator-authored changeset via the Publisher —
