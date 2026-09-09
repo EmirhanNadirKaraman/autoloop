@@ -2074,3 +2074,71 @@ that carries provenance and no authority. Its id is derived from the completed
 task's, so the crash-recovery re-entry of the push path proposes the same id and
 is refused by the registry or by `TaskInbox.pending_creation_ids`. Nothing
 concrete to change files nothing at all.
+
+## Asking why a task got the context it got
+
+```
+python3 -B -m autoloop context explain --task <id> [--packet]
+```
+
+Read-only and lock-free, in the same sense `blockers` is: it takes no lock and
+writes nothing — not into the checkout, not into the state directory. Every git
+call it makes is one of the three read-only plumbing commands the resolver
+already uses (`rev-parse`, `ls-tree`, `diff-tree`), none of which touches an
+index or a ref, so it is safe while a round is running. That is the only moment
+the question is usually asked.
+
+**It calls the resolver; it does not reimplement one.** The selection it prints
+comes out of `context_packet.render_packet_with_resolution` — the one function a
+round's packet is built by — at that round's own base, through that round's own
+worker repository, with the same `[context] max_records` budget. The record
+sections are the packet's own `selection_block` bytes rather than a second
+rendering of them. A diagnostic that can disagree with the loop is worse than
+none, which is the argument `context.MERGE_WINDOW_LABEL` already makes for
+sourcing its line by calling `cli._merge_window_blockers`.
+
+**It explains the round the execution record names**, and refuses rather than
+inventing one. A task that has never been dispatched has no context it *got*, so
+there is nothing to explain; an unreadable execution record, or a worker
+repository that has moved (a released or quarantined round leaves one behind),
+is a stated refusal and exit 1. Exit 0 means the question was answered — a
+digest that does NOT match is a 0, because that is the information this command
+exists to surface.
+
+### What it prints
+
+| Section | What it holds |
+|---|---|
+| header | the worker repository, base sha, base tree, review round, the effective approved paths, the ids the task cites, and whether a record index is wired at all |
+| `selected records (N)` | the packet's own block: each record, its staleness, why it was selected, its invariant, and each source path with the object id it had AT the base |
+| `rejected records (N)` | referenced and NOT selected, with the category: superseded, unknown, duplicated, unreadable, dangling supersession, or dropped by the budget |
+| `stale or unverified records (N)` | a record whose own source paths moved under it (`stale`), and one whose freshness could not be established at all (`staleness_unknown`) — both, always, because "the check could not run" is not "the check found nothing" |
+| `contradictory records (N)` | one source path, two active records asserting different invariants; recorded, no winner picked |
+| `other findings (N)` | the partition remainder — every category the four sections above do not claim, printed rather than dropped |
+| `digest` | the digest rendered now, the one on the execution record, and the one in the stored packet file, each said to match or not |
+| `bounds` | what was NOT printed |
+
+Every section is standing: an empty one renders `(0)` and `(none)`, so "nothing
+was stale" and "the stale section was dropped in a refactor" cannot look alike.
+
+**A digest difference is information, not an accusation.** `review_round` is
+rendered into the packet, so a re-render after a revise verdict and before the
+next dispatch legitimately differs; so does one taken after the base moved,
+after the record directory changed, or against a worker repository that has
+since been quarantined. The line names those causes. An absent stored packet and
+an unreadable one are reported TOGETHER, because `ContextPacketStore.load`
+refuses a file whose bytes do not hash to its own digest exactly as it reports a
+missing one, and claiming to know which would be inventing the distinction.
+
+**No silent caps.** The one thing bounded by default is the packet's own text:
+the bounds section names it, sizes it in lines and characters, and says that
+`--packet` prints it whole. Separately it states what the RESOLVER's budget
+dropped — and every dropped record is already named in the rejected section, so
+the bound has victims rather than only a count.
+
+**What it will show you today is an empty selection**, and that is the honest
+answer rather than a defect: no record directory is wired into this loop
+(`orchestrator._context_record_index` answers `None` and `cli` passes the same),
+so the `context_records:` line says the index is unwired and every cited id is
+reported unresolved. Wiring a directory lights this command up with no change to
+it, because it reads whatever the dispatch path reads.
