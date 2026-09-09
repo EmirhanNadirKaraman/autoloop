@@ -289,6 +289,119 @@ def test_no_store_at_all_still_stops_and_says_nothing_was_recorded():
     assert any("NOT recorded durably" in note for note in proposal.record_notes)
 
 
+def test_two_accepted_tasks_that_scope_one_finding_differently_disagree(tmp_path):
+    """Sharing a tier is not agreeing. Two ACCEPTED TASKS can scope one finding
+    to two different file sets, and suppressing that because both read
+    `accepted_decision` hid the conflict an operator actually has to settle."""
+    store = BlockerStore(tmp_path / "blockers")
+    accepted = TaskRegistry([
+        Task(id="one", title="t", description="covers d1:f1", approved_paths=("a.py",)),
+        Task(id="two", title="t", description="covers d1:f1",
+             approved_paths=("a.py", "b.py", "c.py")),
+    ])
+    proposal = generate_tasks(
+        reconcile([finding("f1")]), accepted, blocker_store=store,
+        now="2026-09-09T00:00:00Z",
+    )
+
+    assert proposal.tasks == []
+    assert proposal.stopped
+    # BOTH tasks named — the source is identical on both sides of this one, so a
+    # record naming only the tier would name neither of them.
+    pair = [
+        c for c in proposal.conflicts
+        if {c.left.author, c.right.author} == {"one", "two"}
+    ]
+    assert len(pair) == 1, [c.describe() for c in proposal.conflicts]
+    details = "\n".join(b.detail for b in store.open_blockers())
+    assert "accepted_decision: one" in details
+    assert "accepted_decision: two" in details
+
+
+def test_two_accepted_tasks_agreeing_about_scope_are_not_a_conflict():
+    """The control. Two tasks that cover one finding with the SAME scope agree,
+    and a guard that reported them would fire on an ordinary registry."""
+    accepted = TaskRegistry([
+        Task(id="one", title="t", description="covers d1:f1",
+             approved_paths=("a.py", "autoloop/tests/")),
+        Task(id="two", title="t", description="covers d1:f1",
+             approved_paths=("a.py", "autoloop/tests/")),
+    ])
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+
+    assert proposal.conflicts == []
+    assert proposal.stopped == ""
+    assert len(proposal.tasks) == 1
+
+
+def test_a_longer_finding_id_is_not_a_mention_of_a_shorter_one():
+    """`d1:f1` is not `d1:f11`. The substring test this replaces manufactured a
+    conflict between two sources that were never talking about the same finding
+    — and an invented conflict has to be disproved by hand before generation can
+    run again, which is how a guard gets switched off."""
+    accepted = TaskRegistry([
+        Task(id="other", title="t", description="covers d1:f11", approved_paths=("z.py",)),
+    ])
+    proposal = generate_tasks(reconcile([finding("f1")]), accepted)
+
+    assert proposal.conflicts == []
+    assert proposal.stopped == ""
+    assert len(proposal.tasks) == 1
+
+    # The real mention still lands, in every ordinary punctuation around it, or
+    # the boundary rule would have closed the check instead of narrowing it.
+    for description in ("covers d1:f1", "covers d1:f1.", "d1:f1: scoped", "(d1:f1)"):
+        narrow = TaskRegistry([
+            Task(id="one", title="t", description=description, approved_paths=("z.py",))
+        ])
+        assert generate_tasks(reconcile([finding("f1")]), narrow).stopped, description
+
+
+def test_a_conflict_that_cannot_be_recorded_stops_even_when_scope_is_unchanged():
+    """The fail-open this closes: "recorded, and generation continues" is only
+    honest when the record EXISTS. Without a store there is nothing for an
+    operator to list or answer, so the conflict is not waved through."""
+    operator = Claim(
+        text="the gate already returns False there",
+        source=SOURCE_OPERATOR_REQUEST,
+        author="the operator",
+        subject="d1:f1",
+        kind=CLAIM_BEHAVIOUR,
+        citation=Evidence(text="the request", source="the operator's request"),
+        paths=("a.py",),          # the SAME paths the finding names
+    )
+    proposal = generate_tasks(reconcile([finding("f1")]), registry(), sources=[operator])
+
+    [conflict] = proposal.conflicts
+    assert conflict.scope_impact == SCOPE_UNCHANGED
+    assert conflict.stops_generation is False, "scope is genuinely unchanged"
+    assert proposal.tasks == [], "and generation stopped anyway, for want of a record"
+    assert "could not be recorded durably" in proposal.stopped
+    # And the operator is told IN THE REPORT — `skipped` is the only field of a
+    # proposal that `audit/report.py` renders.
+    [(subject, reason)] = proposal.skipped
+    assert subject == "d1:f1"
+    assert "NO DURABLE RECORD EXISTS" in reason
+
+
+def test_an_accepted_task_with_no_scope_at_all_stops_rather_than_passes(tmp_path):
+    """Pinned deliberately rather than left to be discovered: a task that names
+    this finding and declares NO approved paths leaves the scope impact
+    unmeasurable, and the tri-state's whole point is that unmeasurable takes the
+    stopping branch. It is also, on its own terms, a task that cannot do what it
+    was filed for."""
+    store = BlockerStore(tmp_path / "blockers")
+    accepted = TaskRegistry([Task(id="empty", title="t", description="covers d1:f1")])
+    proposal = generate_tasks(
+        reconcile([finding("f1")]), accepted, blocker_store=store,
+        now="2026-09-09T00:00:00Z",
+    )
+
+    assert proposal.tasks == []
+    assert "scope_impact_unknown" in proposal.stopped
+    assert "undispatchable" in proposal.stopped
+
+
 def test_a_retired_task_is_not_an_accepted_constraint():
     """A withdrawn decision must not hold up generation forever."""
     accepted = TaskRegistry([

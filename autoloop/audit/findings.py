@@ -222,6 +222,12 @@ class Finding:
 
         report = "the audit report"
         subject = scope_subject(self.qualified_id)
+        # THE AUTHOR of every sentence below is this finding. `detect_conflicts`
+        # compares two claims only when their authors differ, so naming it here
+        # is what keeps a finding from being reported as disagreeing with itself
+        # — and what lets a SECOND finding speaking to the same subject be
+        # compared with this one rather than silently sharing its tier.
+        author = self.qualified_id
         out = [
             # WHAT WAS SEEN. The `evidence` field, cited to the report line it
             # was written on, and carrying the files it puts in scope — which is
@@ -230,6 +236,7 @@ class Finding:
             Claim(
                 text=self.evidence,
                 source=SOURCE_REPOSITORY,
+                author=author,
                 subject=subject,
                 kind=CLAIM_BEHAVIOUR,
                 citation=Evidence(
@@ -245,6 +252,7 @@ class Finding:
             Claim(
                 text=self.proposed_action,
                 source=SOURCE_REPOSITORY,
+                author=author,
                 subject=f"{subject}#action",
                 kind=CLAIM_INTENT,
                 citation=Evidence(text=self.proposed_action, source=report),
@@ -268,6 +276,7 @@ class Finding:
                 Claim(
                     text=self.current_behaviour,
                     source=SOURCE_REPOSITORY,
+                    author=author,
                     subject=f"{subject}#current-behaviour",
                     kind=CLAIM_BEHAVIOUR,
                     citation=citation,
@@ -281,6 +290,7 @@ class Finding:
             Claim(
                 text=text,
                 source=SOURCE_REPOSITORY,
+                author=author,
                 subject=f"{subject}#assumption-{i}",
                 kind=CLAIM_BEHAVIOUR,
                 assumption=text,

@@ -128,12 +128,15 @@ Its fields carry the ordinary meanings with two conventions:
 * `task_id` is always `(loop)` — generation runs BEFORE the task it would
   propose exists, so there is none to name.
 * `phase` is `planning:<identity>`, where the identity digests the subject and
-  both sides' (source, text). `BlockerStore.find_open` keys a record on
+  both sides' (source, author, text). `BlockerStore.find_open` keys a record on
   `(task_id, code, phase)` and a bump REPLACES `question` and `detail`, so a
   constant phase would collapse two different disagreements into one record
   carrying only the later one's account of who disagreed — which is the entire
   content of the record. The digest is what makes one disagreement one record
-  and the same disagreement seen twice a recurrence.
+  and the same disagreement seen twice a recurrence. The AUTHOR is in it because
+  two sides of a WITHIN-TIER conflict carry the same source: three accepted
+  tasks scoping one subject produce disagreements whose (source, text) pairs
+  coincide whenever two of them word their scope alike.
 * `kind` is `task_fatal`, not a new kind: `_KIND_RANK` promotes an unrecognised
   kind to `loop_fatal` rank, which would silently make a planning conflict the
   `primary_blocker` that `health`, `heartbeat` and `status` report the loop as
@@ -142,6 +145,17 @@ Its fields carry the ordinary meanings with two conventions:
 Like `stranded_after_environment_fault`, it is recorded WITHOUT parking and
 changes no task's status, so it is absent from `cli._RESOLUTION_PRECONDITIONS`
 (whose keys must all be codes a park emitter can raise).
+
+**A conflict with no record of this kind stops generation.** "Recorded, and
+generation continues" is only a true sentence when the record exists, so
+`audit/taskgen.generate_tasks` treats a conflict it could not write — no store
+given, or the store raised — exactly as it treats one that bears on scope, and
+says so in the proposal's `skipped`, which is what the audit report renders.
+WHERE THAT BITES TODAY: `audit/executor.py:803` calls the generator with no
+blocker store, so on the shipping audit path no `planning_source_conflict`
+record is ever written and any detected conflict stops that run's generation.
+Passing a store down from `cli.py` through `AuditExecutor.__init__` is the
+remaining half of the wiring and is not ctx-06's to make.
 
 ## Audit finding (audit agent output)
 
@@ -167,6 +181,23 @@ and check the records, and nothing believes one on their strength.
 All four free-text additions count towards `MAX_FINDING_CHARS`, the measured
 whole-finding budget; adding fields outside that sum would reopen the inflation
 path the bound was set for behind new field names.
+
+**HOW FAR THE OPTIONAL FIELDS TRAVEL, stated because the honest answer is "not
+everywhere".** They reach `generate_tasks` on the direct path
+(`parse_findings` → `reconcile` → `generate_tasks`) and are rendered into the
+proposed task's description. They do NOT survive two hops, and neither file is
+ctx-06's to change:
+
+* `audit/reconcile.py:185` rebuilds a `Finding` field by field when it folds a
+  duplicate, so a MERGED finding loses its `current_behaviour`, citation,
+  assumptions, open questions and context ids. The direction is safe — a folded
+  finding can lose a cited claim and cannot gain an uncited one, pinned by
+  `test_audit_taskgen.py::test_a_merged_finding_still_asserts_nothing_uncited` —
+  but the fresh-session context the fields exist to carry is gone.
+* `audit/report.py` does not render them into the Markdown report, so the
+  report → intake round trip (`inbox.parse_audit_findings` →
+  `inbox.AuditFinding`) never sees them. That path is intake-01's promotion
+  route, not this one; nothing on it claims to enforce the citation contract.
 
 ## Audit intake ledger
 
