@@ -14,8 +14,8 @@ loop's escape detector snapshots the primary checkout around every
 write-capable agent call, so a tracker that touched the working tree while
 observing would park the loop.
 
-There are exactly TWO write paths, both in `Handler.do_POST`, and they are
-different in kind:
+There are THREE write paths, all in `Handler.do_POST`, and they are different in
+kind:
 
 * **A new task is QUEUED** into the `TaskInbox` directory OUTSIDE the checkout,
   which the loop drains between steps. A creation carries `approved_paths` —
@@ -37,6 +37,16 @@ different in kind:
   loop's own saves by the fine-grained mutex in `tasks.py`, and attested in a
   ledger outside the checkout so the escape detector can tell it from an agent
   writing into the state dir.
+* **An OPERATOR CONTROL is run as a CLI subprocess** (ops-01, 2026-09-09) —
+  `pause`, `abort`, `run --continuous`, `reset`, `release`, `discard`, `retire`,
+  `answer`, `archive-blocker`, `merge-backlog`. This page writes NOTHING for
+  any of them: the verb is `python -m autoloop <verb>`, so the loop's own code
+  takes `LoopLock`, applies its own refusals and is what the escape detector
+  sees. A control that stops the loop arms the stop with the same CLI verb,
+  waits for a boundary, re-reads the phase it actually landed in, acts only
+  where acting cannot strand a packet, and restarts the loop VERIFIED alive.
+  See the OPERATOR CONTROLS banner further down, which states the claim and the
+  four properties that hold it up.
 
 The one thing it learns that is not already on disk: which domain each in-flight
 agent is on, parsed from the process table. Agent prompts carry
@@ -88,6 +98,7 @@ import argparse
 import contextlib
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -95,6 +106,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -129,6 +141,18 @@ from .config import (
 # it pulls in is pure Python — no cycle, no optional dependency.
 from . import health
 from .errors import ConfigError, StateError, TaskGraphError
+# The loop's OWN answer to "does this session owe a review packet", imported
+# rather than restated (ops-01). It is the predicate `Orchestrator.run` refuses
+# the `abort` KILL on and `cli._shelve_session_refusal` refuses a shelve on, and
+# the operator controls below refuse every stop-the-loop action on — a second
+# copy of that phase set is how a control stays enabled one release after a new
+# phase is added. `state` is already loaded by `health` above and pulls in
+# nothing optional.
+from .state import (
+    LANES_DIRNAME,
+    PACKET_OUTSTANDING_PHASES,
+    packet_outstanding_reason,
+)
 from .tasks import (
     SATISFIES_DEPENDENCY,
     TaskRegistry,
@@ -2025,11 +2049,19 @@ def _one_line(text) -> str:
 def merge_window(repo: Path, git=None) -> dict:
     """May the loop merge into its base branch right now, and WHY not.
 
-    `{"state", "reasons", "notes", "detail"}`, where `state` is one of
-    `MERGE_WINDOW_STATES`. `reasons` CLOSE the window; `notes` do not — they
+    `{"state", "reasons", "notes", "detail", "holders"}`, where `state` is one
+    of `MERGE_WINDOW_STATES`. `reasons` CLOSE the window; `notes` do not — they
     name a record that is wrong in a way an operator should know about — and the
     two are kept apart all the way to the page, because collapsing them would
     either make a latent fault look like a blocker or hide it.
+
+    `holders` is the same list keyed by WHO — `{"task_id", "reason"}` per
+    reason, in the same order — and it comes from `_merge_window_blockers`'
+    own out-param rather than from parsing the reason strings this module
+    prints (ops-01). An empty `task_id` is the loop-wide holder (a phase
+    executing, an unresolvable state directory): a real answer to "who", not a
+    row to drop. `[]` whenever `state` is not `shut`, and `[]` for `unknown`,
+    where nothing was decided about anybody.
 
     Read-only and lock-free, like everything else here. The predicate reads
     execution records as JSON, asks git about ancestry and asks the remote about
@@ -2097,12 +2129,29 @@ def merge_window(repo: Path, git=None) -> dict:
             if git is not None
             else GitGateway(repo, PolicyEngine(config.policy), runner=_bounded_git)
         )
-        reasons, notes = cli._merge_window_blockers(config, set(), gateway)
+        # ASKED FOR ONLY WHERE IT IS ACCEPTED. `_merge_window_blockers` is a
+        # NAME, and this panel's own seam test replaces it with a
+        # three-parameter double to prove the payload is the predicate's return
+        # verbatim (`test_merge_window_panel.py`). The window's VERDICT is the
+        # claim this panel makes, and it must not become breakable by an
+        # addition that only says WHO: a callable that predates the out-param
+        # answers with no holders, which the page renders as naming nobody. A
+        # signature check rather than `except TypeError`, which would swallow a
+        # real one from inside the predicate and sweep the records twice.
+        holders: list[dict] = []
+        blockers = cli._merge_window_blockers
+        extra = (
+            {"holders": holders}
+            if "holders" in inspect.signature(blockers).parameters
+            else {}
+        )
+        reasons, notes = blockers(config, set(), gateway, **extra)
     except Exception as exc:  # deliberately broad — see the docstring
         return {
             "state": "unknown",
             "reasons": [],
             "notes": [],
+            "holders": [],
             "detail": _one_line(f"{type(exc).__name__}: {exc}"),
         }
     return {
@@ -2111,6 +2160,11 @@ def merge_window(repo: Path, git=None) -> dict:
         "state": "shut" if reasons else "open",
         "reasons": [_one_line(reason) for reason in reasons],
         "notes": [_one_line(note) for note in notes],
+        "holders": [
+            {"task_id": str(h.get("task_id") or ""),
+             "reason": _one_line(h.get("reason") or "")}
+            for h in holders
+        ],
         "detail": "",
     }
 
@@ -4007,7 +4061,14 @@ def collect(repo: Path) -> dict:
     # moving together is what keeps the page plainly blank rather than
     # half-live.
     sd, sd_error = _state_dir_or_note(repo)
-    state = _json(_under(sd, "state.json")) or {}
+    # Normalised to a MAPPING, not merely to something truthy: `123` and `"x"`
+    # are valid JSON documents, so a hand-edited session parses fine and then
+    # raises on the first `.get` below — taking down a page whose whole job at
+    # that moment is to show an operator what state the loop is in. Reads stay
+    # free by reading absent, exactly as an unparseable file already does.
+    state = _json(_under(sd, "state.json"))
+    if not isinstance(state, dict):
+        state = {}
     # `tasks.json` only exists once a registry has been saved; before that the
     # CLI seeds from the tracked file. Reading only the former showed an empty
     # roadmap while `next-task` correctly reported rt-01.
@@ -4044,6 +4105,11 @@ def collect(repo: Path) -> dict:
     lock_info = LoopLock(sd).read() if sd is not None else None
     lock_alive = lock_info is not None and LoopLock.is_live(lock_info)
     lock_pid = str(lock_info.pid) if lock_info else ""
+    # The RUN ID as well as the pid, for the operator controls below: a restart
+    # is verified against it rather than against the pid, because `os.execv`
+    # preserves a pid across a replacement and a pid alone therefore cannot tell
+    # "the loop came back" from "the loop never went".
+    lock_run_id = lock_info.run_id if lock_info else ""
     # Kept for display only. Never the authority: it is the check that was
     # wrong before, and both spellings of the command are matched now.
     pids = [
@@ -4186,6 +4252,16 @@ def collect(repo: Path) -> dict:
     subjects = _cached_commit_subjects(repo) if remote_ok else None
 
     live_agents_cache = live_agents()
+    # Every OTHER lane's saved session, for the operator controls alone. One
+    # `LoopLock` stops the whole fleet, so "may the loop be stopped" cannot be
+    # answered from lane 0's `state.json`. A single-lane deployment has no
+    # `lanes/` directory and this costs one `is_dir()`.
+    lane_states, lane_note = _lane_sessions(sd)
+    # The merge window is asked ONCE and shared: the panel renders it and the
+    # operator controls name whichever task holds it shut. Two calls would be
+    # two sweeps of the execution records and could disagree with each other
+    # inside one payload.
+    window = merge_window(repo)
     return {
         "health": {"role": health[0], "label": health[1], "pids": pids,
                    "lock_pid": lock_pid, "lock_alive": lock_alive},
@@ -4255,7 +4331,18 @@ def collect(repo: Path) -> dict:
         # sweep — read it as of `served_at` below, which is the whole point of
         # having it here rather than grepping the last sweep's log line. It is
         # the loop's OWN predicate, called: see `merge_window`.
-        "merge_window": merge_window(repo),
+        "merge_window": window,
+        # WHAT THE OPERATOR MAY DO RIGHT NOW, and why not (ops-01). Pure: it
+        # reads nothing of its own, only what this sweep already holds, so the
+        # page's read-only posture while the loop runs is untouched. The POST
+        # path re-decides every one of these against a FRESH read before acting
+        # — see `perform_control`.
+        "controls": operator_controls(
+            state=state, lock_alive=lock_alive, lock_pid=lock_pid,
+            lock_run_id=lock_run_id, groups=groups, blockers=blockers,
+            note=sd_error, executions=executions, merge=window,
+            lane_states=lane_states, lane_note=lane_note,
+        ),
         # The registry against the code, in BOTH directions: a shipped-elsewhere
         # record whose carrying commits have stopped being ancestors, and a
         # completed task the base cannot show. Re-derived on every poll rather
@@ -4669,6 +4756,26 @@ form.newtask input,form.newtask textarea{display:block;width:100%;margin-top:3px
 form.newtask textarea[name="approved_paths"]{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 form.newtask .two{display:grid;grid-template-columns:2fr 1fr;gap:9px}
 form.newtask .actions{display:flex;align-items:center;gap:8px}
+/* Operator controls. NO new hexes and no new status role: a disabled control is
+   not a health verdict, so it takes the same .5 opacity `button.save[disabled]`
+   already uses, and its reason is rendered as text beside it rather than being
+   left to the colour. `.why` is muted ink because the reason is the quiet half
+   of a control that cannot be pressed — the button is what the eye lands on,
+   and the sentence is what it lands on next. */
+.opfields{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px}
+.opfields label{font-size:11px;color:var(--ink2);text-transform:uppercase;
+  letter-spacing:.05em;display:flex;flex-direction:column;gap:3px;flex:1 1 190px}
+.opfields input{font:13px/1.45 ui-sans-serif,-apple-system,"Segoe UI",sans-serif;
+  padding:5px 7px;border:1px solid var(--line);border-radius:6px;
+  background:var(--card);color:var(--ink);text-transform:none;letter-spacing:normal}
+.oprow{display:flex;align-items:baseline;gap:9px;padding:4px 0;flex-wrap:wrap}
+.oprow .why{font-size:12px;color:var(--ink2);flex:1 1 260px}
+.opgroup{font-size:11px;color:var(--ink2);text-transform:uppercase;
+  letter-spacing:.06em;margin:10px 0 2px}
+#opresult{font-size:12.5px;margin-top:11px;white-space:pre-wrap;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+#opledger{font-size:12.5px;margin-top:10px}
+#opledger code{display:inline-block;margin-right:9px}
 </style>
 <div class="wrap">
   <header>
@@ -4718,6 +4825,53 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
   </section>
 
   <div class="grid" id="tiles"></div>
+
+  <!-- OPERATOR CONTROLS (ops-01). The buttons an operator actually needs,
+       instead of a terminal and a memorised safety procedure.
+
+       The INPUTS are STATIC markup, for the reason the dependency panel's two
+       checkboxes are: this is where the operator's own text lives, and a poll
+       that rewrote them every two seconds would delete a half-typed reason.
+       `renderControls` writes the button list, the state line and the ledger,
+       and never an input's value.
+
+       A disabled button ALWAYS carries its reason beside it and in `title=`.
+       Never grey a control out silently — an operator who cannot see why is
+       worse off than one reading the CLI's refusal, which is the whole thing
+       this panel replaces. -->
+  <section id="opctl">
+    <h2>Operator controls — every refusal says why</h2>
+    <div id="opstop" style="font-size:13px;margin-bottom:10px"></div>
+    <div class="opfields">
+      <label>task <input id="optask" list="optasks" placeholder="task id"
+             aria-label="task id" spellcheck="false"></label>
+      <datalist id="optasks"></datalist>
+      <label>reason <input id="opreason" placeholder="why — recorded verbatim"
+             aria-label="reason" spellcheck="false"></label>
+      <label>superseded by <input id="opsuper" placeholder="task ids, comma separated"
+             aria-label="superseded by" spellcheck="false"></label>
+      <label>answer <input id="opanswer" placeholder="the operator's answer"
+             aria-label="answer text" spellcheck="false"></label>
+    </div>
+    <div id="opactions"></div>
+    <div id="opblockers" class="scroll"></div>
+    <div id="opledger"></div>
+    <div id="opresult"></div>
+    <p class="muted" style="font-size:12px;margin:12px 0 0">
+      Every button here runs the SAME CLI verb you would have typed, in a
+      subprocess — so each command takes the loop lock itself and refuses for
+      itself. Anything that stops the loop arms
+      <code>pause</code> (or <code>abort</code>, which kills the agent instead of
+      waiting for it), waits for a phase boundary, <b>re-reads the phase the loop
+      actually stopped in</b>, acts only where acting cannot strand a review
+      packet, and then restarts with <code>run --continuous</code> — never
+      <code>resume</code>, which runs one foreground round and leaves the loop
+      down. A restart is reported only once a LIVE lock under a NEW run id has
+      been read back; process age proves nothing, because
+      <code>os.execv</code> keeps both pid and start time.
+      Reading — health, blockers, next task, the roadmap — never takes the lock
+      and stays available while the loop runs.</p>
+  </section>
 
   <!-- Live progress for the task executing NOW. STATIC markup, and outside
        `#tiles` on purpose: `render()` rewrites that grid's innerHTML whenever
@@ -5660,6 +5814,18 @@ function renderMergeWindow(d){
   // it. Anything that is not a list is no list.
   const reasons = Array.isArray(mw.reasons) ? mw.reasons : [];
   const notes = Array.isArray(mw.notes) ? mw.notes : [];
+  // WHO holds it shut, named. The reason strings have always carried the task
+  // id inside their prose and nothing surfaced it, so "which task do I have to
+  // deal with" meant reading four lines of explanation per record. `holders`
+  // comes from the predicate's own out-param, never from parsing those strings.
+  // A holder with no task id is real and is NOT dropped — a phase executing,
+  // or a state directory that would not resolve, holds the window with nobody
+  // to name, and a SHUT window listing zero holders reads as a bug in here.
+  const holders = Array.isArray(mw.holders) ? mw.holders : [];
+  const named = holders.map(h => (h && h.task_id) || "").filter(Boolean);
+  const heldBy = named.length ? ` Held by ${esc(named.join(", "))}.`
+               : holders.length ? ` Held by the loop itself — no task is named.`
+               : "";
   // Written on EVERY tick, outside the signature below, because the stamp is
   // the claim: this is the window as of this poll, not as of whenever it last
   // changed.
@@ -5668,12 +5834,13 @@ function renderMergeWindow(d){
     + (state === "open"
         ? `no record is holding it and no phase is executing.`
        : state === "shut"
-        ? `${esc(reasons.length)} reason(s) below. The sweep is all-or-nothing, `
-          + `so while any is listed the loop merges no branch at all.`
+        ? `${esc(reasons.length)} reason(s) below.${heldBy} The sweep is `
+          + `all-or-nothing, so while any is listed the loop merges no branch `
+          + `at all.`
         : `the check could not be completed, so this is NOT open: `
           + `${esc(mw.detail || "no detail was reported")}`)
     + ` <span class="muted">· checked ${esc(d.served_at || "?")}</span>`;
-  const sig = JSON.stringify([state, reasons, notes, mw.detail || ""]);
+  const sig = JSON.stringify([state, reasons, notes, holders, mw.detail || ""]);
   if (sig === MWSIG) return;
   MWSIG = sig;
   // TWO containers, never one. The counts go "unknown" rather than 0 when the
@@ -6095,6 +6262,211 @@ if (deppanel) {
   deppanel.addEventListener("mouseleave", settle);
 }
 
+// ---- operator controls (ops-01) ----------------------------------------------
+//
+// DATA-DRIVEN, and that is the load-bearing part rather than a style. Every
+// button's `enabled` and `reason` come from the backend's `control_refusal`,
+// which is the SAME function `/api/control` re-runs before it acts. Nothing
+// here decides whether an action is allowed — this template could not, and a
+// second opinion written in JavaScript is exactly how a button starts looking
+// pressable for something the server refuses.
+//
+// A disabled button ALWAYS renders its reason, twice: as text beside it and in
+// `title=` for the hover. There is no path through this code that greys one out
+// with nothing said.
+const OPGROUPS = [["running","Running state"],["tasks","Tasks"],
+                  ["blockers","Blockers"],["merging","Merging"]];
+// An action is IN FLIGHT. While it is, this panel is left exactly as it is: an
+// action can wait minutes for a phase boundary, and a 2s poll rebuilding the
+// buttons under it would throw away the "…" that is the only thing saying so.
+let OPBUSY = false;
+let OPSIG = null;
+const opVal = id => (document.getElementById(id) || {}).value || "";
+const opTask = () => opVal("optask").trim();
+const opAction = (d, id) => (((d.controls || {}).actions) || []).find(a => a.id === id) || null;
+// The per-task control record for whatever is typed in the task field. `null`
+// when nothing is typed; `{missing:true}` when the registry has no such task,
+// which is a REASON rather than an empty button.
+const opTaskRow = d => {
+  const id = opTask();
+  if (!id) return null;
+  const rows = ((d.controls || {}).tasks) || [];
+  return rows.find(t => t && t.id === id) || {id: id, missing: true};
+};
+// Both gates, combined, with the GLOBAL one winning when both refuse: "stopping
+// the loop is unsafe here" is what stops every one of these, and naming the
+// task's state first would send an operator to fix the wrong thing.
+function opWhy(d, meta){
+  if (!meta) return "this build does not offer that control";
+  if (!meta.enabled) return meta.reason || "refused, with no reason given — "
+    + "which is itself a fault: report it";
+  if (meta.needs !== "task") return "";
+  const row = opTaskRow(d);
+  if (!row) return "pick a task first";
+  if (row.missing) return `the registry holds no task "${row.id}"`;
+  const per = row[meta.id];
+  if (!per) return `no ${meta.id} verdict was computed for ${row.id}`;
+  return per.enabled ? "" : (per.reason || "refused, with no reason given");
+}
+const opBtn = (id, label, why, attrs) =>
+  `<button class="save opbtn" data-act="${esc(id)}"${attrs || ""}`
+  + ` title="${esc(why || label)}"${why ? " disabled" : ""}>${esc(label)}</button>`;
+const opRow = (id, label, why, attrs) =>
+  `<div class="oprow">${opBtn(id, label, why, attrs)}`
+  + `<span class="why">${esc(why || "")}</span></div>`;
+
+function renderControls(d, force){
+  if (OPBUSY) return;
+  const box = document.getElementById("opactions");
+  if (!box) return;
+  const c = d.controls || null;
+  // The task field is part of the signature: typing an id changes which
+  // per-task verdicts apply, and nothing else on the page would redraw for it.
+  const sig = JSON.stringify([c, opTask()]);
+  if (!force && sig === OPSIG) return;
+  OPSIG = sig;
+  const stopBox = document.getElementById("opstop");
+  if (!c) {
+    stopBox.innerHTML = `<p class="empty">no control payload — this page is `
+      + `older than the loop it is watching</p>`;
+    box.innerHTML = ""; return;
+  }
+  const loop = c.loop || {};
+  const stop = c.stop || {};
+  stopBox.innerHTML =
+    `<b>${loop.running ? "▶ loop RUNNING" : "· loop STOPPED"}</b>`
+    + (loop.running && loop.pid ? ` <code>LOCK pid ${esc(loop.pid)}</code>` : "")
+    + " — "
+    + (!loop.running
+        ? `nothing holds the lock, so a locked verb runs straight away.`
+       : stop.safe
+        ? `stopping is SAFE here: no review packet is outstanding.`
+        : `stopping is UNSAFE here — ${esc(stop.reason || "no reason given")}`)
+    + ` <span class="muted">· unsafe phases: `
+    + `${esc((stop.unsafe_phases || []).join(", "))}</span>`;
+  const list = document.getElementById("optasks");
+  if (list) list.innerHTML = ((c.tasks) || [])
+    .map(t => `<option value="${esc(t.id)}">`).join("");
+  let html = "";
+  for (const [key, label] of OPGROUPS) {
+    const acts = ((c.actions) || []).filter(a => a.group === key && a.needs !== "blocker");
+    if (!acts.length) continue;
+    html += `<div class="opgroup">${esc(label)}</div>`;
+    html += acts.map(a => opRow(a.id, a.label, opWhy(d, a))).join("");
+  }
+  box.innerHTML = html;
+  // The blocker controls are ONE ROW PER OPEN BLOCKER rather than a button plus
+  // a field, because the id an answer lands on is the whole of what an operator
+  // gets wrong here. Every row names its blocker and its task.
+  const bacts = ((c.actions) || []).filter(a => a.needs === "blocker");
+  const blist = c.blockers || [];
+  document.getElementById("opblockers").innerHTML =
+    `<div class="opgroup">Open blockers</div>`
+    + (blist.length
+        ? rows(["blocker","task","kind","actions"], blist.map(b =>
+            `<tr><td><code>${esc(b.id)}</code></td><td><code>${esc(b.task)}</code></td>`
+            + `<td>${esc(b.kind || "")} ${esc(b.code || "")}</td><td>`
+            + bacts.map(a => opBtn(a.id, a.label, opWhy(d, a),
+                ` data-blocker="${esc(b.id)}"`)).join(" ")
+            + (bacts.some(a => !a.enabled)
+                ? `<div class="why">${esc(bacts.map(a => a.reason).filter(Boolean)[0] || "")}</div>`
+                : "")
+            + `</td></tr>`).join(""))
+        : `<p class="empty">none open</p>`);
+  // THE LEDGER, never the counters. On 2026-08-20 port-01 and blk-01 both
+  // reported fault_attempt_count=0 while their ledgers showed a
+  // review_packet_build_failed and a browser_restart_cooldown_blocked — so the
+  // entries are the display, and the counters are labelled as the summary that
+  // has been wrong.
+  const row = opTaskRow(d);
+  const led = (row && !row.missing && row.ledger) || null;
+  document.getElementById("opledger").innerHTML = !row ? ""
+    : row.missing ? `<div class="opgroup">Attempt ledger</div>`
+        + `<p class="empty">the registry holds no task "${esc(row.id)}"</p>`
+    : `<div class="opgroup">Attempt ledger — ${esc(row.id)} (${esc(row.state)})</div>`
+      + ((led && led.entries && led.entries.length)
+          ? led.entries.map(e => `<code>${esc(e)}</code>`).join("")
+            + `<div class="muted" style="font-size:12px">counters: `
+            + `attempts ${esc(led.attempts)}, faults ${esc(led.faults)} — a `
+            + `summary that has read 0 against a ledger showing a burned round, `
+            + `which is why the entries above are the evidence</div>`
+          : `<p class="empty">no execution record, or no attempt recorded yet — `
+            + `which is not the same as no attempt having been made</p>`)
+    + (row && !row.missing && row.answer && row.answer.blocker
+        ? `<div class="muted" style="font-size:12px">Answer would answer `
+          + `<code>${esc(row.answer.blocker)}</code></div>`
+        : row && !row.missing && row.answer
+          ? `<div class="muted" style="font-size:12px">${esc(row.answer.reason)}</div>`
+          : "");
+  document.querySelectorAll("#opctl button.opbtn").forEach(btn => {
+    btn.addEventListener("click", () => opRun(d, btn.dataset.act,
+                                              btn.dataset.blocker || ""));
+  });
+}
+
+async function opRun(d, actionId, blockerId){
+  const meta = opAction(d, actionId);
+  const out = document.getElementById("opresult");
+  if (!meta) { out.className = "savefail"; out.textContent = "unknown action"; return; }
+  const body = {action: actionId};
+  if (meta.needs === "task") body.task = opTask();
+  if (meta.needs === "blocker") body.blocker = blockerId;
+  // Only the fields THIS action declares. A request carrying one it has no use
+  // for would be saying something it does not mean, which is the rule
+  // `/api/priority` refuses unknown fields for.
+  if ((meta.text || []).indexOf("reason") >= 0) body.reason = opVal("opreason");
+  if ((meta.text || []).indexOf("text") >= 0) body.text = opVal("opanswer");
+  if ((meta.ids || []).indexOf("superseded_by") >= 0)
+    body.superseded_by = opVal("opsuper").split(",")
+      .map(s => s.trim()).filter(Boolean);
+  out.className = "muted";
+  out.textContent = meta.stops_loop
+    ? `${meta.label}: stopping the loop at its next phase boundary — this can `
+      + `take as long as the step in flight…`
+    : `${meta.label}: running…`;
+  document.querySelectorAll("#opctl button.opbtn").forEach(b => { b.disabled = true; });
+  // Raised LAST, immediately before the try whose `finally` lowers it. Anything
+  // that threw between the two would latch the panel frozen for the life of the
+  // tab — the guard silently switching itself off, arriving through the guard.
+  OPBUSY = true;
+  try {
+    const r = await fetch("/api/control", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+      body: JSON.stringify(body),
+    });
+    const res = await r.json();
+    // The REPORT, never an echo of the request: the verb's own output, the
+    // phase the loop actually stopped in, and whether the restart was verified.
+    // Every newline escape below is DOUBLED in the Python source. `PAGE` is an
+    // ordinary triple-quoted string, so a single one would be a REAL newline in
+    // the served JavaScript — legal inside a template literal by accident, and
+    // an unterminated string literal in the two double-quoted ones. The
+    // approved-paths form already doubles them for the same reason.
+    if (!r.ok) {
+      out.className = "savefail";
+      out.textContent = "✗ " + (res.error || ("HTTP " + r.status))
+        + (res.stopped_in_phase ? `\\nstopped in phase: ${res.stopped_in_phase}` : "")
+        + ((res.loop && res.loop.detail) ? `\\nloop: ${res.loop.detail}` : "");
+    } else {
+      out.className = res.ok ? "saved" : "savefail";
+      out.textContent = (res.ok ? "✓ " : "✗ ") + meta.label
+        + (res.ran ? ` — exit ${res.returncode}` : " — nothing was run")
+        + (res.stopped_in_phase ? `\\nstopped in phase: ${res.stopped_in_phase}` : "")
+        + (res.output ? `\\n${res.output}` : "")
+        + ((res.notes || []).length ? `\\n${res.notes.join("\\n")}` : "");
+    }
+  } catch (e) {
+    out.className = "savefail";
+    out.textContent = "✗ " + e + "\\nthe request itself failed, so whether "
+      + "the action ran is UNKNOWN — read `autoloop status` before retrying";
+  } finally {
+    OPBUSY = false;
+    OPSIG = null;                 // force a rebuild off the next payload
+    LASTJSON = null;
+  }
+}
+
 function render(d, force){
   if (!d) return;
   // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
@@ -6158,6 +6530,15 @@ function render(d, force){
   // It carries its own signature, so the lists below the stamp are still not
   // rebuilt while they are unchanged.
   renderMergeWindow(d);
+
+  // ---- operator controls --------------------------------------------------
+  // ABOVE the page-wide guard, like the two panels before it, and for a sharper
+  // reason: what a control may do is decided by the PHASE, which moves without
+  // anything else in the payload having to change. A panel that only redrew
+  // when the whole payload changed would leave a button pressable across the
+  // transition into `delivering` — the exact state it exists to refuse in. It
+  // carries its own signature, so it still does not rebuild identical DOM.
+  renderControls(d);
 
   if (!force && sig === LASTJSON) return;
   LASTJSON = sig; LAST = d;
@@ -6685,9 +7066,1121 @@ async function tick(){
   }
 }
 // PURE_POLL_END
+
+// The one STATIC listener the operator panel needs. Typing a task id changes
+// which per-task verdicts apply and nothing else on the page would redraw for
+// it, so this re-renders the controls from the payload already in hand — never
+// from a fresh fetch, which would make each keystroke a request.
+(() => {
+  const field = document.getElementById("optask");
+  if (field) field.addEventListener("input", () => { if (LAST) renderControls(LAST); });
+})();
+
 tick(); setInterval(tick, 2000);
 </script>
 """
+
+
+# ---------------------------------------------------------------------------
+# OPERATOR CONTROLS (ops-01, 2026-09-09)
+# ---------------------------------------------------------------------------
+#
+# Steering this loop used to mean a terminal and a memorised safety procedure.
+# The commands are not the hard part: almost every mutating one takes `LoopLock`,
+# which the loop holds for its WHOLE run, so it only runs with the loop STOPPED —
+# and stopping is itself a procedure with a correctness condition:
+#
+#   * `pause` sets a flag read at the top of each phase-step iteration, so it
+#     lands at the NEXT step boundary, which can be tens of minutes away while a
+#     write-capable agent runs;
+#   * it is only safe in `ready` and `executing`. `delivering` deposits numbered
+#     parts BEFORE the verdict question is asked and `submission_unconfirmed`
+#     means acceptance is unknown, so exiting at either strands a packet;
+#   * `resume` IS NOT A RESTART — `cli._cmd_resume` clears the flags and calls
+#     `_cmd_run` with `continuous` defaulting to False, so it runs ONE foreground
+#     round and exits, leaving the loop down. Nothing here ever calls it;
+#   * `run --continuous` is the restart, and it resumes the in-flight SESSION
+#     before selecting by priority.
+#
+# THE ONE CLAIM THIS SECTION MAKES: every action offered here either completes
+# correctly — arming the stop, WAITING for a safe phase boundary, acting, and
+# restarting the loop VERIFIED ALIVE — or refuses with the reason, and no action
+# is offered in a state where performing it would strand work.
+#
+# Four properties hold it up, and each one is a way this could have failed open:
+#
+# 1. ATTESTED WRITE PATHS ONLY. Nothing here writes into a state directory. Every
+#    mutation is `python -m autoloop <verb>` in a subprocess, so the CLI takes
+#    `LoopLock` itself, applies its own refusals, and the escape detector sees
+#    the loop's own process rather than an unattributable write. A subprocess
+#    rather than an in-process `with LoopLock(...)` for two further reasons:
+#    `Handler.handle` may `os.execv` at a request boundary, and an `execv` while
+#    holding the lock without `mark_exec_handoff` leaves a lock naming a LIVE pid
+#    with no marker — `LockHeldError` forever, recoverable only by `unlock`; and
+#    `LoopLock.acquire`'s `signal.signal` silently no-ops off the main thread,
+#    which every request here is.
+# 2. EVERY LANE'S PHASE IS RE-READ AFTER THE LOOP STOPS, not only before. The
+#    pause exit at the top of `Orchestrator.run` is NOT gated on the phase, so a
+#    pause armed in `executing` can land in `delivering` — per lane, which is why
+#    the re-read walks `lanes/` exactly as the pre-check does rather than trusting
+#    lane 0 to speak for a fleet that stopped at N separate boundaries. The
+#    pre-check is the UI gate; the post-boundary check is the one that makes the
+#    claim true — an unsafe landing runs NOTHING and restarts the loop.
+# 3. A RESTART IS VERIFIED, NEVER ASSUMED. Success requires a lock file whose
+#    `run_id` differs from the one we stopped AND which `LoopLock.is_live`
+#    accepts. Process age proves nothing (`os.execv` preserves pid and start
+#    time), and mere existence proves less — `LoopLock.read` answers a corrupt
+#    file with a `pid=-1` sentinel that is not live.
+# 4. REFUSALS STAY REFUSALS. `release` refusing a non-`in_progress` task,
+#    `archive-blocker` refusing a live session, and the merge window's exemptions
+#    are all correct. This surfaces them; it never routes around them.
+#
+# WHAT IS NOT HERE, and is a separate task rather than an omission: restoring an
+# attempt budget (no CLI verb touches `attempt_count`, so there is no attested
+# path to route through — the LEDGER is shown instead of the counters, which is
+# the half that can be done honestly today), and carrying a reviewed candidate
+# past a moved head.
+
+
+#: Everything an operator control is decided from, read cheaply and in one
+#: place. `collect` already holds all of it and passes it in; the POST path reads
+#: it FRESH, because a control decided from a 35s sweep would be deciding from
+#: the phase the loop was in half a minute ago.
+#:
+#: `note` is the blanket refusal: an unresolvable state directory means nothing
+#: was read, and a control decided from a read that never happened is the
+#: fail-open this page has been bitten by before (port-06).
+_CONTROL_SNAPSHOT_FIELDS = (
+    "note", "running", "pid", "run_id", "stop_reason", "task_states",
+    "task_blockers", "blockers",
+)
+
+
+def _pending_view(raw):
+    """`state.json`'s `pending_request` object, duck-typed for the ONE field
+    `packet_outstanding_reason` reads out of it.
+
+    The nested half of the duck-typing below, and the half that is easy to miss:
+    that predicate asks `getattr(pending, "request_id", "?")`, which on the raw
+    JSON dict this page reads answers `"?"` — the stop is still refused, exactly
+    as it must be, but the refusal cannot name the request an operator has to go
+    and resolve.
+
+    PRESENCE is preserved identically, `is not None` for `is not None`, because
+    that identity is what makes the refusal fire at all: a value of ANY shape —
+    `{}`, a bare string, a list out of a hand-edited file — is a session
+    carrying something where a resolved request carries nothing, and it refuses.
+    An unreadable shape yields `"?"` rather than raising, so a malformed session
+    still produces a refusal instead of an `AttributeError` out of the middle of
+    a page load.
+
+    That is deliberately STRICTER than `state._load_pending_request`, which reads
+    a falsy value (`{}`, `false`) as no request at all. The divergence only ever
+    refuses a stop the loader would have allowed, which cannot strand work; the
+    other direction — matching the loader, and stopping a live loop on the
+    strength of a field we could not make sense of — is the one that can.
+    """
+    if raw is None:
+        return None
+    request_id = raw.get("request_id") if isinstance(raw, dict) else None
+    return types.SimpleNamespace(request_id=str(request_id) if request_id else "?")
+
+
+def _session(state: dict | None):
+    """The raw JSON a `state.json` holds, duck-typed for
+    `packet_outstanding_reason`. `None` for an absent or unreadable one, which
+    that predicate refuses.
+
+    A NON-MAPPING is `None` too, and that is not defensive noise: `123`, `"x"`
+    and `true` are each a whole valid JSON document, so `_json` hands them back
+    parsed and a `.get` on one raises. Raising here would take the read-only page
+    down on a hand-edited file — and, worse, would come out of `perform_control`
+    AFTER the loop had been stopped, leaving it down with a 500 in place of a
+    restart. Answered as "no readable session", which refuses.
+    """
+    if not isinstance(state, dict) or not state:
+        return None
+    return types.SimpleNamespace(
+        phase=state.get("phase", ""),
+        pending_request=_pending_view(state.get("pending_request")),
+    )
+
+
+def _lane_sessions(state_dir: Path | None) -> tuple[list, str]:
+    """Every OTHER lane's saved session, and a note when they could not be
+    listed.
+
+    A fleet is stopped as a WHOLE — one `LoopLock`, one process, N threads — so
+    "may the loop be stopped" is a question about every lane, and answering it
+    from lane 0's `state.json` alone would let a stop land while lane 3 held a
+    packet nobody had asked about. `[concurrency] lanes` is deliberately NOT
+    read here: a lane an operator's lowered cap cut out is still running and
+    still owes whatever it owes, so the directory is what is walked, exactly as
+    `orchestrator.retired_lane_occupants` walks it.
+
+    A lane DIRECTORY with no `state.json` is skipped rather than refused — that
+    is a lane that has never run, and it owes nothing. One that exists and will
+    not parse arrives as `None` and refuses, because an unreadable session is no
+    evidence. A `lanes/` nobody can list refuses everything, in words.
+    """
+    if state_dir is None:
+        return [], ""
+    # `LANES_DIRNAME`, never the string: this guard's whole job is to find the
+    # lanes, and a second spelling of where they live is a guard that answers
+    # "no lanes owe anything" the day the directory is renamed.
+    lanes_dir = Path(state_dir) / LANES_DIRNAME
+    if not lanes_dir.is_dir():
+        return [], ""
+    try:
+        entries = sorted(p for p in lanes_dir.iterdir() if p.is_dir())
+    except OSError as exc:
+        return [], (
+            f"the fleet's lane directory {lanes_dir} could not be listed "
+            f"({exc}), so no lane's phase is known and none may be stopped blind"
+        )
+    return [
+        (entry.name, _json(entry / "state.json"))
+        for entry in entries
+        if (entry / "state.json").exists()
+    ], ""
+
+
+def stop_refusal(state: dict | None, lane_states=(), lane_note: str = "") -> str:
+    """Why the loop must NOT be stopped where it is now, or `""`.
+
+    `state.packet_outstanding_reason` asked of the raw JSON this page already
+    reads — the loop's own predicate, duck-typed exactly as it documents, so the
+    dashboard and `abort` cannot disagree about which phases owe a packet.
+
+    An EMPTY or missing `state.json` is `None`, which that predicate refuses:
+    no session read is no evidence, not a licence. That refusal only ever
+    reaches an operator when the loop is RUNNING (a stopped loop needs no stop),
+    and there it is exactly right — a live loop whose state cannot be read is
+    the last thing to stop blind.
+
+    `lane_states` is `[(lane_id, session)]` for every OTHER lane (see
+    `_lane_sessions`) and `lane_note` is why that list could not be gathered.
+    ANY lane owing a packet refuses the stop, and the refusal names which — a
+    fleet stops as a whole, so a check that only asked lane 0 would be reporting
+    about one thread of N.
+    """
+    if lane_note:
+        return lane_note
+    reason = packet_outstanding_reason(_session(state))
+    if reason:
+        return reason
+    for lane_id, lane_state in lane_states or ():
+        lane_reason = packet_outstanding_reason(_session(lane_state))
+        if lane_reason:
+            return f"lane {lane_id}: {lane_reason}"
+    return ""
+
+
+def _task_states(groups: list[dict] | None) -> dict[str, str]:
+    """`{task_id: TaskState.value}` from the GROUPED read.
+
+    The registry's DERIVED state, never the stored `status` string: `ready` vs
+    `blocked` is computed from dependencies and never stored, and a stored
+    `blocked` means QUARANTINED — so a control that read the raw field would
+    disagree with the code that dispatches, in both directions at once, which is
+    the same rule the roadmap panel is grouped by.
+
+    `{}` when the graph would not load at all (`task_groups` returns `[]`), and
+    every per-task control then refuses for that reason rather than guessing.
+    """
+    return {
+        str(task.get("id") or ""): str(group.get("state") or "")
+        for group in (groups or ())
+        for task in (group.get("tasks") or ())
+        if str(task.get("id") or "")
+    }
+
+
+def control_snapshot(
+    *, state, lock_alive, lock_pid, lock_run_id, groups, blockers, note,
+    lane_states=(), lane_note="",
+) -> dict:
+    """The decided inputs, in the shape every control predicate below reads."""
+    open_blockers = {
+        str(b.get("id") or ""): b for b in (blockers or ()) if str(b.get("id") or "")
+    }
+    task_blockers: dict[str, list[str]] = {}
+    for blocker_id, blocker in open_blockers.items():
+        task_blockers.setdefault(str(blocker.get("task") or ""), []).append(blocker_id)
+    return {
+        "note": note,
+        "running": bool(lock_alive),
+        "pid": str(lock_pid or ""),
+        "run_id": str(lock_run_id or ""),
+        # Only meaningful while the loop RUNS — a stopped loop has nothing to
+        # stop — but computed unconditionally so the panel can say what the
+        # phase would refuse if the loop were started again. Asked of EVERY
+        # lane, because one `LoopLock` stops all of them.
+        "stop_reason": stop_refusal(state, lane_states, lane_note),
+        "task_states": _task_states(groups),
+        "task_blockers": task_blockers,
+        "blockers": open_blockers,
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class OperatorAction:
+    """One button, and everything that decides whether it may be pressed.
+
+    `verb` is the CLI verb this runs, and `()` means the action's whole effect
+    IS the stop (`pause`, `abort`) or the start (`start`). `arm` names the flag
+    that stops the loop for it — the same two flags `cli` writes, armed by
+    running the same two CLI verbs, never by touching the files from here.
+    """
+
+    id: str
+    label: str
+    group: str
+    verb: tuple[str, ...]
+    #: `"pause"` / `"abort"` / `""` — which stop this action needs first.
+    arm: str
+    #: Does its verb take `LoopLock`? Then the loop has to be stopped for it.
+    stops_loop: bool
+    #: Start the loop again afterwards — and only when it was running BEFORE.
+    #: `pause` and `abort` are `False` by construction: an operator who asked
+    #: the loop to stop has not asked for it back.
+    restarts: bool
+    #: `""` / `"task"` / `"blocker"` — what has to be picked first.
+    needs: str
+    #: Does this DISCARD the saved session? Then the phase gate applies whether
+    #: or not the loop is running: a loop stopped in `awaiting` still owes a
+    #: reviewer a packet, and archiving that session leaves nobody able to
+    #: classify the answer when it arrives. `reset` and nothing else.
+    discards_session: bool = False
+    #: Required free text, as `(field, flag)`. `flag=""` is positional.
+    text: tuple[tuple[str, str], ...] = ()
+    #: Optional repeatable ids, as `(field, flag)`.
+    ids: tuple[tuple[str, str], ...] = ()
+    note: str = ""
+
+
+#: The controls, in the order the operator's own 2026-08-20 day listed them.
+#: Every one of them is a CLI verb that already exists with its own refusals —
+#: adding a button never added an authority.
+OPERATOR_ACTIONS: tuple[OperatorAction, ...] = (
+    OperatorAction(
+        id="pause", label="Pause", group="running", verb=(), arm="pause",
+        stops_loop=True, restarts=False, needs="",
+        note="stops at the next phase boundary and stays stopped",
+    ),
+    OperatorAction(
+        id="abort", label="Abort (kill the agent)", group="running", verb=(),
+        arm="abort", stops_loop=True, restarts=False, needs="",
+        note="kills the write-capable agent in flight and its whole process "
+             "group; the task keeps its work and is charged nothing",
+    ),
+    OperatorAction(
+        id="start", label="Start (run --continuous)", group="running", verb=(),
+        arm="", stops_loop=False, restarts=True, needs="",
+        note="never `resume`, which runs ONE foreground round and exits",
+    ),
+    OperatorAction(
+        id="reset", label="Reset the session", group="running",
+        verb=("reset", "--yes"), arm="pause", stops_loop=True, restarts=True,
+        needs="", discards_session=True,
+        note="archives the session so a restart selects by priority instead of "
+             "resuming the in-flight one; the registry is kept",
+    ),
+    OperatorAction(
+        id="release", label="Release", group="tasks", verb=("release",),
+        arm="pause", stops_loop=True, restarts=True, needs="task",
+        note="in-progress -> pending, worker quarantined, execution record "
+             "archived",
+    ),
+    OperatorAction(
+        id="discard", label="Discard", group="tasks", verb=("discard",),
+        arm="pause", stops_loop=True, restarts=True, needs="task",
+        text=(("reason", "--reason"),),
+        note="the BLOCKED counterpart of release — `release` refuses a "
+             "quarantined task deliberately",
+    ),
+    OperatorAction(
+        id="retire", label="Retire", group="tasks", verb=("retire",),
+        arm="pause", stops_loop=True, restarts=True, needs="task",
+        text=(("reason", "--reason"),), ids=(("superseded_by", "--superseded-by"),),
+        note="superseded, never worked again; the successor ids are the record",
+    ),
+    OperatorAction(
+        id="answer", label="Answer", group="blockers", verb=("answer",),
+        arm="pause", stops_loop=True, restarts=True, needs="blocker",
+        text=(("text", ""),),
+        note="resolves the blocker and, if task_fatal, makes its task ready",
+    ),
+    OperatorAction(
+        id="archive-blocker", label="Archive blocker", group="blockers",
+        verb=("archive-blocker",), arm="pause", stops_loop=True, restarts=True,
+        needs="blocker", text=(("reason", "--reason"),),
+        note="for a blocker whose session is gone; it refuses a LIVE session, "
+             "and that refusal is surfaced rather than routed around",
+    ),
+    OperatorAction(
+        id="merge-backlog", label="Merge backlog", group="merging",
+        verb=("merge-backlog",), arm="pause", stops_loop=True, restarts=True,
+        needs="",
+        note="merges every published-but-unmerged branch; it DEFERS by itself "
+             "when the window is shut, which is why a shut window does not "
+             "disable it",
+    ),
+)
+
+ACTIONS_BY_ID: dict[str, OperatorAction] = {a.id: a for a in OPERATOR_ACTIONS}
+
+#: The blanket refusal when nothing could be read. Prefixed to the reason, never
+#: replacing it: "the state directory could not be resolved" is the fact, and
+#: the resolver's own sentence is the why.
+CONTROL_NO_STATE_DIR = (
+    "the state directory could not be resolved, so nothing was read and "
+    "nothing may be acted on — "
+)
+
+
+def _task_action_refusal(action: OperatorAction, task_id: str, snap: dict) -> str:
+    """Why this action may not be run against THIS task, or `""`.
+
+    Each rule is the registry's own refusal, stated ahead of time rather than
+    invented: `TaskRegistry.release` refuses anything that is not `in_progress`,
+    `discard` is the verb for a quarantined one, and a task being written by an
+    agent right now is not a task anyone may retire out from under.
+    """
+    states = snap["task_states"]
+    if not states:
+        return (
+            "the task graph could not be read, so no task's state is known — "
+            "acting on a state nobody could read is how a control strands work"
+        )
+    state = states.get(task_id)
+    if state is None:
+        return f"the registry holds no task {task_id!r}"
+    if action.id == "release" and state != "in_progress":
+        return (
+            f"release returns an IN-PROGRESS task to pending; {task_id} is "
+            f"{state} — TaskRegistry.release refuses anything else deliberately"
+            + (", and `discard` is the verb for a quarantined task"
+               if state == "blocked_by_operator" else "")
+        )
+    if action.id == "discard" and state != "blocked_by_operator":
+        return (
+            f"discard retires a QUARANTINED (blocked) task's round; {task_id} "
+            f"is {state}"
+            + (", and `release` is the verb for one that is in progress"
+               if state == "in_progress" else "")
+        )
+    if action.id == "retire" and state == "in_progress":
+        return (
+            f"{task_id} is in progress — an agent may be mid-write, so retiring "
+            "it would strand the round; release or shelve it first"
+        )
+    return ""
+
+
+def control_gate(action: OperatorAction, snap: dict) -> str:
+    """The action's GLOBAL gate — the state directory, the lock, the phase — with
+    no task or blocker bound to it, or `""`.
+
+    Split out from `control_refusal` so the panel can disable a button and say
+    *why* before anything has been picked: "stopping the loop is unsafe here" is
+    the answer to a question that has nothing to do with which task is selected,
+    and an operator who has to choose one first to find out is reading the
+    procedure out of their head again.
+    """
+    if snap["note"]:
+        return CONTROL_NO_STATE_DIR + snap["note"]
+    running = snap["running"]
+    # BEFORE the `running` test, and that is the point rather than an ordering
+    # detail. A loop STOPPED in `awaiting` still owes a reviewer a packet, and
+    # every other gate here is about stopping — so `reset --yes` against a
+    # stopped loop was the one door left open onto exactly the outcome this
+    # panel exists to refuse: the session archived, and nothing left able to
+    # classify the answer when it arrives.
+    if action.discards_session and snap["stop_reason"]:
+        return (
+            "this ARCHIVES the session, and " + snap["stop_reason"]
+            + " — archiving it would strand that packet whether or not the "
+            "loop is running"
+        )
+    if action.id == "start":
+        if running:
+            return (
+                f"the loop is already running (LOCK pid {snap['pid'] or '?'}) — "
+                "stop it before starting it"
+            )
+        return ""
+    if action.arm and not action.verb and not running:
+        # `pause` / `abort`: their whole effect is the stop.
+        return "the loop is not running, so there is nothing to stop"
+    if action.stops_loop and running and snap["stop_reason"]:
+        return (
+            "this stops the loop, and stopping is unsafe here — "
+            + snap["stop_reason"]
+        )
+    return ""
+
+
+def control_refusal(action: OperatorAction, params: dict, snap: dict) -> str:
+    """THE authority on whether one control may be pressed, and `""` when it may.
+
+    ONE function for both sides on purpose. The payload renders it (which is
+    what disables a button and puts the reason beside it) and `/api/control`
+    re-runs it against a FRESH snapshot before doing anything. Two predicates
+    would agree on the day they were written and disagree the first time one
+    moved — and the direction they would disagree in is a button that looks
+    pressable running an action the server would have refused.
+    """
+    gate = control_gate(action, snap)
+    if gate:
+        return gate
+    if action.needs == "task":
+        task_id = str(params.get("task") or "").strip()
+        if not task_id:
+            return "pick a task first"
+        return _task_action_refusal(action, task_id, snap)
+    if action.needs == "blocker":
+        blocker_id = str(params.get("blocker") or "").strip()
+        if not blocker_id:
+            return "pick an open blocker first"
+        if blocker_id not in snap["blockers"]:
+            return (
+                f"no OPEN blocker {blocker_id!r} — an answered or archived one "
+                "cannot be answered again"
+            )
+        return ""
+    return ""
+
+
+#: How the `answer` control names the blocker it would answer, per task. The
+#: task's ledger of open blockers is what decides it, and the id is SHOWN rather
+#: than implied: an operator answering the wrong blocker is answering a question
+#: nobody asked.
+def _answer_view(task_id: str, snap: dict) -> dict:
+    open_ids = snap["task_blockers"].get(task_id) or []
+    if not open_ids:
+        return {"enabled": False, "reason": f"{task_id} has no OPEN blocker to answer",
+                "blocker": ""}
+    if len(open_ids) > 1:
+        return {
+            "enabled": False,
+            "reason": (
+                f"{task_id} has {len(open_ids)} open blockers "
+                f"({', '.join(open_ids)}) — answer one by id"
+            ),
+            "blocker": "",
+        }
+    return {"enabled": True, "reason": "", "blocker": open_ids[0]}
+
+
+def _attempt_ledger(record: dict | None) -> dict:
+    """One task's ATTEMPT LEDGER, which is the evidence, and the counters beside
+    it, which are not.
+
+    On 2026-08-20 both port-01 and blk-01 reported `fault_attempt_count=0` while
+    their ledgers showed a `review_packet_build_failed` and a
+    `browser_restart_cooldown_blocked` respectively. A control that showed the
+    counters would have shown two zeroes for two tasks that had each burned a
+    round. So the entries are the display and the counters are labelled as
+    what they are — a summary that has been wrong.
+    """
+    if not isinstance(record, dict):
+        return {"entries": [], "attempts": None, "faults": None}
+    entries = [str(e) for e in (record.get("attempt_ledger") or ()) if str(e)]
+    return {
+        "entries": entries,
+        "attempts": record.get("attempt_count"),
+        "faults": record.get("fault_attempt_count"),
+    }
+
+
+def operator_controls(
+    *, state, lock_alive, lock_pid, lock_run_id, groups, blockers, note,
+    executions=None, merge=None, lane_states=(), lane_note="",
+) -> dict:
+    """The whole control panel as data: what may be pressed, and why not.
+
+    PURE and read-only — it takes what `collect` has already read and asks
+    `control_refusal` about it. Nothing here opens a file, takes a lock or
+    spawns anything, which is what keeps the page's read-only posture true while
+    the loop runs.
+    """
+    snap = control_snapshot(
+        state=state, lock_alive=lock_alive, lock_pid=lock_pid,
+        lock_run_id=lock_run_id, groups=groups, blockers=blockers, note=note,
+        lane_states=lane_states, lane_note=lane_note,
+    )
+    executions = executions or {}
+    actions = []
+    for action in OPERATOR_ACTIONS:
+        # The GLOBAL gate only — the loop's phase, the lock, the state
+        # directory. The per-task and per-blocker gates travel beside it in
+        # `tasks` / `blockers` and the page combines the two, so a button can
+        # say "the phase is unsafe" before a task is even picked.
+        reason = control_gate(action, snap)
+        actions.append({
+            "id": action.id, "label": action.label, "group": action.group,
+            "needs": action.needs, "stops_loop": action.stops_loop,
+            "restarts": action.restarts, "note": action.note,
+            "text": [field for field, _flag in action.text],
+            "ids": [field for field, _flag in action.ids],
+            "enabled": not reason,
+            "reason": reason,
+        })
+    tasks = []
+    for task_id, task_state in sorted(snap["task_states"].items()):
+        row = {"id": task_id, "state": task_state,
+               "ledger": _attempt_ledger(executions.get(task_id))}
+        for action in OPERATOR_ACTIONS:
+            if action.needs != "task":
+                continue
+            why = _task_action_refusal(action, task_id, snap)
+            row[action.id] = {"enabled": not why, "reason": why}
+        row["answer"] = _answer_view(task_id, snap)
+        tasks.append(row)
+    blocker_rows = [
+        {
+            "id": blocker_id,
+            "task": str(blocker.get("task") or ""),
+            "kind": str(blocker.get("kind") or ""),
+            "code": str(blocker.get("code") or ""),
+        }
+        for blocker_id, blocker in sorted(snap["blockers"].items())
+    ]
+    window = merge or {}
+    return {
+        "loop": {"running": snap["running"], "pid": snap["pid"],
+                 "run_id": snap["run_id"]},
+        # The stop's own safety, stated once at the top of the panel rather than
+        # repeated on five buttons: "why can I not stop the loop" is the
+        # question the whole 2026-08-20 procedure was about.
+        "stop": {"safe": not snap["stop_reason"], "reason": snap["stop_reason"],
+                 "unsafe_phases": sorted(p.value for p in PACKET_OUTSTANDING_PHASES)},
+        "actions": actions,
+        "tasks": tasks,
+        "blockers": blocker_rows,
+        # WHO holds the merge window shut, straight off the predicate's own
+        # out-param. `state` is repeated here so the merge controls render from
+        # one object rather than reaching across the payload.
+        "merge": {
+            "state": str(window.get("state") or "unknown"),
+            "holders": list(window.get("holders") or ()),
+            "detail": str(window.get("detail") or ""),
+        },
+        "note": snap["note"],
+    }
+
+
+# ---- performing one control (the write path) ---------------------------------
+
+#: Seconds an action waits for a running loop to reach its next phase boundary
+#: after the stop is armed. The DEFAULT is deliberately minutes rather than the
+#: tens of minutes a write-capable agent can take: this is a synchronous HTTP
+#: request, and a browser holding one open for an hour is its own failure.
+#: `wait` in the request body may raise it as far as `CONTROL_WAIT_MAX`.
+CONTROL_WAIT_DEFAULT = 180.0
+CONTROL_WAIT_MAX = 3600.0
+
+#: How often the lock is re-read while waiting. Cheap — one `read_text` of a
+#: small JSON file — and short enough that a boundary reached is acted on rather
+#: than slept through.
+CONTROL_POLL_SECONDS = 0.5
+
+#: After the stop request is WITHDRAWN, how long to keep watching for a boundary
+#: that had already begun. Closes the race where the loop read the flag in the
+#: instant before it was cleared: without it that stop would be reported as "the
+#: loop is still running" while the loop was in fact on its way down.
+CONTROL_WITHDRAW_GRACE = 8.0
+
+#: How long one CLI verb may run before it is killed and reported as a timeout.
+#: `merge-backlog` is the long one — it can push several branches. Deliberately
+#: minutes rather than the quarter of an hour a first cut used: this blocks an
+#: HTTP request, and a ceiling nobody would ever wait out is not a ceiling.
+CONTROL_VERB_TIMEOUT = 300.0
+
+#: How long a restarted loop has to take the lock. It has a preflight
+#: (`_sweep_backlog_on_startup`, a registry load, a reconciliation) before it
+#: acquires, so this is not instant.
+CONTROL_RESTART_TIMEOUT = 60.0
+
+#: Bytes of a verb's output carried back to the page. The whole point of the
+#: panel is that the CLI's own refusal is what the operator reads, so this is
+#: generous; it is bounded at all only so a runaway command cannot fill a
+#: response.
+CONTROL_OUTPUT_CHARS = 8000
+
+#: ONE operator action at a time, process-wide. This is a threading server, so
+#: two tabs can post at once — and two actions interleaving would arm a stop,
+#: have the other clear it, and restart the loop twice. Non-blocking: the second
+#: caller is TOLD, never queued behind a fifteen-minute wait it cannot see.
+_ACTION_LOCK = threading.Lock()
+
+
+def _control_argv(action: OperatorAction, params: dict, config_path: Path) -> list[str]:
+    """The argv for one verb — and the two shapes that keep operator free text
+    out of argparse's option space.
+
+    A `--reason` whose value starts with `-` is read by argparse as another
+    option, so every flag is emitted as `--flag=value`. A positional (the
+    `answer` text, every task and blocker id) is placed after a bare `--`, which
+    stops option parsing for the rest of the line. Between them there is no
+    string an operator can type into this panel that argparse reads as a flag.
+    """
+    argv = [sys.executable, "-m", "autoloop", *action.verb,
+            "--config", str(config_path)]
+    for field, flag in action.ids:
+        for value in params.get(field) or ():
+            text = str(value).strip()
+            if text:
+                argv.append(f"{flag}={text}")
+    for field, flag in action.text:
+        if flag:
+            argv.append(f"{flag}={str(params.get(field) or '')}")
+    positional = []
+    if action.needs == "task":
+        positional.append(str(params.get("task") or "").strip())
+    if action.needs == "blocker":
+        positional.append(str(params.get("blocker") or "").strip())
+    positional += [
+        str(params.get(field) or "") for field, flag in action.text if not flag
+    ]
+    # The `--` is emitted only when something follows it. argparse drops the
+    # first one it sees either way, but a verb with no positionals at all
+    # (`reset --yes`, `merge-backlog`) reads better in a log without it, and
+    # this keeps the argv identical to what an operator would have typed.
+    if positional:
+        argv.append("--")
+        argv += positional
+    return argv
+
+
+def _control_env() -> dict:
+    """The environment every child of this page runs in.
+
+    `PYTHONDONTWRITEBYTECODE` is not tidiness. Four incidents on 2026-08-15/16
+    were a dashboard-adjacent process writing `__pycache__` INSIDE a live
+    checkout, which the escape detector correctly reported as a worker-isolation
+    escape and which cost a reset and the in-flight round each time. A verb
+    subprocess imports the whole package from the observed tree, so it is
+    exactly that process.
+
+    `BYTECODE_ENV` is defined further down this file, with the multi-project
+    view that first needed it; it is read here at CALL time, so the one
+    spelling stays one spelling.
+    """
+    return {**os.environ, BYTECODE_ENV: "1"}
+
+
+def _run_verb(argv: list[str], cwd: Path, timeout: float) -> dict:
+    """Run one CLI verb and report what it said. Never raises."""
+    try:
+        proc = subprocess.run(
+            argv, cwd=str(cwd), capture_output=True, text=True,
+            timeout=timeout, env=_control_env(), check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"returncode": None,
+                "output": f"the command did not finish within {timeout:.0f}s and "
+                          "was killed; whether it acted is unknown"}
+    except (OSError, ValueError) as exc:
+        return {"returncode": None, "output": f"{type(exc).__name__}: {exc}"}
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return {"returncode": proc.returncode, "output": output[-CONTROL_OUTPUT_CHARS:]}
+
+
+def _spawn_loop(argv: list[str], cwd: Path, log: Path | None):
+    """Start `run --continuous` DETACHED, with its output kept somewhere.
+
+    `start_new_session=True` puts it in its own process group, which matters
+    beyond tidiness: `abort` kills a process GROUP, and a loop sharing this
+    page's would take the dashboard with it. Its output goes to a file OUTSIDE
+    the checkout — beside `workers_root`, where the pause flag already lives —
+    because a restart that fails needs its reason readable, and `capture_output`
+    on a process nobody waits for deadlocks on a full pipe.
+    """
+    handle = subprocess.DEVNULL
+    opened = None
+    if log is not None:
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            opened = open(log, "ab")  # noqa: SIM115 - closed below, after the spawn
+            handle = opened
+        except OSError:
+            handle = subprocess.DEVNULL
+    try:
+        return subprocess.Popen(
+            argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=handle,
+            stderr=subprocess.STDOUT, start_new_session=True, env=_control_env(),
+        )
+    finally:
+        if opened is not None:
+            opened.close()
+
+
+def _log_tail(log: Path | None, chars: int = 2000) -> str:
+    if log is None:
+        return ""
+    try:
+        return log.read_text(encoding="utf-8", errors="replace")[-chars:].strip()
+    except OSError:
+        return ""
+
+
+def _wait_for_release(state_dir: Path, run_id: str, deadline: float) -> bool:
+    """Wait until the lock we saw is no longer held by a live process.
+
+    Keyed on the RUN ID as well as liveness, so a loop that stopped and was
+    restarted by somebody else in the meantime does not read as "still running":
+    a different run id is a different run, and this one is over.
+    """
+    from .lock import LoopLock
+
+    while True:
+        info = LoopLock(state_dir).read()
+        if info is None or not LoopLock.is_live(info):
+            return True
+        if run_id and info.run_id != run_id:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(CONTROL_POLL_SECONDS)
+
+
+def _verify_restart(state_dir: Path, before_run_id: str, proc, deadline: float) -> dict:
+    """Did a loop really come back up? Evidence, or a refusal.
+
+    THREE things must hold, and each rules out a way this reports success on a
+    dead loop: a lock file exists, its `run_id` is NOT the one we stopped (so a
+    leftover file is not read as a fresh run), and `LoopLock.is_live` accepts it
+    — which rejects the `pid=-1` sentinel `read` answers a CORRUPT file with,
+    rejects a lock predating this boot, and probes the pid. Process age is
+    deliberately not among them: `os.execv` preserves both pid and start time,
+    so an old-looking process is not evidence of anything either way.
+
+    A child that has already EXITED short-circuits the wait — there is nothing
+    left to come up, and the operator gets the reason now rather than in two
+    minutes.
+    """
+    from .lock import LoopLock
+
+    while True:
+        info = LoopLock(state_dir).read()
+        if (
+            info is not None
+            and (not before_run_id or info.run_id != before_run_id)
+            and LoopLock.is_live(info)
+        ):
+            return {"restarted": True, "pid": info.pid, "run_id": info.run_id,
+                    "detail": ""}
+        exited = proc.poll() if proc is not None else None
+        if exited is not None:
+            return {"restarted": False, "pid": None, "run_id": "",
+                    "detail": f"the loop process exited with rc={exited} before "
+                              "it took the lock"}
+        if time.monotonic() >= deadline:
+            return {"restarted": False, "pid": None, "run_id": "",
+                    "detail": f"no live LOCK appeared within "
+                              f"{CONTROL_RESTART_TIMEOUT:.0f}s"}
+        time.sleep(CONTROL_POLL_SECONDS)
+
+
+class _ControlRefused(Exception):
+    """A control that must not run, with the operator-facing reason and the
+    status code to say it with."""
+
+    def __init__(self, reason: str, code: int = 400, extra: dict | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.code = code
+        self.extra = extra or {}
+
+
+def _control_config(repo: Path):
+    """The loop's config for THIS checkout, with the state directory this page
+    reads — the same substitution `merge_window` makes, for its reason.
+
+    Raises `_ControlRefused` rather than guessing. A control that acted against
+    a state directory nobody writes would report success from an abandoned file,
+    which is the failure `_state_dir` was made to raise about.
+    """
+    try:
+        state_dir = _state_dir(repo)
+    except ConfigError as exc:
+        raise _ControlRefused(CONTROL_NO_STATE_DIR + _one_line(exc)) from exc
+    config_path = repo / ".autoloop" / "config.toml"
+    try:
+        config = dataclasses.replace(load_config(config_path), state_dir=state_dir)
+    except Exception as exc:  # deliberately broad — see `merge_window`
+        raise _ControlRefused(
+            f"the loop's config could not be loaded, so nothing was run: "
+            f"{_one_line(f'{type(exc).__name__}: {exc}')}"
+        ) from exc
+    return config, config_path, state_dir
+
+
+def _fresh_snapshot(repo: Path, state_dir: Path) -> dict:
+    """`control_snapshot` off a FRESH read, for the POST path.
+
+    Cheap by construction: `state.json`, the LOCK, `tasks.json` and the blocker
+    directory. It deliberately does not sweep git — nothing a control is decided
+    from comes from the remote, and a 35s sweep between the click and the act
+    would be deciding from a phase half a minute old.
+    """
+    from .lock import LoopLock
+
+    state = _json(state_dir / "state.json") or {}
+    info = LoopLock(state_dir).read()
+    alive = info is not None and LoopLock.is_live(info)
+    blockers = []
+    blockers_dir = state_dir / "blockers"
+    if blockers_dir.is_dir():
+        for path in sorted(blockers_dir.glob("blk-*.json")):
+            record = _json(path)
+            if record and not record.get("resolved_at"):
+                blockers.append({"id": record.get("id"), "kind": record.get("kind"),
+                                 "code": record.get("code"),
+                                 "task": record.get("task_id")})
+    tasks = _json(state_dir / TASKS_FILENAME) or {}
+    lane_states, lane_note = _lane_sessions(state_dir)
+    return control_snapshot(
+        state=state, lock_alive=alive,
+        lock_pid=str(info.pid) if info else "",
+        lock_run_id=info.run_id if info else "",
+        groups=task_groups(tasks, _executions(state_dir)),
+        blockers=blockers, note="",
+        lane_states=lane_states, lane_note=lane_note,
+    )
+
+
+def _check_fields(action: OperatorAction, params: dict) -> None:
+    """Every required free-text field is present and not blank."""
+    for field, _flag in action.text:
+        if not str(params.get(field) or "").strip():
+            raise _ControlRefused(
+                f"{action.id} needs {field!r}: the CLI records it, and a "
+                "blank one is a decision with no reason attached"
+            )
+
+
+def perform_control(
+    repo: Path, action_id: str, params: dict, *,
+    run_verb=_run_verb, spawn=_spawn_loop,
+) -> dict:
+    """Run one operator control, or refuse — the whole of the claim, in order.
+
+    1. Resolve the state directory and the config, or refuse having read nothing.
+    2. Re-check the SAME predicate the button was drawn from, against a fresh
+       snapshot. The click was decided from a payload up to two seconds old.
+    3. If this stops the loop and the loop is running: arm the stop by running
+       the CLI's own `pause` / `abort`, then WAIT for the lock to be released.
+       A wait that times out WITHDRAWS the stop and runs nothing.
+    4. **Re-read the phase EVERY LANE actually stopped in.** The pause exit at
+       the top of `Orchestrator.run` is not gated on the phase, so a stop armed
+       in a safe one can land in `delivering` — per lane, and the fleet stops at
+       N separate boundaries. An unsafe landing in any of them runs NOTHING, puts
+       the loop back, and reports where it stopped.
+    5. Run the verb — in a subprocess, so the CLI takes `LoopLock` itself and a
+       lock it cannot take is that command's own refusal rather than a write.
+    6. Restart, and VERIFY: clear both flags first (a leftover one stops the
+       fresh loop at the top of its first step), then require a live lock under
+       a new run id.
+
+    `run_verb` and `spawn` are injected so the tests can drive every one of
+    those branches without starting a loop; the defaults are the real ones.
+    """
+    action = ACTIONS_BY_ID.get(action_id)
+    if action is None:
+        raise _ControlRefused(f"unknown action {action_id!r}", code=404)
+    config, config_path, state_dir = _control_config(repo)
+    snap = _fresh_snapshot(repo, state_dir)
+    refusal = control_refusal(action, params, snap)
+    if refusal:
+        raise _ControlRefused(refusal)
+    _check_fields(action, params)
+    try:
+        wait = float(params.get("wait") or CONTROL_WAIT_DEFAULT)
+    except (TypeError, ValueError):
+        wait = CONTROL_WAIT_DEFAULT
+    wait = max(0.0, min(wait, CONTROL_WAIT_MAX))
+
+    from . import cli as _cli
+
+    was_running = snap["running"]
+    stopped_run_id = snap["run_id"]
+    result: dict = {
+        "action": action.id, "ran": False, "returncode": None, "output": "",
+        "loop": {"was_running": was_running, "stopped": False, "restarted": False,
+                 "pid": snap["pid"], "detail": ""},
+        "stopped_in_phase": "", "notes": [],
+    }
+    log = None
+    with contextlib.suppress(Exception):
+        log = config.pause_file.parent / "dashboard-operator.log"
+
+    if action.arm and was_running:
+        armed = run_verb(
+            [sys.executable, "-m", "autoloop", action.arm, "--config",
+             str(config_path)],
+            repo, CONTROL_VERB_TIMEOUT,
+        )
+        if armed.get("returncode") != 0:
+            raise _ControlRefused(
+                f"the {action.arm} request could not be made, so nothing was "
+                f"run: {armed.get('output') or 'no output'}",
+                code=500,
+            )
+        deadline = time.monotonic() + wait
+        released = _wait_for_release(state_dir, stopped_run_id, deadline)
+        if not released:
+            # WITHDRAWN, then watched. Clearing the flag races a loop that read
+            # it in the same instant, so the grace window below is what stops
+            # this reporting "still running" about a loop on its way down.
+            _cli.clear_pause(config)
+            _cli.clear_abort(config)
+            released = _wait_for_release(
+                state_dir, stopped_run_id,
+                time.monotonic() + CONTROL_WITHDRAW_GRACE,
+            )
+            if not released:
+                raise _ControlRefused(
+                    f"the loop did not reach a phase boundary within "
+                    f"{wait:.0f}s, so NOTHING was run and the stop request was "
+                    "withdrawn. A write-capable agent can hold a step for tens "
+                    "of minutes; retry with a longer wait, or use Abort, which "
+                    "kills the agent instead of waiting for it.",
+                    code=409,
+                )
+            result["notes"].append(
+                "the stop request was withdrawn on timeout and the loop stopped "
+                "anyway, within the grace window — it was carried out"
+            )
+        result["loop"]["stopped"] = True
+        # STEP 4. The one check that makes the claim true rather than likely.
+        # ASKED OF EVERY LANE, exactly as the pre-check is, and read FRESH here
+        # rather than reused from `snap`: the reason this check exists at all is
+        # that the pause exit is not gated on the phase, so a stop armed in
+        # `executing` can LAND in `delivering` — and that is true per lane. A
+        # fleet that passed the pre-check can land with lane 0 in `ready` and
+        # lane 1 mid-deposit, and re-reading lane 0 alone would run the verb
+        # anyway. `stop_refusal` takes `lane_note` first, so lanes that became
+        # unlistable while the loop was coming down refuse too.
+        # `{}` for anything that is not a mapping, for `_session`'s reason: a
+        # bare scalar is a valid JSON document, and a `.get` on one would raise
+        # HERE — after the loop has been stopped — where the handler's generic
+        # 500 would leave it down instead of restarting it. `{}` refuses, and a
+        # refusal restarts.
+        landed = _json(state_dir / "state.json")
+        if not isinstance(landed, dict):
+            landed = {}
+        result["stopped_in_phase"] = str(landed.get("phase") or "")
+        landed_lanes, landed_lane_note = _lane_sessions(state_dir)
+        unsafe = stop_refusal(landed, landed_lanes, landed_lane_note)
+        if unsafe and action.verb:
+            restart = _restart(
+                _cli, config, config_path, repo, state_dir, stopped_run_id,
+                spawn, log,
+            )
+            raise _ControlRefused(
+                f"the loop stopped in a phase where acting would strand work — "
+                f"{unsafe}. NOTHING was run. " + restart["message"],
+                code=409,
+                extra={"stopped_in_phase": result["stopped_in_phase"],
+                       "loop": {**result["loop"], **restart["loop"]}},
+            )
+        if unsafe:
+            where = result["stopped_in_phase"] or "an unknown phase"
+            result["notes"].append(
+                f"the loop stopped in {where} — {unsafe}. Nothing was "
+                "discarded and nothing was killed: Start resumes it from there."
+            )
+
+    if action.verb:
+        ran = run_verb(_control_argv(action, params, config_path), repo,
+                       CONTROL_VERB_TIMEOUT)
+        result["ran"] = True
+        result["returncode"] = ran.get("returncode")
+        result["output"] = ran.get("output") or ""
+
+    # A restart happens only where there was a loop to restart. `release` run
+    # against an already-stopped loop leaves it stopped — starting one the
+    # operator had deliberately stopped would be this panel deciding something
+    # nobody asked it to.
+    attempted_restart = action.restarts and (was_running or action.id == "start")
+    if attempted_restart:
+        restart = _restart(_cli, config, config_path, repo, state_dir,
+                           stopped_run_id, spawn, log)
+        result["loop"].update(restart["loop"])
+        result["notes"].append(restart["message"])
+    elif action.restarts:
+        result["notes"].append(
+            "the loop was not running before this action, so it was left "
+            "stopped — Start is the control that brings it back"
+        )
+
+    # `ok` is the page's red/green, and it is deliberately strict in both
+    # directions. A verb that could not be run at all reports `returncode:
+    # None` — a timeout or an `OSError` — and that is NOT a success, however
+    # empty its output looks. A restart that could not be verified is not one
+    # either: "the loop is down" has to be the loud outcome, because the whole
+    # procedure this panel replaces went wrong by leaving it down quietly.
+    verb_ok = True if not action.verb else result["returncode"] == 0
+    restart_ok = result["loop"]["restarted"] if attempted_restart else True
+    result["ok"] = bool(verb_ok and restart_ok)
+    return result
+
+
+def _restart(cli_module, config, config_path: Path, repo: Path, state_dir: Path,
+             stopped_run_id: str, spawn, log) -> dict:
+    """Clear both stop flags, start `run --continuous`, and prove it came up.
+
+    BOTH flags, and BEFORE the spawn. `cli._cmd_start` clears both for the
+    reason this does: a flag left over from the stop this action just made would
+    stop the fresh loop at the top of its first step, and the poll below would
+    have a live lock to see for the second or two before it did — a restart
+    reported as verified about a loop already on its way out.
+
+    `run --continuous`, never `resume`: `cli._cmd_resume` clears the flags and
+    calls `_cmd_run` with `continuous` defaulting to False, so it runs ONE
+    foreground round and exits, leaving the loop down with nothing saying so.
+    """
+    cli_module.clear_pause(config)
+    cli_module.clear_abort(config)
+    argv = [sys.executable, "-m", "autoloop", "run", "--continuous",
+            "--config", str(config_path)]
+    try:
+        proc = spawn(argv, repo, log)
+    except (OSError, ValueError) as exc:
+        return {"loop": {"restarted": False,
+                         "detail": f"the loop could not be started: {exc}"},
+                "message": f"THE LOOP IS DOWN — it could not be started: {exc}"}
+    verdict = _verify_restart(state_dir, stopped_run_id, proc,
+                              time.monotonic() + CONTROL_RESTART_TIMEOUT)
+    if verdict["restarted"]:
+        # Re-asserted AFTER the lock is proved live, not only before the spawn:
+        # a flag written between the two would stop this loop at its next
+        # boundary, and the operator would be reading "restarted, pid N".
+        if cli_module.pause_requested(config):
+            return {"loop": {**verdict, "restarted": False,
+                             "detail": "a pause flag was armed again while the "
+                                       "loop was starting"},
+                    "message": "THE LOOP STARTED (pid "
+                               f"{verdict['pid']}) BUT A PAUSE FLAG IS ARMED — "
+                               "it will stop at its next boundary"}
+        return {"loop": verdict,
+                "message": f"the loop was restarted and verified alive: LOCK pid "
+                           f"{verdict['pid']}, run {str(verdict['run_id'])[:12]}"}
+    tail = _log_tail(log)
+    return {"loop": verdict,
+            "message": "THE LOOP IS DOWN — " + verdict["detail"]
+                       + (f"; last output: {_one_line(tail)}" if tail else "")}
+
+
+#: Fields `/api/control` accepts, and the whole vocabulary. Refused rather than
+#: dropped, for the reason `PRIORITY_REQUEST_FIELDS` gives: a caller that sent a
+#: field this endpoint ignores meant something it did not do.
+CONTROL_REQUEST_FIELDS = frozenset(
+    {"action", "task", "blocker", "reason", "text", "superseded_by", "wait"}
+)
 
 
 #: Fields `/api/task` accepts. Deliberately NARROWER than the inbox's own
@@ -6751,6 +8244,18 @@ class Handler(BaseHTTPRequestHandler):
             rather than showing a value that never landed) and a COMPLETE after
             it (the only one that ever silences the detector).
 
+        `/api/control` (ops-01, 2026-09-09) is the widest of the three and the
+        only one that can stop the loop. It still writes NOTHING from this
+        process: every effect is a `python -m autoloop <verb>` subprocess, so
+        each command takes `LoopLock` itself and refuses for itself. What is
+        genuinely new is the SEQUENCING — arm the stop, wait for a boundary,
+        re-read the phase the loop landed in, act only where acting cannot
+        strand a packet, restart and verify — and that lives in
+        `perform_control`, with its reasoning under the OPERATOR CONTROLS
+        banner. The endpoint offers nothing it would refuse: the same
+        `control_refusal` that disabled the button is re-run here against a
+        fresh read.
+
         Everything else this page does is still reads.
 
         The page has no authentication and binds 127.0.0.1 only, so the residual
@@ -6810,6 +8315,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_response(400, {"error": f"bad request: {exc}"})
         if self.path.startswith("/api/priority"):
             return self._submit_priority(body)
+        if self.path.startswith("/api/control"):
+            return self._operator_control(body)
         if self.path.startswith("/api/suggest-paths"):
             return self._suggest_paths(body)
         # The intake routes are matched BEFORE `/api/task`, and the longer
@@ -7066,6 +8573,77 @@ class Handler(BaseHTTPRequestHandler):
                 "note": "written to tasks.json and read back",
             },
         )
+
+    # ---- operator controls (ops-01) ----------------------------------------
+
+    def _operator_control(self, body: dict) -> None:
+        """Run ONE operator control, through the CLI, or refuse with the reason.
+
+        The third write path on this page, and the widest — it can stop the
+        loop, retire a task, answer a blocker and merge a backlog. What bounds
+        it, honestly stated:
+
+        * **It writes nothing itself.** Every effect is a `python -m autoloop`
+          subprocess, so `LoopLock`, the registry mutex, the blocker store and
+          the merge sweep are all entered by the loop's own code with its own
+          refusals. A verb that cannot take the lock reports that and writes
+          nothing — the refusal is the CLI's, printed back here.
+        * **It offers nothing it would refuse.** The button was drawn from
+          `control_refusal`; this re-runs the SAME function against a fresh read
+          before anything happens, and again from the phase the loop actually
+          stopped in.
+        * **One at a time.** `_ACTION_LOCK` is taken without blocking, so a
+          second tab is told rather than queued behind a wait it cannot see.
+        * The request vocabulary is closed (`CONTROL_REQUEST_FIELDS`) for the
+          reason `/api/priority`'s is: a field this endpoint drops is a field
+          its author meant.
+
+        Every response says what ACTUALLY happened — the verb's own output, the
+        phase the loop stopped in, and whether the restarted loop was verified
+        alive — rather than echoing the request back as success.
+        """
+        unknown = sorted(set(body) - CONTROL_REQUEST_FIELDS)
+        if unknown:
+            return self._json_response(
+                400,
+                {"error": f"unknown field(s) {unknown}; a control carries only "
+                          f"{sorted(CONTROL_REQUEST_FIELDS)}"},
+            )
+        action_id = str(body.get("action") or "")
+        if not action_id:
+            return self._json_response(400, {"error": "no action named"})
+        superseded = body.get("superseded_by") or []
+        if not isinstance(superseded, list):
+            return self._json_response(
+                400, {"error": "superseded_by must be a list of task ids"})
+        params = {
+            "task": body.get("task"), "blocker": body.get("blocker"),
+            "reason": body.get("reason"), "text": body.get("text"),
+            "superseded_by": [str(s) for s in superseded],
+            "wait": body.get("wait"),
+        }
+        if not _ACTION_LOCK.acquire(blocking=False):
+            return self._json_response(
+                409,
+                {"error": "another operator action is in flight — this one was "
+                          "NOT queued and nothing was run. Wait for it to "
+                          "report, then try again."},
+            )
+        try:
+            result = perform_control(self.repo, action_id, params)
+        except _ControlRefused as exc:
+            return self._json_response(
+                exc.code, {"error": exc.reason, "ran": False, **exc.extra})
+        except Exception as exc:  # deliberately broad — a page, not a crash
+            return self._json_response(
+                500,
+                {"error": f"the control failed before it could report: "
+                          f"{_one_line(f'{type(exc).__name__}: {exc}')}",
+                 "ran": False},
+            )
+        finally:
+            _ACTION_LOCK.release()
+        return self._json_response(200, result)
 
     def _submit_task(self, body: dict) -> None:
         """Queue a new task through the same inbox `add-task` uses.

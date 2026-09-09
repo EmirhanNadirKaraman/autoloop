@@ -7591,3 +7591,1194 @@ def test_at_one_lane_the_task_column_is_what_it_always_was(tmp_path):
                     started_at="2026-09-01T09:00:00+00:00")
 
     assert dash._current_task(config) == ("brw-19", "executing", "")
+
+
+# ---- operator controls (ops-01) ----------------------------------------------
+#
+# THE CLAIM these pin: every action offered in the UI either completes correctly
+# — arming the stop, waiting for a SAFE phase boundary, acting, and restarting
+# the loop verified alive — or refuses with the reason, and no action is offered
+# in a state where performing it would strand work.
+#
+# Most of these are PURE: `operator_controls` takes what `collect` already read
+# and returns the panel as data, so "is this control offered, and what does it
+# say when it is not" costs a dict rather than a repository. The handful that
+# drive `perform_control` inject the runner and the spawner, because what is
+# worth pinning there is the ORDER — arm, wait, re-read the phase, act, restart,
+# verify — and a test that really started a loop would prove that no better and
+# take a minute doing it.
+
+
+def a_group(state, ids):
+    """One `task_groups` group, in the shape `collect` passes to the panel."""
+    return {"key": state, "label": state, "state": state, "count": len(ids),
+            "hidden": False, "collapsed": False,
+            "tasks": [{"id": i, "title": i.upper(), "priority": 100} for i in ids]}
+
+
+def controls(**over):
+    """`operator_controls` with a healthy running loop defaulted in."""
+    import autoloop.dashboard as dash
+
+    kwargs = dict(state={"phase": "ready"}, lock_alive=True, lock_pid="4242",
+                  lock_run_id="run-a", groups=[], blockers=[], note="",
+                  executions={}, merge={})
+    kwargs.update(over)
+    return dash.operator_controls(**kwargs)
+
+
+def an_action(payload, action_id):
+    return next(a for a in payload["actions"] if a["id"] == action_id)
+
+
+def a_task_row(payload, task_id):
+    return next(t for t in payload["tasks"] if t["id"] == task_id)
+
+
+#: Every control whose verb takes `LoopLock`, plus the two whose whole effect is
+#: the stop. Derived from the table rather than typed out, so a tenth action
+#: cannot arrive with no phase test against it.
+def stopping_action_ids():
+    import autoloop.dashboard as dash
+
+    return [a.id for a in dash.OPERATOR_ACTIONS if a.stops_loop]
+
+
+def _phase_values():
+    from autoloop.state import Phase
+
+    return [p.value for p in Phase]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "ready", "delivering", "submitting", "submission_unconfirmed",
+        "submission_rejected", "awaiting", "executing", "needs_user",
+        "stopped", "failed",
+        # NOT a Phase member: a build that does not recognise the phase must
+        # fail CLOSED, which is the guard refusing to switch itself off.
+        "a-phase-from-a-newer-build",
+    ],
+)
+def test_every_stop_the_loop_control_is_refused_wherever_a_packet_is_outstanding(phase):
+    """The rule, over the whole phase vocabulary at once.
+
+    `delivering` deposits numbered parts before the verdict question is asked
+    and `submission_unconfirmed` means acceptance is unknown, so exiting at
+    either strands a packet — and an UNRECOGNISED phase is refused for the
+    reason `packet_outstanding_reason` refuses it: whether a packet is
+    outstanding is the one thing that cannot be decided about a phase this build
+    has never heard of.
+    """
+    from autoloop.state import PACKET_OUTSTANDING_PHASES
+
+    payload = controls(state={"phase": phase}, lock_alive=True)
+    unsafe = {p.value for p in PACKET_OUTSTANDING_PHASES}
+    refuse = phase in unsafe or phase not in _phase_values()
+
+    for action_id in stopping_action_ids():
+        row = an_action(payload, action_id)
+        assert row["enabled"] is (not refuse), (
+            f"{action_id} in phase {phase}: enabled={row['enabled']}, "
+            f"expected {not refuse}"
+        )
+        if refuse:
+            assert phase in row["reason"] or "unrecognised" in row["reason"], (
+                f"{action_id} refused in {phase} without naming the phase: "
+                f"{row['reason']!r}"
+            )
+
+
+def test_a_session_nobody_can_read_refuses_every_stop_rather_than_allowing_it():
+    """The fail-OPEN this closes: an empty or missing `state.json` beside a LIVE
+    lock is no evidence, not a licence. A control that read "no session, so no
+    packet" would stop a running loop on the strength of a file it could not
+    open."""
+    for unreadable in ({}, None):
+        payload = controls(state=unreadable, lock_alive=True)
+        for action_id in stopping_action_ids():
+            row = an_action(payload, action_id)
+            assert row["enabled"] is False
+            assert "no readable session" in row["reason"]
+
+
+def test_a_sibling_lane_owing_a_packet_refuses_the_stop_for_the_whole_fleet(tmp_path):
+    """One `LoopLock` stops every lane, so a stop decided from lane 0's phase
+    alone would land while lane 1 held a packet nobody had asked about. The
+    directory is walked rather than `[concurrency] lanes`, because a lane an
+    operator's lowered cap cut out is still running."""
+    import autoloop.dashboard as dash
+
+    state_dir = tmp_path / "state"
+    (state_dir / "lanes" / "_lane-1").mkdir(parents=True)
+    (state_dir / "lanes" / "_lane-1" / "state.json").write_text(
+        json.dumps({"phase": "delivering"}), encoding="utf-8")
+    lane_states, lane_note = dash._lane_sessions(state_dir)
+
+    payload = controls(state={"phase": "ready"}, lane_states=lane_states,
+                       lane_note=lane_note)
+
+    for action_id in stopping_action_ids():
+        row = an_action(payload, action_id)
+        assert row["enabled"] is False
+        assert "_lane-1" in row["reason"] and "delivering" in row["reason"]
+
+
+def test_a_lane_that_has_never_run_owes_nothing_and_a_broken_one_refuses(tmp_path):
+    """A lane directory with no `state.json` is a lane that has never run.
+    One whose session will not parse is no evidence, and refuses."""
+    import autoloop.dashboard as dash
+
+    state_dir = tmp_path / "state"
+    (state_dir / "lanes" / "_lane-1").mkdir(parents=True)
+    lane_states, _note = dash._lane_sessions(state_dir)
+    assert lane_states == []
+    assert an_action(controls(lane_states=lane_states), "release")["enabled"] is True
+
+    (state_dir / "lanes" / "_lane-1" / "state.json").write_text("]", encoding="utf-8")
+    lane_states, _note = dash._lane_sessions(state_dir)
+    assert an_action(controls(lane_states=lane_states), "release")["enabled"] is False
+
+
+def test_a_lane_directory_nobody_can_list_refuses_every_stop():
+    """The fail-CLOSED direction: an unlistable `lanes/` means no lane's phase
+    is known, which is not the same as every lane being safe."""
+    import autoloop.dashboard as dash
+
+    note = "the fleet's lane directory could not be listed"
+    assert dash.stop_refusal({"phase": "ready"}, (), note) == note
+
+    payload = controls(state={"phase": "ready"}, lane_note=note)
+    for action_id in stopping_action_ids():
+        assert an_action(payload, action_id)["enabled"] is False
+
+
+def test_a_pending_request_outliving_its_phase_still_refuses_the_stop():
+    """A request outlives its own phase — `_step_awaiting` clears
+    `pending_request` in the same save that moves to `executing`, so one carried
+    in any other phase is unresolved. The loop's own predicate says so and this
+    panel asks it rather than looking at the phase alone."""
+    payload = controls(
+        state={"phase": "ready", "pending_request": {"request_id": "req-9"}},
+        lock_alive=True,
+    )
+    row = an_action(payload, "release")
+    assert row["enabled"] is False
+    assert "req-9" in row["reason"]
+
+
+def test_a_pending_request_of_any_shape_at_all_still_refuses_the_stop():
+    """Fail-CLOSED on PRESENCE, never on shape.
+
+    `_pending_view` preserves the `is not None` identity
+    `packet_outstanding_reason` tests, so a session carrying `{}`, a bare
+    string, a list or an empty id — every way a hand-edited or half-written
+    `state.json` can carry something where a RESOLVED request carries nothing —
+    refuses the stop. Each names what little it can (`?`) rather than raising
+    out of the middle of a page load, which would take the whole panel with it.
+    """
+    for pending in ({}, "req-9", ["req-9"], 0, {"request_id": ""}):
+        payload = controls(
+            state={"phase": "ready", "pending_request": pending},
+            lock_alive=True,
+        )
+        row = an_action(payload, "release")
+        assert row["enabled"] is False, f"{pending!r} was allowed to stop the loop"
+        assert "still pending" in row["reason"]
+
+
+def test_a_session_that_is_not_a_mapping_at_all_refuses_rather_than_raising():
+    """`123`, `"x"` and `true` are each a whole VALID JSON document, so `_json`
+    hands one back parsed and a `.get` on it raises. This panel is the read-only
+    view of a loop somebody is trying to rescue, so it answers "no readable
+    session" — which refuses every stop — rather than taking the page down with
+    an `AttributeError` on a hand-edited file."""
+    import autoloop.dashboard as dash
+
+    for broken in (123, "executing", True, [{"phase": "ready"}]):
+        assert dash._session(broken) is None
+        payload = controls(state=broken, lock_alive=True)
+        for action_id in stopping_action_ids():
+            row = an_action(payload, action_id)
+            assert row["enabled"] is False, f"{broken!r} allowed the stop"
+            assert "no readable session" in row["reason"]
+
+
+def test_the_whole_page_still_renders_when_the_session_file_is_a_bare_scalar(tmp_path):
+    """Reading stays FREE, and that has to survive the file being nonsense.
+
+    `state.json` holding `123` parses to an int, so `collect` normalises a
+    non-mapping to absent exactly as it already does an unparseable one — and
+    the panel then refuses every stop for the reason a missing session refuses
+    it. A page that raised here would be unavailable in the one state an
+    operator most needs to read it.
+    """
+    repo = make_repo(tmp_path)
+    (repo / ".autoloop" / "state.json").write_text("123", encoding="utf-8")
+
+    payload = collect(repo)
+
+    assert payload["controls"]["stop"]["safe"] is False
+    assert "no readable session" in payload["controls"]["stop"]["reason"]
+
+
+def test_no_control_is_ever_greyed_out_without_a_reason():
+    """The mechanical form of "never grey a control out silently". Every
+    action, every per-task verdict and every answer verdict, across a matrix of
+    states: `enabled is False` implies a non-empty reason, always."""
+    cases = [
+        controls(),
+        controls(lock_alive=False),
+        controls(state={"phase": "awaiting"}),
+        controls(state={}),
+        controls(note="no [paths] section"),
+        controls(groups=[a_group("in_progress", ["a"]), a_group("ready", ["b"]),
+                         a_group("blocked_by_operator", ["c"]),
+                         a_group("retired", ["d"]), a_group("completed", ["e"])],
+                 blockers=[{"id": "blk-1", "task": "c", "kind": "quarantine",
+                            "code": "loop_fatal"}]),
+    ]
+    for payload in cases:
+        for row in payload["actions"]:
+            if not row["enabled"]:
+                assert row["reason"], f"{row['id']} disabled with no reason"
+        for task in payload["tasks"]:
+            for key in ("release", "discard", "retire", "answer"):
+                verdict = task[key]
+                if not verdict["enabled"]:
+                    assert verdict["reason"], (
+                        f"{key} on {task['id']} disabled with no reason")
+
+
+def test_release_is_offered_only_for_a_task_that_is_in_progress():
+    """`TaskRegistry.release` refuses anything else deliberately, and the panel
+    says so ahead of time rather than letting the operator find out."""
+    payload = controls(groups=[
+        a_group("in_progress", ["running-01"]),
+        a_group("ready", ["queued-01"]),
+        a_group("blocked_by_operator", ["parked-01"]),
+    ])
+
+    assert a_task_row(payload, "running-01")["release"]["enabled"] is True
+    for other in ("queued-01", "parked-01"):
+        verdict = a_task_row(payload, other)["release"]
+        assert verdict["enabled"] is False
+        assert other in verdict["reason"]
+    assert "discard" in a_task_row(payload, "parked-01")["release"]["reason"]
+
+
+def test_discard_is_the_blocked_counterpart_and_says_so_for_the_others():
+    payload = controls(groups=[
+        a_group("in_progress", ["running-01"]),
+        a_group("blocked_by_operator", ["parked-01"]),
+    ])
+
+    assert a_task_row(payload, "parked-01")["discard"]["enabled"] is True
+    running = a_task_row(payload, "running-01")["discard"]
+    assert running["enabled"] is False and "release" in running["reason"]
+
+
+def test_retire_is_refused_for_a_task_an_agent_may_be_writing():
+    payload = controls(groups=[
+        a_group("in_progress", ["running-01"]), a_group("ready", ["queued-01"]),
+    ])
+
+    assert a_task_row(payload, "queued-01")["retire"]["enabled"] is True
+    verdict = a_task_row(payload, "running-01")["retire"]
+    assert verdict["enabled"] is False and "in progress" in verdict["reason"]
+
+
+def test_answer_is_offered_only_where_a_task_has_an_open_blocker_and_names_it():
+    """The id it would answer is SHOWN. An operator answering the wrong blocker
+    is answering a question nobody asked."""
+    payload = controls(
+        groups=[a_group("blocked_by_operator", ["parked-01", "parked-02"]),
+                a_group("ready", ["queued-01"])],
+        blockers=[{"id": "blk-t1-001", "task": "parked-01", "kind": "quarantine",
+                   "code": "loop_fatal"},
+                  {"id": "blk-t2-001", "task": "parked-02", "kind": "question",
+                   "code": "x"},
+                  {"id": "blk-t2-002", "task": "parked-02", "kind": "question",
+                   "code": "y"}],
+    )
+
+    one = a_task_row(payload, "parked-01")["answer"]
+    assert one["enabled"] is True and one["blocker"] == "blk-t1-001"
+
+    none = a_task_row(payload, "queued-01")["answer"]
+    assert none["enabled"] is False and none["blocker"] == ""
+    assert "no OPEN blocker" in none["reason"]
+
+    two = a_task_row(payload, "parked-02")["answer"]
+    assert two["enabled"] is False and two["blocker"] == ""
+    assert "blk-t2-001" in two["reason"] and "blk-t2-002" in two["reason"]
+
+
+def test_an_unreadable_task_graph_refuses_every_per_task_control():
+    """`task_groups` returns `[]` when the graph will not load at all. Acting on
+    a state nobody could read is exactly how a control strands work, so every
+    per-task verdict refuses and says which read failed."""
+    import autoloop.dashboard as dash
+
+    snap = dash.control_snapshot(
+        state={"phase": "ready"}, lock_alive=True, lock_pid="1", lock_run_id="r",
+        groups=[], blockers=[], note="",
+    )
+    for action_id in ("release", "discard", "retire"):
+        why = dash._task_action_refusal(dash.ACTIONS_BY_ID[action_id], "any", snap)
+        assert "task graph could not be read" in why
+
+
+def test_an_unresolvable_state_directory_refuses_every_control_with_the_reason():
+    """port-06's rule, applied to the controls: nothing was read, so nothing may
+    be acted on — and the resolver's own sentence travels with the refusal."""
+    payload = controls(note="[paths].state_dir names nothing")
+
+    for row in payload["actions"]:
+        assert row["enabled"] is False
+        assert "state directory could not be resolved" in row["reason"]
+        assert "[paths].state_dir names nothing" in row["reason"]
+
+
+def test_start_is_refused_while_a_live_lock_is_held_and_offered_when_it_is_not():
+    running = an_action(controls(lock_alive=True, lock_pid="4242"), "start")
+    assert running["enabled"] is False and "4242" in running["reason"]
+
+    stopped = an_action(controls(lock_alive=False, lock_pid=""), "start")
+    assert stopped["enabled"] is True and stopped["reason"] == ""
+
+
+def test_pause_and_abort_are_refused_when_there_is_nothing_to_stop():
+    payload = controls(lock_alive=False, lock_pid="")
+    for action_id in ("pause", "abort"):
+        row = an_action(payload, action_id)
+        assert row["enabled"] is False
+        assert "nothing to stop" in row["reason"]
+
+
+def test_reset_is_refused_against_a_stopped_loop_that_still_owes_a_packet():
+    """The door every other gate here left open. A loop stopped in `awaiting`
+    still owes a reviewer a packet; `reset --yes` archives that session, and
+    every other refusal in this panel is about STOPPING — so this one has to be
+    asked whether or not there is anything to stop."""
+    for phase in ("awaiting", "delivering", "submission_unconfirmed"):
+        payload = controls(state={"phase": phase}, lock_alive=False, lock_pid="")
+        row = an_action(payload, "reset")
+        assert row["enabled"] is False, f"reset offered against a stopped {phase}"
+        assert "ARCHIVES the session" in row["reason"] and phase in row["reason"]
+        # And it is reset ALONE: a locked verb that touches no session is still
+        # the right thing to run against a loop that is already down.
+        assert an_action(payload, "release")["enabled"] is True
+
+    safe = controls(state={"phase": "ready"}, lock_alive=False, lock_pid="")
+    assert an_action(safe, "reset")["enabled"] is True
+
+
+def test_a_locked_verb_is_offered_against_a_stopped_loop():
+    """The loop being down is not a refusal — it is the state in which every
+    locked verb runs straight away. What must not happen is the panel then
+    starting a loop nobody asked it to."""
+    payload = controls(lock_alive=False, lock_pid="",
+                       groups=[a_group("in_progress", ["running-01"])])
+
+    assert an_action(payload, "release")["enabled"] is True
+    assert a_task_row(payload, "running-01")["release"]["enabled"] is True
+
+
+def test_the_panel_shows_the_attempt_ledger_rather_than_the_counters():
+    """On 2026-08-20 port-01 and blk-01 both reported fault_attempt_count=0 with
+    a burned round in their ledgers. The entries are the evidence; the counters
+    travel labelled as the summary that has been wrong."""
+    payload = controls(
+        groups=[a_group("in_progress", ["port-01"])],
+        executions={"port-01": {"task_id": "port-01", "attempt_count": 1,
+                                "fault_attempt_count": 0,
+                                "attempt_ledger": [
+                                    "1|task|sent_for_review",
+                                    "2|fault|review_packet_build_failed"]}},
+    )
+
+    ledger = a_task_row(payload, "port-01")["ledger"]
+    assert ledger["entries"] == ["1|task|sent_for_review",
+                                 "2|fault|review_packet_build_failed"]
+    assert ledger["faults"] == 0, "the counter is carried, and it is the wrong one"
+    assert any("review_packet_build_failed" in e for e in ledger["entries"])
+
+
+def test_a_task_with_no_execution_record_reports_an_empty_ledger_not_a_zero():
+    payload = controls(groups=[a_group("ready", ["fresh-01"])], executions={})
+
+    ledger = a_task_row(payload, "fresh-01")["ledger"]
+    assert ledger["entries"] == []
+    assert ledger["attempts"] is None and ledger["faults"] is None
+
+
+def test_the_snapshot_carries_exactly_the_fields_the_predicates_read():
+    """A field added to the snapshot and not to this tuple is a field no reader
+    was told about; one removed is a `KeyError` inside a refusal."""
+    import autoloop.dashboard as dash
+
+    snap = dash.control_snapshot(
+        state={"phase": "ready"}, lock_alive=False, lock_pid="", lock_run_id="",
+        groups=[], blockers=[], note="",
+    )
+    assert set(snap) == set(dash._CONTROL_SNAPSHOT_FIELDS)
+
+
+# --- the merge window says WHO holds it shut ----------------------------------
+
+
+def test_the_window_predicate_reports_the_task_holding_it_shut(tmp_path):
+    """Straight off `_merge_window_blockers`' own out-param. The reason strings
+    have always carried the id inside their prose; parsing them back out would
+    be reading text the loop itself wrote as if it were evidence."""
+    from autoloop import cli
+
+    state_dir = tmp_path / "state"
+    (state_dir / "executions").mkdir(parents=True)
+    (state_dir / "executions" / "held-01.json").write_text(json.dumps({
+        "task_id": "held-01", "candidate_sha": "a" * 40,
+        "task_base_sha": "b" * 40, "worktree_path": str(tmp_path / "w"),
+    }), encoding="utf-8")
+    config = _window_config(tmp_path, state_dir)
+    # The registry has to HOLD the task, and hold it non-terminal: an id it has
+    # never heard of takes the ORPHAN exemption, which is a note rather than a
+    # blocker, and this test would then be asserting about the wrong arm.
+    config.tasks_file.write_text(json.dumps({
+        "schema_version": 1, "tasks": [a_task("held-01", status="in_progress")],
+    }), encoding="utf-8")
+
+    holders = []
+    reasons, _notes = cli._merge_window_blockers(config, set(), _RefusingGit(),
+                                                 holders=holders)
+
+    assert reasons, "the record should hold the window shut"
+    assert [h["task_id"] for h in holders] == ["held-01"]
+    assert [h["reason"] for h in holders] == reasons
+
+
+def test_a_holder_with_no_task_is_reported_rather_than_dropped(tmp_path):
+    """A SHUT window listing zero holders reads as a bug in the panel. "The
+    state directory does not exist" holds it with nobody to name, and that is a
+    real answer to "who"."""
+    from autoloop import cli
+
+    config = _window_config(tmp_path, tmp_path / "gone")
+
+    holders = []
+    reasons, _notes = cli._merge_window_blockers(config, set(), None,
+                                                 holders=holders)
+
+    assert len(reasons) == 1
+    assert holders == [{"task_id": "", "reason": reasons[0]}]
+
+
+def test_an_open_window_names_nobody(tmp_path):
+    from autoloop import cli
+
+    state_dir = tmp_path / "state"
+    (state_dir / "executions").mkdir(parents=True)
+    config = _window_config(tmp_path, state_dir)
+
+    holders = []
+    reasons, _notes = cli._merge_window_blockers(config, set(), None,
+                                                 holders=holders)
+
+    assert reasons == [] and holders == []
+
+
+def test_the_dashboard_window_carries_the_holders_the_predicate_recorded(
+    tmp_path, monkeypatch
+):
+    """Through `merge_window`, so the panel renders what the predicate said."""
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    repo = control_repo(tmp_path)
+
+    def stub(config, seen, git, *, holders=None, obligations=None):
+        if holders is not None:
+            holders.append({"task_id": "held-01", "reason": "held-01 holds it"})
+        return ["held-01 holds it"], []
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", stub)
+
+    window = dash.merge_window(repo)
+
+    assert window["state"] == "shut"
+    assert window["holders"] == [{"task_id": "held-01",
+                                  "reason": "held-01 holds it"}]
+
+
+def test_a_predicate_that_cannot_report_who_still_reports_the_verdict(
+    tmp_path, monkeypatch
+):
+    """The addition must not be able to break the claim it sits beside. A
+    callable bound to that name which takes only the three arguments it always
+    took — the shape this panel's own seam test uses — still decides the
+    window; only the "who" is unavailable, and the page then names nobody."""
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    repo = control_repo(tmp_path)
+    monkeypatch.setattr(cli, "_merge_window_blockers",
+                        lambda config, seen, git: (["a reason"], ["a note"]))
+
+    window = dash.merge_window(repo)
+
+    assert window["state"] == "shut"
+    assert window["reasons"] == ["a reason"] and window["notes"] == ["a note"]
+    assert window["holders"] == []
+
+
+def test_an_unknown_window_verdict_names_nobody(tmp_path):
+    """`unknown` is not `open` and it is not `shut` either: nothing was decided
+    about anybody, so an empty holder list there is the honest answer rather
+    than "nothing is holding it"."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    # No `[paths].workers_root`, which `load_config` requires — so the check
+    # cannot be completed at all, which is precisely the `unknown` arm.
+    window = dash.merge_window(repo)
+
+    assert window["state"] == "unknown"
+    assert window["holders"] == [] and window["reasons"] == []
+    assert window["detail"], "an unknown verdict must say why it could not look"
+
+
+def _window_config(tmp_path, state_dir):
+    from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
+
+    return AutoloopConfig(
+        browser=BrowserConfig(conversation_url="https://example.invalid/c/x"),
+        policy=PolicyConfig(),
+        state_dir=state_dir,
+        workers_root=tmp_path / "workers",
+    )
+
+
+class _RefusingGit:
+    """A gateway that cannot answer anything, so every base is UNVERIFIED — the
+    fail-closed arm, which is what makes the record a blocker rather than a
+    note."""
+
+    def __getattr__(self, _name):
+        def _refuse(*_args, **_kwargs):
+            from autoloop.errors import GitError
+
+            raise GitError("no git here")
+
+        return _refuse
+
+
+def test_the_page_renders_the_holder_beside_the_shut_verdict():
+    """The panel names it in the sentence an operator actually reads."""
+    from autoloop.dashboard import PAGE
+
+    region = PAGE.split("// MERGE_WINDOW_START")[1].split("// MERGE_WINDOW_END")[0]
+    assert "mw.holders" in region
+    assert "heldBy" in region
+    assert "Held by the loop itself" in region, (
+        "a holder with no task id must still be reported")
+
+
+# --- performing one control: arm, wait, re-read the phase, act, restart --------
+
+
+def control_repo(tmp_path):
+    """A checkout whose config the CLI itself can load.
+
+    `workers_root` is REQUIRED and absolute (`load_config`), and the pause flag
+    then lands beside it — OUTSIDE the checkout, which is what makes arming a
+    stop safe while an agent is running.
+    """
+    repo = make_repo(tmp_path)
+    (repo / ".autoloop" / "config.toml").write_text(
+        '[paths]\nstate_dir = ".autoloop"\n'
+        f'workers_root = "{(tmp_path / "workers").as_posix()}"\n',
+        encoding="utf-8",
+    )
+    return repo
+
+
+def write_lock(state_dir, run_id="run-a", pid=None):
+    """A LOCK file a live process really owns — this one. `LoopLock.is_live`
+    probes the pid, so a made-up number would read as dead and every wait below
+    would return instantly for the wrong reason."""
+    import socket
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "LOCK").write_text(json.dumps({
+        "pid": pid or os.getpid(), "hostname": socket.gethostname(),
+        "started_at": utcnow_iso(), "run_id": run_id,
+        "state_dir": str(state_dir),
+    }), encoding="utf-8")
+
+
+def recording_runner(calls, on_verb=None, rc=0, output=""):
+    def run(argv, cwd, timeout):
+        calls.append(list(argv))
+        if on_verb is not None:
+            answer = on_verb(list(argv))
+            if answer is not None:
+                return answer
+        return {"returncode": rc, "output": output}
+
+    return run
+
+
+class _FakeChild:
+    def __init__(self, code=None):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+
+def recording_spawn(spawns, state_dir, run_id="run-b", comes_up=True):
+    def spawn(argv, cwd, log):
+        spawns.append(list(argv))
+        if not comes_up:
+            return _FakeChild(code=2)
+        write_lock(state_dir, run_id=run_id)
+        return _FakeChild()
+
+    return spawn
+
+
+def fast_waits(monkeypatch):
+    """Every deadline in the control path, shrunk to test scale.
+
+    Not tidiness: at the shipped values a control whose stop never lands sits
+    for three minutes and then eight more seconds, so a test that regressed
+    would take the suite's wall clock with it instead of failing in one.
+    """
+    import autoloop.dashboard as dash
+
+    monkeypatch.setattr(dash, "CONTROL_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(dash, "CONTROL_WITHDRAW_GRACE", 0.05)
+    monkeypatch.setattr(dash, "CONTROL_RESTART_TIMEOUT", 2.0)
+
+
+def test_a_stop_the_loop_control_pauses_waits_acts_and_restarts(tmp_path, monkeypatch):
+    """The whole sequence, in order, with nothing skipped: arm the stop with the
+    CLI's own `pause`, wait for the lock to be released, run the verb, restart
+    with `run --continuous`, and report a pid read back from a LIVE lock under a
+    NEW run id."""
+    import autoloop.dashboard as dash
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        if "pause" in argv:  # the loop reaches its boundary and lets go
+            (state_dir / "LOCK").unlink()
+        return None
+
+    result = dash.perform_control(
+        repo, "release", {"task": "running-01", "wait": 2},
+        run_verb=recording_runner(calls, on_verb=on_verb),
+        spawn=recording_spawn(spawns, state_dir),
+    )
+
+    assert [c[3] for c in calls] == ["pause", "release"]
+    assert calls[1][-2:] == ["--", "running-01"]
+    assert result["ok"] is True and result["ran"] is True
+    assert result["loop"]["stopped"] is True
+    assert result["loop"]["restarted"] is True
+    assert result["loop"]["run_id"] == "run-b", "a NEW run, not the one we stopped"
+    assert result["stopped_in_phase"] == "executing"
+    assert spawns[0][3:5] == ["run", "--continuous"]
+    assert "resume" not in " ".join(spawns[0]), (
+        "`resume` runs ONE foreground round and exits — it is not a restart")
+
+
+def test_a_stop_that_lands_in_an_unsafe_phase_runs_nothing_and_puts_the_loop_back(
+    tmp_path, monkeypatch
+):
+    """THE check that makes the claim true rather than likely. The pause exit at
+    the top of `Orchestrator.run` is not gated on the phase, so a stop armed in
+    `executing` can land in `delivering` — where a packet's numbered parts are
+    already deposited. Nothing is run there, and the loop goes back up."""
+    import autoloop.dashboard as dash
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        if "pause" in argv:
+            # The agent finished and the loop moved on before it read the flag.
+            (state_dir / "state.json").write_text(
+                json.dumps({"phase": "delivering"}), encoding="utf-8")
+            (state_dir / "LOCK").unlink()
+        return None
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, "release", {"task": "running-01", "wait": 2},
+            run_verb=recording_runner(calls, on_verb=on_verb),
+            spawn=recording_spawn(spawns, state_dir),
+        )
+
+    assert caught.value.code == 409
+    assert "delivering" in caught.value.reason
+    assert "NOTHING was run" in caught.value.reason
+    assert [c[3] for c in calls] == ["pause"], "the verb must not have run"
+    assert spawns[0][3:5] == ["run", "--continuous"], "the loop is put back"
+    assert caught.value.extra["loop"]["restarted"] is True
+
+
+def test_a_stop_that_lands_with_a_sibling_lane_owing_a_packet_runs_nothing_either(
+    tmp_path, monkeypatch
+):
+    """The post-boundary check is asked of EVERY lane, for the reason it exists
+    at all.
+
+    The pre-check passing is not the question — where the fleet LANDED is. One
+    `LoopLock` stops N lanes at N separate boundaries, so lane 0 can land in
+    `ready` while lane 1 reads the flag a step later and lands mid-deposit. A
+    re-read of lane 0 alone would run the verb over a packet nobody had asked
+    about, which is the pre-check's own rule switching itself off at the only
+    moment it decides anything.
+    """
+    import autoloop.dashboard as dash
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    lane_state = state_dir / "lanes" / "_lane-1" / "state.json"
+    lane_state.parent.mkdir(parents=True)
+    # Both lanes are SAFE when the button is pressed, so the pre-check passes
+    # and the stop is armed — the divergence happens on the way down.
+    lane_state.write_text(json.dumps({"phase": "executing"}), encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        if "pause" in argv:
+            (state_dir / "state.json").write_text(
+                json.dumps({"phase": "ready"}), encoding="utf-8")
+            lane_state.write_text(json.dumps({"phase": "delivering"}),
+                                  encoding="utf-8")
+            (state_dir / "LOCK").unlink()
+        return None
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, "release", {"task": "running-01", "wait": 2},
+            run_verb=recording_runner(calls, on_verb=on_verb),
+            spawn=recording_spawn(spawns, state_dir),
+        )
+
+    assert caught.value.code == 409
+    assert "_lane-1" in caught.value.reason, "the refusal names WHICH lane"
+    assert "delivering" in caught.value.reason
+    assert "NOTHING was run" in caught.value.reason
+    assert [c[3] for c in calls] == ["pause"], "the verb must not have run"
+    assert spawns[0][3:5] == ["run", "--continuous"], "the loop is put back"
+    assert caught.value.extra["loop"]["restarted"] is True
+
+
+def test_a_session_that_will_not_parse_after_the_stop_still_puts_the_loop_back(
+    tmp_path, monkeypatch
+):
+    """The worst place a malformed `state.json` can be found: AFTER the loop has
+    been stopped.
+
+    A bare scalar there used to reach `.get` and raise, and the handler's generic
+    500 would have left the loop DOWN — the exact quiet outcome the whole panel
+    replaces. It refuses instead, and a refusal restarts.
+    """
+    import autoloop.dashboard as dash
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        if "pause" in argv:
+            # A valid JSON document, and not a session.
+            (state_dir / "state.json").write_text("123", encoding="utf-8")
+            (state_dir / "LOCK").unlink()
+        return None
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, "release", {"task": "running-01", "wait": 2},
+            run_verb=recording_runner(calls, on_verb=on_verb),
+            spawn=recording_spawn(spawns, state_dir),
+        )
+
+    assert caught.value.code == 409
+    assert "no readable session" in caught.value.reason
+    assert "NOTHING was run" in caught.value.reason
+    assert [c[3] for c in calls] == ["pause"], "the verb must not have run"
+    assert caught.value.extra["loop"]["restarted"] is True, "never left down"
+    assert spawns[0][3:5] == ["run", "--continuous"]
+
+
+def test_a_stop_that_never_reaches_a_boundary_is_withdrawn_and_runs_nothing(
+    tmp_path, monkeypatch
+):
+    """A write-capable agent can hold a step for tens of minutes. The wait is
+    bounded, and a wait that runs out WITHDRAWS the stop rather than leaving a
+    flag armed that would stop the loop later for a reason nobody remembers."""
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    monkeypatch.setattr(dash, "CONTROL_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(dash, "CONTROL_WITHDRAW_GRACE", 0.05)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    config, _path, _sd = dash._control_config(repo)
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        if "pause" in argv:  # the real verb arms the flag; the loop never reads it
+            config.pause_file.parent.mkdir(parents=True, exist_ok=True)
+            config.pause_file.touch()
+        return None
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, "release", {"task": "running-01", "wait": 0.05},
+            run_verb=recording_runner(calls, on_verb=on_verb),
+            spawn=recording_spawn(spawns, state_dir),
+        )
+
+    assert caught.value.code == 409
+    assert "NOTHING was run" in caught.value.reason
+    assert "withdrawn" in caught.value.reason
+    assert [c[3] for c in calls] == ["pause"]
+    assert spawns == [], "the loop never stopped, so there is nothing to restart"
+    assert not cli.pause_requested(config), "the withdrawn stop must not linger"
+
+
+def test_a_restart_that_never_took_the_lock_is_reported_as_the_loop_being_down(
+    tmp_path, monkeypatch
+):
+    """The loud outcome. The procedure this panel replaces went wrong by leaving
+    the loop down QUIETLY, so a restart that cannot be verified is a failure of
+    the whole action, not a footnote on a success."""
+    import autoloop.dashboard as dash
+
+    monkeypatch.setattr(dash, "CONTROL_POLL_SECONDS", 0.01)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "ready"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    result = dash.perform_control(
+        repo, "release", {"task": "running-01"},
+        run_verb=recording_runner(
+            calls, on_verb=lambda a: (state_dir / "LOCK").unlink()
+            if "pause" in a else None),
+        spawn=recording_spawn(spawns, state_dir, comes_up=False),
+    )
+
+    assert result["ran"] is True, "the verb DID run — only the restart failed"
+    assert result["ok"] is False
+    assert result["loop"]["restarted"] is False
+    assert any("THE LOOP IS DOWN" in n for n in result["notes"])
+    assert "rc=2" in result["loop"]["detail"]
+
+
+def test_a_restart_is_never_believed_from_a_lock_file_alone(tmp_path, monkeypatch):
+    """Two ways "there is a LOCK" is not evidence: a CORRUPT file, which
+    `LoopLock.read` answers with a `pid=-1` sentinel that is not live, and the
+    SAME run id, which is the lock we stopped and not a fresh run."""
+    import autoloop.dashboard as dash
+
+    monkeypatch.setattr(dash, "CONTROL_POLL_SECONDS", 0.01)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    (state_dir / "LOCK").write_text("{not json", encoding="utf-8")
+    corrupt = dash._verify_restart(state_dir, "run-a", _FakeChild(),
+                                   time.monotonic() + 0.05)
+    assert corrupt["restarted"] is False
+
+    write_lock(state_dir, run_id="run-a")
+    same = dash._verify_restart(state_dir, "run-a", _FakeChild(),
+                                time.monotonic() + 0.05)
+    assert same["restarted"] is False
+
+    write_lock(state_dir, run_id="run-b")
+    fresh = dash._verify_restart(state_dir, "run-a", _FakeChild(),
+                                 time.monotonic() + 5)
+    assert fresh["restarted"] is True and fresh["pid"] == os.getpid()
+
+
+def test_operator_free_text_can_never_become_an_argparse_flag(tmp_path):
+    """Argparse reads a value beginning with `-` as another option. Every flag
+    is emitted `--flag=value` and every positional sits after a bare `--`, so
+    there is no string this panel can type that argparse reads as a flag — and
+    the proof is that the real parser parses it back."""
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    config_path = tmp_path / "config.toml"
+
+    def parse(argv):
+        # `SystemExit` is caught rather than allowed to propagate: an
+        # unprotected `--help` would make argparse print help and exit, which in
+        # a pytest-xdist worker is a dead node rather than a failed assertion —
+        # a test that cannot report the bug it is for.
+        try:
+            return cli.build_parser().parse_args(argv[3:])
+        except SystemExit as exc:  # pragma: no cover - the bug this test is for
+            pytest.fail(
+                f"argparse read the operator's own text as a flag (exit "
+                f"{exc.code}) from {argv[3:]!r}")
+
+    parsed = parse(dash._control_argv(
+        dash.ACTIONS_BY_ID["answer"],
+        {"blocker": "blk-t1-001", "text": "--help"}, config_path,
+    ))
+    assert parsed.blocker_id == "blk-t1-001" and parsed.text == "--help"
+
+    parsed = parse(dash._control_argv(
+        dash.ACTIONS_BY_ID["discard"],
+        {"task": "parked-01", "reason": "-x it was wrong"}, config_path,
+    ))
+    assert parsed.task_id == "parked-01" and parsed.reason == "-x it was wrong"
+
+
+def test_a_blank_required_reason_is_refused_before_anything_runs(tmp_path):
+    """The CLI records the reason, and a blank one is a decision with nothing
+    attached to it."""
+    import autoloop.dashboard as dash
+
+    repo = control_repo(tmp_path)
+    write_tasks(repo, [a_task("parked-01", status="blocked")])
+    calls = []
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(repo, "discard", {"task": "parked-01", "reason": "  "},
+                             run_verb=recording_runner(calls),
+                             spawn=recording_spawn([], repo / ".autoloop"))
+
+    assert "reason" in caught.value.reason
+    assert calls == []
+
+
+def test_a_verbs_own_refusal_is_reported_and_nothing_is_written(tmp_path):
+    """A verb that cannot take the lock REPORTS rather than writing: the CLI
+    refuses inside `LoopLock.acquire`, before it touches anything, and this
+    endpoint carries that sentence back verbatim."""
+    import autoloop.dashboard as dash
+
+    repo = control_repo(tmp_path)
+    tasks_file = write_tasks(repo, [a_task("running-01", status="in_progress")])
+    before = tasks_file.read_bytes()
+    held = ("another autoloop process holds .autoloop/LOCK (pid 5150 ...). "
+            "Wait for it or stop it — locks are never stolen.")
+
+    result = dash.perform_control(
+        repo, "release", {"task": "running-01"},
+        run_verb=recording_runner([], rc=1, output=held),
+        spawn=recording_spawn([], repo / ".autoloop"),
+    )
+
+    assert result["ok"] is False and result["returncode"] == 1
+    assert "locks are never stolen" in result["output"]
+    assert tasks_file.read_bytes() == before
+
+
+def test_a_control_writes_nothing_of_its_own(tmp_path):
+    """The read-only posture, kept. The dashboard runs the CLI; it does not
+    reach into the state directory itself, so with the verb stubbed out NOTHING
+    under the checkout moves — which is also why the escape detector can still
+    attribute every write to the loop's own process."""
+    import autoloop.dashboard as dash
+
+    repo = control_repo(tmp_path)
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (repo / ".autoloop" / "state.json").write_text(json.dumps({"phase": "ready"}),
+                                                   encoding="utf-8")
+    before = snapshot(repo)
+
+    result = dash.perform_control(
+        repo, "release", {"task": "running-01"},
+        run_verb=recording_runner([]), spawn=recording_spawn([], repo / ".autoloop"),
+    )
+
+    assert result["ran"] is True
+    assert snapshot(repo) == before, "the page itself wrote something"
+    assert any("was not running" in n for n in result["notes"]), (
+        "a loop that was already stopped is left stopped")
+
+
+def test_no_control_reaches_for_resume_anywhere():
+    """`_cmd_resume` clears the flags and calls `_cmd_run` with `continuous`
+    defaulting to False, so it runs ONE foreground round and exits. Nothing here
+    may use it as a restart."""
+    import autoloop.dashboard as dash
+
+    for action in dash.OPERATOR_ACTIONS:
+        assert "resume" not in action.verb
+        assert action.arm in ("", "pause", "abort")
+    source = Path(dash.__file__).read_text(encoding="utf-8")
+    restart = source.split("def _restart(")[1].split("\ndef ")[0]
+    assert '"run", "--continuous"' in restart
+    assert '"resume"' not in restart
+
+
+def test_the_control_endpoint_refuses_a_field_it_has_no_use_for(tmp_path, monkeypatch):
+    repo = control_repo(tmp_path)
+
+    with serving(repo, tmp_path / "outside" / "inbox", monkeypatch) as base:
+        status, body = post(base, "/api/control",
+                            {"action": "pause", "approved_paths": ["x"]})
+
+    assert status == 400
+    assert "approved_paths" in body["error"]
+
+
+def test_the_control_endpoint_refuses_an_action_it_does_not_have(tmp_path, monkeypatch):
+    repo = control_repo(tmp_path)
+
+    with serving(repo, tmp_path / "outside" / "inbox", monkeypatch) as base:
+        status, body = post(base, "/api/control", {"action": "rm-rf"})
+
+    assert status == 404 and "rm-rf" in body["error"]
+
+
+def test_a_second_control_is_told_rather_than_queued(tmp_path, monkeypatch):
+    """Two tabs can post at once on a threading server, and two actions
+    interleaving would arm a stop, have the other clear it, and restart the loop
+    twice. The second caller is TOLD — never queued behind a wait it cannot
+    see."""
+    import autoloop.dashboard as dash
+
+    repo = control_repo(tmp_path)
+    assert dash._ACTION_LOCK.acquire(blocking=False)
+    try:
+        with serving(repo, tmp_path / "outside" / "inbox", monkeypatch) as base:
+            status, body = post(base, "/api/control", {"action": "pause"})
+    finally:
+        dash._ACTION_LOCK.release()
+
+    assert status == 409
+    assert "another operator action is in flight" in body["error"]
+    assert "NOT queued" in body["error"]
+
+
+def test_the_control_endpoint_keeps_the_pages_routing_guards(tmp_path, monkeypatch):
+    """The same two cheap mitigations every other write path on this page has."""
+    repo = control_repo(tmp_path)
+
+    with serving(repo, tmp_path / "outside" / "inbox", monkeypatch) as base:
+        no_header, _ = post(base, "/api/control", {"action": "pause"}, headers={})
+        cross, _ = post(base, "/api/control", {"action": "pause"},
+                        headers={"X-Autoloop": "1", "Origin": "http://evil.example"})
+
+    assert no_header == 403 and cross == 403
+
+
+def test_reading_and_the_control_panel_both_work_while_the_loop_holds_the_lock(
+    tmp_path, monkeypatch
+):
+    """Reading stays free: health, blockers, the roadmap and the panel that says
+    what may be pressed all render against a HELD lock, which is the only time
+    any of it is useful.
+
+    The lock names a live process — this one — because that is exactly what
+    `LoopLock.is_live` decides on: same host, not before boot, `os.kill(pid, 0)`.
+    A second process would prove nothing further here and the neighbouring
+    priority test already runs one; what this asks is that a READ takes no lock,
+    and a read that took one would block on any live holder.
+    """
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    (state_dir / "state.json").write_text(json.dumps({"phase": "awaiting"}),
+                                          encoding="utf-8")
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    write_lock(state_dir, run_id="run-live")
+
+    with serving(repo, tmp_path / "outside" / "inbox", monkeypatch) as base:
+        with _LOOPBACK.open(base + "/api/state", timeout=30) as resp:
+            payload = json.loads(resp.read())
+
+    controls_payload = payload["controls"]
+    assert controls_payload["loop"]["running"] is True
+    assert controls_payload["loop"]["pid"] == str(os.getpid())
+    assert controls_payload["stop"]["safe"] is False
+    # `awaiting` owes a review packet, so every stop is refused — and says so.
+    for row in controls_payload["actions"]:
+        if row["id"] in ("pause", "release", "reset"):
+            assert row["enabled"] is False and row["reason"]
+    assert payload["blockers"] == [] and payload["roadmap"], "reading still works"
+
+
+# --- the page renders the refusal, never a silent grey ------------------------
+
+
+def test_the_page_disables_a_control_only_with_its_reason_shown():
+    """Beside it AND on hover. An operator who cannot see why is worse off than
+    one reading the CLI's refusal, which is what this panel replaces."""
+    from autoloop.dashboard import PAGE
+
+    assert 'id="opctl"' in PAGE and 'id="opactions"' in PAGE
+    assert "function renderControls(" in PAGE
+    assert "renderControls(d);" in PAGE
+    # One helper builds every button, so there is no second path that could
+    # disable one without a title, and one builds every row's visible reason.
+    assert '`<button class="save opbtn" data-act="${esc(id)}"${attrs || ""}`' in PAGE
+    assert '` title="${esc(why || label)}"${why ? " disabled" : ""}' in PAGE
+    assert '<span class="why">${esc(why || "")}</span>' in PAGE
+
+
+def test_the_panels_inputs_are_static_markup_a_poll_can_never_clear():
+    """The operator's half-typed reason lives in the DOM. `renderControls`
+    writes the buttons, the state line and the ledger — never an input's
+    value."""
+    from autoloop.dashboard import PAGE
+
+    for field in ("optask", "opreason", "opsuper", "opanswer"):
+        assert f'id="{field}"' in PAGE
+    body = PAGE.split("function renderControls(")[1].split("\nasync function opRun")[0]
+    for field in ("optask", "opreason", "opsuper", "opanswer"):
+        assert f'getElementById("{field}").value' not in body
+
+
+def test_the_page_never_decides_for_itself_whether_a_control_is_allowed():
+    """`opWhy` reads the backend's verdict and nothing else. A second opinion in
+    JavaScript is how a button starts looking pressable for something the server
+    refuses."""
+    from autoloop.dashboard import PAGE
+
+    why = PAGE.split("function opWhy(")[1].split("\nconst opBtn")[0]
+    assert "meta.enabled" in why and "per.enabled" in why
+    for invented in ("phase", "in_progress", "delivering", "LOCK"):
+        assert invented not in why, (
+            f"{invented!r} in opWhy is the page re-deriving a verdict it is given")
