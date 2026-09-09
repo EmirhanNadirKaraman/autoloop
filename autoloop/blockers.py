@@ -143,6 +143,89 @@ NO_TASK = "(loop)"
 #:     command that moves the task.
 STRANDED_AFTER_FAULT = "stranded_after_environment_fault"
 
+#: `code` for a PLANNING SOURCE CONFLICT (ctx-06): two of the sources task
+#: generation reads — the operator's request, the accepted tasks and decisions,
+#: the tree, a context record — disagreed about one subject, and generation
+#: refused to pick a winner. Written by `audit/taskgen.generate_tasks` through
+#: `record_planning_conflict` below.
+#:
+#: **Recorded WITHOUT parking**, like `STRANDED_AFTER_FAULT` and
+#: `orchestrator.SPLIT_ACCEPTANCE_UNRECONCILED`, and both of the consequences
+#: that constant documents apply here too: it is invisible to
+#: `test_m1_hardening._emitted_blocker_codes` (which AST-walks `_to_needs_user`
+#: and `_to_fault_stop` only), so it is deliberately absent from
+#: `cli._RESOLUTION_PRECONDITIONS`, and it never changes a task's status. What
+#: it stops is one GENERATION — no task is proposed from a subject whose sources
+#: disagree about scope — and the loop is otherwise untouched.
+#:
+#: A durable record rather than a field in `state.json` because that is the
+#: whole requirement: this store already survives a `task_fatal` park and the
+#: session reset that follows it, and an operator can list and answer it
+#: (`python -m autoloop blockers` / `answer`) days later.
+PLANNING_SOURCE_CONFLICT = "planning_source_conflict"
+
+#: Where a planning conflict is filed: `planning:<identity>`, one phase string
+#: per DISAGREEMENT.
+#:
+#: The phase slot carries the identity because `BlockerStore.find_open` keys a
+#: record on `(task_id, code, phase)` and a bump REPLACES `question` and
+#: `detail`. Filed under one constant phase, two genuinely different conflicts
+#: would collapse into a single record carrying only the text of whichever was
+#: written last — losing the naming of both sources that is the entire point of
+#: the record. Digesting the condition into the key is the same move
+#: `refusal_identity` makes for the same reason.
+PLANNING_CONFLICT_PHASE_PREFIX = "planning:"
+
+
+def planning_conflict_phase(identity: str) -> str:
+    """The `phase` a conflict with this identity is filed under.
+
+    Raises on an empty identity rather than filing under a shared key: `""`
+    would make every unidentifiable conflict the same record, so the second one
+    would silently overwrite the first one's account of who disagreed. The one
+    producer (`inbox.SourceConflict.identity`) always digests something, so
+    arriving here empty is a bug and is reported as one.
+    """
+    if not str(identity or "").strip():
+        raise StateError("a planning conflict with no identity cannot be recorded")
+    return f"{PLANNING_CONFLICT_PHASE_PREFIX}{identity}"
+
+
+def record_planning_conflict(
+    store: "BlockerStore",
+    *,
+    identity: str,
+    question: str,
+    detail: str,
+    now: str,
+    task_id: str = NO_TASK,
+    session_id: str = "",
+    lane_id: str = "",
+) -> "Blocker":
+    """Persist ONE planning source conflict. Returns the record.
+
+    `task_id` defaults to `NO_TASK`: generation runs BEFORE the task it would
+    propose exists, so there is no task id to name and inventing one would put a
+    quarantine on a task that was never created.
+
+    `kind` is `task_fatal` and is not a parameter. A conflict holds up ONE
+    subject's generation and nothing else, so it is the narrower of the two
+    kinds — and an invented third kind would rank with `loop_fatal` in
+    `_KIND_RANK`, quietly making this record the `primary_blocker` that `health`,
+    `heartbeat` and the CLI's status all report the loop as stuck on.
+    """
+    return store.record(
+        task_id=task_id,
+        kind="task_fatal",
+        code=PLANNING_SOURCE_CONFLICT,
+        question=question,
+        detail=detail,
+        phase=planning_conflict_phase(identity),
+        now=now,
+        session_id=session_id,
+        lane_id=lane_id,
+    )
+
 
 # ---- autonomous recovery (halt-02, 2026-08-25) ------------------------------
 #

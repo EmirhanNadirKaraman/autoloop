@@ -2467,3 +2467,104 @@ def test_the_exhaustion_summary_for_a_single_blocker_is_unchanged(capsys):
     assert "1 blocker(s) are still open" in out
     assert f"  {only.id}  task=t-a  code=review_round_cap  {only.question}" in out
     assert "primary" not in out
+
+
+# =============================================================================
+# §  planning source conflicts (ctx-06)
+#
+# A conflict between the sources planning reads is recorded HERE rather than in
+# `state.json`, because this store already survives a task_fatal park and the
+# session reset that follows it. These own that durability and the one thing
+# that would silently destroy it: two different conflicts collapsing into one
+# record.
+# =============================================================================
+
+
+def conflict_store(tmp_path):
+    from autoloop.blockers import record_planning_conflict
+
+    return BlockerStore(tmp_path / "blockers"), record_planning_conflict
+
+
+def test_a_planning_conflict_is_durable_and_names_no_task(tmp_path):
+    store, record = conflict_store(tmp_path)
+
+    blocker = record(
+        store, identity="abc123", question="A and B disagree",
+        detail="source A: ...\nsource B: ...", now="2026-09-09T00:00:00+00:00",
+    )
+
+    assert blocker.task_id == NO_TASK, "generation precedes the task it would propose"
+    assert blocker.kind == "task_fatal"
+    assert blocker.code == "planning_source_conflict"
+    # Durable: a FRESH store over the same directory reads it back whole, which
+    # is what surviving a set-aside and a session reset actually means.
+    [reloaded] = BlockerStore(tmp_path / "blockers").open_blockers()
+    assert reloaded.question == "A and B disagree"
+    assert "source B" in reloaded.detail
+
+
+def test_two_different_conflicts_do_not_collapse_into_one_record(tmp_path):
+    """`find_open` keys on (task, code, phase) and a bump REPLACES question and
+    detail. Filed under one phase these would be a single record carrying only
+    the second one's account of who disagreed — losing the naming of both
+    sources, which is the entire content of the record."""
+    store, record = conflict_store(tmp_path)
+
+    record(store, identity="first", question="A vs B", detail="a", now="2026-09-09T00:00:00Z")
+    record(store, identity="second", question="C vs D", detail="c", now="2026-09-09T00:00:01Z")
+
+    questions = sorted(b.question for b in store.open_blockers())
+    assert questions == ["A vs B", "C vs D"]
+
+
+def test_the_same_conflict_seen_twice_is_one_record(tmp_path):
+    """The other direction, and why the key is a digest of the CONDITION: a
+    second generation run finding the same disagreement must not fill the
+    operator's queue with duplicates of one problem."""
+    store, record = conflict_store(tmp_path)
+
+    record(store, identity="same", question="A vs B", detail="a", now="2026-09-09T00:00:00Z")
+    again = record(
+        store, identity="same", question="A vs B", detail="a", now="2026-09-09T00:01:00Z"
+    )
+
+    assert len(store.open_blockers()) == 1
+    assert again.recurrences == 2
+
+
+def test_a_conflict_with_no_identity_is_refused_rather_than_filed(tmp_path):
+    """`""` would be a phase every unidentifiable conflict shared, so the second
+    would overwrite the first one's text. Refused instead."""
+    store, record = conflict_store(tmp_path)
+
+    for empty in ("", "   ", None):
+        with pytest.raises(StateError, match="no identity"):
+            record(store, identity=empty, question="q", detail="d", now="2026-09-09T00:00:00Z")
+    assert store.open_blockers() == []
+
+
+def test_a_planning_conflict_does_not_become_the_primary_blocker(tmp_path):
+    """It uses `task_fatal` rather than a new kind, deliberately: `_KIND_RANK`
+    promotes an unrecognised kind to loop_fatal, which would make a planning
+    conflict the thing `health`, `heartbeat` and `status` report the loop as
+    stuck on."""
+    store, record = conflict_store(tmp_path)
+    store.save(Blocker(
+        id="blk-t-001", task_id="t", kind="loop_fatal", code="login_expired",
+        question="the login expired", detail="", phase="submitting",
+        created_at="2026-09-09T00:00:00+00:00",
+    ))
+    record(store, identity="abc", question="A vs B", detail="a",
+           now="2026-09-09T01:00:00+00:00")
+
+    assert store.primary_blocker().code == "login_expired"
+
+
+def test_the_conflict_code_needs_no_resolution_precondition():
+    """Recorded WITHOUT parking, like `STRANDED_AFTER_FAULT`: it is invisible to
+    `test_m1_hardening._emitted_blocker_codes`, whose AST walk covers the two
+    park emitters only, and that dict's keys must all be emitted codes."""
+    from autoloop.blockers import PLANNING_SOURCE_CONFLICT
+
+    assert PLANNING_SOURCE_CONFLICT not in cli._RESOLUTION_PRECONDITIONS

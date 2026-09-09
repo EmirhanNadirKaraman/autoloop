@@ -15,7 +15,12 @@ def finding(fid="f1", domain="d1", category="defect", severity="high",
         confidence=confidence,
         affected_files=tuple(files),
         symbols=(),
-        evidence="saw it",
+        # A LOCATION, not just a sentence. ctx-06 refuses a finding whose
+        # evidence cites nowhere a reviewer can open, so the shared fixture
+        # carries what the schema has always asked for ("file:line references
+        # to what you saw"); `test_audit_compaction.item` already did.
+        # `test_audit_taskgen` has the deliberately-uncited case.
+        evidence="a.py:12 saw it",
         impact=impact,
         proposed_action=proposed_action,
         dependencies=tuple(deps),

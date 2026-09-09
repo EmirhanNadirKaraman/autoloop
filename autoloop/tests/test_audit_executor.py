@@ -4,6 +4,7 @@ task proposal, revise-of-audit, audit-only policy, failure honesty."""
 
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,8 +13,11 @@ from gitrepo import make_repo_from_template
 from autoloop.audit.agents import AgentResult
 from autoloop.audit.executor import AuditExecutor
 from autoloop.audit.markdown import MarkdownPolicy
+from autoloop.blockers import PLANNING_SOURCE_CONFLICT, BlockerStore
+from autoloop.cli import _planning_sources
 from autoloop.contract import Decision, Directive
 from autoloop.git_gateway import GitGateway
+from autoloop.inbox import attach_planning_sources
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import TaskRegistry
 
@@ -29,7 +33,12 @@ def repo(tmp_path):
     make_repo_from_template(
         root,
         branch="main",
-        files=(("README.md", "hi"),),
+        # `a.py` is TRACKED deliberately (ctx-06): every finding below cites
+        # `a.py:12`, and a citation to a path this checkout does not have is
+        # refused rather than believed — so a fixture without the file would make
+        # every end-to-end run here assert on an empty proposal for a reason that
+        # has nothing to do with what it is testing.
+        files=(("README.md", "hi"), ("a.py", "x = 1\n")),
         email="t@e.c",
         name="T",
     )
@@ -47,7 +56,13 @@ def good_findings(fid="f1", category="defect"):
                     "confidence": "confirmed",
                     "affected_files": ["a.py"],
                     "symbols": [],
-                    "evidence": "seen",
+                    # A LOCATION, which the schema has always asked `evidence`
+                    # for ("file:line references to what you saw"). ctx-06 makes
+                    # it load-bearing: a finding citing nowhere a reviewer can
+                    # open is refused and becomes no task, so a fixture reading
+                    # "seen" would make this whole end-to-end run assert on an
+                    # empty proposal. `test_audit_taskgen` owns the uncited case.
+                    "evidence": "a.py:12 seen",
                     "impact": "bad",
                     "proposed_action": "fix the thing",
                     "dependencies": [],
@@ -89,13 +104,36 @@ def ok_command(argv, **kwargs):
     return Proc()
 
 
-def build_executor(repo, tmp_path, runner=None, validation=(("ruff", "check", "."),)):
+def planning_config(tmp_path):
+    """The three fields `cli._planning_sources` reads, and nothing else.
+
+    A stand-in rather than a real `AutoloopConfig` because building one needs a
+    file and a whole deployment; what is being exercised is cli's own wiring
+    function, which is the point — an end-to-end test that hand-rolled its own
+    seam would pass on wiring production does not have.
+    """
+    return SimpleNamespace(
+        workers_root=tmp_path / "workers",
+        state_dir=tmp_path / "state",
+        blockers_dir=tmp_path / "blockers",
+    )
+
+
+def build_executor(
+    repo, tmp_path, runner=None, validation=(("ruff", "check", "."),), registry=None
+):
     git = GitGateway(repo, PolicyEngine(PolicyConfig()))
+    registry = registry if registry is not None else TaskRegistry()
+    # ctx-06: the planning seam, attached through `cli`'s own wiring function and
+    # onto the object `AuditExecutor` hands `generate_tasks`. This is the whole
+    # production route — a store to record a conflict in, a tree to check a cited
+    # location against, and the operator's drafts to compare with.
+    attach_planning_sources(registry, _planning_sources(planning_config(tmp_path), repo))
     return AuditExecutor(
         git=git,
         agent_runner=runner or FakeRunner(),
         markdown=MarkdownPolicy(repo),
-        registry=TaskRegistry(),
+        registry=registry,
         run_dir_base=tmp_path / "runs",
         validation_commands=validation,
         max_parallel_agents=2,
@@ -432,3 +470,193 @@ def test_an_audit_unit_id_is_not_in_the_roadmap_namespace():
     assert is_audit_unit("audit-0001"), "a unit minted before the rename still counts"
     assert not is_audit_unit("t1")
     assert not is_audit_unit("brw-19c")
+
+
+# ---- planning discipline on the PRODUCTION path (ctx-06) -------------------
+#
+# `AuditExecutor.execute` is the only caller of `generate_tasks` that ships, so
+# the discipline is worth exactly what it is worth THERE. These two drive the
+# real executor rather than calling the generator directly: a guard that holds
+# in `test_audit_taskgen.py` and is bypassed by the wiring is a guard nobody has.
+
+
+def audited_registry(*tasks):
+    return TaskRegistry(list(tasks))
+
+
+def written_report(repo):
+    [report] = [p for p in (repo / "docs").iterdir() if p.name.startswith("AUDIT_")]
+    return report.read_text(encoding="utf-8")
+
+
+def test_the_audit_path_stops_rather_than_proposing_a_task_over_a_conflict(repo, tmp_path):
+    """A real audit run whose finding disagrees with an accepted task about which
+    files the work touches. The run must not quietly propose the task anyway, and
+    the operator's REPORT — not an object in memory — must name both sources."""
+    from autoloop.tasks import Task
+
+    runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
+    registry = audited_registry(
+        Task(
+            id="already",
+            title="t",
+            description="covers security_paths:f1",
+            approved_paths=("b.py",),          # the finding needs a.py
+        )
+    )
+    outcome = build_executor(repo, tmp_path, runner, registry=registry).execute(
+        audit_directive(), None
+    )
+
+    # NOTHING was proposed, and the artifact a `plan` decision is adopted from is
+    # empty rather than quietly holding a task nobody reconciled.
+    [run_dir] = (tmp_path / "runs").iterdir()
+    assert json.loads((run_dir / "proposed_tasks.json").read_text()) == []
+    assert "0 tasks proposed" in outcome.summary
+
+    report = written_report(repo)
+    assert "generation stopped" in report
+    assert "accepted_decision" in report and "repository" in report
+    assert "a.py" in report and "b.py" in report
+    assert "No winner was chosen" in report
+    # AND THE RECORD EXISTS, on disk, where `python -m autoloop blockers` reads
+    # it. This is what the wiring buys: before it, the audit path had no store
+    # and the report could only say there was nothing to go and answer.
+    [blocker] = BlockerStore(tmp_path / "blockers").open_blockers()
+    assert blocker.code == PLANNING_SOURCE_CONFLICT
+    assert "a.py" in blocker.detail and "b.py" in blocker.detail
+    assert "NO DURABLE RECORD EXISTS" not in report
+
+
+def test_an_ordinary_audit_run_still_proposes_its_tasks(repo, tmp_path):
+    """The control, without which the test above is satisfied by a generator that
+    stopped on everything. Same run, same finding, a registry that says nothing
+    about it: the task is proposed and no conflict is reported."""
+    runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
+    outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+
+    [run_dir] = (tmp_path / "runs").iterdir()
+    assert [t["id"] for t in json.loads((run_dir / "proposed_tasks.json").read_text())] == [
+        "au-001"
+    ]
+    assert "1 tasks proposed" in outcome.summary
+    assert "generation stopped" not in written_report(repo)
+
+
+def test_the_audit_path_records_a_non_scope_conflict_and_keeps_going(repo, tmp_path):
+    """THE ACCEPTANCE CRITERION THAT NEEDS A REAL STORE, on the shipping path.
+
+    Two sources that word one scope differently and mean the SAME files: an
+    accepted task and the operator's own draft. Nothing about the work changes,
+    so generation must not stop — and the disagreement must still be durable,
+    because "recorded and continued" is only honest when the record exists.
+    """
+    from autoloop.inbox import DraftTask, IntakeDraft, intake_dir_for, render_draft
+    from autoloop.tasks import Task
+
+    config = planning_config(tmp_path)
+    intake = intake_dir_for(config.workers_root, config.state_dir)
+    intake.mkdir(parents=True, exist_ok=True)
+    (intake / "idea.md").write_text(
+        render_draft(
+            IntakeDraft(
+                slug="idea",
+                idea="tidy up security_paths:f1",
+                tasks=(
+                    DraftTask(
+                        id="t1", title="t",
+                        # The same two files the accepted task names, written the
+                        # other way round: different words, identical scope.
+                        approved_paths=("b.py", "a.py"),
+                    ),
+                ),
+            )
+        ),
+        encoding="utf-8",
+    )
+    registry = audited_registry(
+        Task(
+            id="already",
+            title="t",
+            description="covers security_paths:f1",
+            approved_paths=("a.py", "b.py"),
+        )
+    )
+    runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
+    outcome = build_executor(repo, tmp_path, runner, registry=registry).execute(
+        audit_directive(), None
+    )
+
+    # Generation CONTINUED.
+    [run_dir] = (tmp_path / "runs").iterdir()
+    assert [t["id"] for t in json.loads((run_dir / "proposed_tasks.json").read_text())] == [
+        "au-001"
+    ]
+    assert "1 tasks proposed" in outcome.summary
+    assert "generation stopped" not in written_report(repo)
+
+    # And the conflict is DURABLE, naming both sources, with no winner.
+    [blocker] = BlockerStore(tmp_path / "blockers").open_blockers()
+    assert blocker.code == PLANNING_SOURCE_CONFLICT
+    assert "accepted_decision: already" in blocker.detail
+    assert "draft:idea:t1" in blocker.detail
+    # The round that works the task is told, too.
+    proposed = json.loads((run_dir / "proposed_tasks.json").read_text())
+    assert "Recorded source conflict (no winner chosen)" in proposed[0]["description"]
+
+
+def test_the_wiring_layer_supplies_every_planning_input(repo, tmp_path):
+    """`cli._planning_sources` is the whole production half of ctx-06, so what it
+    carries is asserted directly rather than inferred from a run that happened to
+    behave."""
+    from autoloop.cli import CONTEXT_TIER_UNWIRED_NOTE
+    from autoloop.inbox import intake_dir_for, resolve_tree
+
+    config = planning_config(tmp_path)
+    sources = _planning_sources(config, repo)
+
+    assert sources.blocker_store.directory == tmp_path / "blockers"
+    assert CONTEXT_TIER_UNWIRED_NOTE in sources.notes
+
+    # THE TREE IS LAZY, and this is what that buys: a file added after the loop
+    # started is still verifiable. Read once at wiring time, a citation to it
+    # would be refused for the rest of the process's life.
+    (repo / "later.py").write_text("y = 2\n", encoding="utf-8")
+    run_git(repo, "add", "later.py")
+    tree = resolve_tree(sources.tree)
+    assert tree.read and tree.holds("a.py") and tree.holds("later.py")
+
+    # And the provider reads the operator's drafts from the intake directory
+    # this deployment uses — the operator-request tier, wired, not represented.
+    from autoloop.inbox import DraftTask, IntakeDraft, render_draft
+
+    intake = intake_dir_for(config.workers_root, config.state_dir)
+    intake.mkdir(parents=True, exist_ok=True)
+    (intake / "idea.md").write_text(
+        render_draft(
+            IntakeDraft(
+                slug="idea",
+                idea="about security_paths:f1",
+                tasks=(DraftTask(id="t1", title="t", approved_paths=("a.py",)),),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    class _Finding:
+        qualified_id = "security_paths:f1"
+
+    claims, notes = sources.provider([_Finding()])
+    [claim] = claims
+    assert claim.author == "draft:idea:t1" and claim.paths == ("a.py",)
+    assert notes == ()
+
+
+def test_the_audit_path_says_which_tier_it_did_not_compare(repo, tmp_path):
+    """A tier with no producer must not read as a tier that agreed. The context
+    records have no index anywhere in this loop, and the report says so rather
+    than leaving a reviewer to infer silence meant assent."""
+    runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
+    build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+
+    assert "no context record index is wired" in written_report(repo)

@@ -31,6 +31,7 @@ from autoloop.audit.findings import (
 from autoloop.audit.reconcile import reconcile
 from autoloop.audit.report import render_report
 from autoloop.audit.taskgen import generate_tasks
+from autoloop.inbox import TreeReader
 from autoloop.tasks import TaskRegistry
 
 #: Re-exported so the reshape tests below can request the real-git fixture.
@@ -290,7 +291,13 @@ def test_three_reports_of_one_defect_collapse_without_losing_any_of_them():
 
 def render(findings):
     reconciled = reconcile(findings)
-    proposal = generate_tasks(reconciled, TaskRegistry())
+    # THE TREE the fixture's citations are checked against (ctx-06): `item`
+    # writes `evidence: "a.py:10 does X"`, and a generation with no reader
+    # refuses a model-authored citation rather than believing it — so a report
+    # test that stated no tree would render an empty proposal and assert nothing.
+    proposal = generate_tasks(
+        reconciled, TaskRegistry(), tree=TreeReader.of_paths(("a.py",))
+    )
     return render_report(
         date="2026-08-01",
         branch="main",
