@@ -16,6 +16,7 @@ rewrites.
 | `tasks.json` | object | The task registry: id, status, priority, `depends_on`, `approved_paths`. |
 | `transcript.jsonl` | one JSON object per line | Append-only event log. A partial final line is expected and tolerated. |
 | `executions/<task>.json` | object | Per-task execution record: branch, base sha, candidate sha, review round, attempt ledger. |
+| `context-packets/<task>.json` | object | The context packet the task's CURRENT round was cut with. Replaced per round. |
 | `blockers/` | one file per blocker | Open and resolved blockers, with the code that raised them. |
 | `pending_upgrade.json` | object | A merge that changed loop code, and whether the handoff happened. |
 | `wanted_decisions.json` | object | `{verb: count}` — the verbs reviewers said they WOULD have used, `none` included. Evidence for a human; enforces nothing, so an unreadable file is read as empty and rewritten. |
@@ -166,6 +167,54 @@ window shut, exactly as a live, worker-backed or published one does.
 Nothing archives an orphaned record automatically. `release` and `discard` both
 require a task id the registry knows, so retiring one is still a move into
 `executions/archive/` by hand.
+
+## Context packet
+
+`context-packets/<task>.json`, one per task, written by
+`context_packet.ContextPacketStore` at `AutoloopConfig.context_packets_dir` —
+under the state directory, beside `executions/`, and NEVER inside the checkout:
+`escape_detector` snapshots the observed checkout with an exclusion list that is
+empty by measurement, so a packet written into the tree would be reported as
+`checkout_escape_detected`.
+
+`task_id`, `task_base_sha`, `worker_repo`, `digest`, `rendered_at`, `text`.
+
+`text` is the packet, and `digest` covers exactly it — nothing else in the
+envelope, and `rendered_at` deliberately sits OUTSIDE it, because two renders of
+one repository state have to produce the same bytes. A file whose stored
+`digest` does not cover its own `text` is UNREADABLE, not "close enough": it is
+neither served to a prompt nor shown to a reviewer. Absent and unreadable both
+read as "no packet" — unlike an execution record, which raises — because the
+binding artifact is `TaskExecution.context_packet_sha256` next door, and the
+review packet reports the difference rather than substituting anything.
+
+REPLACED PER ROUND, never accumulated. `orchestrator._dispatch_task_postcommit`
+renders one for every implement/revise round from the task's OWN worker
+repository at `TaskExecution.task_base_sha` — below every path that can still
+move that base, above the agent — so a revise round after
+`_rebase_execution_if_stale` is cut from the base it now names. Each earlier
+round's digest survives inside the review packet that was sent for it. An AUDIT
+round renders none, and its record's digest stays empty.
+
+THE AGENT IS HANDED THE RENDER, not this file. The same dispatch passes the
+rendered section to the executor about to run
+(`implement_executor.deliver_round_context_packet`, set immediately before the
+executor call and cleared in a `finally`), because the loop's single
+`TaskExecutor` is `cli._DispatchingExecutor` in production and forwards nothing
+else. This file is the REVIEWER's copy, and the round trip through it is a
+precondition: a round whose packet cannot be written and read back at the digest
+its record carries does not start at all — no agent, no attempt charged, a
+`context_packet_unavailable` task-fatal park naming the directory that failed
+(task-fatal rather than loop-fatal only because every loop-fatal code must be
+classified in `blockers.LANE_FATAL_CODES`/`FLEET_FATAL_CODES`, which ctx-05 could
+not edit).
+A digest in front of a reviewer for an artifact nobody can produce is evidence
+of context that was never evidenced, which is worse than not running.
+
+The packet is DATA. Nothing parses it, no gate reads it, and
+`tasks.effective_approved_paths` is never handed a context reference. It is
+rendered strictly after every stamp line, in the agent prompt and in the review
+packet alike; see `docs/SECURITY.md` S33 for the two controls.
 
 ## Context record
 

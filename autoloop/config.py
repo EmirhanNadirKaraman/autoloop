@@ -1399,6 +1399,23 @@ class AutoloopConfig:
         return self.state_dir / "executions"
 
     @property
+    def context_packets_dir(self) -> Path:
+        """The CONTEXT PACKET each write-capable round was cut with
+        (`context_packet.ContextPacketStore`) — one file per task, replaced per
+        round, beside `executions/` because the digest that binds it lives on
+        the execution record next door.
+
+        UNDER THE STATE DIRECTORY, never inside the checkout, and that is the
+        whole of the placement argument: `escape_detector` snapshots the
+        observed checkout with an exclusion list that is empty by measurement,
+        so a packet written into the tree would be reported as
+        `checkout_escape_detected` — loop-fatal, and indistinguishable from an
+        agent writing where it may not. Same reasoning port-01 moved every other
+        writable path out under.
+        """
+        return self.state_dir / "context-packets"
+
+    @property
     def intents_dir(self) -> Path:
         return self.state_dir / "intents"
 
