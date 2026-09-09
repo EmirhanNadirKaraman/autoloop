@@ -44,6 +44,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -1585,6 +1586,18 @@ class TaskRegistry:
         #: caller's own and its save is byte-identical to today's — which is
         #: what keeps the mechanism invisible to a test that hand-builds one.
         self._baseline: dict[str, dict] = {}
+        #: THIS LANE'S VIEW of the queue (conc-12): ids some OTHER lane is
+        #: holding, and the one id a fleet hold named as admissible instead.
+        #: In-memory only, never persisted, never part of a row — so
+        #: `asdict`, `to_dict` and `changed_since_baseline` cannot see it and
+        #: the reconciliation above is unaffected by which lane is asking.
+        #:
+        #: EMPTY IS THE WHOLE OF THE `lanes = 1` GUARANTEE. Nothing sets these
+        #: below two lanes (`Orchestrator._refresh_lane_view` returns before it
+        #: reads anything), so `next_ready()` is the same first element of
+        #: `ready_in_dispatch_order()` it has always been.
+        self._held_elsewhere: frozenset[str] = frozenset()
+        self._preferred: str = ""
         if tasks:
             self.add_many(tasks)
 
@@ -3668,9 +3681,46 @@ class TaskRegistry:
             key=lambda t: (0 if t.urgent_at else 1, t.priority, t.id),
         )
 
+    def set_lane_view(
+        self, held_elsewhere: Iterable[str] = (), prefer: str = ""
+    ) -> None:
+        """Narrow what `next_ready()` OFFERS to what this lane may take
+        (conc-12).
+
+        Two values, both about the fleet and neither about the task graph:
+
+        * `held_elsewhere` — ids another lane is running. A task in that set is
+          not offered here however its row reads, which is the half of the
+          claim a status cannot make: the two records move at different moments
+          (`orchestrator.FleetSupervisor.plan`'s first hold), so a task can be
+          held by a lane while its row still says `pending` — and, until
+          conc-12, could be put BACK to `pending` by a neighbour's strand sweep
+          while its agent was still running.
+        * `prefer` — the admissible task a fleet hold NAMED. Carried so the
+          next proposal is the alternative the refusal already computed rather
+          than the held task again, which is the re-prompt fixed point
+          `postcommit-01` closed for approvals. It is a HINT and never an
+          authorization: an id that is not offerable right now (taken,
+          completed, quarantined, held elsewhere, unknown) is ignored and the
+          head of the queue answers, so a string that went stale between two
+          rounds cannot put a non-READY task in front of the reviewer.
+
+        Deliberately NOT applied to `ready_in_dispatch_order()`, which the
+        supervisor walks: a task filtered out of that list would stop being
+        CLASSIFIED by `FleetSupervisor.plan` — no `admitted` entry and no hold
+        reason — and `_refused_outside_fleet_admission` reads an unclassified
+        task as "not this gate's business" and lets it through. Narrowing the
+        offer must not widen the gate.
+
+        Replaces the previous view rather than adding to it, so a lane that
+        re-reads its fleet each round cannot accumulate an id that was freed.
+        """
+        self._held_elsewhere = frozenset(held_elsewhere)
+        self._preferred = prefer or ""
+
     def next_ready(self) -> Task | None:
-        """Highest-priority ready task; ties broken by id — unless one carries
-        the URGENT PIN, which outranks both.
+        """Highest-priority ready task THIS LANE MAY TAKE; ties broken by id —
+        unless one carries the URGENT PIN, which outranks both.
 
         Was insertion order. Ordering by `priority` first is what lets an
         operator steer a running loop — otherwise a task added later can
@@ -3684,10 +3734,29 @@ class TaskRegistry:
         other task can hold cannot tie.
 
         The sort itself lives in `ready_in_dispatch_order` above, which this is
-        the first element of.
+        the first element of — MINUS whatever `set_lane_view` says another lane
+        is holding, and with that view's `prefer` id moved to the front when it
+        is still offerable. Both are empty at one lane, where this is exactly
+        `ready_in_dispatch_order()[0]` and nothing about the answer has changed.
         """
-        ready = self.ready_in_dispatch_order()
-        return ready[0] if ready else None
+        ready = [
+            task
+            for task in self.ready_in_dispatch_order()
+            if task.id not in self._held_elsewhere
+        ]
+        if not ready:
+            return None
+        # THE PIN STILL OUTRANKS THE HINT. `ready` is urgent-first, so an
+        # unpinned head means no offerable task is pinned; a preference applied
+        # over one would be a fleet hint overruling an operator, which is the
+        # one thing `next_ready`'s own ordering exists to make impossible.
+        if self._preferred and not ready[0].urgent_at:
+            # VALIDATED against the list this call just built, never trusted:
+            # the id was computed a round ago and the fleet has moved since.
+            for task in ready:
+                if task.id == self._preferred:
+                    return task
+        return ready[0]
 
     def summary(self) -> str:
         """One line of roadmap state, rendered into every review request.
