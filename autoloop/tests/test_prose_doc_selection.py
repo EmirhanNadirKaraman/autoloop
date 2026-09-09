@@ -520,7 +520,12 @@ DOCS_ONLY_SELECTED = 20
 #: checkout it lives in and is not a reader of that tracker. It spawns nothing
 #: either (its git comes from `gitrepo.py`), so it is not on the opaque frontier
 #: and the same 20 hold.
-SUITE_SIZE = 116
+#: 116 -> 117 when conc-12 added `test_lane_hold_scheduling.py` (2026-09-09), the
+#: DENOMINATOR again and for conc-10's reason: it names no document at all, it
+#: resolves no `__file__`, and it builds no repository and spawns nothing — its
+#: only git is a three-method stub — so it is neither a reader nor on the opaque
+#: frontier and the same 20 hold.
+SUITE_SIZE = 117
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
