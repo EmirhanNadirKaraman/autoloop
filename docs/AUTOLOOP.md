@@ -1979,3 +1979,98 @@ Two limits it does not hide. The new rows are not in
 failing preflight does not hold a transport blocker shut. And because
 `cli._precondition_transport_live` runs the whole sweep, answering such a
 blocker makes one trivial invocation.
+
+---
+
+## Reading a context closeout in the transcript
+
+A task that publishes can leave a context record saying something that is no
+longer true. The closeout (ctx-07, `context_packet.classify_closeout`, called
+from `orchestrator._close_out_context` immediately after
+`_mark_task_completed`) is what answers that, once per completed task, and every
+outcome is one of four entries — including the ones where it did nothing.
+
+| Entry | What happened |
+|---|---|
+| `context_closeout` | it ran: `updated` names the record files written, `needs_attention` the records it did not write, `follow_up_task` the one task it filed (or `follow_up_skipped` saying why it filed none), `notes` every reason it did less than it might have |
+| `context_closeout_skipped` | it was not asked — no record store is wired into this loop, no execution record, or no published commit |
+| `context_closeout_refused` | it was asked and would not answer: the packet could not be read back, the base no longer resolves, or the selection resolved now is not the one the round's packet showed |
+| `context_closeout_error` | a bug. Logged and swallowed, like `_mark_task_completed` and `_auto_merge_after_completion` on either side of it — the push has landed, and bookkeeping never undoes durable work |
+
+**`context_closeout_skipped: no_context_record_store` is what every production
+run writes today**, and that is the honest state rather than a defect: ctx-03
+fixed the record shape and deliberately not its location, and nothing has named
+a directory since. Wiring one store (`Orchestrator(context_records=...)`) lights
+both halves at once — `_context_record_index` feeds the same directory to the
+packet a round is given and to the closeout that grades it, which is why there
+is one accessor and not two.
+
+Two things whoever wires that directory has to know.
+
+**It may not be inside the observed checkout**, and a store that is gets a
+`context_closeout_refused` before anything is written. This is port-01's rule —
+the same one the packet store follows — arriving at a new writer: a record file
+written into the observed tree is an uncommitted file the loop cannot commit, and
+the next write-capable dispatch refuses to start against a dirty observed
+checkout (`primary_checkout_dirty`, loop-fatal). So the directory lives outside
+the tree and `repo_prefix` says what its files are CALLED in the repository,
+which is the only thing the scope check needs.
+
+The limit those two together leave, stated rather than left to be found: the
+follow-up's `approved_paths` names a REPOSITORY path (`docs/context/x.json`)
+while the directory the loop reads and writes is outside the tree. This round
+makes the scope question askable and answers it with the shared matcher; it does
+not decide where records live, so whoever wires a directory still has to
+reconcile the two — by committing the store, or by syncing it — and that is the
+roadmap item after this one, not something this one quietly assumes.
+
+**A push an earlier process never finished gets no closeout.** The one call site
+is `_dispatch_task_push`; the stale-record reconciliation that completes such a
+push (`_reconcile_published_execution`) is archiving the execution record and
+quarantining the worker repository that the packet confirmation would have to
+read, so there would be nothing left to confirm against. The transcript says so
+by having no `context_closeout` entry for that task.
+
+### What it may and may not conclude
+
+Four questions, and the loop only answers the two it can answer from its own
+records:
+
+* a **feature** or **incident** record whose own `source_paths` this change
+  altered has its `last_verified_commit` advanced to the published commit. That
+  means "these paths were part of a change that passed post-commit validation
+  and review at this commit" — not that the invariant was re-proved, since the
+  validation a round runs may have been narrowed to the tests its changed paths
+  reach;
+* a **decision** is never rewritten. A supersession needs a successor and a
+  successor is a claim somebody has to author, so it becomes a follow-up line —
+  and when it is written, it is written with `context_records.superseded_record`,
+  which leaves the old record in place with `superseded_by` set. Deleting it
+  deletes the reason it was made;
+* a **lesson** is created only on ctx-02's bar, measured off the loop's own
+  `TaskExecution.attempt_ledger`: the same failure outcome more than once. A
+  clean round creates none. One mistake is not a lesson.
+
+Nothing on this path reads the agent's report or the reviewer's feedback. Text
+that was given to a model and read back is not evidence the model produced, and
+a record written from one would be exactly that.
+
+### The scope rule, and the follow-up
+
+A record's own file is a repository path, and whether the completed task may
+write it is `tasks.unauthorized_paths` over `tasks.effective_approved_paths` —
+the same single matcher the pre-commit gate and the post-commit ownership check
+use. So there are two outcomes and no third: written in scope, or named in the
+follow-up. **"Add the path to `approved_paths`" is not one of them**, and neither
+is adding a record directory to `tasks.TRACKER_PATHS` — that list is granted to
+every task at once, so a record directory in it would authorize every round in
+the repository to rewrite every record.
+
+The follow-up is ONE inbox creation request per completed task
+(`context_packet.follow_up_request`, through `TaskInbox.submit` and no second
+route), it `depends_on` the completed task, its `approved_paths` are exactly the
+record files it would touch, and its `context_ids` name the records — a field
+that carries provenance and no authority. Its id is derived from the completed
+task's, so the crash-recovery re-entry of the push path proposes the same id and
+is refused by the registry or by `TaskInbox.pending_creation_ids`. Nothing
+concrete to change files nothing at all.

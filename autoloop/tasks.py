@@ -160,6 +160,29 @@ def _validate_approved_paths(task_id: object, paths: object) -> tuple[str, ...]:
     return tuple(paths)
 
 
+def is_valid_approved_path(path: object) -> bool:
+    """Would `_validate_approved_path` accept `path`? A PREDICATE, not a second
+    rule (ctx-07).
+
+    For a caller that is BUILDING a task rather than checking one an operator
+    wrote: the context closeout composes a follow-up task's `approved_paths` out
+    of record file names, and a single malformed entry there gets the whole
+    creation request refused on drain — which loses the follow-up while the
+    round that filed it reports success. Asking first lets it drop the one path
+    it cannot name and file the rest, saying so.
+
+    It answers off `_validate_approved_path` itself and never off a copy of that
+    function's rules, for the reason `unauthorized_paths` and
+    `effective_approved_paths` each state: a second spelling of "is this path
+    well formed" is a second answer waiting to disagree with the registry's.
+    """
+    try:
+        _validate_approved_path(path)
+    except TaskGraphError:
+        return False
+    return True
+
+
 def _validate_depends_on(
     task_id: object, depends_on: object, known: dict[str, "Task"]
 ) -> tuple[str, ...]:
@@ -442,6 +465,29 @@ def _validate_context_ids(task_id: object, ids: object) -> tuple[str, ...]:
             )
         seen.add(context_id)
     return tuple(ids)
+
+
+def is_valid_context_id(context_id: object) -> bool:
+    """Would `_validate_context_ids` accept `context_id` as one entry? A
+    PREDICATE, and `is_valid_approved_path`'s twin (ctx-07).
+
+    Same caller and same failure: a follow-up task built by the loop names the
+    context records that need attention in `context_ids`, and record ids are a
+    BROADER shape than task ids — `context_records._require_clean_string` takes
+    any non-empty unpadded string, while this field takes `_ID_RE` and no
+    whitespace, so a perfectly legal record id can be one this field refuses.
+    Refusing it silently loses the whole request; asking first lets the caller
+    keep the id in the prose it also writes, where nothing constrains it.
+
+    Answered by running the list validator over a one-element list, so there is
+    no second copy of the id rule to drift — including the `fullmatch` that
+    keeps a trailing newline out of a rendered block.
+    """
+    try:
+        _validate_context_ids("(predicate)", [context_id])
+    except TaskGraphError:
+        return False
+    return True
 
 
 def _persisted_context_ids(raw: dict) -> tuple[str, ...]:
@@ -1302,6 +1348,15 @@ class Task:
 #: chunked (no shared conversation on the provider, a part that fails to land,
 #: over `packet.DIFF_MAX_PARTS`) falls back to the same omission. That is an
 #: argument for keeping this list short, not for trusting it less.
+#: **The context closeout does not touch this list** (ctx-07). A completed round
+#: that owes a context record an update either writes it inside the task's own
+#: `approved_paths` or files ONE narrow follow-up task naming the record files it
+#: would have written — see `context_packet.classify_closeout`. Adding a path
+#: here, or to a task's `approved_paths`, would be the same widening from the
+#: other end: this list is granted to EVERY task at once, so a record directory
+#: named here would make every round in the repository authorized to rewrite
+#: every context record, which is precisely the circular ownership
+#: `docs/SECURITY.md` finding #2 closes.
 TRACKER_PATHS: tuple[str, ...] = (
     "CLAUDE.md",
     "docs/COMMON_ERRORS.md",
