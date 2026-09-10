@@ -112,11 +112,18 @@ class PolicyConfig:
     #: Review rounds allowed per task. 0 means UNLIMITED, which is the
     #: default: a hard cap of 2 abandoned work that was still converging,
     #: and the operator, not this file, should decide when to give up.
-    #: Unlimited is only safe because a SEPARATE guard stops the real
-    #: runaway case — identical revise feedback twice in a row means the
-    #: round cannot change its own outcome (see
-    #: `_revise_feedback_is_unchanged`). Bound this only if you want a
-    #: hard ceiling on top of that.
+    #: Unlimited is only safe because SEPARATE guards stop the two runaway
+    #: cases, and both live in `orchestrator`, not here:
+    #:
+    #:   * identical revise feedback twice in a row means the round cannot
+    #:     change its own outcome (`_revise_feedback_is_unchanged`);
+    #:   * a `revise` answering an executor that has reported its approved
+    #:     paths make the task impossible cannot change its outcome either —
+    #:     the feedback may be new every time and the scope is the same
+    #:     (`_revise_cannot_help`). That guard runs BEFORE this cap, so
+    #:     setting a number here does not preempt it.
+    #:
+    #: Bound this only if you want a hard ceiling on top of those.
     max_review_rounds: int = 0
     allow_commit: bool = True
     allow_push: bool = True
