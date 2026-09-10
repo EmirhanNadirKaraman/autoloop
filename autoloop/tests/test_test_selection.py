@@ -652,7 +652,11 @@ FLOOR_AFTER = 16
 #: than being one — resolves no `__file__` of its own (the source it reads is
 #: reached as an ATTRIBUTE, `sys.modules[...].__file__`, which is not an
 #: `ast.Name`), and its git comes from `gitrepo.py`, so 20 and 24 hold.
-SUITE_SIZE = 118
+#: 118 -> 119 when ctx-08 added `test_context_diagnostics.py` (2026-09-09), the
+#: DENOMINATOR again and for the same reason: it names no change-note tracker in
+#: any evaluated string, resolves no `__file__`, and its git comes from
+#: `gitrepo.py`, so 20 and 24 hold.
+SUITE_SIZE = 119
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

@@ -89,6 +89,29 @@ STALE_FINDING = "stale"
 STALENESS_UNKNOWN_FINDING = "staleness_unknown"
 BUDGET_DROPPED = "budget_dropped"
 
+#: The categories that each mean ONE THING to a reader: a record was referenced
+#: and is NOT in the selection. Grouped here, beside the constants themselves,
+#: rather than at a reader — a new category added above and forgotten in a
+#: reader's private tuple is a rejection that stops being reported, which is the
+#: silence this module is written against. `context_packet.explanation_lines`
+#: partitions on these and prints whatever is left over, so a category missing
+#: from here is still shown; it is shown under the wrong heading, which is loud,
+#: rather than not at all, which is not.
+REJECTED_CATEGORIES: tuple[str, ...] = (
+    BUDGET_DROPPED,
+    DANGLING_SUPERSESSION,
+    DUPLICATE_RECORD_ID,
+    SUPERSEDED,
+    UNKNOWN_RECORD,
+    UNREADABLE_RECORD,
+)
+
+#: The two halves of the staleness tri-state that are NOT `FRESH`. Both, always:
+#: "the check ran and the paths moved" and "the check could not run" are
+#: different answers, and reporting only the first is exactly how a record whose
+#: commit no longer resolves reads as fine.
+STALENESS_CATEGORIES: tuple[str, ...] = (STALE_FINDING, STALENESS_UNKNOWN_FINDING)
+
 #: The reason a seed carries. Every seed carries the SAME one, whatever its
 #: position in the list, which is half of why reversing the seed list cannot
 #: change the output.
