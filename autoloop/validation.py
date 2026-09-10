@@ -138,6 +138,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
 from .per_test_deps import dependencies_by_test
+from .tasks import paths_within_scope
 from .validation_env import ValidationEnv, redact_with, strip_validation_vars
 
 #: Validation commands may only start with these binaries.
@@ -1769,6 +1770,346 @@ def build_import_graph(root: Path) -> ImportGraph:
         importers={key: frozenset(value) for key, value in importers.items()},
         opaque=frozenset(opaque),
     )
+
+
+# ---------------------------------------------------------------------------
+# split-order advisory (split-06)
+#
+# ONE NARROW, DECIDABLE CHECK on a decomposition, and deliberately not a general
+# one: whether an arbitrary task is completable inside its scope is undecidable,
+# and nothing here attempts it. The case that is decidable, and the case that
+# actually cost a task:
+#
+#   brw-19 (2026-08-27) was split into brw-19a..e with the order inverted.
+#   brw-19a DELETED `autoloop/browser/`; the only three files importing that
+#   package — `autoloop/orchestrator.py:352` (a TOP-LEVEL import),
+#   `autoloop/tests/test_conversation_retirement.py`,
+#   `autoloop/tests/test_transport_recovery.py` — belonged to brw-19b and
+#   brw-19c, both of which DEPENDED ON brw-19a. So brw-19a ran first, deleting
+#   the package turned `import autoloop.orchestrator` into an ImportError, and
+#   every path that could have repaired it was outside brw-19a's scope. No
+#   answer existed. It cost four attempts, four review rounds, the attempt
+#   ceiling and a `task_fatal` park, discovering something a static read of the
+#   import graph could have said before the plan was accepted.
+#
+# The graph is `build_import_graph`'s, reused rather than rebuilt: `importers`
+# is already "who imports whom, in the direction risk travels", which is exactly
+# the direction this question is asked in. The ownership rule is
+# `tasks.paths_within_scope`, which is `unauthorized_paths` — the matcher the
+# real scope gate enforces — so a part is judged to hold a file if and only if
+# the executor would let it write that file.
+#
+# IT WARNS, IT DOES NOT REFUSE, and that is a decision rather than a default.
+# The check reads scopes, and a scope says what a part MAY WRITE; it cannot tell
+# a deletion from an edit. A part legitimately holding a module it only edits
+# produces the same edge as brw-19a's deletion, so refusing would gate a plan
+# the reviewer has already reasoned about on evidence that does not distinguish
+# the two — and the only recovery from a refused split is another round of
+# exactly the loop `split` exists to escape. What makes the warning worth
+# carrying is the NAMED EDGE: brw-19's whole cost was four attempts spent
+# discovering which edge was inverted, and a plan that arrives with the edge
+# already named recovers nearly all of it.
+#
+# IT FAILS OPEN, which is the opposite of the usual rule in this file, and also
+# deliberate. This is advisory analysis of a PLAN, not a gate on correctness: a
+# splitter that refused every plan it could not analyse would stop the loop
+# decomposing anything in a repository whose import graph is partly unreadable.
+# Every failure — an unbuildable graph, a truncated walk, a plan whose parts
+# cannot be read, an unexpected exception anywhere in the analysis — answers
+# `ran=False` with a reason, and the caller applies the plan unchanged. The one
+# thing that must never happen is a silent pass, so `ran` and `not_run_reason`
+# are carried into the transcript, into the reviewer's report AND into every
+# successor's brief — the same three destinations a warning reaches, because
+# "nobody checked the order of this plan" is worth as much to the agent whose
+# part cannot succeed as a named edge is. A check that did not run says so, in
+# words, everywhere a check that ran clean says nothing.
+# ---------------------------------------------------------------------------
+
+#: How many split-order edges the advisory names in full before it stops
+#: enumerating and reports a count instead.
+#:
+#: A cap rather than a complete list, for the reason the check exists: a part
+#: holding a `conftest.py` gets one edge per Python file under that directory
+#: (`build_import_graph` gives a conftest an edge FROM every file it
+#: configures), so an uncapped enumeration of a plan that splits `autoloop/`
+#: from `autoloop/tests/` is thousands of lines — the panel nobody reads. The
+#: cap is on what is RENDERED only: `SplitOrderReport.omitted` says how many
+#: were left out and `flagged` counts them, so a capped report can never read as
+#: a clean one.
+SPLIT_ORDER_MAX_EDGES = 20
+
+
+@dataclass(frozen=True)
+class SplitOrderEdge:
+    """One part holds a module; a file that imports it is out of that part's
+    reach at the point in the dependency order where the part runs."""
+
+    #: The part whose `approved_paths` contain `module`.
+    part: str
+    #: The imported module, repo-relative.
+    module: str
+    #: The file that imports it, repo-relative.
+    importer: str
+    #: The part(s) whose `approved_paths` contain `importer`. Never empty — an
+    #: importer no part holds is not an ORDERING fault (no re-ordering of this
+    #: plan could fix it) and is counted rather than named; see
+    #: `SplitOrderReport.unowned_importers`.
+    importer_parts: tuple[str, ...]
+    #: Does the importer's part DEPEND on `part` — the brw-19 shape, where the
+    #: order is exactly inverted — or are the two simply unordered against each
+    #: other? Both are faults; they read differently to whoever re-orders.
+    inverted: bool = False
+
+    def describe(self) -> str:
+        holders = ", ".join(self.importer_parts)
+        relation = (
+            f"which depends on {self.part}"
+            if self.inverted
+            else f"which is not ordered after {self.part}"
+        )
+        return (
+            f"{self.part} holds {self.module}; {self.importer} imports it and "
+            f"is in {holders}, {relation}"
+        )
+
+
+@dataclass(frozen=True)
+class SplitOrderReport:
+    """What the advisory found, or why it could not look."""
+
+    #: The named edges, sorted by (part, module, importer) and capped.
+    edges: tuple[SplitOrderEdge, ...] = ()
+    #: Edges found but not named, because the cap was reached.
+    omitted: int = 0
+    #: Did the analysis run at all? `False` means the plan was NOT analysed and
+    #: was accepted unchanged.
+    ran: bool = True
+    #: Why it did not run, in words. Empty when it did.
+    not_run_reason: str = ""
+    #: Importers held by NO part of the plan. Counted, never named and never
+    #: flagged: a module in one part's scope whose importers live outside the
+    #: whole plan is the ordinary shape of an EDIT, so flagging it would fire on
+    #: nearly every split, and no re-ordering of the plan could answer it.
+    unowned_importers: int = 0
+    #: Files whose own imports `build_import_graph` could not read (a dynamic
+    #: import, an interpreter subprocess, a parse error). Their edges are
+    #: missing, so the analysis UNDER-reports by this many files' worth. Not a
+    #: reason to answer `ran=False` — nearly every real checkout has one, and a
+    #: check that switched itself off for that would never run anywhere.
+    opaque_files: int = 0
+
+    @property
+    def flagged(self) -> bool:
+        """Did the plan draw a warning? Counts `omitted`, so a cap of 0 cannot
+        turn a plan with edges into a clean one."""
+        return bool(self.edges) or self.omitted > 0
+
+    def describe(self) -> str:
+        """The advisory in words — a warning, a did-not-run notice, or `""` when
+        the check ran and found nothing. Rendered ONCE here so the transcript,
+        the reviewer's report and the parts' briefs cannot disagree."""
+        if not self.ran:
+            return (
+                "SPLIT-ORDER CHECK DID NOT RUN — "
+                f"{self.not_run_reason}. The plan was accepted unchanged and "
+                "nothing was checked about the order of its parts."
+            )
+        if not self.flagged:
+            return ""
+        lines = [
+            "SPLIT-ORDER WARNING — this plan may order a part before the work "
+            "that makes it possible. A part below holds a Python module whose "
+            "importer is in another part that does not run first, so if the "
+            "module is DELETED (rather than edited) that part cannot repair "
+            "the importer from inside its own approved paths, and no attempt "
+            "it makes can succeed. This is advisory: the check reads scopes, "
+            "and a scope cannot tell a deletion from an edit. Re-order the "
+            "parts, or widen one of them, if any of these is a deletion.",
+        ]
+        lines += [f"  * {edge.describe()}" for edge in self.edges]
+        if self.omitted:
+            lines.append(f"  * ... and {self.omitted} more edge(s) not named here.")
+        return "\n".join(lines)
+
+
+def _split_plan_scopes(parts) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
+    """`({part id: approved paths}, {part id: depends_on})`, in plan order.
+
+    Raises on anything it cannot read — the caller turns that into a
+    did-not-run report rather than a refusal.
+
+    A BARE STRING is refused explicitly on both list fields, and that is the one
+    shape here that could fail silently rather than loudly: `"autoloop/x.py"`
+    iterates into single characters, raises nothing, and leaves the part owning
+    no module and depending on nothing — `ran=True`, no edge, alarm never fired.
+    `contract` validates both fields as lists on the wire, so this is not
+    reachable from a reviewer's reply; it is reachable from a hand-built
+    `TaskSpec` or `Task`, which is exactly what an embedder and a test pass.
+    """
+    scopes: dict[str, tuple[str, ...]] = {}
+    deps: dict[str, tuple[str, ...]] = {}
+    for part in parts:
+        part_id = str(part.id)
+        if not part_id:
+            raise ValueError("a part carries no id")
+        paths = part.approved_paths or ()
+        depends_on = part.depends_on or ()
+        for field_name, value in (("approved_paths", paths), ("depends_on", depends_on)):
+            if isinstance(value, (str, bytes)):
+                raise ValueError(
+                    f"part {part_id!r} carries {field_name} as a bare "
+                    f"{type(value).__name__} rather than a list"
+                )
+        scopes[part_id] = tuple(str(path) for path in paths)
+        deps[part_id] = tuple(str(dep) for dep in depends_on)
+    return scopes, deps
+
+
+def _reachable_parts(part_id: str, deps: dict[str, tuple[str, ...]]) -> frozenset[str]:
+    """Every part `part_id` transitively depends on, within this plan.
+
+    TRANSITIVE, not direct: A holding a module, depending on B, which depends on
+    C which holds the importer, is a correctly ordered plan — C runs first — and
+    a direct-only reading would report it as a fault.
+
+    Iterative with a visited set, because the plan is UNVALIDATED at the point
+    this runs: `add_many`/`_check_acyclic` have not seen it yet, so a cyclic
+    `depends_on` is reachable input and a recursive walk would blow the stack on
+    it. `part_id` itself is in the answer only if the plan really is cyclic; the
+    caller checks self-ownership separately.
+    """
+    seen: set[str] = set()
+    frontier = [part_id]
+    while frontier:
+        current = frontier.pop()
+        for dep in deps.get(current, ()):
+            if dep not in seen:
+                seen.add(dep)
+                frontier.append(dep)
+    return frozenset(seen)
+
+
+def _split_order_analysis(root, parts, max_edges: int) -> SplitOrderReport:
+    """`split_order_warnings`'s body. May return a did-not-run report; may also
+    raise, which the wrapper turns into one."""
+    scopes, deps = _split_plan_scopes(parts)
+    if not scopes:
+        return SplitOrderReport(
+            ran=False, not_run_reason="the plan names no parts to analyse"
+        )
+    checkout = Path(root)
+    if not checkout.is_dir():
+        # `_python_files` walks with `os.walk`, which yields NOTHING for a path
+        # that does not exist and raises nothing — so a checkout this cannot
+        # reach would otherwise produce an empty graph, no edges, and a report
+        # that reads exactly like a clean plan. That is the silent pass, and it
+        # is the one outcome this whole design forbids.
+        return SplitOrderReport(
+            ran=False,
+            not_run_reason=f"{checkout} is not a readable directory to analyse",
+        )
+    try:
+        graph = build_import_graph(checkout)
+    except (OSError, ValueError) as exc:
+        return SplitOrderReport(
+            ran=False,
+            not_run_reason=f"the repository import graph could not be built ({exc})",
+        )
+    if graph.truncated:
+        # THE fail-open trap this branch exists for. A truncated walk returns
+        # `importers={}`, so every lookup below answers "nothing imports this"
+        # and the whole plan reads clean — a check that silently passes exactly
+        # where the checkout is largest. `_select_tests` refuses the same
+        # condition for the same reason.
+        return SplitOrderReport(
+            ran=False,
+            not_run_reason=(
+                f"the checkout has more than {_GRAPH_MAX_FILES} Python files, "
+                "above the import walk's cap, so no import edge was resolved"
+            ),
+        )
+    files = sorted(graph.files)
+    # The DECLARED scope, not `tasks.effective_approved_paths`. The difference
+    # between the two is `tasks.TRACKER_PATHS`, which is six Markdown files —
+    # so for the question actually being asked ("which Python modules does this
+    # part hold?") the two lists are identical, and reaching for the wider one
+    # would only couple this to a constant it does not depend on.
+    owned = {
+        part_id: (paths_within_scope(files, paths) if paths else set())
+        for part_id, paths in scopes.items()
+    }
+    owners: dict[str, list[str]] = {}
+    for part_id in scopes:
+        for path in sorted(owned[part_id]):
+            owners.setdefault(path, []).append(part_id)
+    reach = {part_id: _reachable_parts(part_id, deps) for part_id in scopes}
+
+    edges: list[SplitOrderEdge] = []
+    unowned = 0
+    for part_id in scopes:
+        for module in sorted(owned[part_id]):
+            for importer in sorted(graph.importers.get(module, ())):
+                if importer in owned[part_id]:
+                    # The part holds the module AND its importer: whatever it
+                    # does to one, it may do to the other. Not a fault.
+                    continue
+                holders = tuple(owners.get(importer, ()))
+                if not holders:
+                    unowned += 1
+                    continue
+                if any(
+                    holder == part_id or holder in reach[part_id] for holder in holders
+                ):
+                    continue
+                edges.append(
+                    SplitOrderEdge(
+                        part=part_id,
+                        module=module,
+                        importer=importer,
+                        importer_parts=holders,
+                        inverted=any(part_id in reach[holder] for holder in holders),
+                    )
+                )
+    # SORTED, not left in walk order. `graph.importers` values are frozensets
+    # and string hashing is randomised per process, so an unsorted list would
+    # put a different order in the transcript, the report and the briefs on
+    # every run of the same plan.
+    edges.sort(key=lambda edge: (edge.part, edge.module, edge.importer))
+    cap = max(0, int(max_edges))
+    return SplitOrderReport(
+        edges=tuple(edges[:cap]),
+        omitted=max(0, len(edges) - cap),
+        ran=True,
+        unowned_importers=unowned,
+        opaque_files=len(graph.opaque),
+    )
+
+
+def split_order_warnings(
+    root, parts, max_edges: int = SPLIT_ORDER_MAX_EDGES
+) -> SplitOrderReport:
+    """Does this decomposition order a part before the work that makes it
+    possible? See the section comment above for what is and is not claimed.
+
+    `parts` is any sequence of objects carrying `id`, `depends_on` and
+    `approved_paths` — `contract.TaskSpec` and `tasks.Task` both do.
+
+    NEVER RAISES. Every failure is a `SplitOrderReport` with `ran=False` and a
+    reason, because the caller's correct response to "this could not be
+    analysed" is to accept the plan unchanged and say so. The bare `Exception`
+    arm is the point of the function rather than a lapse: an advisory read of a
+    plan must not be able to take down the acceptance it is advising on.
+    """
+    try:
+        return _split_order_analysis(root, parts, max_edges)
+    except Exception as exc:
+        return SplitOrderReport(
+            ran=False,
+            not_run_reason=(
+                "the split-order check itself failed "
+                f"({type(exc).__name__}: {exc})"
+            ),
+        )
 
 
 def _reference_tokens(rel: str) -> tuple[str, ...]:

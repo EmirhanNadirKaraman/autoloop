@@ -247,6 +247,56 @@ already made, and rewriting it from `{}` to record one more would destroy them.
 its own elapsed time puts it under `data.duration_seconds`; a record without one
 is not an error, it predates the measurement.
 
+## Split-order advisory
+
+`task_ceiling_split` and `task_reviewer_split` — the two transcript events a
+split acceptance writes — carry an advisory read of the plan that was accepted:
+does a part hold a Python module whose importer belongs to a part that does not
+run first? (split-06; the `brw-19` decomposition, where deleting
+`autoloop/browser/` was ordered ahead of every file importing it, cost four
+attempts and a `task_fatal` park.)
+
+| Key | Shape | Notes |
+|---|---|---|
+| `split_order_ran` | bool | Did the check run at all? Recorded on BOTH arms, because a check that never looked and a check that looked and found nothing leave the same empty `split_order_edges`. |
+| `split_order_not_run_reason` | string | Why it did not run; `""` when it did. |
+| `split_order_edges` | list of strings | One named edge each: `"<part> holds <module>; <importer> imports it and is in <part>, which depends on <part>"`. Empty is the ordinary answer. |
+| `split_order_edges_omitted` | int | Edges found but not named, the cap being `validation.SPLIT_ORDER_MAX_EDGES`. |
+| `split_order_unowned_importers` | int | Importers held by no part of the plan — counted, never named and never flagged, because that is the ordinary shape of an edit and no re-ordering could answer it. |
+| `split_order_opaque_files` | int | Files whose own imports `build_import_graph` could not read, so the analysis under-reports by that many files' worth. |
+
+**It warns; it does not refuse, and the plan is applied unchanged either way.**
+The check reads `approved_paths`, and a scope says what a part may WRITE — it
+cannot tell a deletion from an edit, so a part legitimately holding a module it
+only edits produces the same edge as `brw-19a`'s deletion did. Refusing would
+gate a plan the reviewer has already reasoned about on evidence that does not
+distinguish the two, and the only recovery from a refused split is another round
+of exactly the loop `split` exists to escape. The rendered text is appended to
+every successor's `description` and to the reviewer's report, because the named
+edge is the whole of what makes the warning actionable.
+
+**It fails open, unlike the rest of `validation.py`.** An unbuildable graph, a
+walk truncated at `_GRAPH_MAX_FILES`, an unreadable checkout, a part whose scope
+cannot be read, or any unexpected exception answers `split_order_ran: false`
+with a reason, and the plan is accepted untouched. This is advisory analysis of
+a plan rather than a gate on correctness: a splitter that refused what it could
+not analyse would stop the loop decomposing anything in a repository whose
+import graph is partly unreadable.
+
+**Both outcomes reach all three destinations — a warning and a did-not-run
+notice alike.** `SplitOrderReport.describe()` renders one of three things: the
+warning with its named edges, `SPLIT-ORDER CHECK DID NOT RUN — <reason>`, or
+`""` when the check ran and found nothing. The transcript event carries the
+structured keys above on every arm; `_apply_split` appends the rendered text,
+whenever it is non-empty, to the reviewer's report and to EVERY successor's
+`description`. The did-not-run notice belongs in a brief for the same reason it
+belongs in the record: it and a clean bill leave an identical empty
+`split_order_edges`, and the agent it matters to is the one whose part
+cannot succeed inside its own approved paths — that agent must be able to read
+that nobody checked the order rather than spend its attempts concluding the
+fault is its own. Only the `""` arm leaves a successor's brief byte-identical to
+the spec the reviewer wrote.
+
 ## Execution record retirement
 
 `executions/<task>.json` is meant to be retired WITH the work it describes:
