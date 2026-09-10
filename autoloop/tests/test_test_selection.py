@@ -656,7 +656,12 @@ FLOOR_AFTER = 16
 #: DENOMINATOR again and for the same reason: it names no change-note tracker in
 #: any evaluated string, resolves no `__file__`, and its git comes from
 #: `gitrepo.py`, so 20 and 24 hold.
-SUITE_SIZE = 119
+#: 119 -> 120 when split-06 added `test_split_order_advisory.py` (2026-09-10),
+#: the DENOMINATOR again and for ctx-08's reason: it resolves no `__file__`, so
+#: the `.md` extension token it does spell attributes it no document; it spawns
+#: nothing of its own (its git comes from `test_task_split.py`, whose own
+#: opacity is unchanged by being imported), so 20 and 24 hold.
+SUITE_SIZE = 120
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

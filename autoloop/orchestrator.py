@@ -532,7 +532,12 @@ from .tasks import (
     unauthorized_paths,
 )
 from .transcript import Stopwatch, TranscriptLogger
-from .validation import run_validation_commands, select_validation_commands
+from .validation import (
+    SplitOrderReport,
+    run_validation_commands,
+    select_validation_commands,
+    split_order_warnings,
+)
 from .worktask import (
     ATTEMPT_FAULT,
     ATTEMPT_OPEN,
@@ -12875,13 +12880,31 @@ class Orchestrator:
             )
             return
 
+        # THE SPLIT-ORDER ADVISORY (split-06), and everything about WHERE it
+        # sits is deliberate. AFTER every refusal above, so a plan that is about
+        # to be refused never pays for a full parse of the checkout, and BEFORE
+        # the durable marker below, so it is outside the window in which
+        # acceptance is mid-flight. It refuses nothing and it cannot raise
+        # (`validation.split_order_warnings` never does, by construction), so
+        # the three-store acceptance below is byte-for-byte the operation it was
+        # before this existed — the split-01 guarantee is untouched, which is
+        # the property `test_split_order_advisory.py` pins directly.
+        order = self._split_order_advisory(specs)
+        advisory = order.describe()
+        # Appended to EVERY child's brief, not only to the parts an edge names.
+        # Which child is dispatched first is the scheduler's decision, and the
+        # whole point is that the FIRST agent to run reads the inverted edge
+        # instead of spending its attempt budget rediscovering it. Empty when
+        # the check ran clean, so an unflagged plan leaves every brief
+        # byte-identical to the spec the reviewer wrote.
+        brief = f"\n\n{advisory}" if order.flagged else ""
         inherited = self._nonneg_int(execution.attempt_count)
         child_depth = self._nonneg_int(parent.split_depth) + 1
         children = [
             Task(
                 id=s.id,
                 title=s.title,
-                description=s.description,
+                description=s.description + brief,
                 depends_on=s.depends_on,
                 approved_paths=s.approved_paths,
                 inherited_attempts=inherited,
@@ -13026,6 +13049,17 @@ class Orchestrator:
                 ),
                 "artifacts_retired": release.artifacts_retired,
                 "obstacle": release.obstacle,
+                # THE SPLIT RECORD's half of the advisory (split-06). `ran` is
+                # recorded on BOTH arms on purpose: a check that quietly did not
+                # run and a check that ran and found nothing leave the same
+                # empty edge list, and this field is the only thing that tells
+                # them apart afterwards.
+                "split_order_ran": order.ran,
+                "split_order_not_run_reason": order.not_run_reason,
+                "split_order_edges": [edge.describe() for edge in order.edges],
+                "split_order_edges_omitted": order.omitted,
+                "split_order_unowned_importers": order.unowned_importers,
+                "split_order_opaque_files": order.opaque_files,
             },
         )
         if release.artifacts_retired:
@@ -13105,10 +13139,43 @@ class Orchestrator:
             self._attempt_cap_for(children[0]),
             release,
         )
+        if advisory:
+            # The reviewer is the only actor who can RE-ORDER a plan, so the
+            # advisory goes back to it as well as into the children's briefs —
+            # including the did-not-run notice, which is the whole of "say when
+            # it did not run". `advisory` is `""` only when the check ran and
+            # found nothing, so a clean plan's report is unchanged.
+            state.outbox += "\n\n" + advisory
         state.last_response = None
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    def _split_order_advisory(self, specs: tuple[TaskSpec, ...]) -> SplitOrderReport:
+        """Does this plan order a part before the work that makes it possible?
+
+        THE FAIL-OPEN BOUNDARY, and it fails open in the direction opposite to
+        almost every other guard in this file. `validation.split_order_warnings`
+        already answers `ran=False` rather than raising for everything it can
+        anticipate; this wrapper covers the one thing it cannot, which is
+        getting a checkout root at all — `self._git` is an injected collaborator
+        and a test double or a mis-wired loop can fail on the attribute itself.
+        A split is a decomposition of work the reviewer has already judged, and
+        an advisory read of the plan must never be able to refuse it, park it,
+        or take it down; the WORST outcome allowed here is a plan applied
+        unchanged with a recorded sentence saying nothing was checked.
+        """
+        try:
+            root = Path(self._git.repo_root)
+        except Exception as exc:
+            return SplitOrderReport(
+                ran=False,
+                not_run_reason=(
+                    "this loop could not resolve a checkout to read the import "
+                    f"graph from ({type(exc).__name__}: {exc})"
+                ),
+            )
+        return split_order_warnings(root, specs)
 
     def _successors_that_would_strand(
         self, parent: Task, specs: tuple[TaskSpec, ...]
