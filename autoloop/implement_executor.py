@@ -882,6 +882,7 @@ def implement_agent_runner(
     sleep=None,
     abort_file: Path | None = None,
     abort_ledger: AbortLedger | None = None,
+    action_log_dir: Path | None = None,
 ) -> ClaudeCliRunner:
     """The ONE place a write-capable `ClaudeCliRunner` is constructed.
 
@@ -922,6 +923,21 @@ def implement_agent_runner(
     classify it — the executor cannot reach into a runner this factory built, and
     a second ledger would remember the kill where nobody reads it. See
     `AbortLedger` for the race that record closes.
+
+    **`action_log_dir` is what makes `[audit] action_log` reach a real round**,
+    and it is here because this is the ONE place the runner a round actually
+    runs gets built. `cli._build_executor` passes
+    `config.action_log_dir if config.audit.action_log else None` — so with the
+    operator's flag off this is `None` and the runner behaves byte for byte as
+    it did before the setting existed, and with the flag on the round's agent
+    output is appended to a file under the state directory WHILE the agent is
+    still running. Default `None`, so every caller that says nothing (every
+    test that stubs a `runner`, and the standalone binding before
+    `cli._build_executor` started passing one) is unaffected. A parameter and
+    not a process-wide default on purpose: a value armed as a side effect of
+    loading a config makes the behaviour of every runner in the process depend
+    on which config was read last, which no reader of a call site could
+    predict. See `audit.agents.ClaudeCliRunner.__init__`.
     """
     probe = None
     if policy is not None:
@@ -941,6 +957,7 @@ def implement_agent_runner(
         progress_probe=probe,
         stall_policy=stall_policy,
         spawn=abort_aware_spawn(abort_file, spawn, ledger=abort_ledger),
+        action_log_dir=action_log_dir,
         **kwargs,
     )
 
