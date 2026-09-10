@@ -7941,9 +7941,10 @@ def _merge_window_blockers(
     say WHICH task holds the window shut rather than only that something does
     (ops-01). Out-param rather than a third return value for the reason
     `obligations` is one: every existing caller keeps the two-tuple it already
-    unpacks. The EXECUTING-phase reason is a holder too, with an empty
-    `task_id` — a shut window with no holders listed reads as a bug in the
-    panel, and "a lane is mid-write" is a real answer to "who".
+    unpacks. The EXECUTING-phase reason — produced at `lanes = 1` only, see
+    below — is a holder too, with an empty `task_id`: a shut window with no
+    holders listed reads as a bug in the panel, and "a lane is mid-write" is a
+    real answer to "who".
 
     THE single predicate for "may the branch head move". `auto_merge.py` calls
     this rather than re-deriving the same conditions: a second implementation
@@ -8043,22 +8044,66 @@ def _merge_window_blockers(
     after. A caller that passes nothing (the operator's `merge-window`, the
     sweep's own gate call) still sees the note, and still sees every blocker.
 
-    Three things are deliberately NOT relaxed at any lane count:
+    Two things are deliberately NOT relaxed at any lane count:
 
     * `BASE_UNVERIFIED` stays a BLOCKER. "Cannot be shown to be bound to the
       head" is not "is bound to the head, and carriable": nothing can be
       carried forward past a base git will not place, so the fail-closed arm
       keeps failing closed.
-    * The EXECUTING-phase reason below is untouched. A lane mid-write is not
-      a candidate obligation and has no carry-forward to owe.
     * Every exemption above (terminal state, published, retired, orphaned,
       already-behind) is evaluated first and unchanged, so a record that never
       reached the bound-candidate arm cannot become an obligation.
 
+    **AND AT `lanes > 1` THE EXECUTING-PHASE REASON BECOMES THE SAME
+    OBLIGATION** (conc-13, and the same Decision 6 conversion one clause
+    along). It was the second fleet-wide mutual exclusion in this function and
+    it was wrong twice over. UNSOUND: `_load_state` reads LANE 0's file
+    (`state.lane_paths`), so it spoke for the fleet from one lane and could not
+    notice lanes 1..N−1 mid-write at all. STARVING: lane 0 is executing nearly
+    all the time, so at N lanes the window essentially never opened — measured
+    2026-09-09, a fleet on two lanes for 5.5 hours that completed two tasks
+    while `autoloop/mainline` did not advance once.
+
+    The safety that reason was buying is KEPT, by machinery more precise than
+    it is rather than by the clause. "An agent may be mid-write" guards against
+    moving the base under a round that is writing, and every lane state in
+    which that matters is already answered per candidate:
+
+    * A round holding a REVIEWED candidate bound to the head is the obligation
+      arm above. It is marked `rereview_owed_base` BEFORE the head moves,
+      carried onto the new head after
+      (`orchestrator._carry_reviewed_candidate_past`, a merge that rewrites
+      nothing), and refused at push time on its old approval —
+      `PostcommitBinding.candidate_sha`, `candidate_tree_sha` and
+      `packet_sha256` all disagree once the candidate advances, and the marker
+      refuses it even when they do not (`_dispatch_task_push`, which re-loads
+      the record from disk, so the mark another lane wrote is the one it reads).
+    * A round whose worker tree is DIRTY — an agent literally mid-write — is
+      precondition 4 of that carry-forward. It refuses rather than merging over
+      the residue ("merging over them could destroy work no reviewer has
+      seen"), and `auto_merge._park_carry_forward_refused` parks
+      `task_base_behind_head` beside it. The worker repository and the record
+      are left exactly as they were, which is the same answer
+      `_rebase_execution_if_stale` gives from the other side.
+    * A round with no candidate YET is skipped above for want of a
+      `candidate_sha`, and its worker is a separate clone
+      (`worker_env.WorkerRepoManager` runs `git init` + a local fetch, never a
+      linked worktree) that a merge into THIS checkout never touches. Its base
+      moving is what `_rebase_execution_if_stale`'s unreviewed arm re-bases at
+      the next dispatch, unchanged.
+    * A base git cannot place is `BASE_UNVERIFIED`, and still a blocker.
+
+    So above one lane this function READS NO LANE'S STATE FILE AT ALL. That is
+    Decision 7's rule rather than a convenience — `health._judge` does exactly
+    this, for exactly this reason — and it is what makes the narrowing sound as
+    well as unblocking: `state.json` is lane 0's, so a phase read from it could
+    only ever be one lane's, and reporting it as the fleet's would be worse
+    than reporting nothing.
+
     At `lanes = 1` — the shipped default, and the acceptance criterion every
-    candidate in that plan carries — `obligations` is never appended to and the
-    reason string below is the one this function has always produced, byte for
-    byte.
+    candidate in that plan carries — `obligations` is never appended to, lane
+    0's state file is read exactly where it always was, and BOTH reason strings
+    below are the ones this function has always produced, byte for byte.
 
     Nothing here changes the ALL-OR-NOTHING sweep. `merge_sweep` checks this
     predicate once for the whole backlog and merges every branch or none; this
@@ -8240,9 +8285,23 @@ def _merge_window_blockers(
             ),
         )
 
-    _, state = _load_state(config)
-    if state is not None and Phase(state.phase) is Phase.EXECUTING:
-        hold("", "a phase is executing — an agent may be mid-write")
+    # THE EXECUTING-PHASE REASON, AND THE ONE OTHER LANE-DEPENDENT LINE HERE
+    # (conc-13). `_load_state` resolves LANE 0's state file, which IS the whole
+    # loop at one lane and is one lane of N above that — so this question is
+    # asked only where its answer can be about the loop. Above one lane it is
+    # not asked at all, deliberately and not by omission: see the docstring's
+    # "AND AT `lanes > 1` THE EXECUTING-PHASE REASON BECOMES THE SAME
+    # OBLIGATION" for the lane state each of the fleet's rounds is in when the
+    # base moves under it, and which guard answers it. Surveying every lane and
+    # reporting a note instead was considered and refused — it would make this
+    # predicate's output depend on N state files it has no need of, with its own
+    # unreadable-lane failure mode, to say something no caller may act on
+    # (Decision 7: reporting one lane's phase as the system's is worse than
+    # reporting nothing).
+    if config.concurrency.lanes <= 1:
+        _, state = _load_state(config)
+        if state is not None and Phase(state.phase) is Phase.EXECUTING:
+            hold("", "a phase is executing — an agent may be mid-write")
 
     return reasons, notes
 
@@ -8261,6 +8320,16 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
 
         git switch -c fix/whatever && ...work...
         python -m autoloop merge-window --wait && git switch <base> && git merge --ff-only fix/whatever
+
+    THE OPEN LINE IS LANE-DEPENDENT, because what OPEN means is. At one lane it
+    is the sentence it has always been. Above one lane neither of its two
+    clauses would be true: a candidate bound to the head is reported as owing a
+    re-review rather than blocking (conc-03), and no lane's phase is read at all
+    (conc-13) — so printing "no unpublished candidate, no executing phase"
+    there would be this command asserting exactly the two things it stopped
+    checking, which is the defect `health.py`'s own held-sweep paragraph was
+    corrected for in the same round. The notes below still name every candidate
+    that owes one.
     """
     config = load_config(args.config)
     deadline = time.monotonic() + args.timeout
@@ -8268,7 +8337,15 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
     while True:
         reasons, notes = _merge_window_blockers(config, seen)
         if not reasons:
-            print("merge window OPEN — no unpublished candidate, no executing phase")
+            if config.concurrency.lanes > 1:
+                print(
+                    f"merge window OPEN — at {config.concurrency.lanes} lanes: no "
+                    "candidate that cannot be carried past this head, and no "
+                    "lane's phase was read (any candidate bound to the head owes "
+                    "a re-review; see the notes below)"
+                )
+            else:
+                print("merge window OPEN — no unpublished candidate, no executing phase")
             for note in notes:
                 print(f"  note: {note}")
             return 0

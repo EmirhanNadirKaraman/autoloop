@@ -15154,15 +15154,25 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
-        # AFTER the state save, deliberately. `cli._merge_window_blockers`
-        # reads the phase from `state.json` on DISK, and the last thing
-        # written there before this point was `phase=executing` (set in
-        # `_await_response`). Calling the gate any earlier in this method
-        # would see that stale value, report "a phase is executing", and defer
-        # every single merge forever — a feature that logs busily and never
-        # integrates anything. The registry write in `_mark_task_completed`
-        # above matters for the same reason: it is what makes the gate exempt
-        # the record we just published instead of treating it as a hazard.
+        # AFTER the state save, deliberately, and this ordering is a `lanes = 1`
+        # fact. There `cli._merge_window_blockers` reads the phase from
+        # `state.json` on DISK, and the last thing written there before this
+        # point was `phase=executing` (set in `_await_response`). Calling the
+        # gate any earlier in this method would see that stale value, report "a
+        # phase is executing", and defer every single merge forever — a feature
+        # that logs busily and never integrates anything.
+        #
+        # ABOVE one lane the gate reads no lane's state file at all (conc-13),
+        # so nothing about this call's position matters there — which is the
+        # point: `state.json` is LANE 0's, so this save could never have
+        # unblocked a merge attempted from lane 1, and the same stale value it
+        # avoids here held the fleet's window shut permanently instead
+        # (measured 2026-09-09). The order is kept because one lane still
+        # depends on it, not because it ever spoke for N.
+        #
+        # The registry write in `_mark_task_completed` above matters at every
+        # lane count: it is what makes the gate exempt the record we just
+        # published instead of treating it as a hazard.
         self._auto_merge_after_completion(binding.task_id)
 
     def _auto_merge_after_completion(self, task_id: str) -> None:

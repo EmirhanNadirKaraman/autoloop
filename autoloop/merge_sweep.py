@@ -288,6 +288,15 @@ condition, which is the "part of it" this exists to avoid. `attempt` still
 re-checks the gate per branch, and that check stays: it is the race guard for
 a window that shuts mid-sweep.
 
+**Above one lane that gate is also the only thing standing between this sweep
+and the backlog**, which is why conc-13 matters here even though nothing in this
+module changed for it. Until then the window carried a second fleet-wide mutual
+exclusion — "a phase is executing", read from LANE 0's state file — and at N
+lanes lane 0 is executing nearly all the time, so this sweep essentially always
+deferred on that first check: measured 2026-09-09, two lanes for 5.5 hours,
+`autoloop/mainline` unmoved. The predicate now asks no lane's phase above one
+lane, and the per-branch re-evaluation below is what makes that safe.
+
 **And at `lanes > 1` it is the race guard for the re-review obligation too**
 (conc-03, docs/AUTOLOOP.md Decision 6). Each merge inside a sweep moves the base
 for every candidate that is not it, so the obligation cannot be computed once at

@@ -25,6 +25,15 @@ which the loop must NOT ask (a carry that refused, an outstanding stat-only
 split ask, a spent round budget, a task the registry lost, a worker that cannot
 be read) each keep the park, with the reason they did not ask in the transcript.
 
+conc-13 finishes the same conversion for the OTHER fleet-wide mutual exclusion
+in that predicate — "a phase is executing", read from LANE 0's state file, which
+was unsound (one lane, speaking for the fleet) and starving (lane 0 is executing
+nearly always, so at N lanes the window essentially never opened: 5.5 hours on
+2026-09-09 with the base unmoved). Its tests are the two window-predicate cases
+below and the section at the end of this file, which walks the lane states that
+clause was standing in for — a bound candidate, a DIRTY worker, a round with no
+candidate yet — with every lane's own state file set to `executing`.
+
 `lanes = 1` is the acceptance criterion every candidate in that plan carries,
 and it is asserted here rather than assumed: the reason string, the merge
 outcome and the untouched record are pinned at one lane in the same file that
@@ -38,17 +47,20 @@ mirrors — duplicated rather than imported, like every other suite here).
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from autoloop import auto_merge, cli, merge_sweep
 from autoloop.auto_merge import MergeObligation
 from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig, ConcurrencyConfig
 from autoloop.contract import Decision, Directive
-from autoloop.errors import GitCommandError
+from autoloop.errors import GitCommandError, StateCorruptError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -60,6 +72,7 @@ from autoloop.state import (
     Phase,
     PostcommitBinding,
     StateStore,
+    lane_paths,
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
@@ -282,21 +295,157 @@ def test_a_terminal_task_produces_no_obligation(tmp_path):
     assert (reasons, obligations) == ([], [])
 
 
-def test_an_executing_phase_still_shuts_the_window_at_two_lanes(tmp_path):
-    """Untouched, and named so the narrowing is on the record: a lane mid-write
-    is not a candidate obligation, has no carry-forward to owe, and still
-    stops a merge."""
-    config = window_config(tmp_path, lanes=2)
+def executing(config, *lane_indices):
+    """Put each named lane into `Phase.EXECUTING` in that lane's OWN state file.
+
+    `lane_paths` rather than `config.state_file`, and that IS the point of the
+    tests below: lane 0's state file is literally `state.json` while lane k>0
+    lives under `lanes/<lane_id>/`, so a predicate that reads only the first one
+    cannot see the second one at all. Writing both is what makes "the window
+    opens while lanes are executing" a claim about the FLEET rather than about
+    whichever lane happens to own `state.json`.
+    """
+    for index in lane_indices:
+        paths = lane_paths(config.state_dir, index)
+        paths.state_dir.mkdir(parents=True, exist_ok=True)
+        StateStore(paths.state_file).save(
+            LoopState(
+                session_id=f"s{index}",
+                conversation_url=URL,
+                phase=Phase.EXECUTING.value,
+            )
+        )
+
+
+def test_at_one_lane_an_executing_phase_still_shuts_the_window(tmp_path):
+    """THE acceptance criterion for the clause conc-13 converted, pinned as a
+    literal for `test_at_one_lane_a_bound_candidate...`'s reason: at one lane
+    `state.json` IS the loop, an agent may be mid-write, and the whole sentence
+    an operator reads must be the one this function has always produced.
+
+    NO execution record, deliberately: the two blockers are independent and both
+    fire at one lane, so a record here would make this an assertion about the
+    bound-candidate reason as well and stop pinning either one exactly. The pair
+    is asserted next, and the two-lane case after that is where a record IS
+    needed — there it becomes the note, leaving this reason as the only thing
+    that could still have held the window."""
+    config = window_config(tmp_path, lanes=1)
+    register(config, "t9")
+    placer = _Placer()
+    executing(config, 0)
+
+    reasons, notes = cli._merge_window_blockers(config, set(), placer)
+
+    assert reasons == ["a phase is executing — an agent may be mid-write"]
+    assert notes == []
+
+
+def test_at_one_lane_both_blockers_fire_together_and_stay_independent(tmp_path):
+    """And with a record, at one lane, BOTH — in this order. The clause conc-13
+    converted never subsumed the bound-candidate one and still does not: a lane
+    mid-write and a candidate pinned to the head are two different facts about
+    the same instant, and the one-lane predicate reports both exactly as it
+    always has."""
+    config = window_config(tmp_path, lanes=1)
     register(config, "t9")
     placer = _Placer()
     write_record(config, "t9", base=placer.head)
-    StateStore(config.state_file).save(
-        LoopState(session_id="s", conversation_url=URL, phase=Phase.EXECUTING.value)
-    )
+    executing(config, 0)
 
     reasons, _notes = cli._merge_window_blockers(config, set(), placer)
 
-    assert reasons == ["a phase is executing — an agent may be mid-write"]
+    assert len(reasons) == 2
+    assert reasons[0].startswith("task t9 has a candidate") and "strand it" in reasons[0]
+    assert reasons[1] == "a phase is executing — an agent may be mid-write"
+
+
+def test_above_one_lane_executing_lanes_do_not_shut_the_window(tmp_path):
+    """conc-13, and the direct falsifier of what this predicate did before it.
+
+    EVERY lane is mid-write here, which is the ordinary steady state of a
+    two-lane fleet — measured 2026-09-09: 5.5 hours, two tasks completed, and
+    the base did not advance once. The record bound to the head still owes its
+    re-review; nothing about the fleet's phases withholds the window on top of
+    that."""
+    config = window_config(tmp_path, lanes=2)
+    register(config, "t9")
+    placer = _Placer()
+    (tmp_path / "w9").mkdir()
+    write_record(config, "t9", base=placer.head, worktree_path=str(tmp_path / "w9"))
+    executing(config, 0, 1)
+
+    obligations: list = []
+    reasons, notes = cli._merge_window_blockers(
+        config, set(), placer, obligations=obligations
+    )
+
+    assert reasons == [], "the window OPENS with both lanes mid-write"
+    assert [o.task_id for o in obligations] == ["t9"], (
+        "and the candidate bound to the head still owes its re-review"
+    )
+    assert len(notes) == 1 and "OWES A RE-REVIEW" in notes[0]
+
+
+def test_above_one_lane_no_lane_state_file_is_read_at_all(tmp_path):
+    """Decision 7's rule, made CHECKABLE rather than asserted in prose.
+
+    `state.json` is lane 0's, so any phase read from it could only ever be one
+    lane's — and the old clause read exactly that and spoke for the fleet. The
+    proof that it is no longer read is a lane 0 state file that CANNOT be read:
+    `StateStore.load` raises `StateCorruptError` on it, so a window that still
+    consulted it could not return at all. A survey-for-a-note would fail this
+    test too, deliberately — it would put the same unreadable file back on the
+    path of a predicate that has no need of it."""
+    config = window_config(tmp_path, lanes=2)
+    register(config, "t9")
+    config.state_file.write_text("{not json", encoding="utf-8")
+
+    reasons, notes = cli._merge_window_blockers(config, set(), _Placer())
+
+    assert (reasons, notes) == ([], [])
+
+
+def test_at_one_lane_the_state_file_is_still_read_and_still_refuses(tmp_path):
+    """The other side of the same fact, so "not read above one lane" cannot be
+    mistaken for "not read at all". At one lane the file is the loop's own, and
+    an unreadable one raises exactly as it always did — every caller here wraps
+    that in a fail-closed `except` (`_shelved_candidate_window_report`,
+    `_discarded_candidate_window_report`, `merge_sweep`'s gate) and reads it as
+    SHUT."""
+    config = window_config(tmp_path, lanes=1)
+    register(config, "t9")
+    config.state_file.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(StateCorruptError):
+        cli._merge_window_blockers(config, set(), _Placer())
+
+
+def test_the_command_says_what_OPEN_means_at_each_lane_count(tmp_path, monkeypatch, capsys):
+    """The operator-facing half, and the same defect class as the `health.py`
+    line this round corrects. "No unpublished candidate, no executing phase" is
+    what OPEN means at one lane; above one lane NEITHER clause is checked any
+    more, so printing it there would be this command asserting exactly the two
+    things it stopped asking. No execution records in either half, deliberately:
+    with none, nothing reaches the gateway, so this is a claim about the
+    sentence and nothing else."""
+    args = argparse.Namespace(config=None, wait=False, timeout=0.1, poll=0.01)
+
+    one = window_config(tmp_path / "one", lanes=1)
+    monkeypatch.setattr(cli, "load_config", lambda _p: one)
+
+    assert cli._cmd_merge_window(args) == 0
+    assert capsys.readouterr().out.splitlines()[0] == (
+        "merge window OPEN — no unpublished candidate, no executing phase"
+    ), "byte for byte at one lane"
+
+    two = window_config(tmp_path / "two", lanes=2)
+    monkeypatch.setattr(cli, "load_config", lambda _p: two)
+
+    assert cli._cmd_merge_window(args) == 0
+    line = capsys.readouterr().out.splitlines()[0]
+    assert line.startswith("merge window OPEN — at 2 lanes")
+    assert "no executing phase" not in line, "it did not look, so it must not say"
+    assert "no unpublished candidate" not in line
 
 
 def test_a_caller_that_passes_no_list_still_gets_the_open_window(tmp_path):
@@ -1103,6 +1252,231 @@ def test_a_carried_forward_record_still_reads_as_reviewed(tmp_path):
     assert survivor is not None, "the reviewed record is carried, never re-based"
     assert survivor.candidate_sha, "a re-base would have blanked this"
     assert h.execution_store.load("t9").candidate_sha == survivor.candidate_sha
+
+
+# --- the executing-phase clause, converted (conc-13) ---------------------------
+#
+# The window predicate's own half is in the first section of this file, beside
+# the bound-candidate cases. What follows is the same claim END TO END, over
+# real repositories: with EVERY lane mid-write — the state that shut the window
+# for 5.5 hours on 2026-09-09 — the backlog drains, and each lane state the old
+# clause was standing in for is answered by the machinery that is more precise
+# than it was. One test per lane state, and `executing(...)` is written into
+# every lane's own state file in all of them, because a claim about the fleet
+# that only ever sets lane 0's file is a claim about lane 0.
+
+
+def test_a_sweep_lands_a_branch_with_every_lane_executing(tmp_path):
+    """THE measured failure, inverted. Two lanes, both mid-write, one completed
+    task published and unintegrated: the sweep merges it and the base moves.
+
+    Before conc-13 this deferred on the very first gate check — `merge_sweep`
+    checks the window once for the whole backlog, and lane 0's phase shut it —
+    so the branch waited for an operator to merge it by hand."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "1\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    before = h.head()
+    h.push("t1")                       # published, not integrated: the backlog
+    assert h.head() == before
+    landed = h.execution_store.load("t1").candidate_sha
+    executing(h.config, 0, 1)
+
+    result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+
+    assert result.outcome == merge_sweep.SWEPT
+    assert result.merged == ["t1"]
+    assert h.head() != before, "the base advanced, which is the whole claim"
+    assert contains(h.repo, h.head(), landed)
+    assert h.origin_base() == h.head(), "and it was pushed, not merged locally"
+
+
+def test_at_one_lane_an_executing_phase_still_defers_the_whole_sweep(tmp_path):
+    """The acceptance criterion end to end, and the reason the test above is
+    not simply "sweeps work now". At one lane `state.json` IS the loop, the
+    clause is the one it has always been, and the sweep defers on it with
+    today's reason — nothing was merged and nothing was pushed."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "1\n"}}, lanes=1, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    executing(h.config, 0)
+
+    result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+
+    assert result.outcome == merge_sweep.DEFERRED
+    assert result.reasons == ["a phase is executing — an agent may be mid-write"]
+    assert result.merged == []
+    assert h.head() == before and h.origin_base() == before
+
+
+def test_with_every_lane_executing_a_bound_candidate_is_carried_and_re_asked(tmp_path):
+    """LANE STATE: a reviewed candidate bound to the head, in a lane that is
+    mid-write. The base moves under it and it is not stranded — carried onto the
+    new head, its review round reset, and the approval taken against the old
+    base publishes nothing and asks for a new review instead."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    worktree = Path(nine.worktree_path)
+    stale = binding_for(nine, worktree)
+    executing(h.config, 0, 1)
+
+    result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+
+    assert result.merged == ["t1"]
+    assert h.head() != before
+    carried = h.execution_store.load("t9")
+    assert carried.task_base_sha == h.head()
+    assert carried.candidate_sha != nine.candidate_sha
+    assert contains(worktree, carried.candidate_sha, nine.candidate_sha), (
+        "a MERGE: the reviewed commit still exists and is still reachable"
+    )
+    assert carried.review_round == 0, "reset, so the loop ASKS for the new review"
+    assert carried.carried_review_rounds == 1, "and no budget was refilled"
+    assert carried.rereview_owed_base == before
+
+    approve(h, stale)
+
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == "", (
+        "never pushed on its old approval"
+    )
+    assert h.blockers("t9") == [], "asked, not parked"
+    assert carried.candidate_sha in queued_review_packet(h)
+
+
+def test_with_every_lane_executing_an_uncarryable_candidate_still_parks(tmp_path):
+    """LANE STATE: a reviewed candidate the head cannot be merged into — both
+    branches take the same file. The sweep still lands its own branch (the
+    all-or-nothing property is about the SWEEP's branches, unchanged), and the
+    candidate that cannot be carried parks `task_base_behind_head` rather than
+    being merged or pushed on the approval it already had."""
+    h = build(
+        tmp_path,
+        per_task={"t1": {"shared.py": "one\n"}},
+        lanes=2,
+        auto_merge_enabled=False,
+    )
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "shared.py", "nine\n")
+    worktree = Path(nine.worktree_path)
+    tip_before = head(worktree)
+    stale = binding_for(nine, worktree)
+    executing(h.config, 0, 1)
+
+    result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+
+    assert result.merged == ["t1"]
+    parks = [b for b in h.blockers("t9") if b.code == "task_base_behind_head"]
+    assert len(parks) == 1
+    # Nothing was discarded to buy that park.
+    assert is_clean(worktree), "the carry-forward's own merge was aborted"
+    assert head(worktree) == tip_before
+    kept = h.execution_store.load("t9")
+    assert (kept.candidate_sha, kept.task_base_sha) == (nine.candidate_sha, before)
+    assert kept.review_round == 1
+    assert kept.rereview_owed_base == before
+
+    approve(h, stale)
+
+    assert "push_rereview_owed" in [b.code for b in h.blockers("t9")]
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+
+
+def test_a_lane_mid_write_loses_no_work_when_the_base_moves_under_it(tmp_path):
+    """LANE STATE: an agent literally mid-write — a worker repository with
+    uncommitted changes, which is what "a phase is executing" was standing in
+    for and the one thing it could not actually see (it read lane 0's phase, not
+    any lane's tree).
+
+    The dirty tree is the guard, and it is precondition 4 of the carry-forward:
+    merging over that residue is exactly the quiet discard the refusal exists to
+    prevent. So the merge lands, the carry refuses, the task parks, and every
+    byte the agent had written is still there."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    worktree = Path(nine.worktree_path)
+    tip_before = head(worktree)
+    stale = binding_for(nine, worktree)
+    # THE MID-WRITE: a revise round is under way in this lane's worker — the
+    # reviewed candidate is still what the record names, and an agent is part
+    # way through the next one.
+    (worktree / "nine.py").write_text("half of the next round\n", encoding="utf-8")
+    (worktree / "brand-new.py").write_text("a file it just made\n", encoding="utf-8")
+    executing(h.config, 0, 1)
+
+    result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+
+    assert result.merged == ["t1"], "the fleet's backlog still drains"
+    # NOT ONE BYTE of the in-flight round was touched.
+    assert (worktree / "nine.py").read_text() == "half of the next round\n"
+    assert (worktree / "brand-new.py").read_text() == "a file it just made\n"
+    assert head(worktree) == tip_before
+    assert run_git(worktree, "branch", "--show-current").strip() == nine.task_branch
+    # And the refusal names the reason rather than being silent about it.
+    refusals = [e["data"] for e in h.entries("auto_merge_carry_forward_refused")]
+    assert [d["task_id"] for d in refusals] == ["t9"]
+    assert "uncommitted changes" in refusals[0]["reason"]
+    assert len([b for b in h.blockers("t9") if b.code == "task_base_behind_head"]) == 1
+    kept = h.execution_store.load("t9")
+    assert (kept.candidate_sha, kept.task_base_sha) == (nine.candidate_sha, before)
+    assert kept.rereview_owed_base == before
+
+    approve(h, stale)
+
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == "", (
+        "the approval taken against the old base still publishes nothing"
+    )
+
+
+def test_a_lane_with_no_candidate_yet_is_not_stranded_by_the_moving_base(tmp_path):
+    """LANE STATE: a round that has dispatched but not committed, so its record
+    names no candidate at all. It is skipped by the window for want of one — and
+    that is safe for a reason the phase clause never supplied: the worker is a
+    SEPARATE repository, so a merge into this checkout does not reach it, and
+    nothing reviewed exists to strand. What happens NEXT is
+    `_rebase_execution_if_stale`'s unreviewed arm — unchanged by this round, and
+    reached because the record stays unreviewed, which is asserted here rather
+    than driven (that arm rebuilds the worker through `_worker_repos`, which
+    this harness does not wire)."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n", review_round=0)
+    worktree = Path(nine.worktree_path)
+    nine.candidate_sha = ""            # dispatched, nothing committed yet
+    nine.candidate_commit_count = 0
+    h.execution_store.save(nine)
+    (worktree / "nine.py").write_text("mid-write\n", encoding="utf-8")
+    executing(h.config, 0, 1)
+
+    result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+
+    assert result.merged == ["t1"]
+    assert h.head() != before
+    # Nothing was marked, nothing was carried, nothing was parked — and the
+    # worker's uncommitted work is exactly where the agent left it.
+    assert h.entries("auto_merge_rereview_owed") == []
+    assert h.blockers("t9") == []
+    assert (worktree / "nine.py").read_text() == "mid-write\n"
+    stale = h.execution_store.load("t9")
+    assert stale.rereview_owed_base == ""
+    assert (stale.review_round, stale.carried_review_rounds) == (0, 0), (
+        "unreviewed, which is what routes the next dispatch to the re-base arm "
+        "rather than to the carry-forward or the park"
+    )
+    assert stale.task_base_sha == before, "still on the base it was cut from"
 
 
 def test_the_round_cap_counts_the_rounds_a_carry_forward_moved(tmp_path):

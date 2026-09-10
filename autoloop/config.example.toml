@@ -73,9 +73,16 @@ allow_protected_push = false
 # setting that moves the shared branch head with no operator in the loop.
 #
 # It is gated on exactly the same predicate `python -m autoloop merge-window`
-# reports — no unpublished candidate bound to the current base, no executing
-# phase — because moving the head strands any task whose reviewed candidate is
-# pinned to it. When the gate is shut the merge is DEFERRED (recorded under
+# reports. At ONE lane: no unpublished candidate bound to the current base, and
+# no executing phase — because moving the head strands any task whose reviewed
+# candidate is pinned to it. Above one lane both of those become per-candidate
+# obligations instead: a bound candidate is carried forward onto the new head
+# and re-reviewed before it can be pushed, and no lane's phase is read at all.
+# (Never write the concurrency section's own header inside prose anywhere in
+# this file: test_config_concurrency.py locates that section by splitting this
+# text on it, so a second copy above it hands both tests a comment to parse.)
+#
+# When the gate is shut the merge is DEFERRED (recorded under
 # <state_dir>/merge-deferrals/ and retried after the next completion), never
 # forced and never parked. Conflicts abort cleanly and name the files.
 #
