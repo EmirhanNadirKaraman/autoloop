@@ -222,4 +222,4 @@ exists to hold still. Every document named below is named in a comment, which
 # Append below this line. One line per test file added, saying what the new file
 # does to BOTH selections — the docs-only 20 in `test_prose_doc_selection.py`
 # and the 20/24 pair in `test_test_selection.py` — and then bump the counter.
-SUITE_SIZE = 120
+SUITE_SIZE = 122
