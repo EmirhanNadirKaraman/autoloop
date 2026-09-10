@@ -7690,6 +7690,33 @@ def test_every_stop_the_loop_control_is_refused_wherever_a_packet_is_outstanding
             )
 
 
+def test_the_five_phases_the_operator_named_unsafe_are_each_refused_by_name():
+    """The matrix above takes its expectation from `PACKET_OUTSTANDING_PHASES` —
+    the SAME constant the panel decides from — so on its own it would stay green
+    if that set ever shrank: the test and the code would be wrong together and
+    agree about it. These five are the phases named by hand on 2026-08-20, spelled
+    out here so the spec is asserted rather than echoed. `delivering` deposits
+    numbered parts before the verdict question is asked, `submitting` may already
+    have sent, both `submission_*` phases mean acceptance is unknown or
+    disproved, and `awaiting` has a reviewer holding the packet.
+
+    And the two named SAFE are offered, because a panel that refused `ready` and
+    `executing` as well would be refusing the thing it exists to make possible.
+    """
+    for phase in ("delivering", "submitting", "submission_unconfirmed",
+                  "submission_rejected", "awaiting"):
+        payload = controls(state={"phase": phase}, lock_alive=True)
+        for action_id in stopping_action_ids():
+            row = an_action(payload, action_id)
+            assert row["enabled"] is False, f"{action_id} offered in {phase}"
+            assert row["reason"], f"{action_id} greyed out silently in {phase}"
+    for phase in ("ready", "executing"):
+        payload = controls(state={"phase": phase}, lock_alive=True)
+        for action_id in stopping_action_ids():
+            row = an_action(payload, action_id)
+            assert row["enabled"] is True, f"{action_id} refused in {phase}"
+
+
 def test_a_session_nobody_can_read_refuses_every_stop_rather_than_allowing_it():
     """The fail-OPEN this closes: an empty or missing `state.json` beside a LIVE
     lock is no evidence, not a licence. A control that read "no session, so no
@@ -8342,6 +8369,126 @@ def test_a_stop_that_lands_in_an_unsafe_phase_runs_nothing_and_puts_the_loop_bac
     assert caught.value.extra["loop"]["restarted"] is True
 
 
+#: The controls whose whole effect IS the stop — the ones with no verb after it.
+#: Derived from the table for `stopping_action_ids`'s reason, and for a sharper
+#: one: the landing check used to fire only where a verb followed, so these were
+#: exactly the actions it silently did not cover, and an eleventh one shaped like
+#: them must not arrive with no landing test against it either.
+def stop_only_action_ids():
+    import autoloop.dashboard as dash
+
+    return [a.id for a in dash.OPERATOR_ACTIONS if a.stops_loop and not a.verb]
+
+
+@pytest.mark.parametrize("action_id", stop_only_action_ids())
+def test_a_stop_only_control_that_lands_unsafe_is_rolled_back_not_reported_done(
+    action_id, tmp_path, monkeypatch
+):
+    """The half of the landing check that used to be missing.
+
+    `pause` and `abort` run no verb, so there is nothing for the landing check to
+    withhold — and a check that only refused where a verb followed left the loop
+    DOWN in `delivering` and reported a stop that worked. STAYING stopped there
+    strands the numbered parts exactly as acting there would, so the stop is
+    rolled back and the operator is told, rather than reading a green tick over a
+    stranded packet.
+    """
+    import autoloop.dashboard as dash
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    # Armed in `executing`, which is safe and passes the pre-check.
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        # The agent finished and the loop moved on before it read the flag, so
+        # it comes down mid-deposit.
+        (state_dir / "state.json").write_text(
+            json.dumps({"phase": "delivering"}), encoding="utf-8")
+        (state_dir / "LOCK").unlink()
+        return None
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, action_id, {"wait": 2},
+            run_verb=recording_runner(calls, on_verb=on_verb),
+            spawn=recording_spawn(spawns, state_dir),
+        )
+
+    assert caught.value.code == 409
+    assert "delivering" in caught.value.reason
+    assert [c[3] for c in calls] == [action_id], "the arm, and nothing after it"
+    assert spawns[0][3:5] == ["run", "--continuous"], "the loop is put back"
+    assert "resume" not in " ".join(spawns[0])
+    assert caught.value.extra["stopped_in_phase"] == "delivering"
+    assert caught.value.extra["loop"]["stopped"] is True
+    assert caught.value.extra["loop"]["restarted"] is True, "never left down"
+    # The reason is about THIS action's own effect. "NOTHING was run" is true of
+    # a verb withheld and false of a stop that landed, and an operator could
+    # disprove it by reading the log.
+    assert "NOTHING was run" not in caught.value.reason
+    assert "STAYING stopped" in caught.value.reason
+    if action_id == "abort":
+        assert "NOT brought back" in caught.value.reason, (
+            "the restart undoes the stop; it does not undo the kill")
+
+
+def test_a_rolled_back_stop_whose_restart_fails_never_claims_the_loop_is_back(
+    tmp_path, monkeypatch
+):
+    """The refusal states what was VERIFIED, not what was attempted.
+
+    "The loop was put back" is the sentence a rolled-back Pause wants to end on,
+    and glued in front of a restart that failed it would sit immediately above
+    "THE LOOP IS DOWN" — two claims about the same loop, in one message, one of
+    them false. The head is chosen from `_restart`'s own verdict instead.
+    """
+    import autoloop.dashboard as dash
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    (state_dir / "state.json").write_text(json.dumps({"phase": "executing"}),
+                                          encoding="utf-8")
+    write_lock(state_dir, run_id="run-a")
+    calls, spawns = [], []
+
+    def on_verb(argv):
+        (state_dir / "state.json").write_text(
+            json.dumps({"phase": "delivering"}), encoding="utf-8")
+        (state_dir / "LOCK").unlink()
+        return None
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, "pause", {"wait": 2},
+            run_verb=recording_runner(calls, on_verb=on_verb),
+            spawn=recording_spawn(spawns, state_dir, comes_up=False),
+        )
+
+    assert caught.value.code == 409
+    assert "THE LOOP IS DOWN" in caught.value.reason, "the loud outcome"
+    assert "was put back" not in caught.value.reason
+    assert "could NOT be verified" in caught.value.reason
+    assert caught.value.extra["loop"]["restarted"] is False
+
+
+def test_the_verb_less_stop_controls_are_a_non_empty_set_the_matrix_covers():
+    """The parametrize above degrades to a SKIP if that list is ever empty, and
+    a matrix that covers nothing reports the same green as one that covers
+    everything — the guard switching itself off, which is the class of failure it
+    was written for. Both members are named here, so a table edit that empties it
+    fails loudly instead."""
+    assert set(stop_only_action_ids()) >= {"pause", "abort"}
+    assert set(stopping_action_ids()) >= set(stop_only_action_ids())
+
+
 def test_a_stop_that_lands_with_a_sibling_lane_owing_a_packet_runs_nothing_either(
     tmp_path, monkeypatch
 ):
@@ -8536,6 +8683,84 @@ def test_a_restart_is_never_believed_from_a_lock_file_alone(tmp_path, monkeypatc
     fresh = dash._verify_restart(state_dir, "run-a", _FakeChild(),
                                  time.monotonic() + 5)
     assert fresh["restarted"] is True and fresh["pid"] == os.getpid()
+
+
+@pytest.mark.parametrize("flag", ["pause", "abort"])
+def test_a_stop_flag_armed_while_the_loop_starts_is_not_a_verified_restart(
+    flag, tmp_path, monkeypatch
+):
+    """A live lock is not enough when a stop flag landed beside it.
+
+    `_restart` CLEARS both flags before it spawns, so the window it has to
+    re-read is both of them: one armed again between the clear and the lock read
+    brings the fresh loop straight back down, and the operator would be reading
+    "restarted and verified alive: LOCK pid N" about it. Either flag is enough:
+    `cli._run_continuous` asks `pause_requested` and then `abort_requested` at
+    the top of every outer iteration and returns on either, so one landing in
+    that window ends the new loop at its first outer iteration — before it
+    resumes a session or selects a task.
+    """
+    import autoloop.dashboard as dash
+    from autoloop import cli
+    from autoloop.config import load_config
+    from autoloop.state import abort_flag_file
+
+    fast_waits(monkeypatch)
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    config_path = state_dir / "config.toml"
+    config = load_config(config_path)
+    flag_file = config.pause_file if flag == "pause" else abort_flag_file(config)
+    spawns = []
+
+    def spawn(argv, cwd, log):
+        # The loop really comes up and takes the lock; the flag lands in the same
+        # instant, which is the race the second read exists for.
+        spawns.append(list(argv))
+        write_lock(state_dir, run_id="run-b")
+        flag_file.parent.mkdir(parents=True, exist_ok=True)
+        flag_file.touch()
+        return _FakeChild()
+
+    out = dash._restart(cli, config, config_path, repo, state_dir, "run-a",
+                        spawn, None)
+
+    assert spawns and spawns[0][3:5] == ["run", "--continuous"]
+    assert out["loop"]["restarted"] is False, (
+        f"a {flag} flag armed while the loop started was reported as a restart")
+    assert f"THE {flag.upper()} FLAG IS ARMED" in out["message"]
+    assert flag in out["loop"]["detail"]
+    # The pid is still reported: the loop DID start, and the operator has to be
+    # able to go and look at the process that is about to stop.
+    assert out["loop"]["pid"] == os.getpid()
+
+
+def test_the_restart_check_reads_every_stop_flag_the_page_can_arm():
+    """The correspondence, both ways, so the guard cannot cover half of what it
+    arms.
+
+    An `OperatorAction.arm` with no reader is a flag nothing re-reads after a
+    restart — which is how the abort half came to be missing. A reader for a flag
+    nothing arms is dead weight. And the reader NAMES are asserted against `cli`
+    itself, because `_armed_stop_flag` deliberately has no `getattr` default: a
+    rename must fail here rather than quietly answer "nothing is armed".
+    """
+    import inspect
+
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    arms = {a.arm for a in dash.OPERATOR_ACTIONS if a.arm}
+    readers = dict(dash.CONTROL_STOP_FLAG_READERS)
+    assert set(readers) == arms, (
+        "every stop flag an action can arm needs a reader, and no reader may "
+        f"stand for a flag nothing arms: {sorted(readers)} vs {sorted(arms)}")
+    for flag, reader in readers.items():
+        assert callable(getattr(cli, reader)), (
+            f"cli has no reader for the {flag} flag — `_armed_stop_flag` would "
+            "raise rather than answer")
+    assert "_armed_stop_flag" in inspect.getsource(dash._restart), (
+        "the restart check must go through the helper that reads both flags")
 
 
 def test_operator_free_text_can_never_become_an_argparse_flag(tmp_path):
