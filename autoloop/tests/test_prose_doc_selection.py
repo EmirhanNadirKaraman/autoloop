@@ -565,7 +565,7 @@ DOCS_ONLY_SELECTED = 20
 #: check it replaced did resolve one. It builds no `.md` name either, so
 #: `test_no_file_that_addresses_this_checkout_builds_a_document_name_dynamically`
 #: is unmoved too.
-SUITE_SIZE = 120
+SUITE_SIZE = 122
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
