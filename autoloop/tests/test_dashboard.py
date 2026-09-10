@@ -8013,6 +8013,350 @@ def test_a_locked_verb_is_offered_against_a_stopped_loop():
     assert a_task_row(payload, "running-01")["release"]["enabled"] is True
 
 
+# --- a STOPPED loop still owes its packet, and the session names whose it is ---
+#
+# The hole every other gate in this panel left open. They are all about STOPPING,
+# so a loop ALREADY stopped in `awaiting` passes each of them — and `release`
+# against the very task the reviewer is holding a packet for then archives its
+# execution record and quarantines its worker. The stop-the-loop path never had
+# it: a hold exists only where a session owes a packet, any session owing one
+# makes `stop_refusal` non-empty, so `perform_control`'s post-boundary re-read
+# refuses there and puts the loop back. These pin the other half.
+
+
+def task_action_ids():
+    """Every control that acts on a TASK. Derived from the table, so a fourth one
+    cannot arrive with no session-gate test against it."""
+    import autoloop.dashboard as dash
+
+    return [a.id for a in dash.OPERATOR_ACTIONS if a.needs == "task"]
+
+
+#: The registry state each task control is OTHERWISE offered in, so the matrix
+#: below proves the session gate fires where the control would have been enabled
+#: rather than where it was already refused for its own reason.
+ELIGIBLE_STATE_FOR = {
+    "release": "in_progress",
+    "discard": "blocked_by_operator",
+    "retire": "ready",
+}
+
+
+def test_every_task_control_has_a_state_the_session_matrix_exercises_it_in():
+    """A parametrize over an empty or partial list reports the same green as one
+    covering everything — the reason `stop_only_action_ids` is asserted non-empty
+    too. A fourth task control must fail here until somebody decides which state
+    it is eligible in."""
+    assert task_action_ids(), "no task control found — the matrix covers nothing"
+    assert set(ELIGIBLE_STATE_FOR) == set(task_action_ids())
+
+
+def a_held_session(field, task_id="running-01", phase="awaiting"):
+    """A saved session that owes a packet and names its task in ONE of the three
+    fields `cli._session_names_task` reads."""
+    value = task_id if field == "park_task_id" else {"task_id": task_id}
+    return {"phase": phase, field: value}
+
+
+def test_release_is_refused_for_the_task_a_stopped_session_still_owes_a_packet_for():
+    """THE case: the loop is DOWN, so every stop-shaped gate passes, and the
+    reviewer is still holding running-01's packet. Releasing it archives the
+    execution record and quarantines the worker the approval would push from.
+
+    And it is TASK-SCOPED: other-01 is equally in progress, no packet is
+    outstanding about it, and its Release is exactly as available as it was.
+    """
+    payload = controls(
+        state=a_held_session("current_task"), lock_alive=False, lock_pid="",
+        groups=[a_group("in_progress", ["running-01", "other-01"])],
+    )
+
+    held = a_task_row(payload, "running-01")["release"]
+    assert held["enabled"] is False
+    assert "running-01" in held["reason"] and "awaiting" in held["reason"]
+    assert "whether or not the loop is running" in held["reason"]
+
+    free = a_task_row(payload, "other-01")["release"]
+    assert free["enabled"] is True and free["reason"] == ""
+    # The action itself is untouched: `release` is still the right verb to press,
+    # for a task the packet is not about.
+    assert an_action(payload, "release")["enabled"] is True
+
+
+@pytest.mark.parametrize("field", ["current_task", "task_execution", "park_task_id"])
+@pytest.mark.parametrize("action_id", task_action_ids())
+def test_every_task_control_is_refused_for_the_task_the_session_names(
+    action_id, field
+):
+    """All three fields, because three different readers decide "which task is
+    this session about" from three different places — `cli._session_names_task`
+    reads exactly these, and a session naming the task in ANY of them can still
+    act on it. All three controls, because each ends a round the loop has not
+    finished."""
+    payload = controls(
+        state=a_held_session(field), lock_alive=False, lock_pid="",
+        groups=[a_group(ELIGIBLE_STATE_FOR[action_id], ["running-01"])],
+    )
+
+    verdict = a_task_row(payload, "running-01")[action_id]
+    assert verdict["enabled"] is False, f"{action_id} offered for a held task"
+    assert "running-01" in verdict["reason"]
+
+
+def test_the_three_naming_fields_are_the_ones_the_cli_reads():
+    """The correspondence itself, both ways. `cli._session_names_task` is the
+    loop's own answer to "does this session belong to that task"; a field this
+    page stopped reading would be a session that holds a task the CLI agrees it
+    holds, with nothing here saying so."""
+    import types
+
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    for field in ("current_task", "task_execution", "park_task_id"):
+        raw = a_held_session(field)
+        assert dash._session_task_ids(raw)[0] == {"running-01"}, field
+        fields = {"current_task": None, "task_execution": None, "park_task_id": None}
+        fields[field] = raw[field]
+        assert cli._session_names_task(types.SimpleNamespace(**fields),
+                                       "running-01") is True, field
+
+
+def test_a_session_that_owes_no_packet_never_holds_the_task_it_names():
+    """The gate keys on the PACKET, never on the task having been dispatched.
+
+    A `loop_fatal` park leaves the task marked in-progress with nothing to finish
+    it, and the session still names it — that is the case `release` exists for,
+    and a gate that refused every task a session mentions would have taken the
+    verb away in exactly the state it is meant for.
+    """
+    for phase in ("ready", "executing", "needs_user", "failed", "stopped"):
+        payload = controls(
+            state=a_held_session("current_task", phase=phase),
+            lock_alive=False, lock_pid="",
+            groups=[a_group("in_progress", ["running-01"])],
+        )
+        verdict = a_task_row(payload, "running-01")["release"]
+        assert verdict["enabled"] is True, f"release refused in phase {phase}"
+
+
+def test_a_sibling_lane_owing_a_packet_holds_its_own_task_and_only_that_one():
+    """A fleet's packet belongs to the lane that sent it. The reason names the
+    lane, exactly as the stop refusal does, because "which lane" is the first
+    thing an operator has to look at."""
+    payload = controls(
+        state={"phase": "ready"}, lock_alive=False, lock_pid="",
+        groups=[a_group("in_progress", ["lane-task-01", "other-01"])],
+        lane_states=[("_lane-1", {"phase": "delivering",
+                                  "task_execution": {"task_id": "lane-task-01"}})],
+    )
+
+    held = a_task_row(payload, "lane-task-01")["release"]
+    assert held["enabled"] is False
+    assert "_lane-1" in held["reason"] and "delivering" in held["reason"]
+    assert a_task_row(payload, "other-01")["release"]["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        # A packet outstanding and no task named at all.
+        {"phase": "awaiting"},
+        # A record, in a shape no id can be read out of.
+        {"phase": "awaiting", "current_task": "running-01"},
+        {"phase": "awaiting", "current_task": {"note": "no id here"}},
+        {"phase": "awaiting", "task_execution": []},
+        {"phase": "awaiting", "park_task_id": 123},
+        # One field readable, another not — the readable one must not narrow the
+        # refusal down to itself.
+        {"phase": "delivering", "current_task": {"task_id": "running-01"},
+         "task_execution": "junk"},
+        # A request outliving its phase, which owes a packet just the same.
+        {"phase": "ready", "pending_request": {"request_id": "req-9"}},
+        # A session nobody can read at all.
+        {},
+        None,
+        123,
+    ],
+)
+def test_a_packet_nobody_can_attribute_to_a_task_refuses_every_task_control(session):
+    """The fail-CLOSED direction, and the one this could most easily have got
+    backwards. An unattributable packet is not an absent packet: a session that
+    owes one and names no task id anybody can read is the same read failure
+    `_session` answers `None` to, one field further in. It widens the refusal to
+    every task rather than narrowing it to none."""
+    payload = controls(
+        state=session, lock_alive=False, lock_pid="",
+        groups=[a_group("in_progress", ["running-01"]),
+                a_group("ready", ["queued-01"])],
+    )
+
+    for task_id in ("running-01", "queued-01"):
+        for action_id in task_action_ids():
+            verdict = a_task_row(payload, task_id)[action_id]
+            assert verdict["enabled"] is False, (
+                f"{action_id} offered on {task_id} beside {session!r}")
+            assert verdict["reason"], f"{action_id} greyed out silently"
+
+
+def test_the_session_task_read_is_total_and_never_raises():
+    """Read off a file an operator can hand-edit, in the middle of a page load
+    whose whole job at that moment is to show a loop somebody is rescuing. Every
+    shape answers; an unreadable one answers OPAQUE, which refuses."""
+    import autoloop.dashboard as dash
+
+    for broken in (123, "executing", True, None, [{"task_id": "t"}]):
+        assert dash._session_task_ids(broken) == (set(), True), broken
+    # Falsy is ABSENT, not opaque: this is what an idle session carries, and
+    # reading it as "a task we cannot name" would refuse every control on a loop
+    # between rounds.
+    assert dash._session_task_ids(
+        {"phase": "ready", "current_task": None, "task_execution": {},
+         "park_task_id": ""}) == (set(), False)
+    assert dash._session_task_ids(
+        {"current_task": {"task_id": " spaced-01 "}}) == ({"spaced-01"}, False)
+
+
+def test_an_idle_session_holds_nothing_and_a_packet_phase_holds_its_task():
+    """`session_holds` on its own, both answers."""
+    import autoloop.dashboard as dash
+
+    assert dash.session_holds({"phase": "ready"}) == ({}, "")
+    holds, note = dash.session_holds(a_held_session("current_task"))
+    assert list(holds) == ["running-01"] and "awaiting" in holds["running-01"]
+    assert note == ""
+
+
+def test_a_lane_directory_nobody_can_list_holds_every_task_too():
+    """No lane's session was read at all, so which task any of them owes a packet
+    about is unknown — the same fail-closed answer `stop_refusal` gives."""
+    import autoloop.dashboard as dash
+
+    note = "the fleet's lane directory could not be listed"
+    holds, hold_note = dash.session_holds({"phase": "ready"}, (), note)
+    assert holds == {} and hold_note == note
+
+    payload = controls(state={"phase": "ready"}, lock_alive=False, lock_pid="",
+                       lane_note=note, groups=[a_group("ready", ["queued-01"])])
+    verdict = a_task_row(payload, "queued-01")["retire"]
+    assert verdict["enabled"] is False and note in verdict["reason"]
+
+
+def test_a_missing_session_file_is_not_a_session_and_an_unreadable_one_is(tmp_path):
+    """`_lane_sessions`' own rule, applied to lane 0. A lane directory with no
+    `state.json` has never run and owes nothing; one that EXISTS and will not
+    parse is no evidence and refuses.
+
+    It matters here because `reset --yes` ARCHIVES the session file: "there is no
+    state.json" is an ordinary state an operator releases a stranded task from,
+    and refusing there would take the verb away in the case it exists for.
+    """
+    import autoloop.dashboard as dash
+
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress")])
+    release = dash.ACTIONS_BY_ID["release"]
+
+    snap = dash._fresh_snapshot(repo, state_dir)
+    assert snap["session_holds"] == {} and snap["session_hold_note"] == ""
+    assert dash._task_action_refusal(release, "running-01", snap) == ""
+
+    (state_dir / "state.json").write_text("]", encoding="utf-8")
+    snap = dash._fresh_snapshot(repo, state_dir)
+    why = dash._task_action_refusal(release, "running-01", snap)
+    assert "no readable session" in why
+
+    # And a file that turns up between the existence check and the read is still
+    # judged as the session it is — the flag only ever speaks for one nobody
+    # could read.
+    holds, _note = dash.session_holds(
+        a_held_session("current_task"), session_absent=True)
+    assert list(holds) == ["running-01"]
+
+
+def test_only_a_stat_that_says_NOT_FOUND_is_evidence_of_no_session(tmp_path):
+    """The fail-OPEN inside the flag itself. `Path.exists()` swallows
+    `PermissionError` and `NotADirectoryError` and answers False for both, so an
+    unreadable state directory would have read as "no session here" — the one
+    answer that lets a per-task control through. Only `FileNotFoundError` counts
+    as absence; every other `OSError` is a read that failed."""
+    import autoloop.dashboard as dash
+
+    assert dash._session_file_absent(None) is False, "no path is not absence"
+    assert dash._session_file_absent(tmp_path / "nope.json") is True
+
+    present = tmp_path / "state.json"
+    present.write_text("{}", encoding="utf-8")
+    assert dash._session_file_absent(present) is False
+
+    # A path THROUGH a file: `stat` raises NotADirectoryError, which
+    # `Path.exists()` would have swallowed into False.
+    assert dash._session_file_absent(present / "state.json") is False
+
+
+def test_a_control_against_a_stopped_loops_own_task_refuses_before_it_runs(tmp_path):
+    """The POST path, which is where it counts: the endpoint re-decides against a
+    FRESH read, and a refusal here means the CLI verb was never spawned — no
+    execution record archived, no worker quarantined.
+
+    The loop is DOWN throughout (no LOCK file), which is precisely the state that
+    passed every other gate in this panel.
+    """
+    import autoloop.dashboard as dash
+
+    repo = control_repo(tmp_path)
+    state_dir = repo / ".autoloop"
+    write_tasks(repo, [a_task("running-01", status="in_progress"),
+                       a_task("other-01", status="in_progress")])
+    (state_dir / "state.json").write_text(
+        json.dumps({"phase": "awaiting",
+                    "current_task": {"task_id": "running-01"}}),
+        encoding="utf-8")
+    calls, spawns = [], []
+
+    with pytest.raises(dash._ControlRefused) as caught:
+        dash.perform_control(
+            repo, "release", {"task": "running-01"},
+            run_verb=recording_runner(calls), spawn=recording_spawn(spawns, state_dir),
+        )
+
+    assert caught.value.code == 400
+    assert "awaiting" in caught.value.reason
+    assert calls == [], "the verb must never have been spawned"
+    assert spawns == [], "and nothing may have been started either"
+
+    # The unrelated in-progress task is released exactly as it always was.
+    result = dash.perform_control(
+        repo, "release", {"task": "other-01"},
+        run_verb=recording_runner(calls), spawn=recording_spawn(spawns, state_dir),
+    )
+    assert [c[3] for c in calls] == ["release"]
+    assert calls[0][-2:] == ["--", "other-01"]
+    assert result["ok"] is True and spawns == []
+
+
+def test_a_blocker_control_is_not_caught_by_the_session_gate():
+    """Scoped to the task controls DELIBERATELY, and this says which way.
+
+    `answer` and `archive-blocker` are scoped to a blocker: neither archives an
+    execution record nor moves a worker, so neither can invalidate a packet the
+    way ending a round does — and `archive-blocker`'s own refusal of a LIVE
+    session stays its own refusal, surfaced rather than routed around.
+    """
+    payload = controls(
+        state=a_held_session("current_task", task_id="parked-01"),
+        lock_alive=False, lock_pid="",
+        groups=[a_group("blocked_by_operator", ["parked-01"])],
+        blockers=[{"id": "blk-p1-001", "task": "parked-01", "kind": "quarantine",
+                   "code": "loop_fatal"}],
+    )
+
+    assert a_task_row(payload, "parked-01")["discard"]["enabled"] is False
+    answer = a_task_row(payload, "parked-01")["answer"]
+    assert answer["enabled"] is True and answer["blocker"] == "blk-p1-001"
+
+
 def test_the_panel_shows_the_attempt_ledger_rather_than_the_counters():
     """On 2026-08-20 port-01 and blk-01 both reported fault_attempt_count=0 with
     a burned round in their ledgers. The entries are the evidence; the counters

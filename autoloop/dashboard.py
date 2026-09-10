@@ -4066,9 +4066,20 @@ def collect(repo: Path) -> dict:
     # raises on the first `.get` below — taking down a page whose whole job at
     # that moment is to show an operator what state the loop is in. Reads stay
     # free by reading absent, exactly as an unparseable file already does.
-    state = _json(_under(sd, "state.json"))
+    state_path = _under(sd, "state.json")
+    state = _json(state_path)
     if not isinstance(state, dict):
         state = {}
+    # ABSENT and UNREADABLE must not look the same to the operator controls, and
+    # normalising both to `{}` above is exactly how they would: `reset --yes`
+    # ARCHIVES the session file, so "there is no state.json" is an ordinary
+    # state a stranded task is released from, while "there is one and it will
+    # not parse" is a session nobody can say owes a packet or not. It is
+    # `_lane_sessions`' own rule for lane 0 — a lane with no `state.json` has
+    # never run and owes nothing; one that will not parse refuses. Unresolvable
+    # state dir stays `False`, the fail-closed answer, and `note` refuses every
+    # control there anyway.
+    session_absent = _session_file_absent(state_path)
     # `tasks.json` only exists once a registry has been saved; before that the
     # CLI seeds from the tracked file. Reading only the former showed an empty
     # roadmap while `next-task` correctly reported rt-01.
@@ -4342,6 +4353,7 @@ def collect(repo: Path) -> dict:
             lock_run_id=lock_run_id, groups=groups, blockers=blockers,
             note=sd_error, executions=executions, merge=window,
             lane_states=lane_states, lane_note=lane_note,
+            session_absent=session_absent,
         ),
         # The registry against the code, in BOTH directions: a shipped-elsewhere
         # record whose carrying commits have stopped being ancestors, and a
@@ -7140,6 +7152,14 @@ tick(); setInterval(tick, 2000);
 # 4. REFUSALS STAY REFUSALS. `release` refusing a non-`in_progress` task,
 #    `archive-blocker` refusing a live session, and the merge window's exemptions
 #    are all correct. This surfaces them; it never routes around them.
+# 5. A STOPPED LOOP STILL OWES ITS PACKET. Properties 2 and 3 are both about
+#    stopping, so a loop ALREADY stopped in `awaiting` passes every one of them —
+#    and ending that task's round there strands the packet exactly as stopping
+#    into it would. So the session is asked WHICH TASK it owes a packet about
+#    (`session_holds`), and every per-task control refuses that task whether or
+#    not there is a loop running. It is task-scoped on purpose: the other tasks
+#    in the registry are untouched, which is what makes the panel usable at the
+#    moment an operator most needs it.
 #
 # WHAT IS NOT HERE, and is a separate task rather than an omission: restoring an
 # attempt budget (no CLI verb touches `attempt_count`, so there is no attested
@@ -7157,8 +7177,8 @@ tick(); setInterval(tick, 2000);
 #: was read, and a control decided from a read that never happened is the
 #: fail-open this page has been bitten by before (port-06).
 _CONTROL_SNAPSHOT_FIELDS = (
-    "note", "running", "pid", "run_id", "stop_reason", "task_states",
-    "task_blockers", "blockers",
+    "note", "running", "pid", "run_id", "stop_reason", "session_holds",
+    "session_hold_note", "task_states", "task_blockers", "blockers",
 )
 
 
@@ -7282,6 +7302,152 @@ def stop_refusal(state: dict | None, lane_states=(), lane_note: str = "") -> str
     return ""
 
 
+#: The fields a saved session names its task in — the same three
+#: `cli._session_names_task` reads, and for its reason: `current_task` is what
+#: `Orchestrator._dispatch` writes before it cuts a round, `task_execution` is
+#: the serialised record a resumed dispatch rehydrates, and `park_task_id` is
+#: what `cli._handle_parked_task` quarantines on the next iteration. A session
+#: naming a task in ANY of them can still act on it, so any of them counts.
+#:
+#: Split by SHAPE because the file is: the first two are records carrying a
+#: `task_id`, the third is the id itself.
+_SESSION_TASK_RECORDS = ("current_task", "task_execution")
+_SESSION_TASK_IDS = ("park_task_id",)
+
+
+def _session_file_absent(path: Path | None) -> bool:
+    """POSITIVE evidence that there is no saved session at `path`.
+
+    `Path.exists()` is deliberately not used, and this is the fail-open it would
+    have been: it SWALLOWS `PermissionError` and `NotADirectoryError` and answers
+    False for each, so a state directory an ancestor's permissions made
+    unreadable would read as "no session here" — which is the one answer that
+    lets a per-task control through. `stat` distinguishes them: only
+    `FileNotFoundError` is evidence of absence, and every other `OSError` is a
+    read that failed, which `session_holds` must treat as a session it could not
+    read rather than as one that is not there.
+
+    `None` (an unresolvable state directory) is not absence either.
+    """
+    if path is None:
+        return False
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _session_task_ids(state) -> tuple[set[str], bool]:
+    """Every task id a saved session names, and whether any naming field was in
+    a shape no id could be read out of.
+
+    The second half of the answer is the one that matters. A session that owes a
+    review packet and names its task lets the refusal be TASK-SCOPED: that task's
+    round may not be archived, every other task is untouched. A session that owes
+    one and names a task NOBODY CAN READ — `current_task` holding a string, a
+    record with no `task_id`, a `park_task_id` that is a number — is not evidence
+    that no task is held; it is the same read failure `_session` answers `None`
+    to, one field further in, and it must widen the refusal rather than narrow
+    it. So `opaque` is returned beside the ids and the caller refuses every task
+    on it.
+
+    Total and never raises, for `_session`'s reason: this is read off a file an
+    operator can hand-edit, in the middle of a page load whose whole job at that
+    moment is to show a loop somebody is trying to rescue.
+    """
+    if not isinstance(state, dict):
+        return set(), True
+    ids: set[str] = set()
+    opaque = False
+    for field in _SESSION_TASK_RECORDS:
+        record = state.get(field)
+        if not record:
+            # Falsy is ABSENT, not opaque: `None` and `{}` are what a session
+            # between rounds carries, and reading those as "a task we cannot
+            # name" would refuse every task control on an idle loop.
+            continue
+        candidate = record.get("task_id") if isinstance(record, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            ids.add(candidate.strip())
+        else:
+            opaque = True
+    for field in _SESSION_TASK_IDS:
+        candidate = state.get(field)
+        if not candidate:
+            continue
+        if isinstance(candidate, str) and candidate.strip():
+            ids.add(candidate.strip())
+        else:
+            opaque = True
+    return ids, opaque
+
+
+#: Prefixed to the reason a session owes a packet when that packet cannot be
+#: attributed to a task. The blanket refusal for every per-task control, and the
+#: fail-CLOSED half of `_session_task_ids`.
+SESSION_HOLD_UNATTRIBUTED = (
+    " — and no task id can be read out of it, so WHICH task's round that packet "
+    "belongs to is unknown"
+)
+
+
+def session_holds(
+    state: dict | None, lane_states=(), lane_note: str = "",
+    session_absent: bool = False,
+) -> tuple[dict[str, str], str]:
+    """`({task_id: why its round is held}, blanket refusal)` — which tasks a
+    saved session still owes a review packet ABOUT.
+
+    THE GAP THIS CLOSES, and it is only ever open one way. Every other refusal in
+    this panel is about STOPPING the loop, so a loop that is ALREADY STOPPED in
+    `awaiting` passes all of them — and `release` against the very task the
+    reviewer is holding a packet for then archives its execution record and
+    quarantines its worker, which is the outcome this panel exists to refuse. The
+    stop-the-loop path never had that hole: a hold exists only where some session
+    owes a packet, and any session owing a packet makes `stop_refusal` non-empty,
+    so `perform_control`'s post-boundary re-read already refuses there and puts
+    the loop back. This is the same question asked of the STOPPED loop.
+
+    A MISSING main `state.json` is not a session, and `session_absent` says so.
+    That is `_lane_sessions`' own rule applied to lane 0 rather than a new
+    exception: a lane directory with no `state.json` is a lane that has never run
+    and owes nothing, while one that EXISTS and will not parse arrives as `None`
+    and refuses. `reset --yes` archives the session file, so "no state.json"
+    is an ordinary state an operator releases a stranded task from — and refusing
+    there would break the case `release` exists for. Two things keep that from
+    becoming a way through: the flag comes from `_session_file_absent`, which
+    counts only a `FileNotFoundError` as absence and treats every other `OSError`
+    as a read that failed; and it is honoured only when the session is ALSO
+    unreadable (`_session` answers `None`), so a file that turned up between the
+    stat and the read is still judged as the session it is.
+
+    A session that owes a packet and names no readable task refuses EVERY task,
+    through the blanket note: an unattributable packet is not an absent one.
+    `lane_note` — a `lanes/` nobody can list — refuses the same way, because no
+    lane's session was read at all.
+    """
+    holds: dict[str, str] = {}
+    note = lane_note or ""
+    sessions: list[tuple[str, object]] = []
+    if not (session_absent and _session(state) is None):
+        sessions.append(("", state))
+    sessions += [(f"lane {lane_id}: ", lane_state)
+                 for lane_id, lane_state in (lane_states or ())]
+    for prefix, raw in sessions:
+        reason = packet_outstanding_reason(_session(raw))
+        if not reason:
+            continue
+        ids, opaque = _session_task_ids(raw)
+        for task_id in ids:
+            holds.setdefault(task_id, prefix + reason)
+        if opaque or not ids:
+            note = note or (prefix + reason + SESSION_HOLD_UNATTRIBUTED)
+    return holds, note
+
+
 def _task_states(groups: list[dict] | None) -> dict[str, str]:
     """`{task_id: TaskState.value}` from the GROUPED read.
 
@@ -7304,7 +7470,7 @@ def _task_states(groups: list[dict] | None) -> dict[str, str]:
 
 def control_snapshot(
     *, state, lock_alive, lock_pid, lock_run_id, groups, blockers, note,
-    lane_states=(), lane_note="",
+    lane_states=(), lane_note="", session_absent=False,
 ) -> dict:
     """The decided inputs, in the shape every control predicate below reads."""
     open_blockers = {
@@ -7313,6 +7479,11 @@ def control_snapshot(
     task_blockers: dict[str, list[str]] = {}
     for blocker_id, blocker in open_blockers.items():
         task_blockers.setdefault(str(blocker.get("task") or ""), []).append(blocker_id)
+    # WHICH TASK the outstanding packet is about, carried beside the reason it is
+    # outstanding. `stop_reason` above answers "may the loop be stopped"; this
+    # answers "whose round may not be touched", which is a different question and
+    # the one a STOPPED loop still has to be asked. See `session_holds`.
+    holds, hold_note = session_holds(state, lane_states, lane_note, session_absent)
     return {
         "note": note,
         "running": bool(lock_alive),
@@ -7323,6 +7494,8 @@ def control_snapshot(
         # phase would refuse if the loop were started again. Asked of EVERY
         # lane, because one `LoopLock` stops all of them.
         "stop_reason": stop_refusal(state, lane_states, lane_note),
+        "session_holds": holds,
+        "session_hold_note": hold_note,
         "task_states": _task_states(groups),
         "task_blockers": task_blockers,
         "blockers": open_blockers,
@@ -7459,6 +7632,17 @@ def _task_action_refusal(action: OperatorAction, task_id: str, snap: dict) -> st
     invented: `TaskRegistry.release` refuses anything that is not `in_progress`,
     `discard` is the verb for a quarantined one, and a task being written by an
     agent right now is not a task anyone may retire out from under.
+
+    THE SESSION GATE IS ASKED FIRST, and of EVERY task control rather than of a
+    named three. All of them end a round the loop has not finished — `release`
+    archives the execution record and quarantines the worker, `discard` retires a
+    quarantined round, `retire` supersedes the task the packet is about — so a
+    fourth one arriving later is far likelier to belong under this gate than
+    outside it, and a hardcoded set is a gate that switches itself off for
+    whatever is added next. (The blocker controls are deliberately not here:
+    `answer` and `archive-blocker` are scoped to a blocker, neither archives an
+    execution record nor moves a worker, and `archive-blocker`'s own refusal of a
+    LIVE session stays its own refusal.)
     """
     states = snap["task_states"]
     if not states:
@@ -7469,6 +7653,25 @@ def _task_action_refusal(action: OperatorAction, task_id: str, snap: dict) -> st
     state = states.get(task_id)
     if state is None:
         return f"the registry holds no task {task_id!r}"
+    # `.strip()` on the lookup because the session's ids are stripped
+    # (`_session_task_ids`, exactly as `Orchestrator._task_id_in` strips them)
+    # while a registry key is whatever the file holds. `_ID_RE` is enforced on
+    # `add_many` and not on a load, so a hand-edited `tasks.json` can carry a
+    # padded id — and the two spellings failing to meet is a hold that silently
+    # does not apply. Comparing stripped can only ever refuse more.
+    held = snap["session_holds"].get(task_id.strip())
+    if held:
+        return (
+            f"{held}, and {task_id} is the task that session names — ending its "
+            "round now would strand a packet a reviewer may already be holding, "
+            "or have accepted. Refused whether or not the loop is running: a "
+            "loop STOPPED in that phase owes the packet just the same"
+        )
+    if snap["session_hold_note"]:
+        # The blanket refusal, and it covers every task rather than one: an
+        # unattributable packet is not an absent packet, and picking a task to
+        # spare would be the guess this exists to refuse.
+        return "no task's round may be ended here: " + snap["session_hold_note"]
     if action.id == "release" and state != "in_progress":
         return (
             f"release returns an IN-PROGRESS task to pending; {task_id} is "
@@ -7610,6 +7813,7 @@ def _attempt_ledger(record: dict | None) -> dict:
 def operator_controls(
     *, state, lock_alive, lock_pid, lock_run_id, groups, blockers, note,
     executions=None, merge=None, lane_states=(), lane_note="",
+    session_absent=False,
 ) -> dict:
     """The whole control panel as data: what may be pressed, and why not.
 
@@ -7622,6 +7826,7 @@ def operator_controls(
         state=state, lock_alive=lock_alive, lock_pid=lock_pid,
         lock_run_id=lock_run_id, groups=groups, blockers=blockers, note=note,
         lane_states=lane_states, lane_note=lane_note,
+        session_absent=session_absent,
     )
     executions = executions or {}
     actions = []
@@ -7941,7 +8146,14 @@ def _fresh_snapshot(repo: Path, state_dir: Path) -> dict:
     """
     from .lock import LoopLock
 
-    state = _json(state_dir / "state.json") or {}
+    state_path = state_dir / "state.json"
+    state = _json(state_path) or {}
+    # Read AFTER the parse, so the two answers describe the same instant as
+    # closely as one process can: a file that appeared in between is judged as a
+    # session anyway (`session_holds` only honours this flag for a session that
+    # is also unreadable), and one that vanished in between reads as absent,
+    # which is what it now is.
+    session_absent = _session_file_absent(state_path)
     info = LoopLock(state_dir).read()
     alive = info is not None and LoopLock.is_live(info)
     blockers = []
@@ -7962,6 +8174,7 @@ def _fresh_snapshot(repo: Path, state_dir: Path) -> dict:
         groups=task_groups(tasks, _executions(state_dir)),
         blockers=blockers, note="",
         lane_states=lane_states, lane_note=lane_note,
+        session_absent=session_absent,
     )
 
 
@@ -8031,6 +8244,14 @@ def perform_control(
     1. Resolve the state directory and the config, or refuse having read nothing.
     2. Re-check the SAME predicate the button was drawn from, against a fresh
        snapshot. The click was decided from a payload up to two seconds old.
+       **This is where a STOPPED loop's outstanding packet is refused** — step 4
+       below never runs when there was nothing to stop, and `release` against the
+       task a reviewer is still holding a packet for would otherwise archive its
+       execution record and quarantine its worker. The two paths together are
+       exhaustive: a hold exists only where some session owes a packet, any
+       session owing one makes `stop_refusal` non-empty, so a loop that WAS
+       running is refused at step 4 and one that was not is refused here. See
+       `session_holds`.
     3. If this stops the loop and the loop is running: arm the stop by running
        the CLI's own `pause` / `abort`, then WAIT for the lock to be released.
        A wait that times out WITHDRAWS the stop and runs nothing.
