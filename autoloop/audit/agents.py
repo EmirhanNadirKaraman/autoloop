@@ -36,10 +36,23 @@ that motivated the split.
 **The ACTION LOG is an optional third thing, and it is default off.**
 `action_log_dir=` gives a runner somewhere to append the agent PROCESS's own
 output while the run is still going, so an operator can watch a round instead
-of waiting for it. Absent — every existing construction site — no file is
-opened, nothing is written, nothing is printed, and the captured result is byte
-for byte what it was before this existed. See `ActionLogWriter` for what the
-file does and does not contain, and why nothing in it may fail a round.
+of waiting for it. With no directory — neither named here nor armed by the
+operator's config — no file is opened, nothing is written, nothing is printed,
+and the captured result is byte for byte what it was before this existed. See
+`ActionLogWriter` for what the file does and does not contain, and why nothing
+in it may fail a round.
+
+**DEFAULT OFF IS NOT THE SAME AS UNWIRED, and this module carries the
+difference.** A runner nobody hands a directory to would be a mechanism no
+production round ever reaches, whatever the operator's flag said — so
+`set_default_action_log_dir` holds the loop's configured answer for the whole
+process, and every runner built WITHOUT an explicit `action_log_dir=` uses it.
+`config.load_config` is the one production caller: it arms the default with
+`AutoloopConfig.action_log_dir` when `[audit] action_log` is on and disarms it
+otherwise, so the write-capable runner `implement_executor
+.implement_agent_runner` builds — which names no directory and is the runner a
+real round runs — streams when the operator asked for it and is untouched when
+they did not.
 
 Tests never invoke the real CLI — AgentRunner is a protocol; the executors
 are exercised with fakes, and ClaudeCliRunner itself is tested with a
@@ -165,6 +178,63 @@ ACTION_LOG_HEADER = """\
 """
 
 _SLUG_SAFE = frozenset(string.ascii_letters + string.digits + "._-")
+
+
+#: THE WIRE between the operator's `[audit] action_log` setting and the runners
+#: the loop really runs. `None` — the value it holds until something arms it,
+#: and the value it is put back to by any config with the flag off — means every
+#: runner built without an explicit directory logs nothing at all.
+#:
+#: A PROCESS-WIDE default rather than a constructor argument threaded from
+#: `cli._build_executor`, because the two construction sites that would carry
+#: such an argument (`cli._build_executor` and
+#: `implement_executor.implement_agent_runner`) are not this task's to edit —
+#: see `config.load_config`, which is the one production caller of the setter
+#: and the reason a `true` in the config file now reaches a real round. Threading
+#: the value through those two call sites instead would be a strictly smaller
+#: change and nothing here forecloses it: delete the two lines in
+#: `load_config`, pass `action_log_dir=config.action_log_dir` at the factory, and
+#: this module is unchanged.
+_default_action_log_dir: Path | None = None
+
+
+def set_default_action_log_dir(directory: Path | None) -> None:
+    """Arm (or disarm) the action log for every runner built AFTER this call.
+
+    Idempotent, and total in the direction that matters: `None` disarms, so a
+    process that loads a config with the flag off is put back to the behaviour
+    that existed before this parameter did — including a process that loaded a
+    config with the flag ON earlier.
+
+    Runners already constructed are deliberately unaffected: `ClaudeCliRunner`
+    resolves this once, in `__init__`, so a round cannot have the log switched
+    out from under it halfway through and end up with a file that covers part
+    of a run without saying which part.
+
+    TOTAL, like everything else in this section, and for a sharper reason than
+    the rest: its one production caller is `config.load_config`, so a `Path()`
+    that refused whatever it was handed would stop the loop from reading its
+    own configuration at all — observability failing work, at the worst
+    possible place. A value that cannot name a directory leaves the log OFF and
+    says so, rather than leaving the previous one armed.
+    """
+    global _default_action_log_dir
+    try:
+        resolved = Path(directory) if directory is not None else None
+    except Exception as exc:  # noqa: BLE001 — total by contract
+        _announce(
+            f"autoloop: {directory!r} cannot name an agent action log directory "
+            f"({_describe_exc(exc)}); the action log is off and the loop is "
+            "otherwise unaffected"
+        )
+        resolved = None
+    _default_action_log_dir = resolved
+
+
+def default_action_log_dir() -> Path | None:
+    """Where a runner that was given no directory of its own will log, or
+    `None` for "nowhere", which is the default until a config arms it."""
+    return _default_action_log_dir
 
 
 def _describe_exc(exc: BaseException) -> str:
@@ -502,14 +572,29 @@ class ClaudeCliRunner:
         no real process and no real waiting; production leaves all three at
         their defaults.
 
-        **`action_log_dir` is the ONLY switch for the action log, and `None` —
-        every construction site that does not name it — is OFF.** Off means no
-        directory is created, no file is opened, nothing is printed, `sleep` is
-        passed to `supervise` unwrapped, and the returned `AgentResult` is byte
-        for byte what it was before this parameter existed. On means one file
-        per round under that directory, appended to while the agent is still
-        running. `action_log_max_bytes` caps the AGENT OUTPUT it records (see
-        `DEFAULT_ACTION_LOG_MAX_BYTES`); `action_log_opener` is a test seam.
+        **`action_log_dir` names where this runner logs; omitting it (or
+        passing `None`, which is the same thing) asks
+        `default_action_log_dir()` instead — the process-wide answer
+        `config.load_config` arms from `[audit] action_log`.** That fallback is
+        the whole of the wiring: `implement_executor.implement_agent_runner`
+        names no directory, so a production round logs exactly when the
+        operator's config says to and not otherwise.
+
+        With neither — the default until a config arms one, and the state any
+        config with the flag off puts the process back into — the log is OFF:
+        no directory is created, no file is opened, nothing is printed, `sleep`
+        is passed to `supervise` unwrapped, and the returned `AgentResult` is
+        byte for byte what it was before this parameter existed. On means one
+        file per round under that directory, appended to while the agent is
+        still running. `action_log_max_bytes` caps the AGENT OUTPUT it records
+        (see `DEFAULT_ACTION_LOG_MAX_BYTES`); `action_log_opener` is a test
+        seam.
+
+        There is deliberately no third state meaning "off however the process
+        is configured": an explicit directory wins, and `None` defers. A caller
+        that must not log while the flag is on does not exist today, and adding
+        a sentinel for it would be a switch with two off positions — the shape
+        that makes a default-off flag hard to reason about.
 
         ONE RUNNER IS ONE ROUND, which is what makes the file name honest:
         `ImplementExecutor._bindings_for` builds a fresh runner from the
@@ -528,11 +613,18 @@ class ClaudeCliRunner:
         self._spawn = spawn or spawn_supervised
         self._clock = clock
         self._sleep = sleep
-        self._action_log_dir = Path(action_log_dir) if action_log_dir is not None else None
+        # RESOLVED ONCE, here, and never re-read: a round that started with the
+        # log on keeps it for its whole length even if the process is re-armed
+        # meanwhile, which is what stops a file that covers part of a run
+        # without saying which part.
+        resolved_log_dir = (
+            Path(action_log_dir) if action_log_dir is not None else default_action_log_dir()
+        )
+        self._action_log_dir = resolved_log_dir
         self._action_log_max_bytes = action_log_max_bytes
         self._action_log_opener = action_log_opener
         self._action_log_stamp = (
-            action_log_round_stamp() if action_log_dir is not None else ""
+            action_log_round_stamp() if resolved_log_dir is not None else ""
         )
         self._action_log_announced = False
 
