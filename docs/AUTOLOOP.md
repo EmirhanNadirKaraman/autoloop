@@ -2074,3 +2074,109 @@ that carries provenance and no authority. Its id is derived from the completed
 task's, so the crash-recovery re-entry of the push path proposes the same id and
 is refused by the registry or by `TaskInbox.pending_creation_ids`. Nothing
 concrete to change files nothing at all.
+
+## Asking why a task got the context it got
+
+```
+python3 -B -m autoloop context explain --task <id> [--packet]
+```
+
+Read-only and lock-free, in the same sense `blockers` is: it takes no lock and
+writes nothing — not into the checkout, not into the state directory. Every git
+call it makes is one of the three read-only plumbing commands the resolver
+already uses (`rev-parse`, `ls-tree`, `diff-tree`), none of which touches an
+index or a ref, so it is safe while a round is running. That is the only moment
+the question is usually asked.
+
+**The answer is the round's own bytes, anchored by one digest.** When the loop
+dispatches a round it renders the packet, stamps the digest onto the
+`TaskExecution` and stores the text. That digest is the anchor: written by the
+loop from its own render before any agent ran, and unmovable by anything a record
+directory does afterwards. So the answer is the stored packet that hashes to it —
+or a re-render that reproduces it — and `context_packet.provenance_verdict` says
+which, in one of three words on the `provenance:` line:
+
+| Verdict | What it means |
+|---|---|
+| `AS DISPATCHED` | a re-resolution reproduced the recorded digest, so the sections printed from it are the round's own selection |
+| `RECORDED PACKET ONLY` | the stored packet hashes to the recorded digest and the re-resolution does not: the stored bytes are printed first, as the answer, and the re-resolution follows as a labelled comparison |
+| `UNVERIFIED` | neither reproduces it, or the record carries no digest at all — nothing shown has been established as the context that round got, and the output says so |
+
+An **empty recorded digest matches nothing**, an empty stored one included. An
+audit round records none and a task no write-capable round has been dispatched
+for has none; treating that absence as agreement would be a check that passes
+because its evidence is gone.
+
+**It calls the resolver; it does not reimplement one.** The re-resolution printed
+beside the recorded packet comes out of
+`context_packet.render_packet_with_resolution` — the one function a round's
+packet is built by — at that round's own base, through that round's own worker
+repository, with the same `[context] max_records` budget. The record sections are
+the packet's own `selection_block` bytes rather than a second rendering of them.
+But one function called at two times is still two invocations: this command wires
+no record index (no config names a directory) while a loop embedded with
+`Orchestrator(context_records=...)` dispatched against one it cannot see, so the
+re-render is promoted from comparison to answer only by the digest. A diagnostic
+that can disagree with the loop is worse than none, which is the argument
+`context.MERGE_WINDOW_LABEL` already makes for sourcing its line by calling
+`cli._merge_window_blockers`.
+
+**It explains the round the execution record names**, and refuses rather than
+inventing one. A task that has never been dispatched has no context it *got*, so
+there is nothing to explain; that and an unreadable execution record are stated
+refusals and exit 1. A worker repository that has moved (a released or
+quarantined round leaves one behind) is **not** a refusal: no git runs — `Path("")`
+is `Path(".")`, and resolving there would describe whatever repository the
+operator is standing in — and the recorded packet answers the question without a
+repository. It is exit 1 only when there is neither a readable packet nor a
+possible re-render. Exit 0 means an explanation was printed; a digest that does
+NOT match is a 0, because that is the information this command exists to surface.
+
+### What it prints
+
+| Section | What it holds |
+|---|---|
+| header | the worker repository, base sha, review round, the effective approved paths and the ids the task cites — all off the execution record, so a round whose worker has moved still has them |
+| `provenance` | one of the three verdicts above, what proves it, and why a re-resolution can legitimately differ |
+| `as recorded at dispatch` | the packet this round was given, verbatim, whenever the sections below are not proven to be those bytes — printed rather than parsed, with one loop-authored line mapping each answer to the packet's own headings (`selected records`, `stale records`, `superseded records` and the rejections under `unresolved questions`, `contradictory records`) |
+| `selected records (N)` | the packet's own block: each record, its staleness, why it was selected, its invariant, and each source path with the object id it had AT the base |
+| `rejected records (N)` | referenced and NOT selected, with the category: superseded, unknown, duplicated, unreadable, dangling supersession, or dropped by the budget |
+| `stale or unverified records (N)` | a record whose own source paths moved under it (`stale`), and one whose freshness could not be established at all (`staleness_unknown`) — both, always, because "the check could not run" is not "the check found nothing" |
+| `contradictory records (N)` | one source path, two active records asserting different invariants; recorded, no winner picked |
+| `other findings (N)` | the partition remainder — every category the four sections above do not claim, printed rather than dropped |
+| `digest` | the digest on the execution record — the anchor — then the stored packet file's and the one re-rendered now, each said to match the anchor or not |
+| `bounds` | what was NOT printed |
+
+The five record sections carry a banner saying whose selection they are: `AS
+DISPATCHED`, or a present-time comparison that is not what the round got.
+
+Every section is standing: an empty one renders `(0)` and `(none)`, so "nothing
+was stale" and "the stale section was dropped in a refactor" cannot look alike.
+When nothing was re-resolved at all they carry `(not re-resolved)` instead — "I
+looked and found nothing" is not "I did not look", and printing the second as the
+first would be this command's own fail-open.
+
+**A digest difference is information, not an accusation.** `review_round` is
+rendered into the packet, so a re-render after a revise verdict and before the
+next dispatch legitimately differs; so does one taken after the base moved,
+after the record directory changed, or against a worker repository that has
+since been quarantined. The line names those causes. An absent stored packet and
+an unreadable one are reported TOGETHER, because `ContextPacketStore.load`
+refuses a file whose bytes do not hash to its own digest exactly as it reports a
+missing one, and claiming to know which would be inventing the distinction.
+
+**No silent caps.** Two artifacts are accounted for, not one: the recorded
+packet's text (printed in full whenever the sections are not proven to be those
+bytes) and the re-rendered packet's (behind `--packet`). The bounds section sizes
+each in lines and characters and says which was printed and which withheld.
+Separately it states what the RESOLVER's budget dropped — and every dropped
+record is already named in the rejected section, so the bound has victims rather
+than only a count.
+
+**What a re-resolution will show you today is an empty selection**, and that is
+the honest answer rather than a defect: no record directory is wired into this
+command, so the `context_records:` line says the index is unwired and every cited
+id is reported unresolved. A loop embedded with `Orchestrator(context_records=…)`
+dispatched against a real one, and the recorded packet is where that round's
+selection is read — which is exactly why the answer is anchored on the digest
+rather than on whatever this process can resolve.
