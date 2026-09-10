@@ -7125,12 +7125,18 @@ tick(); setInterval(tick, 2000);
 #    the re-read walks `lanes/` exactly as the pre-check does rather than trusting
 #    lane 0 to speak for a fleet that stopped at N separate boundaries. The
 #    pre-check is the UI gate; the post-boundary check is the one that makes the
-#    claim true — an unsafe landing runs NOTHING and restarts the loop.
+#    claim true — an unsafe landing runs NOTHING and restarts the loop. INCLUDING
+#    for the two actions whose whole effect is the stop: a `pause` that lands in
+#    `delivering` and is left there strands the packet exactly as a verb run
+#    there would, so it is rolled back and refused rather than reported done.
 # 3. A RESTART IS VERIFIED, NEVER ASSUMED. Success requires a lock file whose
 #    `run_id` differs from the one we stopped AND which `LoopLock.is_live`
-#    accepts. Process age proves nothing (`os.execv` preserves pid and start
-#    time), and mere existence proves less — `LoopLock.read` answers a corrupt
-#    file with a `pid=-1` sentinel that is not live.
+#    accepts, AND that NEITHER stop flag is armed when that lock is read:
+#    `_restart` clears both before it spawns, so one armed in between is a loop
+#    about to stop again, and `cli._run_continuous` returns on either at the top
+#    of every outer iteration. Process age proves nothing (`os.execv` preserves
+#    pid and start time), and mere existence proves less — `LoopLock.read`
+#    answers a corrupt file with a `pid=-1` sentinel that is not live.
 # 4. REFUSALS STAY REFUSALS. `release` refusing a non-`in_progress` task,
 #    `archive-blocker` refusing a live session, and the merge window's exemptions
 #    are all correct. This surfaces them; it never routes around them.
@@ -7343,7 +7349,10 @@ class OperatorAction:
     stops_loop: bool
     #: Start the loop again afterwards — and only when it was running BEFORE.
     #: `pause` and `abort` are `False` by construction: an operator who asked
-    #: the loop to stop has not asked for it back.
+    #: the loop to stop has not asked for it back. This flag governs the SUCCESS
+    #: path ONLY. An UNSAFE LANDING rolls the stop back whatever it says, because
+    #: a loop left down in `delivering` strands the packet whether it was paused
+    #: on purpose or stopped on the way to a verb — see `perform_control` step 4.
     restarts: bool
     #: `""` / `"task"` / `"blocker"` — what has to be picked first.
     needs: str
@@ -7366,13 +7375,17 @@ OPERATOR_ACTIONS: tuple[OperatorAction, ...] = (
     OperatorAction(
         id="pause", label="Pause", group="running", verb=(), arm="pause",
         stops_loop=True, restarts=False, needs="",
-        note="stops at the next phase boundary and stays stopped",
+        note="stops at the next phase boundary and stays stopped — unless it "
+             "LANDS where a packet is outstanding, which puts the loop back and "
+             "refuses",
     ),
     OperatorAction(
         id="abort", label="Abort (kill the agent)", group="running", verb=(),
         arm="abort", stops_loop=True, restarts=False, needs="",
         note="kills the write-capable agent in flight and its whole process "
-             "group; the task keeps its work and is charged nothing",
+             "group; the task keeps its work and is charged nothing. A landing "
+             "where a packet is outstanding puts the loop back, but the kill "
+             "itself is not undone",
     ),
     OperatorAction(
         id="start", label="Start (run --continuous)", group="running", verb=(),
@@ -7962,6 +7975,53 @@ def _check_fields(action: OperatorAction, params: dict) -> None:
             )
 
 
+def _unsafe_landing_reason(
+    action: OperatorAction, unsafe: str, restarted: bool
+) -> str:
+    """Why an unsafe LANDING refuses, in the words that action's own effect makes
+    true — and never a word about an outcome that has not been verified.
+
+    Two shapes, because the two kinds of action have done different amounts by
+    the time the phase is re-read. One with a verb has done NOTHING yet: the stop
+    was only its precondition, so "NOTHING was run" is the fact, and it stays the
+    fact whatever the restart did. `pause` and `abort` have no verb — the stop IS
+    their whole effect and it has already landed — so that sentence would be one
+    the operator could disprove by reading the log. What is true of BOTH is that
+    STAYING stopped there strands the packet, which is why both restart rather
+    than reporting a successful stop.
+
+    `restarted` is taken rather than assumed, and that is the trap this argument
+    exists for: "the loop was put back" is the claim a stop-only refusal wants to
+    make, and glued in front of a `_restart` that FAILED it would read "put back"
+    immediately above "THE LOOP IS DOWN". The head states what was verified; the
+    restart's own message states the rest.
+
+    `abort` carries one clause more. Its kill is not undone by the restart, and a
+    refusal that read as though the abort had been rolled back would have this
+    panel reporting a state it did not put the loop in.
+    """
+    if action.verb:
+        return (
+            f"the loop stopped in a phase where acting would strand work — "
+            f"{unsafe}. NOTHING was run. "
+        )
+    head = (
+        f"the {action.id} landed in a phase where STAYING stopped would strand "
+        f"work — {unsafe}. "
+    )
+    if action.arm == "abort":
+        head += (
+            "The agent this abort already killed is NOT brought back by any of "
+            "this. "
+        )
+    return head + (
+        "The loop was put back rather than left down there; retry once it is "
+        "past that phase. "
+        if restarted else
+        "Putting it back was attempted and could NOT be verified: "
+    )
+
+
 def perform_control(
     repo: Path, action_id: str, params: dict, *,
     run_verb=_run_verb, spawn=_spawn_loop,
@@ -7978,7 +8038,10 @@ def perform_control(
        the top of `Orchestrator.run` is not gated on the phase, so a stop armed
        in a safe one can land in `delivering` — per lane, and the fleet stops at
        N separate boundaries. An unsafe landing in any of them runs NOTHING, puts
-       the loop back, and reports where it stopped.
+       the loop back, and reports where it stopped. That holds for `pause` and
+       `abort` too, whose whole effect IS the stop: the refusal there is that
+       STAYING stopped would strand the packet, so they are rolled back and
+       refused rather than reported as a stop that worked.
     5. Run the verb — in a subprocess, so the CLI takes `LoopLock` itself and a
        lock it cannot take is that command's own refusal rather than a write.
     6. Restart, and VERIFY: clear both flags first (a leftover one stops the
@@ -8075,23 +8138,25 @@ def perform_control(
         result["stopped_in_phase"] = str(landed.get("phase") or "")
         landed_lanes, landed_lane_note = _lane_sessions(state_dir)
         unsafe = stop_refusal(landed, landed_lanes, landed_lane_note)
-        if unsafe and action.verb:
+        if unsafe:
+            # EVERY action that armed a stop, `pause` and `abort` included.
+            # Their `restarts=False` governs the SUCCESS path — an operator who
+            # asked for a stop has not asked for it back — and says nothing about
+            # this one: a loop left down in `delivering` strands the packet
+            # whether it was stopped on purpose or on the way to a verb, and
+            # reporting that as a successful stop is the report being wrong about
+            # the one thing this panel exists to get right.
             restart = _restart(
                 _cli, config, config_path, repo, state_dir, stopped_run_id,
                 spawn, log,
             )
             raise _ControlRefused(
-                f"the loop stopped in a phase where acting would strand work — "
-                f"{unsafe}. NOTHING was run. " + restart["message"],
+                _unsafe_landing_reason(
+                    action, unsafe, bool(restart["loop"].get("restarted"))
+                ) + restart["message"],
                 code=409,
                 extra={"stopped_in_phase": result["stopped_in_phase"],
                        "loop": {**result["loop"], **restart["loop"]}},
-            )
-        if unsafe:
-            where = result["stopped_in_phase"] or "an unknown phase"
-            result["notes"].append(
-                f"the loop stopped in {where} — {unsafe}. Nothing was "
-                "discarded and nothing was killed: Start resumes it from there."
             )
 
     if action.verb:
@@ -8129,6 +8194,36 @@ def perform_control(
     return result
 
 
+#: Every stop flag this page can arm, as `(flag, the reader that answers for
+#: it)`. TWO, because `OperatorAction.arm` offers two — and a test asserts that
+#: correspondence both ways, so a third stop verb cannot arrive with nothing
+#: re-reading its flag after a restart.
+CONTROL_STOP_FLAG_READERS: tuple[tuple[str, str], ...] = (
+    ("pause", "pause_requested"),
+    ("abort", "abort_requested"),
+)
+
+
+def _armed_stop_flag(cli_module, config) -> str:
+    """Which stop flag is armed RIGHT NOW — `"pause"`, `"abort"` or `""`.
+
+    Asked through `cli`, which defines `pause_requested` and imports
+    `abort_requested` from `state`: one spelling each, and the same two flags
+    `_restart` clears before it spawns.
+
+    Deliberately NO `getattr` default. A reader this build does not have is a
+    rename, and answering "no flag is armed" for one would be the guard
+    switching itself off exactly where it is load-bearing — the restart would
+    then report a verified pid for a loop already on its way back down. An
+    `AttributeError` here is loud, reaches the operator as a 500 with the loop
+    genuinely up, and the suite fails on it first.
+    """
+    for flag, reader in CONTROL_STOP_FLAG_READERS:
+        if getattr(cli_module, reader)(config):
+            return flag
+    return ""
+
+
 def _restart(cli_module, config, config_path: Path, repo: Path, state_dir: Path,
              stopped_run_id: str, spawn, log) -> dict:
     """Clear both stop flags, start `run --continuous`, and prove it came up.
@@ -8159,13 +8254,23 @@ def _restart(cli_module, config, config_path: Path, repo: Path, state_dir: Path,
         # Re-asserted AFTER the lock is proved live, not only before the spawn:
         # a flag written between the two would stop this loop at its next
         # boundary, and the operator would be reading "restarted, pid N".
-        if cli_module.pause_requested(config):
+        #
+        # BOTH flags, and the symmetry is the check rather than tidiness. This
+        # function CLEARS two, so re-reading one covers half of what it armed.
+        # `cli._run_continuous` asks `pause_requested` and then
+        # `abort_requested` at the top of every outer iteration and returns 0 on
+        # either (cli.py), so a flag landing in the window between the clear
+        # above and the lock read below ends the fresh loop at its first outer
+        # iteration — before it resumes a session or selects a task, with
+        # nothing but this check to say so.
+        armed = _armed_stop_flag(cli_module, config)
+        if armed:
             return {"loop": {**verdict, "restarted": False,
-                             "detail": "a pause flag was armed again while the "
-                                       "loop was starting"},
+                             "detail": f"the {armed} flag was armed again while "
+                                       "the loop was starting"},
                     "message": "THE LOOP STARTED (pid "
-                               f"{verdict['pid']}) BUT A PAUSE FLAG IS ARMED — "
-                               "it will stop at its next boundary"}
+                               f"{verdict['pid']}) BUT THE {armed.upper()} FLAG "
+                               "IS ARMED — it will stop at its next boundary"}
         return {"loop": verdict,
                 "message": f"the loop was restarted and verified alive: LOCK pid "
                            f"{verdict['pid']}, run {str(verdict['run_id'])[:12]}"}

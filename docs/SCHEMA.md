@@ -417,16 +417,31 @@ found in after it let go of the lock — never the phase the button was drawn
 from. `loop` is `{"was_running", "stopped", "restarted", "pid", "run_id",
 "detail"}`, and `restarted` is only ever true against a lock file that exists,
 carries a run id DIFFERENT from the one that was stopped, and passes
-`LoopLock.is_live`. `ok` is false whenever the verb failed or a restart that was
-attempted could not be verified.
+`LoopLock.is_live` — and only while NEITHER stop flag is armed. `_restart` clears
+both before it spawns, so one armed in the window between that clear and the lock
+read is a loop about to stop again (`cli._run_continuous` asks `pause_requested`
+and then `abort_requested` at the top of every outer iteration and returns on
+either): `restarted` is false, the flag is named in `loop.detail`, and the pid is
+still reported, because the loop genuinely did start. `ok` is false whenever the
+verb failed or a restart that was attempted could not be verified.
 
 REFUSALS carry `{"error", "ran": false}` with the status that says which kind:
 400 a precondition (the phase, the task's state, a missing required reason, an
 unresolvable state directory), 404 an action this build does not have, 409 a
-boundary that was never reached, a landing phase where acting would strand a
-packet, or another action already in flight, and 500 an internal failure. A 409
-for an unsafe landing also carries `stopped_in_phase` and the `loop` object, so
-the operator can see that the loop was put back up.
+boundary that was never reached, a landing phase where acting — or, for `pause`
+and `abort`, STAYING stopped — would strand a packet, or another action already
+in flight, and 500 an internal failure. A 409 for an unsafe landing also carries
+`stopped_in_phase` and the `loop` object, so the operator can see that the loop
+was put back up.
+
+AN UNSAFE LANDING IS ROLLED BACK FOR EVERY ACTION THAT ARMED A STOP, including
+the two whose whole effect IS the stop. `OperatorAction.restarts` is `false` for
+`pause` and `abort` — an operator who asked for a stop has not asked for it back
+— and that governs the SUCCESS path only: a loop left down in `delivering`
+strands the packet whether it was paused on purpose or stopped on the way to a
+verb, so the stop is undone and refused rather than reported as a stop that
+worked. The `abort` refusal says in words that the restart does not bring back
+the agent it killed.
 
 `reset` is asked that question WHETHER OR NOT the loop is running
 (`OperatorAction.discards_session`). Every other refusal in the panel is about
