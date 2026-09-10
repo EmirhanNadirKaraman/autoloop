@@ -34,6 +34,14 @@ below and the section at the end of this file, which walks the lane states that
 clause was standing in for — a bound candidate, a DIRTY worker, a round with no
 candidate yet — with every lane's own state file set to `executing`.
 
+That clause was also buying SERIALISATION, by accident: while it held the window
+shut whenever a round was mid-write, two lanes could not both be inside
+`AutoMerger.after_completion`, which every lane reaches the moment it publishes
+and which merges into the one shared checkout. The last section of this file
+pins the fleet merge token that buys it back — the same file `merge_sweep` takes
+— by driving a second lane's completion from inside the first lane's
+`merge_commit`, which is the interleaving rather than a hope of one.
+
 `lanes = 1` is the acceptance criterion every candidate in that plan carries,
 and it is asserted here rather than assumed: the reason string, the merge
 outcome and the untouched record are pinned at one lane in the same file that
@@ -58,9 +66,9 @@ import pytest
 from autoloop import auto_merge, cli, merge_sweep
 from autoloop.auto_merge import MergeObligation
 from autoloop.blockers import BlockerStore
-from autoloop.config import AutoloopConfig, BrowserConfig, ConcurrencyConfig
+from autoloop.config import AutoloopConfig, BrowserConfig, ConcurrencyConfig, lane_id
 from autoloop.contract import Decision, Directive
-from autoloop.errors import GitCommandError, StateCorruptError
+from autoloop.errors import GitCommandError, LockHeldError, StateCorruptError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -1497,3 +1505,395 @@ def test_the_round_cap_counts_the_rounds_a_carry_forward_moved(tmp_path):
     )
 
     assert [b.code for b in h.blockers("t9")] == ["review_round_cap"]
+
+
+# --- and two lanes merging at once (conc-13) -----------------------------------
+#
+# The clause converted above was buying ONE thing the per-candidate obligation
+# does not: while it held the window shut whenever a round was mid-write, two
+# lanes could not both be inside `AutoMerger.after_completion` — the path EVERY
+# lane takes the moment it publishes, in its own process, into the ONE shared
+# checkout the whole fleet builds against. Opening the window made those
+# simultaneous, and simultaneous is `index.lock`, a merge verified against a head
+# the sibling has already moved, or one lane's `merge --abort` unwinding the
+# other's. What follows pins the token that buys it back — the SAME file the
+# sweep takes — and the acceptance criterion that no such file exists at one
+# lane.
+
+
+def merger(h, *, lane_index):
+    """One lane's `AutoMerger` over the shared checkout, wired exactly as
+    `orchestrator._auto_merge_after_completion` wires it — same config, same
+    gateway, same stores, and its own lane index. Two of these ARE two lanes as
+    far as that checkout is concerned: the fleet's serialisation is a file under
+    the state dir, not an object either of them holds."""
+    config = enabled(h.config)
+    return auto_merge.AutoMerger(
+        config=config,
+        git=h.orch._git,
+        policy=PolicyEngine(config.policy),
+        execution_store=h.execution_store,
+        registry=h.orch._registry,
+        log=h.orch._log,
+        carry_forward=h.orch._carry_candidate_past_for_merge,
+        lane_index=lane_index,
+    )
+
+
+def token_file(h):
+    return merge_sweep.merge_token_file(h.config.state_dir)
+
+
+def test_a_second_lanes_completion_cannot_enter_the_merge_of_the_first(tmp_path):
+    """THE regression, forced rather than raced for.
+
+    Lane 1's completion is driven from INSIDE lane 0's `merge_commit` — the one
+    instant where a second mutation of that checkout does the damage, and the
+    interleaving a thread test can only hope to hit. Lane 1 defers, moves
+    nothing, leaves no residue and aborts nothing; lane 0's merge lands and is
+    pushed; and lane 1 merges on its own next completion with nothing lost.
+    """
+    h = build(
+        tmp_path,
+        per_task={"t1": {"a.py": "one\n"}, "t2": {"b.py": "two\n"}},
+        lanes=2,
+        auto_merge_enabled=False,
+    )
+    h.push("t1")
+    h.push("t2")                       # both published, neither integrated
+    before = h.head()
+    assert not token_file(h).exists()
+    one = h.execution_store.load("t1").candidate_sha
+    two = h.execution_store.load("t2").candidate_sha
+
+    lane0, lane1 = merger(h, lane_index=0), merger(h, lane_index=1)
+    inner: dict = {}
+    entered: list = []
+    real_merge = h.orch._git.merge_commit
+
+    def racing_merge(candidate, message):
+        # The flag is raised BEFORE the re-entrant call, not after it: were the
+        # sibling ever to reach a merge of its own, this hook would otherwise
+        # call itself forever instead of failing the assertion below.
+        if not entered:                # lane 0's own merge, once
+            entered.append(True)
+            inner["outcome"] = lane1.after_completion("t2")
+            inner["head"] = h.head()
+            inner["clean"] = is_clean(h.repo)
+            inner["token"] = token_file(h).exists()
+        return real_merge(candidate, message)
+
+    h.orch._git.merge_commit = racing_merge
+    try:
+        outcome = lane0.after_completion("t1")
+    finally:
+        h.orch._git.merge_commit = real_merge
+
+    # 1. The sibling was refused, and refused for THIS reason rather than by
+    #    accident of some other precondition.
+    assert inner["outcome"] == {"t2": auto_merge.DEFERRED}
+    refusals = [
+        e["data"] for e in h.entries("auto_merge_deferred")
+        if e["data"]["task_id"] == "t2"
+    ]
+    assert len(refusals) == 1
+    assert "another lane is merging" in refusals[0]["reason"]
+    assert "merge token" in refusals[0]["reason"]
+    # 2. It overlapped no mutation: the head lane 0 was merging onto was still
+    #    the head, the checkout was clean, and the token was lane 0's.
+    assert inner["head"] == before
+    assert inner["clean"]
+    assert inner["token"], "lane 0 was holding it, which is why lane 1 was refused"
+    # 3. And it aborted nothing — lane 0's merge landed and was pushed.
+    assert h.entries("auto_merge_conflict") == []
+    assert outcome == {"t1": auto_merge.MERGED}
+    assert h.head() != before
+    assert contains(h.repo, h.head(), one)
+    assert h.origin_base() == h.head()
+    assert not token_file(h).exists(), "the token went back"
+
+    # 4. Nothing was lost: the deferred lane merges on its own next completion.
+    assert lane1.after_completion("t2") == {"t2": auto_merge.MERGED}
+    assert contains(h.repo, h.head(), two)
+    assert h.origin_base() == h.head()
+    assert not token_file(h).exists()
+
+
+def test_at_one_lane_a_completion_takes_no_token_at_all(tmp_path):
+    """THE acceptance criterion, asserted DURING the merge rather than after it.
+
+    A token created and released again also satisfies "no file afterwards", and
+    that is not the claim: at one lane there is nothing to serialise, so the
+    completion path must never build the object, construct the path or write the
+    file. The observation is taken from inside `merge_commit`, which is the one
+    moment the file would exist if it were ever written."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=1)
+    before = h.head()
+    seen: dict = {}
+    real_merge = h.orch._git.merge_commit
+
+    def watching_merge(candidate, message):
+        seen["token"] = token_file(h).exists()
+        return real_merge(candidate, message)
+
+    h.orch._git.merge_commit = watching_merge
+    try:
+        h.push("t1")                   # through the orchestrator, real wiring
+    finally:
+        h.orch._git.merge_commit = real_merge
+
+    assert seen["token"] is False, "no token exists while a single lane merges"
+    assert not token_file(h).exists()
+    assert h.head() != before, "and the merge still landed"
+    assert h.origin_base() == h.head()
+
+
+def test_at_one_lane_a_stray_token_file_is_never_even_looked_at(tmp_path):
+    """The other half of that criterion. A `merge_token.json` an experiment left
+    behind is unreadable bytes — which above one lane is a REFUSAL, deliberately
+    (`MergeToken.read` fails closed). At one lane the completion path does not
+    read it, does not repair it and does not defer on it, and the file is exactly
+    as it was afterwards."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=1)
+    before = h.head()
+    stray = token_file(h)
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text("{not json", encoding="utf-8")
+
+    h.push("t1")
+
+    assert h.head() != before
+    assert h.origin_base() == h.head()
+    assert stray.read_text(encoding="utf-8") == "{not json"
+
+
+def test_a_completion_defers_while_a_sibling_lane_holds_the_merge_token(tmp_path):
+    """The same refusal from the other direction: the holder is a token file a
+    live lane wrote, not a re-entrant call. Nothing merges, nothing is pushed,
+    the sibling's token is neither stolen nor rewritten, and the deferral is
+    RECORDED — so the next completion drains it rather than the work waiting for
+    a sweep to notice."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    held = merge_sweep.MergeToken(h.config.state_dir, lane_id(1)).acquire()
+    fingerprint = token_file(h).read_text(encoding="utf-8")
+
+    try:
+        outcome = merger(h, lane_index=0).after_completion("t1")
+
+        assert outcome == {"t1": auto_merge.DEFERRED}
+        assert h.head() == before and h.origin_base() == before
+        assert token_file(h).read_text(encoding="utf-8") == fingerprint
+        recorded = auto_merge.MergeDeferralStore(
+            h.config.merge_deferrals_dir
+        ).all_deferrals()
+        assert [d.task_id for d in recorded] == ["t1"]
+        assert "another lane is merging" in recorded[0].reason
+    finally:
+        held.release()
+
+    assert merger(h, lane_index=0).after_completion("t1") == {"t1": auto_merge.MERGED}
+    assert h.head() != before and h.origin_base() == h.head()
+
+
+def test_a_merge_token_that_cannot_be_read_defers_rather_than_merging(tmp_path):
+    """FAIL CLOSED, and this is the fail-open a token invites: bytes nobody can
+    parse read as "nobody holds it" would be two lanes merging with nothing
+    saying so. `MergeToken.read` raises, `take_merge_token` turns that into a
+    refusal, and the completion defers with the base where it was."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    token_file(h).write_text("{not json", encoding="utf-8")
+
+    outcome = merger(h, lane_index=0).after_completion("t1")
+
+    assert outcome == {"t1": auto_merge.DEFERRED}
+    assert h.head() == before and h.origin_base() == before
+    assert token_file(h).read_text(encoding="utf-8") == "{not json", "not stolen"
+
+
+def test_the_token_goes_back_when_the_merge_raises_out_of_the_gateway(tmp_path):
+    """The `finally` is the whole of it. A token returned only on the paths
+    somebody remembered would leave the fleet unable to merge until a lane died
+    and was recovered — a worse failure than the one it prevents — so an
+    exception from inside the merge still gives it back, and the next completion
+    merges."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")
+    before = h.head()
+    real_merge = h.orch._git.merge_commit
+
+    def exploding_merge(candidate, message):
+        raise RuntimeError("the gateway fell over")
+
+    h.orch._git.merge_commit = exploding_merge
+    try:
+        outcome = merger(h, lane_index=0).after_completion("t1")
+    finally:
+        h.orch._git.merge_commit = real_merge
+
+    assert outcome == {"t1": auto_merge.FAILED}
+    assert h.head() == before
+    assert not token_file(h).exists(), "the token went back anyway"
+    assert merger(h, lane_index=0).after_completion("t1") == {"t1": auto_merge.MERGED}
+
+
+def test_the_token_is_the_same_file_the_sweep_takes(tmp_path):
+    """ONE FILE, ONE GATE, asserted in the direction the other tests do not
+    cover. A completion holding a token of its own and a sweep holding another
+    would serialise each kind against itself and neither against the other —
+    with an extra file in the way of noticing.
+
+    The path is the assertion: `test_a_second_lanes_completion_...` observes
+    `merge_token_file(state_dir)` EXISTING while a completion merges, so the
+    completion writes that file and no other, and this shows a sweep refusing on
+    exactly it. Written as one held token rather than as a re-entrant sweep
+    inside a merge, because the claim is about which file each side reads and a
+    sweep driven from inside another merger's `merge_commit` would buy nothing
+    but a second way to hang."""
+    h = build(
+        tmp_path,
+        per_task={"t1": {"a.py": "one\n"}, "t2": {"b.py": "two\n"}},
+        lanes=2,
+        auto_merge_enabled=False,
+    )
+    h.push("t1")
+    h.push("t2")
+    before = h.head()
+    # A lane mid-completion, as far as this file is concerned.
+    held = merge_sweep.MergeToken(h.config.state_dir, lane_id(0)).acquire()
+    try:
+        result = sweep(h, carry_forward=h.orch._carry_candidate_past_for_merge)
+    finally:
+        held.release()
+
+    assert result.outcome == merge_sweep.DEFERRED
+    assert "merge token" in result.reasons[0]
+    assert result.merged == []
+    assert h.head() == before and h.origin_base() == before
+
+
+# --- the token's own gate, without a repository ---------------------------------
+#
+# The claim in these is a pure decision over a config and one file, so none of
+# them builds a repository: the cost of a real one buys nothing when nothing git
+# does is in question.
+
+
+def test_at_one_lane_no_token_object_is_built_at_all(tmp_path, monkeypatch):
+    """The acceptance criterion at its narrowest, and structurally: at one lane
+    `take_merge_token` must not construct a `MergeToken`, derive its path or
+    touch the state dir. A constructor that fails the test if it is reached
+    proves that more exactly than an absent file does — the file is also absent
+    after a token that was created and released."""
+    config = window_config(tmp_path, lanes=1)
+    monkeypatch.setattr(
+        merge_sweep,
+        "MergeToken",
+        lambda *a, **k: pytest.fail("no token object may be built at one lane"),
+    )
+
+    assert merge_sweep.take_merge_token(config, 0) == (None, "")
+    assert not merge_sweep.merge_token_file(config.state_dir).exists()
+
+
+def test_the_token_gate_and_the_window_read_the_same_lane_count(tmp_path):
+    """THE PAIRING, and the fail-open it closes. The window decides whether it
+    may open above one lane from `config.concurrency.lanes > 1`; if the token
+    gate ever read that differently, a window could open as a fleet while the
+    token was skipped as a single lane — two lanes merging with nothing saying
+    so. `merges_are_serialised` is the union of both readings, so a value the
+    defensive reading calls one lane and the window calls a fleet is serialised
+    rather than waved through."""
+    merges = merge_sweep.merges_are_serialised
+    assert merges(window_config(tmp_path, lanes=1)) is False
+    assert merges(window_config(tmp_path, lanes=2)) is True
+    # The window's own reading, for values `_fleet_lanes` alone would call one
+    # lane. `2.5 > 1` opens the window; this must not skip the token.
+    odd = dataclasses.replace(
+        window_config(tmp_path, lanes=1),
+        concurrency=ConcurrencyConfig(lanes=2.5),
+    )
+    assert merges(odd) is True
+    # And a count nothing can COMPARE is a fleet, fail-closed: "could not tell"
+    # is never "one lane".
+    unreadable = dataclasses.replace(
+        window_config(tmp_path, lanes=1),
+        concurrency=ConcurrencyConfig(lanes="two"),
+    )
+    assert merges(unreadable) is True
+
+
+def test_a_token_the_race_keeps_losing_defers_instead_of_recursing(
+    tmp_path, monkeypatch
+):
+    """The retry is BOUNDED. "The file existed, and by the time it was read it
+    did not" is a sibling releasing between two syscalls, and one more attempt
+    is the right answer — but the branch used to spell that as a self-call with
+    no bound on it, and conc-13 gave it a second caller that reaches it on every
+    completion instead of once per sweep. A lane that loses the race every time
+    is CONTENDED rather than unlucky: it gets the refusal every caller already
+    turns into a deferral, not a stack that grows until `RecursionError` leaves
+    by a path neither caller catches."""
+    config = window_config(tmp_path, lanes=2)
+    token = merge_sweep.MergeToken(config.state_dir, lane_id(1))
+    # The file is REALLY there, so `O_EXCL` really fails; `read` answering
+    # `None` is the sibling that released between the two syscalls, every time.
+    # Built this way rather than by patching `os.open`, which is process-wide
+    # and would sit under everything else running in this worker.
+    token.path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(merge_sweep.MergeToken, "read", lambda self: None)
+
+    with pytest.raises(LockHeldError) as caught:
+        token.acquire()
+
+    assert "faster than this lane can claim it" in str(caught.value)
+    assert token.path.read_text(encoding="utf-8") == "{}", "and nothing was stolen"
+
+
+def test_the_token_gate_refuses_rather_than_raising_whatever_goes_wrong(
+    tmp_path, monkeypatch
+):
+    """FAIL CLOSED AND QUIETLY. Both callers take the token OUTSIDE their own
+    `try/finally` and both are documented never to raise, so anything escaping
+    here leaves `sweep` or `after_completion` by traceback in a caller whose
+    push has already landed. Refusing is also the closed direction, which is
+    what makes catching this widely safe: the outcome is always "this lane does
+    not merge", never "this lane merges without the token"."""
+    config = window_config(tmp_path, lanes=2)
+
+    def falls_over(self):
+        raise RuntimeError("the filesystem fell over")
+
+    monkeypatch.setattr(merge_sweep.MergeToken, "acquire", falls_over)
+
+    token, refusal = merge_sweep.take_merge_token(config, 0)
+
+    assert token is None
+    assert "RuntimeError" in refusal and "the filesystem fell over" in refusal
+
+
+def test_releasing_a_token_swallows_what_it_cannot_remove(tmp_path, monkeypatch):
+    """The other half of the same contract. `release_merge_token` runs in a
+    `finally` in both callers, so an `unlink` that fails for a reason
+    `MergeToken.release` does not already tolerate would turn a merge that
+    LANDED into an exception its caller reports as a failure. `None` — every
+    single-lane caller — is a no-op that touches nothing."""
+    config = window_config(tmp_path, lanes=2)
+    token = merge_sweep.MergeToken(config.state_dir, lane_id(0)).acquire()
+
+    def falls_over(self):
+        raise RuntimeError("the filesystem fell over on the way out")
+
+    monkeypatch.setattr(merge_sweep.MergeToken, "release", falls_over)
+
+    merge_sweep.release_merge_token(token)      # must not raise
+    merge_sweep.release_merge_token(None)       # nor must the one-lane no-op
