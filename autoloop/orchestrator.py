@@ -15191,6 +15191,13 @@ class Orchestrator:
         `AutoMerger` guards each task individually too; this outer guard
         covers the construction itself.
 
+        ABOVE ONE LANE THIS MAY SIMPLY DEFER, and that is the intended outcome
+        rather than a failure (conc-13): `after_completion` takes the fleet's
+        merge token, so a lane whose sibling is mid-merge records a deferral and
+        returns without touching the shared checkout. The next completion drains
+        it, and the backlog sweep enumerates it either way. At `lanes = 1` no
+        token exists and this path is what it always was.
+
         The AUDIT pseudo-task reaches here as well, since `_dispatch_task_push`
         does not distinguish it. Its unit id is only sometimes in the registry
         (`cli` registers synthetic `audit-NNNN` units so `block` can quarantine
@@ -15221,6 +15228,13 @@ class Orchestrator:
                 # what makes the observed clone the fetch source — see
                 # `_carry_candidate_past_for_merge`.
                 carry_forward=self._carry_candidate_past_for_merge,
+                # WHICH LANE is about to mutate the shared checkout (conc-13).
+                # `after_completion` takes the fleet's merge token, and this is
+                # the name that lands in it — so a sibling that finds the token
+                # held is told which lane is merging rather than just that
+                # somebody is. Never read at `lanes = 1`, where no token is
+                # taken at all.
+                lane_index=self.lane_index,
             ).after_completion(task_id)
         except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
             self._log(

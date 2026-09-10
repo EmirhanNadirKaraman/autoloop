@@ -1011,8 +1011,25 @@ clears that signal rather than ageing it, and is still visible only in the
 transcript. A multi-lane backlog stalled on a deferral remains unreported. That
 is a follow-up, not something this candidate closed.
 
-At `lanes = 1` the read, the reason string and the `merge-window` OPEN line are
-byte-identical to what they were, and no existing test needed an edit.
+**The clause was also buying serialisation, by accident, and that half had to be
+bought back.** While it held the window shut whenever a round was mid-write, two
+lanes could not be inside a merge at the same time — so
+`auto_merge.AutoMerger.after_completion`, which every lane reaches the moment it
+publishes and which merges into the one shared checkout, had never needed a
+token. Opening the window made two completions in the same instant two merges in
+one checkout: an `index.lock`, a merge verified against a head the sibling had
+already moved, or one lane's `merge --abort` unwinding the other's. So that path
+now takes the **same** merge token `merge_sweep` takes — one file, one gate
+(`merge_sweep.take_merge_token`), held across the whole drain rather than around
+the merge alone, because the window verdict, the obligations marked against that
+head and the merge verification are one sequence and a sibling moving the base
+through any of it voids all three. A lane that cannot take it defers and is
+retried by the next completion and by the sweep; `attempt` deliberately takes
+nothing, since the sweep is already holding the token when it calls.
+
+At `lanes = 1` the read, the reason string, the `merge-window` OPEN line and the
+completion path are byte-identical to what they were — no token object is built
+and no file appears under the state dir — and no existing test needed an edit.
 
 ### Decision 7 — observability: N lanes, truthfully
 
