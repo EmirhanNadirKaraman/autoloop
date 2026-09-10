@@ -18588,10 +18588,16 @@ class Orchestrator:
         Returns `(worker_git, conflicts) -> bool`. The decision is entirely
         `note_merge.combine_conflicted_notes`'s — the same function
         `auto_merge.AutoMerger._resolve_note_conflicts` calls — so this is the
-        reporting half and nothing more. The gateway hands it the gateway that
-        is actually mid-merge rather than one built here, which is what makes
-        "the three sides it read belong to THIS merge" structural instead of a
-        convention.
+        reporting half and nothing more. That covers both shapes that function
+        knows (an appended change note and a bumped counter; see
+        `_carry_reviewed_candidate_past`), which is why the entry types below
+        keep their `notes` names even though a resolution may now name a
+        counter file: an operator greps them for "the loop resolved a conflict
+        here without me", and splitting the vocabulary would hide half of that
+        from every query written before conc-14. The gateway hands it the
+        gateway that is actually mid-merge rather than one built here, which is
+        what makes "the three sides it read belong to THIS merge" structural
+        instead of a convention.
 
         Both outcomes are logged, refusals included: this path is about to park
         a reviewed candidate, and "the resolver looked at this and declined, for
@@ -18694,18 +18700,25 @@ class Orchestrator:
         reports the conflicted paths; resolving them here would be the same
         silent rewrite of reviewed work, one level down.
 
-        ONE CONFLICT SHAPE IS COMBINED INSTEAD OF PARKED (notes-04,
-        2026-08-23), and it is the SAME one, decided by the SAME code, that
-        `auto_merge.AutoMerger._merge` already combines when a task is merged
-        the other way: both sides only appended change-note lines to the
-        terminal append-only section of a tracker in `note_merge.NOTE_TRACKERS`.
+        TWO CONFLICT SHAPES ARE COMBINED INSTEAD OF PARKED, and both are the
+        SAME ones, decided by the SAME code, that `auto_merge.AutoMerger._merge`
+        combines when a task is merged the other way:
+
+          * both sides only APPENDED change-note lines to the terminal
+            append-only section of a tracker in `note_merge.NOTE_TRACKERS`
+            (notes-04, 2026-08-23);
+          * both sides RAISED the same hand-written counter in a file in
+            `note_merge.COUNTER_FILES`, each for the test file it added, and
+            each classified what it added (conc-14, 2026-09-10). The merged
+            value is the base's plus both deltas, read from the index stages.
+
         `note_merge.combine_conflicted_notes` is handed the in-progress merge
         (via `merge_foreign_commit`'s `resolve_conflicts` hook, so it sees the
         three index stages before the abort clears them) and either concludes
         the merge or declines, and a decline lands on the park below with the
         message it always had.
 
-        Why this direction needed it at all: every task appends a change note
+        Why this direction needed the first: every task appends a change note
         by construction, so two tasks in flight across one merge collide in the
         trackers by DEFAULT. Measured 2026-08-23, hours after notes-03 widened
         the tracker list: `blk-quota-01-002` parked `task_base_behind_head`
@@ -18715,6 +18728,21 @@ class Orchestrator:
         WHICH files may be combined bought nothing here, because the resolver
         was never consulted in this direction at all.
 
+        Why it then needed the second: the resolution is ALL OR NOTHING, so
+        combining the trackers is worth nothing on any round that also
+        conflicts elsewhere — and a task that adds a test file also bumps the
+        suite-size counter, so at `lanes = 2` it always did. Measured
+        2026-09-10: the first automatic merge stranded both other candidates
+        with "conflicts at autoloop/tests/test_prose_doc_selection.py,
+        autoloop/tests/test_test_selection.py, docs/SUMMARY.md, docs/TESTS.md"
+        — two trackers this could already combine, held hostage by two copies
+        of one number. The counter now has one home and one resolvable shape.
+
+        The all-or-nothing rule itself is UNCHANGED and deliberately so: the
+        hook below returns a bool, and `_finish_resolved_merge` believes it
+        only against a committed merge and a clean tree, so there is no partial
+        answer for this method to act on. See `note_merge`'s docstring.
+
         `THEIRS_FIRST` is not a detail. Here "theirs" is the incoming head,
         which becomes this task's new base, so its note lines must come FIRST
         and the task's own additions must stay at the very end — otherwise the
@@ -18722,9 +18750,11 @@ class Orchestrator:
         eventual merge back OUT refuses forever (the ctx-01 shape; see
         `note_merge.OURS_FIRST`).
 
-        NOTHING ELSE IS WEAKENED. A conflict in any path outside that list —
-        a source file, or a tracker's own prose above the marker — refuses the
-        whole merge and parks. The five preconditions below still run FIRST, so
+        NOTHING ELSE IS WEAKENED. A conflict in any path outside those two
+        lists — a source file, a tracker's own prose above the marker, or a
+        counter file whose ledger was rewritten rather than appended to —
+        refuses the whole merge and parks. The five preconditions below still
+        run FIRST, so
         a dirty worker or a tip that lost the candidate is still refused before
         any merge is attempted, and a resolution that cannot be verified is
         reported as a failure by `merge_foreign_commit` rather than accepted.

@@ -95,6 +95,12 @@ from test_implement_executor import (
 )
 from test_orchestrator import URL, build_postcommit
 
+# The suite's own size, declared ONCE (conc-14) rather than once per test file:
+# two copies conflicted in two files whenever two tasks each added a test file,
+# and every conflicted path has to be resolvable or a carry-forward resolves
+# none of them. Bump it, and classify your new file, THERE.
+from suite_size import SUITE_SIZE
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: `build_import_graph(REPO_ROOT)` costs an `ast.parse` of every `.py` file in
@@ -579,89 +585,9 @@ FLOOR_AFTER = 16
 #: else. Asserted as a count out of the whole suite, both before and after, so
 #: "it narrows" is a number rather than an adjective. The denominator is
 #: asserted too: the suite grows, and a ratio whose bottom half drifted would
-#: read as a narrowing that never happened.
-#: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). The
-#: DENOMINATOR only: the new file reads no tracker and spawns no interpreter, so
-#: neither the docs-only selection nor the floor moved with it.
-#: 103 -> 104 when prov-01 added `test_codex_stdout_verdict.py` (2026-09-01),
-#: for the same reason and with the same effect — 20 and 24 are unchanged.
-#: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01). The
-#: DENOMINATOR again: it fakes the invocation boundary rather than spawning
-#: one, and reads no tracker, so 20 and 24 are unchanged once more.
-#: 105 -> 106 when conc-02 added `test_config_concurrency.py` (2026-09-01),
-#: the DENOMINATOR again: it validates `[concurrency]` from `tmp_path` config
-#: strings and reads no tracker, so 20 and 24 are unchanged once more.
-#: 106 -> 107 when conc-05 added `test_lane_state.py` (2026-09-01), the
-#: DENOMINATOR again: it resolves lane paths and lease records under
-#: `tmp_path`, reads no tracker and spawns nothing, so 20 and 24 are unchanged
-#: once more.
-#: 107 -> 108 when conc-06 added `test_fleet_supervisor.py` (2026-09-02), the
-#: DENOMINATOR again: it plans against in-memory registries, reaches its
-#: trackers through `tasks.TRACKER_PATHS` instead of naming one, resolves no
-#: `__file__` and spawns nothing, so 20 and 24 are unchanged once more.
-#: 108 -> 109 when conc-11 added `test_fleet_throttle.py` (2026-09-02), the
-#: DENOMINATOR again: it works on one small JSON record and two orchestrators
-#: under `tmp_path`, names no tracker, resolves no `__file__`, and its only
-#: concurrency is `threading` — which is not a spawn entry point under the rule
-#: above — so 20 and 24 are unchanged once more.
-#: 109 -> 110 when conc-03b added `test_merge_rereview.py` (2026-09-03), the
-#: DENOMINATOR again: it names no tracker, resolves no `__file__`, and its
-#: `run_git` hands an unreadable argv to `subprocess.run` with no interpreter
-#: literal anywhere in the file — so neither term of the opacity rule above
-#: holds and 20 and 24 are unchanged once more.
-#: 110 -> 111 when conc-04b added `test_lane_observed_checkout.py` (2026-09-03),
-#: the DENOMINATOR again: it names `docs/AUTOLOOP.md`, which is not one of the
-#: change-note trackers a docs-only round changes, resolves no `__file__`, and
-#: borrows `gitrepo.run_git` without an interpreter literal of its own — so 20
-#: and 24 are unchanged once more.
-#: 111 -> 112 when ctx-03 added `test_context_resolver.py` (2026-09-03), the
-#: DENOMINATOR again: the one document it names is `autoloop/config.example.toml`
-#: (through its own `__file__`, exactly as `test_config_concurrency.py` does),
-#: which is not one of the change-note trackers a docs-only round changes, and
-#: its `CountingRunner` hands `subprocess.run` an argv this cannot read with no
-#: interpreter literal anywhere in the file — so 20 and 24 are unchanged once
-#: more.
-#: 112 -> 113 when conc-07 added `test_fault_isolation.py` (2026-09-03), the
-#: DENOMINATOR again: the one document it names is `docs/AUTOLOOP.md`, which is
-#: not one of the change-note trackers a docs-only round changes, it resolves no
-#: `__file__`, and it spawns no process at all — so 20 and 24 are unchanged once
-#: more.
-#: 113 -> 114 when conc-08 added `test_lane_death_recovery.py` (2026-09-03), the
-#: DENOMINATOR once again and for conc-07's reason exactly: the one document it
-#: names is `docs/AUTOLOOP.md`, it resolves no `__file__`, and the git it needs
-#: is spawned by `gitrepo.py` rather than by anything this file binds — so 20 and
-#: 24 hold.
-#: 114 -> 115 when conc-10 added `test_fleet_end_to_end.py` (2026-09-08), the
-#: DENOMINATOR again and for conc-07's and conc-08's reason: the one document it
-#: names is `docs/AUTOLOOP.md`, it resolves no `__file__`, and its only
-#: concurrency is `threading` — no repository, no subprocess and no interpreter
-#: literal anywhere in it — so 20 and 24 hold.
-#: 115 -> 116 when ctx-05 added `test_context_packet.py` (2026-09-09), the
-#: DENOMINATOR again. It spells `CLAUDE.md` in an evaluated string — the scope
-#: line a context packet renders unions the trackers in — and is still not a
-#: reader of it, because the rule is a CONJUNCTION and this file resolves no
-#: `__file__`. It spawns no interpreter either (its git comes from
-#: `gitrepo.py`), so 20 and 24 hold.
-#: 116 -> 117 when conc-12 added `test_lane_hold_scheduling.py` (2026-09-09), the
-#: DENOMINATOR again and for conc-10's reason: it names no document at all, it
-#: resolves no `__file__`, and it builds no repository and spawns no process —
-#: its only git is a three-method stub — so 20 and 24 hold.
-#: 116 -> 117 when ctx-07 added `test_context_closeout.py` (2026-09-09), the
-#: DENOMINATOR again. It names no change-note tracker in any evaluated string —
-#: the one it spells is `TRACKER_PATHS`, the identifier, which holds paths rather
-#: than being one — resolves no `__file__` of its own (the source it reads is
-#: reached as an ATTRIBUTE, `sys.modules[...].__file__`, which is not an
-#: `ast.Name`), and its git comes from `gitrepo.py`, so 20 and 24 hold.
-#: 118 -> 119 when ctx-08 added `test_context_diagnostics.py` (2026-09-09), the
-#: DENOMINATOR again and for the same reason: it names no change-note tracker in
-#: any evaluated string, resolves no `__file__`, and its git comes from
-#: `gitrepo.py`, so 20 and 24 hold.
-#: 119 -> 120 when split-06 added `test_split_order_advisory.py` (2026-09-10),
-#: the DENOMINATOR again and for ctx-08's reason: it resolves no `__file__`, so
-#: the `.md` extension token it does spell attributes it no document; it spawns
-#: nothing of its own (its git comes from `test_task_split.py`, whose own
-#: opacity is unchanged by being imported), so 20 and 24 hold.
-SUITE_SIZE = 120
+#: read as a narrowing that never happened. That denominator is `SUITE_SIZE`,
+#: imported above — and the ledger saying what every bump was for, which used
+#: to sit right here, moved with it (conc-14).
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
