@@ -882,6 +882,27 @@ def unauthorized_paths(changed, approved) -> set[str]:
     }
 
 
+def paths_within_scope(candidates, approved) -> set[str]:
+    """Which of `candidates` the scope `approved` DOES authorize.
+
+    The positive complement of `unauthorized_paths`, defined in terms of it and
+    never re-deriving the rule: a second prefix matcher would answer a scope
+    question differently from the gate that actually enforces the scope, which
+    is the drift `unauthorized_paths` above exists to prevent. BATCH, because
+    the caller that wanted this asks the question about every Python file in the
+    checkout at once (`validation.split_order_warnings`), and one call per file
+    would rebuild the exact/prefix split of `approved` once per file.
+
+    NOT `authorized_cleanup_paths`, which reads similarly and is a different
+    rule: that one is exact-match-only against paths the LOOP recorded, and
+    grants repair. This one answers the ordinary scope question — exact entries
+    plus directory prefixes — and grants nothing at all; it is a predicate, and
+    no caller may treat its answer as authorization to write.
+    """
+    candidates = list(candidates)
+    return set(candidates) - unauthorized_paths(candidates, approved)
+
+
 def authorized_cleanup_paths(requested, recorded) -> tuple[set[str], set[str]]:
     """Split `requested` into `(authorized, refused)` against `recorded`.
 
