@@ -418,17 +418,16 @@ test_selection = "reachable"
 # a buffer nobody can see; with this on, the same output is ALSO appended to a
 # file as it is produced.
 #
-# READ THIS FIRST — NOT YET REACHED BY A PRODUCTION ROUND (stream-01b,
-# 2026-09-10). The mechanism, the cap, the failure tolerance and the tests are
-# all in place on autoloop/audit/agents.py's ClaudeCliRunner(action_log_dir=),
-# but the two lines that hand it this setting are in autoloop/cli.py and
-# autoloop/implement_executor.py, which that task was not authorized to edit.
-# So setting this to true today changes NOTHING, and this paragraph is here
-# rather than absent because a key that reads as configured while doing nothing
-# is the exact failure the rest of this file refuses to ship. Delete this
-# paragraph in the round that adds `action_log_dir=` to
-# `implement_agent_runner` and passes `config.action_log_dir` from
-# `cli._build_executor`'s agent_runner_factory.
+# IT REACHES A REAL ROUND (stream-01b, 2026-09-10): loading this file arms
+# autoloop/audit/agents.py's process-wide default with <state_dir>/action-logs
+# when this is true and clears it when it is false, and every agent runner the
+# loop builds — the write-capable one a task's round runs, and the read-only
+# audit ones — uses that default. So `true` here means the NEXT round writes a
+# log while it works, and `false` means the loop behaves exactly as it did
+# before this key existed. It applies to the audit subagents too; those are
+# bounded by an elapsed timeout rather than supervised, so their output is
+# handed over in one piece when the process exits and the file SAYS so instead
+# of letting it read as a stream that recorded nothing.
 #
 # WHERE: <state_dir>/action-logs/<task>-<round>.log — one file per round, named
 # by task and by the instant the round started, so rounds never overwrite each

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import tomllib
 
+from .audit.agents import set_default_action_log_dir
 from .codex.sandbox import DEFAULT_SANDBOX_ARGS
 from .errors import ConfigError
 from .notify import (
@@ -523,13 +524,19 @@ class AuditConfig:
     #: (`audit.agents.ClaudeCliRunner`, via its `action_log_dir=`) rather than
     #: on a mechanism nothing reaches.
     #:
-    #: AND IT IS STILL UNWIRED AS SHIPPED (stream-01b, 2026-09-10), which is
-    #: said here rather than left to be discovered: the two lines that carry
-    #: this value to that runner live in `implement_executor
-    #: .implement_agent_runner` and `cli._build_executor`, and the task that
-    #: added this key was not authorized to edit either file. Setting it `true`
-    #: today therefore does nothing. `config.example.toml` says the same, in
-    #: the same words, so an operator reading either one is told.
+    #: HOW IT GETS THERE (stream-01b, 2026-09-10 — it was inert for one round
+    #: before this, and the paragraph saying so is gone because it is no longer
+    #: true): the LAST thing `load_config` does is call
+    #: `audit.agents.set_default_action_log_dir` with
+    #: `AutoloopConfig.action_log_dir` when this is on and `None` when it is
+    #: off. Every `ClaudeCliRunner` built afterwards without a directory of its
+    #: own — which is every production one, including the write-capable runner
+    #: `implement_executor.implement_agent_runner` builds per task — uses that.
+    #: A process-wide default is used because the two call sites that would
+    #: otherwise carry the argument (`cli._build_executor` and that factory)
+    #: were outside the authorized paths of the task that wired this; passing
+    #: `action_log_dir=` at those two sites instead would be strictly smaller
+    #: and nothing here forecloses it.
     #:
     #: IT IS AN ACTION LOG. It records what the agent process PRINTED — its tool
     #: calls, reads, writes and commands as the CLI reports them. It is not the
@@ -2517,7 +2524,7 @@ def load_config(path: Path) -> AutoloopConfig:
     concurrency = _load_concurrency_section(data)
     context = _load_context_section(data)
 
-    return AutoloopConfig(
+    config = AutoloopConfig(
         browser=browser,
         policy=policy,
         state_dir=state_dir,
@@ -2537,3 +2544,19 @@ def load_config(path: Path) -> AutoloopConfig:
         concurrency=concurrency,
         context=context,
     )
+    # THE LINE THAT MAKES `[audit] action_log` REACH A REAL ROUND. Every
+    # `ClaudeCliRunner` the loop builds — the write-capable one
+    # `implement_executor.implement_agent_runner` makes per task, and the
+    # read-only audit ones — names no log directory, so this process-wide
+    # default is what they use. See `AuditConfig.action_log`.
+    #
+    # SET UNCONDITIONALLY, in both directions. Arming only when the flag is on
+    # would leave a process that had loaded a `true` config earlier logging
+    # after it loaded a `false` one, which is a flag that cannot be turned off
+    # — the failure a default-off setting exists to avoid.
+    #
+    # LAST, after every check above and after the config object exists: a
+    # config that is REFUSED must arm nothing, and each `raise ConfigError`
+    # above returns before reaching this line.
+    set_default_action_log_dir(config.action_log_dir if config.audit.action_log else None)
+    return config

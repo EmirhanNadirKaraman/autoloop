@@ -15,6 +15,15 @@ The claim this file grades has two halves and both are pinned here:
   write-at-exit implementation leaves an identical file behind and still fails
   here, which is the entire point of the task.
 
+Section 7 grades the WIRE between those two halves, which is the part
+stream-01 did not have: a `[audit] action_log = true` written in a real config
+file, read by the real `load_config`, arriving at the write-capable runner the
+real `implement_agent_runner` builds — a runner that, exactly as in
+`cli._build_executor`, names no log directory of its own. Nothing there
+constructs a runner by hand: a test that describes production rather than using
+it can pass while production stays inert, which is the failure this whole file
+exists to make impossible.
+
 No real `claude` process is ever spawned and nothing ever really waits: the
 supervised path is driven by a fake spawn, a fake handle and a fake clock, the
 same way `test_stall_detector.py` drives it. One test uses real git
@@ -37,7 +46,9 @@ from autoloop.audit.agents import (
     ClaudeCliRunner,
     action_log_round_stamp,
     action_log_slug,
+    default_action_log_dir,
     open_action_log,
+    set_default_action_log_dir,
 )
 from autoloop.config import AuditConfig, AutoloopConfig, BrowserConfig, load_config
 from autoloop.contract import Decision, Directive
@@ -50,12 +61,7 @@ from autoloop.implement_executor import (
     implement_agent_runner,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
-from autoloop.stall import (
-    DEFAULT_CEILING_SECONDS,
-    PartialWork,
-    ProgressSample,
-    StallPolicy,
-)
+from autoloop.stall import PartialWork, ProgressSample, StallPolicy
 from autoloop.tasks import Task
 
 SPEC = AgentSpec(domain="t1", title="Add widget", prompt="do the thing")
@@ -64,6 +70,23 @@ SPEC = AgentSpec(domain="t1", title="Add widget", prompt="do the thing")
 #: brief is explicit: it is an ACTION log, and labelling process output as the
 #: model's thinking misrepresents what the operator is reading.
 THINKING_WORDS = ("thinking", "reasoning", "chain of thought", "thought process")
+
+
+@pytest.fixture(autouse=True)
+def restore_the_process_default():
+    """The armed default is PROCESS-WIDE, so every test in this file puts it
+    back to whatever it found.
+
+    Autouse for the whole module rather than requested per test, because the
+    tests below are the only ones in the suite that arm it: a leak out of this
+    file would switch logging on inside unrelated tests that build a runner
+    without asking for one, and the symptom would appear somewhere else.
+    """
+    before = default_action_log_dir()
+    try:
+        yield
+    finally:
+        set_default_action_log_dir(before)
 
 
 # ---- fakes ------------------------------------------------------------------
@@ -660,45 +683,169 @@ def worker_repo(tmp_path):
     return _init_repo(tmp_path / "worker", "autoloop/t1")
 
 
-def production_runner(root, *, action_log_dir, spawn, clock, stall_policy):
-    """The runner `cli._build_executor` builds for a real round, plus the one
-    argument this change adds.
+def write_config(tmp_path, *, action_log=None, tail=""):
+    """A real config file for `load_config`, with `[audit] action_log` written
+    exactly as an operator would write it (or ABSENT, which is every config
+    file that predates the key)."""
+    workers_root = tmp_path / "workers"
+    state_dir = tmp_path / "state"
+    body = [
+        "[paths]",
+        f'workers_root = "{workers_root}"',
+        f'state_dir = "{state_dir}"',
+    ]
+    if action_log is not None:
+        body += ["[audit]", f"action_log = {str(bool(action_log)).lower()}"]
+    path = tmp_path / "config.toml"
+    path.write_text("\n".join(body) + "\n" + tail)
+    return path
 
-    Built by ASSERTING equality against `implement_agent_runner` — the single
-    production construction site — rather than by describing it, so this test
-    cannot drift into grading a runner production does not use. The assertions
-    below are what fail if the write-capable tool sets, the argv, the timeout
-    or the progress probe ever stop matching.
+
+def production_factory(root, *, spawn, clock, stall_policy, policy):
+    """EXACTLY the call `cli._build_executor`'s `agent_runner_factory` makes,
+    minus the abort switch and with the process faked.
+
+    No `action_log_dir=` — that is the point. If the operator's setting does
+    not reach this runner on its own, the log this test looks for never
+    appears.
     """
-    production = implement_agent_runner(
+    return implement_agent_runner(
         root,
-        policy=PolicyEngine(PolicyConfig()),
+        policy=policy,
         stall_policy=stall_policy,
         spawn=spawn,
         clock=clock,
         sleep=clock.sleep,
     )
-    runner = ClaudeCliRunner(
-        repo_root=root,
-        command=("claude",),
-        timeout_seconds=DEFAULT_CEILING_SECONDS,
-        allowed_tools=WRITE_ALLOWED_TOOLS,
-        disallowed_tools=IMPLEMENT_DISALLOWED_TOOLS,
-        progress_probe=production._progress_probe,
-        stall_policy=stall_policy,
-        spawn=spawn,
-        clock=clock,
-        sleep=clock.sleep,
-        action_log_dir=action_log_dir,
+
+
+def test_a_config_with_the_flag_on_arms_the_directory_it_names(tmp_path):
+    config = load_config(write_config(tmp_path, action_log=True))
+
+    assert config.audit.action_log is True
+    assert default_action_log_dir() == config.action_log_dir
+    assert config.action_log_dir == tmp_path / "state" / "action-logs"
+
+
+def test_a_config_with_the_flag_off_disarms_a_process_that_was_armed(tmp_path):
+    """A flag that cannot be turned off again is not a default-off flag. The
+    setting is applied in BOTH directions, so a process that read a `true`
+    config and then a `false` one logs nothing."""
+    set_default_action_log_dir(tmp_path / "left-over")
+
+    load_config(write_config(tmp_path, action_log=False))
+
+    assert default_action_log_dir() is None
+
+
+def test_a_config_that_never_mentions_the_key_arms_nothing(tmp_path):
+    """Every config file written before this key existed, since the template is
+    copied once and never re-read."""
+    set_default_action_log_dir(tmp_path / "left-over")
+
+    load_config(write_config(tmp_path))
+
+    assert default_action_log_dir() is None
+
+
+def test_a_refused_config_arms_nothing(tmp_path):
+    """Arming is the LAST thing `load_config` does.
+
+    The failure here is in `[context]`, the last section the loader reads —
+    after `[audit]` has been parsed and accepted. A config that is REFUSED must
+    leave the process exactly as it was, rather than logging to the directory
+    of a config nobody accepted.
+    """
+    set_default_action_log_dir(None)
+    path = write_config(tmp_path, action_log=True, tail="[context]\nmax_records = 0\n")
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+    assert default_action_log_dir() is None
+
+
+def test_a_value_that_cannot_name_a_directory_leaves_the_log_off_and_says_so(
+    tmp_path, capsys
+):
+    """The setter's one production caller is `load_config`. A `Path()` that
+    refused what it was handed would stop the loop from reading its own
+    configuration — observability failing work. So it cannot refuse: the log
+    goes OFF, the previously armed directory does not survive, and stderr says
+    why rather than leaving it to be discovered."""
+    set_default_action_log_dir(tmp_path / "armed")
+
+    set_default_action_log_dir(object())
+
+    assert default_action_log_dir() is None
+    assert "action log" in capsys.readouterr().err
+
+
+def test_a_runner_built_without_a_directory_uses_the_armed_default(tmp_path):
+    """The fallback itself: no `action_log_dir=` anywhere, and a log appears
+    because the process was armed."""
+    load_config(write_config(tmp_path, action_log=True))
+    clock = FakeClock()
+    spawn, _ = chatty_spawn(clock, exit_at=20.0, per_poll=b"tool: Read(a)\n")
+
+    supervised_runner(tmp_path, spawn, clock).run(SPEC)
+
+    assert "tool: Read(a)" in only_log(tmp_path / "state" / "action-logs").read_text()
+
+
+def test_an_explicit_directory_wins_over_the_armed_default(tmp_path):
+    load_config(write_config(tmp_path, action_log=True))
+    clock = FakeClock()
+    spawn, _ = chatty_spawn(clock, exit_at=20.0)
+
+    supervised_runner(tmp_path, spawn, clock, action_log_dir=tmp_path / "explicit").run(SPEC)
+
+    assert only_log(tmp_path / "explicit").exists()
+    assert not (tmp_path / "state" / "action-logs").exists()
+
+
+def test_a_runner_already_built_keeps_the_state_it_started_with(tmp_path):
+    """Resolved once, in `__init__`. Arming the process halfway through a round
+    must not produce a file that covers part of a run without saying which
+    part — and disarming it must not stop one mid-file either."""
+    set_default_action_log_dir(None)
+    clock = FakeClock()
+    spawn, _ = chatty_spawn(clock, exit_at=20.0)
+    runner = supervised_runner(tmp_path, spawn, clock)
+
+    set_default_action_log_dir(tmp_path / "armed-too-late")
+    runner.run(SPEC)
+
+    assert not (tmp_path / "armed-too-late").exists()
+
+
+def test_the_production_factory_takes_the_directory_from_the_config(
+    tmp_path, worker_repo
+):
+    """`implement_agent_runner` is the ONE place a write-capable runner is
+    built, and `cli._build_executor` calls it with no `action_log_dir`. With the
+    flag on it must still end up with the configured directory — and with the
+    write-capable tool sets, so this is the runner a real round runs and not
+    some other one."""
+    config = load_config(write_config(tmp_path, action_log=True))
+
+    runner = implement_agent_runner(
+        worker_repo, policy=PolicyEngine(PolicyConfig()), stall_policy=make_policy()
     )
-    assert runner.build_argv(SPEC) == production.build_argv(SPEC)
-    assert runner._allowed_tools == production._allowed_tools
-    assert runner._disallowed_tools == production._disallowed_tools
-    assert runner._timeout == production._timeout
-    assert type(runner._progress_probe) is type(production._progress_probe)
-    assert runner._action_log_dir is not None
-    assert production._action_log_dir is None  # today's default, on the real factory
-    return runner
+
+    assert runner._action_log_dir == config.action_log_dir
+    assert runner._allowed_tools == WRITE_ALLOWED_TOOLS
+    assert runner._disallowed_tools == IMPLEMENT_DISALLOWED_TOOLS
+
+
+def test_the_production_factory_logs_nowhere_with_the_flag_off(tmp_path, worker_repo):
+    load_config(write_config(tmp_path, action_log=False))
+
+    runner = implement_agent_runner(
+        worker_repo, policy=PolicyEngine(PolicyConfig()), stall_policy=make_policy()
+    )
+
+    assert runner._action_log_dir is None
 
 
 def test_a_production_round_produces_a_non_empty_log_while_it_is_still_running(
@@ -707,13 +854,17 @@ def test_a_production_round_produces_a_non_empty_log_while_it_is_still_running(
     """The test stream-01 never had.
 
     A whole round through `ImplementExecutor.execute()` — the real executor
-    entry point, the real `_bindings_for`, the real worker repository, the real
-    `WorkerTreeProbe` over real git, the real supervisor — with the agent's
-    process faked and nothing else. The log is sampled from inside the
-    supervisor's sleep, so a non-empty sample is a non-empty log at a moment
-    when the round had not finished.
+    entry point, the real `_bindings_for`, the real `implement_agent_runner`
+    called the way `cli._build_executor` calls it, the real worker repository,
+    the real `WorkerTreeProbe` over real git, the real supervisor — with the
+    agent's process faked and nothing else. The only thing that turns the log
+    on is `[audit] action_log = true` in a config file `load_config` read.
+
+    The log is sampled from inside the supervisor's sleep, so a non-empty
+    sample is a non-empty log at a moment when the round had not finished.
     """
-    log_dir = tmp_path / "state" / "action-logs"
+    config = load_config(write_config(tmp_path, action_log=True))
+    log_dir = config.action_log_dir
     clock = FakeClock()
     policy = PolicyEngine(PolicyConfig())
     stall_policy = make_policy(stall=600.0, ceiling=6000.0, poll=10.0)
@@ -752,8 +903,8 @@ def test_a_production_round_produces_a_non_empty_log_while_it_is_still_running(
         validation_commands=(),
         worker_repo_root_for=lambda task_id: worker_repo,
         policy=policy,
-        agent_runner_factory=lambda root: production_runner(
-            root, action_log_dir=log_dir, spawn=spawn, clock=clock, stall_policy=stall_policy
+        agent_runner_factory=lambda root: production_factory(
+            root, spawn=spawn, clock=clock, stall_policy=stall_policy, policy=policy
         ),
         advisory_zero_call_returns=0,
     )
@@ -774,15 +925,24 @@ def test_a_production_round_produces_a_non_empty_log_while_it_is_still_running(
     written = only_log(log_dir)
     assert written.name.startswith("t1-")  # named by the task
     assert "tool: Write(feature.py)" in written.read_text()
+    # OUTSIDE the observed tree (port-01). A log written inside the worker
+    # repository is the agent writing where it may not, as far as
+    # `escape_detector` is concerned — a `loop_fatal` park caused by watching
+    # the round.
+    assert not written.is_relative_to(worker_repo)
+    assert not written.is_relative_to(main_repo)
 
 
 def test_the_same_production_round_with_the_log_off_writes_nothing(
     main_repo, worker_repo, tmp_path, capsys
 ):
-    """The other half of the claim: default off is still today's behaviour all
-    the way through the executor, and `implement_agent_runner` — the factory
-    `cli._build_executor` actually calls — is what is used here, unmodified."""
-    log_dir = tmp_path / "state" / "action-logs"
+    """The other half of the claim, and the same round: with the setting OFF —
+    which is what a config that never mentions it gives, i.e. every config file
+    that predates the key — the whole executor path behaves as it did before
+    this existed. Same executor, same factory, same fake process as the test
+    above; only the config file differs."""
+    config = load_config(write_config(tmp_path, action_log=False))
+    log_dir = config.action_log_dir
     clock = FakeClock()
     policy = PolicyEngine(PolicyConfig())
 
@@ -805,13 +965,12 @@ def test_the_same_production_round_with_the_log_off_writes_nothing(
         validation_commands=(),
         worker_repo_root_for=lambda task_id: worker_repo,
         policy=policy,
-        agent_runner_factory=lambda root: implement_agent_runner(
+        agent_runner_factory=lambda root: production_factory(
             root,
-            policy=policy,
-            stall_policy=make_policy(stall=600.0, ceiling=6000.0, poll=10.0),
             spawn=spawn,
             clock=clock,
-            sleep=clock.sleep,
+            stall_policy=make_policy(stall=600.0, ceiling=6000.0, poll=10.0),
+            policy=policy,
         ),
         advisory_zero_call_returns=0,
     )
