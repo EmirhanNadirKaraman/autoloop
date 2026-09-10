@@ -46,13 +46,28 @@ in it may fail a round.
 difference.** A runner nobody hands a directory to would be a mechanism no
 production round ever reaches, whatever the operator's flag said — so
 `set_default_action_log_dir` holds the loop's configured answer for the whole
-process, and every runner built WITHOUT an explicit `action_log_dir=` uses it.
+process, and a runner that OMITS `action_log_dir=` asks for it.
 `config.load_config` is the one production caller: it arms the default with
 `AutoloopConfig.action_log_dir` when `[audit] action_log` is on and disarms it
 otherwise, so the write-capable runner `implement_executor
 .implement_agent_runner` builds — which names no directory and is the runner a
 real round runs — streams when the operator asked for it and is untouched when
 they did not.
+
+**THE DEFAULT REACHES SUPERVISED RUNNERS ONLY, and `action_log_dir=None` still
+means OFF.** Two bounds on how far a process-wide value may travel, because a
+default that travels everywhere is a setting nobody can predict:
+
+* OMITTED (`INHERIT_ACTION_LOG_DIR`) asks the process default; an explicit
+  `None` refuses it. Those are different requests and this module keeps them
+  different — `None` meant "no log" before the default existed and it still
+  does, so no caller loses the ability to say so.
+* Only a runner with a `progress_probe` inherits. That is the write-capable
+  supervised path, the one that can actually append output WHILE the agent
+  runs. The unsupervised audit runners are
+  `subprocess.run(capture_output=True)` and could only ever have produced a
+  file written after the process exited — a log that looks like a live stream
+  and is not. They are left exactly as they were.
 
 Tests never invoke the real CLI — AgentRunner is a protocol; the executors
 are exercised with fakes, and ClaudeCliRunner itself is tested with a
@@ -153,6 +168,10 @@ ACTION_LOG_TRUNCATION_NOTICE = (
 #: Written rather than left to be inferred: a file that appeared at the end of a
 #: run, with no note, is indistinguishable from a stream that recorded nothing
 #: until the last moment. That inference is the fail-open this line closes.
+#:
+#: REACHED ONLY BY A CALLER THAT NAMED A DIRECTORY. The operator's setting no
+#: longer arms this path at all (`INHERIT_ACTION_LOG_DIR`), so a buffered log
+#: exists only where something asked for one by name and can be told what it is.
 ACTION_LOG_BUFFERED_NOTICE = (
     "\n[NOT STREAMED — this run was bounded by an elapsed timeout, so its "
     "output was buffered by the process runner and everything below was "
@@ -180,26 +199,59 @@ ACTION_LOG_HEADER = """\
 _SLUG_SAFE = frozenset(string.ascii_letters + string.digits + "._-")
 
 
+class _InheritActionLogDir:
+    """The type of `INHERIT_ACTION_LOG_DIR`; see it for what it is for."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - a debugging aid
+        return "INHERIT_ACTION_LOG_DIR"
+
+
+#: "I did not say" — the `action_log_dir=` default, and the ONLY value that
+#: consults the process-wide default below.
+#:
+#: A sentinel rather than `None`, because the two are genuinely different
+#: requests and collapsing them costs a caller something it used to have:
+#: `action_log_dir=None` meant "this runner logs nowhere" before a process-wide
+#: default existed, and with `None` reading as "ask the default" there would be
+#: no way left to say it. A switch whose off position turns itself back on when
+#: the process is armed is exactly the shape a default-off flag must not have.
+INHERIT_ACTION_LOG_DIR = _InheritActionLogDir()
+
+
 #: THE WIRE between the operator's `[audit] action_log` setting and the runners
 #: the loop really runs. `None` — the value it holds until something arms it,
 #: and the value it is put back to by any config with the flag off — means every
-#: runner built without an explicit directory logs nothing at all.
+#: runner logs nothing at all.
+#:
+#: WHAT IT CAN REACH IS BOUNDED TWICE, and both bounds are load-bearing rather
+#: than tidiness. A runner that passes `action_log_dir=` explicitly (including
+#: an explicit `None`) never consults it, and a runner with no `progress_probe`
+#: never consults it either — see `ClaudeCliRunner.__init__`. The second bound
+#: is the one worth stating: the unsupervised path is
+#: `subprocess.run(capture_output=True)`, whose output exists only once the
+#: process has exited, so arming it process-wide would hand the loop's read-only
+#: audit subagents a file that CANNOT be the live stream this setting promises.
+#: The supervised write-capable runner is the one a task's round runs and the
+#: one that can stream, and it is the one the default is for.
 #:
 #: A PROCESS-WIDE default rather than a constructor argument threaded from
 #: `cli._build_executor`, because the two construction sites that would carry
 #: such an argument (`cli._build_executor` and
 #: `implement_executor.implement_agent_runner`) are not this task's to edit —
 #: see `config.load_config`, which is the one production caller of the setter
-#: and the reason a `true` in the config file now reaches a real round. Threading
+#: and the reason a `true` in the config file reaches a real round. Threading
 #: the value through those two call sites instead would be a strictly smaller
 #: change and nothing here forecloses it: delete the two lines in
 #: `load_config`, pass `action_log_dir=config.action_log_dir` at the factory, and
-#: this module is unchanged.
+#: the gate below becomes dead code rather than wrong code.
 _default_action_log_dir: Path | None = None
 
 
 def set_default_action_log_dir(directory: Path | None) -> None:
-    """Arm (or disarm) the action log for every runner built AFTER this call.
+    """Arm (or disarm) the action log for SUPERVISED runners built AFTER this
+    call that named no directory of their own.
 
     Idempotent, and total in the direction that matters: `None` disarms, so a
     process that loads a config with the flag off is put back to the behaviour
@@ -232,8 +284,12 @@ def set_default_action_log_dir(directory: Path | None) -> None:
 
 
 def default_action_log_dir() -> Path | None:
-    """Where a runner that was given no directory of its own will log, or
-    `None` for "nowhere", which is the default until a config arms it."""
+    """The armed answer, or `None` for "nowhere" — which is the value until a
+    config arms one.
+
+    What CONSULTS it is narrower than what this returns: only a runner that
+    both omitted `action_log_dir=` and has a `progress_probe`. See
+    `INHERIT_ACTION_LOG_DIR`."""
     return _default_action_log_dir
 
 
@@ -544,7 +600,7 @@ class ClaudeCliRunner:
         spawn=None,
         clock=time.monotonic,
         sleep=time.sleep,
-        action_log_dir: Path | None = None,
+        action_log_dir: Path | None | _InheritActionLogDir = INHERIT_ACTION_LOG_DIR,
         action_log_max_bytes: int = DEFAULT_ACTION_LOG_MAX_BYTES,
         action_log_opener=open,
     ):
@@ -572,29 +628,41 @@ class ClaudeCliRunner:
         no real process and no real waiting; production leaves all three at
         their defaults.
 
-        **`action_log_dir` names where this runner logs; omitting it (or
-        passing `None`, which is the same thing) asks
-        `default_action_log_dir()` instead — the process-wide answer
-        `config.load_config` arms from `[audit] action_log`.** That fallback is
-        the whole of the wiring: `implement_executor.implement_agent_runner`
-        names no directory, so a production round logs exactly when the
-        operator's config says to and not otherwise.
+        **`action_log_dir` has three states, and the third one is why it is not
+        simply `Path | None`:**
 
-        With neither — the default until a config arms one, and the state any
-        config with the flag off puts the process back into — the log is OFF:
-        no directory is created, no file is opened, nothing is printed, `sleep`
-        is passed to `supervise` unwrapped, and the returned `AgentResult` is
-        byte for byte what it was before this parameter existed. On means one
-        file per round under that directory, appended to while the agent is
-        still running. `action_log_max_bytes` caps the AGENT OUTPUT it records
-        (see `DEFAULT_ACTION_LOG_MAX_BYTES`); `action_log_opener` is a test
-        seam.
+        * a DIRECTORY — this runner logs there, whatever the process default
+          says and whether or not it is supervised;
+        * `None` — this runner logs NOWHERE, whatever the process default says.
+          That is what `None` meant before the default existed, and keeping it
+          means a caller can still switch one runner off without switching the
+          operator's setting off for the whole loop;
+        * OMITTED (`INHERIT_ACTION_LOG_DIR`, the default) — ask
+          `default_action_log_dir()`, the process-wide answer
+          `config.load_config` arms from `[audit] action_log`, AND ONLY IF THIS
+          RUNNER IS SUPERVISED (`progress_probe` present).
 
-        There is deliberately no third state meaning "off however the process
-        is configured": an explicit directory wins, and `None` defers. A caller
-        that must not log while the flag is on does not exist today, and adding
-        a sentinel for it would be a switch with two off positions — the shape
-        that makes a default-off flag hard to reason about.
+        That last gate is what keeps the wiring honest. The inherited default is
+        the whole of the production wiring — `implement_executor
+        .implement_agent_runner` names no directory, so a production round logs
+        exactly when the operator's config says to and not otherwise — but the
+        unsupervised path cannot deliver what the setting promises: it is
+        `subprocess.run(capture_output=True)`, so its output does not exist
+        until the process has exited and no amount of arming makes it a live
+        stream. Rather than hand the audit subagents a file that reads like one,
+        an unsupervised runner that was not given a directory OF ITS OWN logs
+        nothing. Naming one explicitly still works, and still records the
+        `ACTION_LOG_BUFFERED_NOTICE` saying what it is.
+
+        With the log off — the default until a config arms one, the state any
+        config with the flag off puts the process back into, and the state of
+        every unsupervised runner that named no directory — no directory is
+        created, no file is opened, nothing is printed, `sleep` is passed to
+        `supervise` unwrapped, and the returned `AgentResult` is byte for byte
+        what it was before this parameter existed. On means one file per round
+        under that directory, appended to while the agent is still running.
+        `action_log_max_bytes` caps the AGENT OUTPUT it records (see
+        `DEFAULT_ACTION_LOG_MAX_BYTES`); `action_log_opener` is a test seam.
 
         ONE RUNNER IS ONE ROUND, which is what makes the file name honest:
         `ImplementExecutor._bindings_for` builds a fresh runner from the
@@ -617,9 +685,24 @@ class ClaudeCliRunner:
         # log on keeps it for its whole length even if the process is re-armed
         # meanwhile, which is what stops a file that covers part of a run
         # without saying which part.
-        resolved_log_dir = (
-            Path(action_log_dir) if action_log_dir is not None else default_action_log_dir()
-        )
+        #
+        # The gate reads `progress_probe`, the parameter, rather than
+        # `self._progress_probe` — same object, but this must not depend on the
+        # order two assignments happen to sit in.
+        if isinstance(action_log_dir, _InheritActionLogDir):
+            # NOTHING was said, so the process default answers — for a
+            # supervised runner, which is the only kind that can stream. An
+            # unsupervised one is left off rather than given a file that looks
+            # like a live stream and is written after the process exits.
+            resolved_log_dir = (
+                default_action_log_dir() if progress_probe is not None else None
+            )
+        elif action_log_dir is None:
+            # SAID, and what was said is "nowhere". An explicit off is not a
+            # question, so the process default does not get to answer it.
+            resolved_log_dir = None
+        else:
+            resolved_log_dir = Path(action_log_dir)
         self._action_log_dir = resolved_log_dir
         self._action_log_max_bytes = action_log_max_bytes
         self._action_log_opener = action_log_opener

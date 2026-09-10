@@ -657,9 +657,11 @@ FLOOR_AFTER = 16
 #: any evaluated string, resolves no `__file__`, and its git comes from
 #: `gitrepo.py`, so 20 and 24 hold.
 #: 119 -> 120 when stream-01b added `test_agent_action_log.py` (2026-09-10), the
-#: DENOMINATOR once more and for the same reason: it names no change-note
-#: tracker in any evaluated string, resolves no `__file__`, and its git comes
-#: from `gitrepo.py`, so 20 and 24 hold.
+#: DENOMINATOR once more: it names no change-note tracker in any evaluated
+#: string and its git comes from `gitrepo.py`, so 20 and 24 hold. It DOES
+#: resolve `__file__` — it reads `cli.py` to check a production call site — but
+#: attribution is a CONJUNCTION and the tracker half is absent, so that half
+#: alone reaches nothing.
 SUITE_SIZE = 120
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20

@@ -537,9 +537,13 @@ DOCS_ONLY_SELECTED = 20
 #: (its git comes from `gitrepo.py`), so it is neither a reader nor on the opaque
 #: frontier and the same 20 hold.
 #: 119 -> 120 when stream-01b added `test_agent_action_log.py` (2026-09-10), the
-#: DENOMINATOR once more and for the same reason: it names no change-note
-#: tracker in any evaluated string, resolves no `__file__`, and spawns nothing
-#: of its own (its git comes from `gitrepo.py`), so the same 20 hold.
+#: DENOMINATOR once more: it names no change-note tracker in any evaluated
+#: string and spawns nothing of its own (its git comes from `gitrepo.py`), so
+#: the same 20 hold. It DOES resolve `__file__` — it reads `cli.py` to check a
+#: production call site — but attribution is a CONJUNCTION and the other half is
+#: absent, so that reaches nothing. It builds no `.md` name either, so
+#: `test_no_file_that_addresses_this_checkout_builds_a_document_name_dynamically`
+#: (which it is now in scope for) is unmoved too.
 SUITE_SIZE = 120
 
 

@@ -420,14 +420,16 @@ test_selection = "reachable"
 #
 # IT REACHES A REAL ROUND (stream-01b, 2026-09-10): loading this file arms
 # autoloop/audit/agents.py's process-wide default with <state_dir>/action-logs
-# when this is true and clears it when it is false, and every agent runner the
-# loop builds — the write-capable one a task's round runs, and the read-only
-# audit ones — uses that default. So `true` here means the NEXT round writes a
-# log while it works, and `false` means the loop behaves exactly as it did
-# before this key existed. It applies to the audit subagents too; those are
-# bounded by an elapsed timeout rather than supervised, so their output is
-# handed over in one piece when the process exits and the file SAYS so instead
-# of letting it read as a stream that recorded nothing.
+# when this is true and clears it when it is false, and the write-capable agent
+# runner a task's round runs picks that default up. So `true` here means the
+# NEXT round writes a log while it works, and `false` means the loop behaves
+# exactly as it did before this key existed.
+#
+# IT DOES NOT APPLY TO THE READ-ONLY AUDIT SUBAGENTS. Those are bounded by an
+# elapsed timeout rather than watched for progress, so their output is buffered
+# by the process runner and does not exist until the run has ENDED — a file for
+# them could not be the live stream this setting offers, only something that
+# looks like one. They are left exactly as they are, on or off.
 #
 # WHERE: <state_dir>/action-logs/<task>-<round>.log — one file per round, named
 # by task and by the instant the round started, so rounds never overwrite each
