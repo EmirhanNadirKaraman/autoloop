@@ -504,6 +504,44 @@ class AuditConfig:
     #: asked for; the safety comes from the widening rules (anything the graph
     #: cannot resolve runs the full suite), not from leaving the flag off.
     test_selection: str = TEST_SELECTION_REACHABLE
+    #: Stream the agent's ACTION LOG — everything the agent PROCESS writes to
+    #: stdout and stderr — to a per-round file under
+    #: `AutoloopConfig.action_log_dir`, appended WHILE the round is still
+    #: running, so a live round can be watched instead of waited out.
+    #:
+    #: OFF BY DEFAULT, and that default is the compatibility contract: absent —
+    #: which is every config file written before this key existed, since the
+    #: template is copied once and never re-read — no directory is created, no
+    #: file is opened, nothing is printed on stderr, and the `AgentResult` a
+    #: round is parsed from is byte for byte what `subprocess.run(
+    #: capture_output=True)` produced before this setting existed. Turning it
+    #: back off restores that exactly; nothing here forecloses either reading.
+    #:
+    #: DEFAULT-OFF IS NOT UNWIRED, and the two are different failures. A flag
+    #: that no production caller reads is inert whatever its default says, so
+    #: the value belongs on the runner the loop actually runs
+    #: (`audit.agents.ClaudeCliRunner`, via its `action_log_dir=`) rather than
+    #: on a mechanism nothing reaches.
+    #:
+    #: AND IT IS STILL UNWIRED AS SHIPPED (stream-01b, 2026-09-10), which is
+    #: said here rather than left to be discovered: the two lines that carry
+    #: this value to that runner live in `implement_executor
+    #: .implement_agent_runner` and `cli._build_executor`, and the task that
+    #: added this key was not authorized to edit either file. Setting it `true`
+    #: today therefore does nothing. `config.example.toml` says the same, in
+    #: the same words, so an operator reading either one is told.
+    #:
+    #: IT IS AN ACTION LOG. It records what the agent process PRINTED — its tool
+    #: calls, reads, writes and commands as the CLI reports them. It is not the
+    #: model's reasoning, it is not a thinking stream, and no surface that shows
+    #: it may call it one.
+    #:
+    #: IN `[audit]` rather than a new `[implement]` section for the reason
+    #: `cli._build_executor` already gives about `validation_commands` and
+    #: `agent_command`: this section is where the loop's agent-CLI settings
+    #: live, for BOTH the read-only audit subagents and the write-capable
+    #: implement subagent, and there is no `[implement]` section to put it in.
+    action_log: bool = False
 
 
 @dataclass(frozen=True)
@@ -1271,6 +1309,24 @@ class AutoloopConfig:
     @property
     def diagnostics_dir(self) -> Path:
         return self.state_dir / "diagnostics"
+
+    @property
+    def action_log_dir(self) -> Path:
+        """Per-round agent action logs, when `[audit] action_log` is on.
+
+        UNDER `state_dir`, like everything writable the loop keeps between
+        steps, and therefore outside the observed checkout — port-01's rule,
+        and it applies to this file more sharply than to most: the agent's own
+        output written inside the tree `escape_detector` snapshots around every
+        write-capable call would be reported as the agent writing where it may
+        not, which is a `loop_fatal` park caused by watching the round.
+
+        One directory for every task's logs rather than one per task: a file
+        name carries the task and the round (`agents.action_log_round_stamp`),
+        so a flat directory is greppable and an operator tailing a live round
+        needs one `ls -t`.
+        """
+        return self.state_dir / "action-logs"
 
     @property
     def pause_file(self) -> Path:
@@ -2402,6 +2458,18 @@ def load_config(path: Path) -> AutoloopConfig:
                 + ", ".join(f'"{mode}"' for mode in TEST_SELECTION_MODES)
                 + f", got {selection!r}"
             )
+    # Checked HERE rather than left to be read as truthy, exactly like
+    # `autonomy.enabled` below: TOML happily carries `action_log = "false"`, and
+    # a non-empty string is truthy — so an unchecked value would switch the log
+    # ON for an operator who typed the word rather than the literal, which is
+    # the one direction a default-off flag must never fail in.
+    if "action_log" in audit_data and not isinstance(audit_data["action_log"], bool):
+        raise ConfigError(
+            "audit.action_log must be a boolean (true/false), got "
+            f"{audit_data['action_log']!r} — a non-boolean is refused rather "
+            "than coerced, because the truthy reading would turn the agent "
+            "action log on by accident"
+        )
     audit = AuditConfig(**audit_data)
     # Checked here rather than left to fail at kill time. A stall window at or
     # above the ceiling reads as configured while being unreachable — the
