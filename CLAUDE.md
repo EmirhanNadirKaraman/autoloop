@@ -96,6 +96,13 @@ round pays forever.
 ## Conventions
 
 - Commit messages never mention AI tooling.
+- A dashboard control that MUTATES goes through an attested path: the CLI verb in
+  a subprocess (`dashboard.perform_control`), or the file mutex plus the
+  `MutationLedger` as `/api/priority` does. Never a bare write into `.autoloop/`
+  — the escape detector reports one as loop-fatal and cannot attribute it to an
+  operator. Anything that stops the loop waits for a phase boundary outside
+  `state.PACKET_OUTSTANDING_PHASES` and restarts with `run --continuous`;
+  `resume` runs one foreground round and exits, so it is never a restart.
 - Migrations of state files are append-only; never rewrite a shipped record.
 - Every finding in `docs/SECURITY.md` carries `file:line`, a severity, a
   verification check, and a suggested fix.

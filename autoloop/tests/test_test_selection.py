@@ -681,7 +681,7 @@ FLOOR_AFTER = 16
 #: and 24 hold. It reaches `cli._build_executor` by CALLING it rather than by
 #: reading `cli.py` as text, which is why the `__file__` half is absent — the
 #: check it replaced did resolve one.
-SUITE_SIZE = 120
+SUITE_SIZE = 122
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 

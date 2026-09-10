@@ -478,3 +478,95 @@ category no reader knows yet is printed rather than filtered away) and `bounds`
 (what was not printed — for the recorded packet AND the re-render, which are two
 artifacts and are accounted for separately). See `docs/AUTOLOOP.md`, "Asking why
 a task got the context it got".
+## Operator control request (`/api/control`, ops-01)
+
+The dashboard's third write path, and the only one that can stop the loop. It
+writes nothing itself: every effect is one `python -m autoloop <verb>`
+subprocess, so `LoopLock`, the registry mutex and the blocker store are entered
+by the loop's own code with its own refusals.
+
+REQUEST — `{"action", "task", "blocker", "reason", "text", "superseded_by",
+"wait"}` and nothing else (`dashboard.CONTROL_REQUEST_FIELDS`). An unknown field
+is REFUSED rather than dropped, for the reason `/api/priority`'s vocabulary is
+closed: a caller that named a field the receiver ignores has not done what its
+author intended. `action` is one of `dashboard.OPERATOR_ACTIONS` — `pause`,
+`abort`, `start`, `reset`, `release`, `discard`, `retire`, `answer`,
+`archive-blocker`, `merge-backlog` — and anything else is a 404. `task` /
+`blocker` / `reason` / `text` / `superseded_by` are only read where the action
+declares them; `wait` is how long to wait for a phase boundary, defaulting to
+`CONTROL_WAIT_DEFAULT` and clamped at `CONTROL_WAIT_MAX`.
+
+RESPONSE — `{"action", "ok", "ran", "returncode", "output", "stopped_in_phase",
+"loop", "notes"}`. `ran` is whether the verb was invoked at all and
+`returncode` is its own, so a verb that REFUSED (a lock it could not take, a
+task not `in_progress`) comes back `ran: true`, non-zero, with the CLI's
+sentence in `output`. `stopped_in_phase` is the phase the loop was actually
+found in after it let go of the lock — never the phase the button was drawn
+from. `loop` is `{"was_running", "stopped", "restarted", "pid", "run_id",
+"detail"}`, and `restarted` is only ever true against a lock file that exists,
+carries a run id DIFFERENT from the one that was stopped, and passes
+`LoopLock.is_live` — and only while NEITHER stop flag is armed. `_restart` clears
+both before it spawns, so one armed in the window between that clear and the lock
+read is a loop about to stop again (`cli._run_continuous` asks `pause_requested`
+and then `abort_requested` at the top of every outer iteration and returns on
+either): `restarted` is false, the flag is named in `loop.detail`, and the pid is
+still reported, because the loop genuinely did start. `ok` is false whenever the
+verb failed or a restart that was attempted could not be verified.
+
+REFUSALS carry `{"error", "ran": false}` with the status that says which kind:
+400 a precondition (the phase, the task's state, a missing required reason, an
+unresolvable state directory), 404 an action this build does not have, 409 a
+boundary that was never reached, a landing phase where acting — or, for `pause`
+and `abort`, STAYING stopped — would strand a packet, or another action already
+in flight, and 500 an internal failure. A 409 for an unsafe landing also carries
+`stopped_in_phase` and the `loop` object, so the operator can see that the loop
+was put back up.
+
+AN UNSAFE LANDING IS ROLLED BACK FOR EVERY ACTION THAT ARMED A STOP, including
+the two whose whole effect IS the stop. `OperatorAction.restarts` is `false` for
+`pause` and `abort` — an operator who asked for a stop has not asked for it back
+— and that governs the SUCCESS path only: a loop left down in `delivering`
+strands the packet whether it was paused on purpose or stopped on the way to a
+verb, so the stop is undone and refused rather than reported as a stop that
+worked. The `abort` refusal says in words that the restart does not bring back
+the agent it killed.
+
+`reset` is asked that question WHETHER OR NOT the loop is running
+(`OperatorAction.discards_session`). Every other refusal in the panel is about
+stopping, so a loop already stopped in `awaiting` — with a reviewer still
+holding its packet — would otherwise be offered the one control that archives
+that session.
+
+WHOSE PACKET IT IS is asked separately, and of a STOPPED loop too. Every refusal
+above is about stopping, so a loop already down in `awaiting` passes all of them
+— and `release` against the very task the reviewer is holding a packet for
+archives its execution record and quarantines the worker that approval would push
+from. `dashboard.session_holds` reads the task ids the saved session names —
+`current_task`, `task_execution`, `park_task_id`, the three
+`cli._session_names_task` reads — and every per-task control (`release`,
+`discard`, `retire`; anything with `needs == "task"`) refuses THAT task while
+`state.packet_outstanding_reason` is non-empty for the session naming it,
+running or not. It is task-scoped: another task's Release is exactly as
+available as it was. A session that owes a packet and names no task id anybody
+can read refuses EVERY task instead — an unattributable packet is not an absent
+one — and so does a lane directory nobody can list. A state file that is simply
+NOT THERE is not a session and holds nothing, which is `_lane_sessions`' own rule
+(a lane that has never run owes nothing; one that will not parse refuses) and
+matters because `reset --yes` archives that file.
+
+WHETHER THE LOOP MAY BE STOPPED is asked of every lane, not of lane 0.
+`dashboard._lane_sessions` walks `state_dir/lanes/` — the directory, never
+`[concurrency] lanes`, because a lane an operator's lowered cap cut out is still
+running and still owes whatever it owes — and any lane in
+`state.PACKET_OUTSTANDING_PHASES`, or carrying a pending request in any other
+phase, refuses the stop and is named in the reason. A lane directory with no
+`state.json` has never run and owes nothing; one whose session will not parse,
+and a `lanes/` nobody can list, both refuse.
+
+The `controls` slice of `/api/state` is the same predicate rendered:
+`{"loop", "stop", "actions", "tasks", "blockers", "merge", "note"}`, where every
+`actions[]` entry and every per-task verdict carries `enabled` AND a `reason`
+that is non-empty whenever `enabled` is false. `tasks[].ledger` carries the
+`attempt_ledger` ENTRIES, with `attempts` / `faults` beside them labelled as the
+summary that has been wrong — on 2026-08-20 port-01 and blk-01 both reported
+`fault_attempt_count = 0` against ledgers showing a burned round.
