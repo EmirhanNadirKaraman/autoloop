@@ -536,7 +536,16 @@ DOCS_ONLY_SELECTED = 20
 #: any evaluated string, resolves no `__file__`, and spawns nothing of its own
 #: (its git comes from `gitrepo.py`), so it is neither a reader nor on the opaque
 #: frontier and the same 20 hold.
-SUITE_SIZE = 119
+#: 119 -> 120 when review-01b added `test_impossible_scope.py` (2026-09-10), the
+#: DENOMINATOR again, and this one is back inside ctx-05's conjunction rather
+#: than short of it: it DOES spell `docs/SUMMARY.md` and `docs/TESTS.md` in
+#: evaluated strings, because three of its negative fixtures are real change
+#: notes copied out of the first — and it is still not a reader, because it
+#: resolves no `__file__`. Nor is it opaque: the `python3 -m ...` inside those
+#: fixtures is part of a longer sentence, and the rule compares the WHOLE
+#: constant, so nothing here reaches a `subprocess` entry point. The same 20
+#: hold.
+SUITE_SIZE = 120
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

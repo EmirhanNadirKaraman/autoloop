@@ -474,6 +474,7 @@ from .packet import (
     attached_payload,
     build_review_packet_with_diff,
     build_stat_only_review_packet,
+    impossible_scope_disclosures,
     omission_payload,
     payload_carries_diff,
     plan_chunked_delivery,
@@ -1229,6 +1230,40 @@ def _preemption_stop_reason(target: Task, displaced_id: str, record: dict) -> st
 #: counter alone and leaves `attempt_count` exactly where it was
 #: (`cli._clear_fault_budget_on_answer`).
 MAX_TASK_FAULT_ATTEMPTS = 5
+
+
+#: How many REVIEWS a record must already have spent before a standing
+#: impossible-scope disclosure turns the next `revise` into a park
+#: (`Orchestrator._revise_cannot_help`). Two, which is to say: the reviewer has
+#: been sent a packet, answered, been sent another, and is answering again.
+#:
+#: WHY NOT ONE. A single disclosure is not a repeat. The reviewer's first
+#: `revise` after one may be about something else in the candidate entirely, or
+#: may name a remedy that dissolves the disclosure — and a guard that fired on
+#: it would convert the ordinary first round of a review into a park. That is
+#: the failure this number exists to avoid, and it is why the counter it is
+#: compared against has to be the one that cannot double-count (see
+#: `_reviews_delivered`).
+#:
+#: WHY NOT MORE. Every round past this one is another agent handed the same
+#: approved paths and asked to do what it has already reported it cannot: on
+#: brw-19a (2026-08-27) that was four rounds, four agents and four correct
+#: reports, ending at the attempt ceiling with the task parked and none of the
+#: four disclosures acted on.
+#:
+#: THE RESIDUAL, stated rather than left to be found. This counts REVIEWS, not
+#: disclosures, because nothing durable records which round a given assumption
+#: came from: `TaskExecution.assumptions` is accumulated and deduplicated, so a
+#: line first written in round 2 and one restated from round 1 are the same
+#: entry by the time this is read. A task whose FIRST disclosure appears in its
+#: second round therefore parks on that disclosure rather than after it. That
+#: is the safe direction of the two: the reviewer had in fact been shown the
+#: disclosure and had in fact answered `revise`, the park quotes it and names
+#: the remedy, and no work is discarded — where the other direction is another
+#: agent round that cannot change its own outcome. Closing it properly needs a
+#: per-round field on the execution record, which is `worktask.py`.
+MIN_REVIEWS_BEFORE_SCOPE_PARK = 2
+
 
 def _conversation_id(url: str) -> str | None:
     """The id a `/c/<id>` URL ends with, or None for anything else.
@@ -9416,6 +9451,13 @@ class Orchestrator:
     # range diff and the latest round's own diff, plus the feedback that
     # triggered it.
     #
+    # A revise round is also refused before the executor when the record
+    # carries a standing IMPOSSIBLE-SCOPE disclosure and the reviewer answers
+    # `revise` anyway (`_revise_cannot_help` / `approved_scope_blocks_task`).
+    # That check runs BEFORE the round cap and before both attempt ceilings,
+    # because those are the walls such a task otherwise hits — each of which
+    # ends it under a code naming a budget rather than the scope.
+    #
     # The audit runs through here too (2026-07-30): `_dispatch_executor`
     # resolves it to a synthetic `Task` (`_resolve_audit_task`) with its own
     # stable per-run id, so `task` below is never `None` — there is exactly
@@ -10700,6 +10742,41 @@ class Orchestrator:
         # round that finished — see the method's own docstring.
         self._reconcile_unfinished_attempts(execution)
 
+        # BEFORE EVERY CEILING, and the position is the claim (review-01b).
+        #
+        # This guard exists because a reviewer answering `revise` to "I cannot
+        # do this inside my approved paths" spends rounds that cannot change
+        # their own outcome. The three CEILINGS below are exactly what such a
+        # task eventually hits — and each of them ends it under a code that
+        # names a BUDGET (`attempt_count_ceiling`), an ENVIRONMENT
+        # (`fault_attempt_ceiling`) or a ROUND COUNT (`review_round_cap`).
+        # Every one of those is true and none of them is the reason. Ordered
+        # after any of them, this guard would be correct and never reached on
+        # the tasks it is for: brw-19a's four `revise` rounds ended at the
+        # attempt ceiling, so the ceiling is precisely what preempted it.
+        #
+        # `_revise_feedback_is_unchanged`, the fourth check below, is not a
+        # ceiling and is not preempted in substance: it recognises a REVIEWER
+        # repeating itself, where this recognises an EXECUTOR whose report the
+        # reviewer keeps answering with the one verb that cannot help. On
+        # brw-19a the feedback escalated in detail every round, so that check
+        # never fired at all.
+        #
+        # Preceding `fault_attempt_ceiling` was not required by the objection
+        # this answers, and is a deliberate trade rather than an oversight: a
+        # record can only be here with a standing disclosure AND a spent fault
+        # budget, and of the two, "your scope forbids this task" is the one an
+        # operator can act on. The fault budget is still spent, still on the
+        # record and still in the `detail` this park writes.
+        #
+        # NOT a ceiling itself: it refuses one VERB on one record, spends no
+        # budget, and every other decision — `push`, `stop`, `recut`, a plan —
+        # still reaches this record untouched.
+        blocked_by_scope = self._revise_cannot_help(execution, directive)
+        if blocked_by_scope:
+            self._park_scope_blocks_task(task, execution, directive, blocked_by_scope)
+            return
+
         attempt_cap = self._attempt_cap_for(task)
         if execution.attempt_count >= attempt_cap:
             # Since ceil-01 this is not automatically a park: the reviewer is
@@ -11797,6 +11874,13 @@ class Orchestrator:
     #
     # The sequence, in the order a task meets it:
     #
+    #   0. `_revise_cannot_help` runs FIRST, above this whole sequence, and is
+    #      listed here because "the order a task meets it" is otherwise wrong.
+    #      A record whose executor has reported that its approved paths make
+    #      the task impossible never reaches step 1 on a `revise`: it parks
+    #      `approved_scope_blocks_task` instead. Nothing below is reached for
+    #      it, which is the point — every step here reads the ceiling as a
+    #      budget problem, and that task does not have one.
     #   1. `_attempt_cap_for` says what this task's ceiling actually is —
     #      `MAX_TASK_ATTEMPTS`, plus whatever a reviewer already granted, minus
     #      whatever a parent already spent.
@@ -13483,6 +13567,34 @@ class Orchestrator:
             },
         )
 
+    @staticmethod
+    def _reviews_delivered(execution: TaskExecution) -> int:
+        """How many review packets this record has actually spent.
+
+        THE re-entry-safe counter, and the reason it is named rather than
+        inlined at each reader. `_review_rounds_exhausted` below applies a cap
+        to it, `_revise_cannot_help` applies a floor, and
+        `_park_scope_blocks_task` writes it down for an operator — all three
+        asking the same question, how far through the review conversation this
+        record is, and a second copy of the sum is how they start disagreeing.
+
+        `review_round` is incremented at the one line where a packet BECOMES
+        the outbox, and nowhere else; `carried_review_rounds` holds what a
+        carry-forward reset off it (conc-03), so a base moving under a task
+        refills nothing.
+
+        **What this deliberately is NOT is `attempt_count`, or the length of
+        `attempt_ledger`.** Both of those are charged PER DISPATCH, above
+        `_open_attempt` — which is exactly what makes them right for bounding
+        churn and wrong for measuring a conversation. A dispatch that crashes
+        mid-execution resumes in `executing` and re-dispatches the SAME
+        directive for the SAME round, so the round is charged twice: a meter
+        reading them would count one round more than once after any such
+        re-entry, and would then report a first disclosure as a repeat. Neither
+        counter here moves on a re-entry that sends no new packet.
+        """
+        return execution.review_round + execution.carried_review_rounds
+
     def _review_rounds_exhausted(self, execution: TaskExecution) -> bool:
         """Has this record spent `policy.max_review_rounds`?
 
@@ -13492,6 +13604,12 @@ class Orchestrator:
         instead — and a second copy of the sum is how they start disagreeing,
         which here means one of them sending a review round the other would
         have refused.
+
+        The sum itself moved down one level, to `_reviews_delivered` above,
+        when a THIRD site started asking how far through the review
+        conversation a record is (`_revise_cannot_help`). The rule is
+        unchanged — this is still the only place the CAP is applied — and the
+        counter is now shared rather than restated.
 
         `carried_review_rounds` is the rounds a carry-forward reset off
         `review_round` (conc-03). Counted so a base that moves under a task
@@ -13505,7 +13623,7 @@ class Orchestrator:
         first.
         """
         cap = self._policy.config.max_review_rounds
-        return bool(cap) and execution.review_round + execution.carried_review_rounds >= cap
+        return bool(cap) and self._reviews_delivered(execution) >= cap
 
     def _park_round_cap(
         self,
@@ -13561,6 +13679,161 @@ class Orchestrator:
         if not current:
             return False
         return current == execution.last_revise_feedback
+
+    def _revise_cannot_help(
+        self, execution: TaskExecution, directive: Directive
+    ) -> tuple[str, ...]:
+        """The disclosures that make THIS `revise` the one verb that cannot
+        work — empty when another round is still worth dispatching.
+
+        The failure this answers, measured on brw-19a (2026-08-27): an agent
+        disclosed, in the exact `ASSUMPTION:` form the brief demands, that
+        three of four consumers it had to change were outside its approved
+        paths, and named the remedy it would have asked for. The reviewer
+        answered `revise` four times in escalating detail. Four rounds, four
+        agents, every report correct — and every round was handed the same
+        approved paths and asked again for the thing that scope forbids. The
+        task ended at the attempt ceiling, which blamed the churn on the task's
+        own budget rather than on the scope nobody widened.
+
+        THREE CONDITIONS, and each is load-bearing:
+
+          * the directive is a `revise`. `push`, `stop`, `recut` and `plan` all
+            remain available on a record carrying a disclosure — this refuses
+            ONE verb, not the task. **`implement` is not refused either, and
+            that is the carve-out with a sharp edge**: an attempt-ceiling
+            classification (ceil-01) arrives as an `implement` OR a `revise`
+            carrying a new decomposition, and only the `revise` form meets this
+            guard. Such a round is read by `_ceiling_reply_ok` in
+            `_dispatch_executor`, ABOVE this method, and a plan that differs has
+            already bought its extension by the time control reaches here —
+            `tasks.grant_attempt_extension` grants and clears
+            `ceiling_plan_requested_at` in one call, so the marker is gone and
+            this guard cannot see it. The task then parks here with that
+            extension spent and not refundable. That is the intended OUTCOME
+            (a new plan inside a scope the executor has reported it cannot work
+            in still cannot be done, and the park quotes the disclosure) at a
+            real COST (one of `MAX_CEILING_EXTENSIONS` grants, consumed by a
+            round that never ran). Moving this guard above `_ceiling_reply_ok`
+            would avoid the cost and is deliberately not done here: that method
+            runs before the execution record is loaded, so the guard would have
+            to read a record from a place that has none;
+
+          * a disclosure is standing (`packet.impossible_scope_disclosures`
+            over the accumulated record, which is the literal `ASSUMPTION:`
+            form and nothing wider);
+          * the record has already spent `MIN_REVIEWS_BEFORE_SCOPE_PARK`
+            reviews, counted by `_reviews_delivered` — the counter charged once
+            per packet, never once per dispatch. A first disclosure is not a
+            repeat, and a re-entered round is not a second review.
+
+        **The previous directive having been a `revise` is deliberately NOT a
+        fourth condition**, though it is nearly free to check
+        (`execution.last_revise_feedback`). That field is only written for a
+        `revise` whose feedback is non-empty (see the dispatch), so a reviewer
+        that answers `revise` with no feedback text leaves it blank — and
+        requiring it would be a guard that switches itself off precisely when
+        the reviewer says least. It rides in the park's `detail` instead, where
+        being empty costs an operator nothing.
+
+        Returns the lines rather than a bool so the park can quote the
+        executor's own words: an operator reading this blocker needs the
+        disclosure, not a summary of it.
+        """
+        if directive.decision is not Decision.REVISE:
+            return ()
+        if self._reviews_delivered(execution) < MIN_REVIEWS_BEFORE_SCOPE_PARK:
+            return ()
+        return impossible_scope_disclosures(execution.assumptions)
+
+    def _park_scope_blocks_task(
+        self,
+        task: Task,
+        execution: TaskExecution,
+        directive: Directive,
+        disclosures: tuple[str, ...],
+    ) -> None:
+        """The disposition that is not `revise`.
+
+        `task_fatal` and naming the task, like every other park a task's own
+        work reaches: continuous mode then sets THIS task aside and keeps
+        working, which is the whole point — the loop should stop spending
+        rounds on a task whose scope forbids its own completion, not stop.
+
+        The park text is written for an operator who has to choose between the
+        three answers that can actually move it, so it names all three. It
+        quotes the disclosure verbatim rather than paraphrasing: the agent's
+        own sentence names the files and the remedy, and a paraphrase would be
+        the loop putting words in its mouth — the same discipline
+        `packet._format_executor_report` keeps by labelling that section
+        CLAIMED.
+
+        **And it names the step that makes any of them take effect**, because
+        without it this park is a dead end rather than a redirection: the
+        disclosure lives on the EXECUTION RECORD, which accumulates across
+        rounds and is never re-derived from the `Task`, so widening
+        `approved_paths` and re-dispatching a `revise` against the same record
+        parks here again. `discard` (quarantined) and `release` (in progress)
+        both retire the record through `worktask.retire_execution`, and the
+        next dispatch then cuts a fresh one under the wider scope.
+        `test_impossible_scope.py::test_the_park_is_not_a_dead_end_once_the_
+        record_is_retired` is that claim, exercised.
+        """
+        self.state.last_response = None
+        quoted = "\n".join(f"  - {line}" for line in disclosures)
+        self._to_needs_user(
+            f"task {task.id}: the executor has reported that this task cannot "
+            "be done inside its approved paths, and the reviewer answered "
+            f"`revise` again (round {execution.review_round}). A revise round "
+            "cannot resolve that: the next agent is handed the same "
+            "`approved_paths` and would report the same thing. Nothing was "
+            "dispatched, nothing was rolled back, and the candidate on "
+            f"{execution.task_branch} is untouched.\n\n"
+            "The executor's own disclosure:\n"
+            f"{quoted}\n\n"
+            "Three answers can move this task, and `revise` is not one of "
+            f"them: widen `approved_paths` for {task.id} in `tasks.json` (with "
+            "the loop stopped); decompose it so the work outside those paths "
+            "becomes its own task; or accept the candidate as the part of the "
+            "task that was reachable and let a follow-up task carry the "
+            "rest.\n\n"
+            "WIDENING THE SCOPE IS NOT ENOUGH ON ITS OWN, and this is the step "
+            "that is easy to miss: the disclosure above is on the EXECUTION "
+            "RECORD, which accumulates across rounds and is not re-derived "
+            "from the task — so a `revise` dispatched against the same record "
+            f"parks here again. `python -m autoloop discard {task.id}` retires "
+            "that record (worker repo to quarantine, record to "
+            "`executions/archive/`), closes this blocker and returns the task "
+            "to the queue, which is what makes the wider scope take effect; "
+            "`release` is the same move for a task that is still in progress "
+            "rather than quarantined. Answering this blocker alone changes "
+            "neither the scope nor the record.",
+            kind="task_fatal",
+            code="approved_scope_blocks_task",
+            task_id=task.id,
+            detail=(
+                f"reviews={self._reviews_delivered(execution)} "
+                f"review_round={execution.review_round} "
+                f"carried_review_rounds={execution.carried_review_rounds} "
+                f"attempt_count={execution.attempt_count} "
+                f"disclosures={len(disclosures)} "
+                f"branch={execution.task_branch} "
+                f"candidate={execution.candidate_sha} "
+                f"last_revise_feedback={execution.last_revise_feedback[:120]}"
+            ),
+        )
+        self._log(
+            "approved_scope_blocks_task",
+            data={
+                "task_id": task.id,
+                "reviews": self._reviews_delivered(execution),
+                "review_round": execution.review_round,
+                "attempt_count": execution.attempt_count,
+                "decision": directive.decision.value,
+                "disclosures": list(disclosures),
+                "approved_paths": sorted(task.approved_paths),
+            },
+        )
 
     def _park_unchanged_feedback(self, execution: TaskExecution, directive: Directive, task: Task) -> None:
         self._to_needs_user(
@@ -16576,6 +16849,13 @@ class Orchestrator:
     #      dispatching it through `_dispatch` rather than building a second path
     #      to the executor — and the last two end at `review_round_cap` and
     #      `attempt_count_ceiling`, both set-aside codes;
+    #   2b. `_revise_cannot_help`, which gates a self-issued revise for the same
+    #      reason and ahead of all three of those (review-01b). A refusal
+    #      returned to an agent that has already reported its approved paths
+    #      make the task impossible is the loop asking it, in its own voice,
+    #      for the thing that scope forbids — so such a record parks
+    #      `approved_scope_blocks_task` instead, which is a task-scoped
+    #      `task_fatal` park and therefore quarantines exactly that task;
     #   3. the set-aside itself, which leaves the task `blocked` — and
     #      `policy.authorize_directive` refuses a revise of a blocked task, so a
     #      quarantined task cannot be revised back out of quarantine.

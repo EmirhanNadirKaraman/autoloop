@@ -656,7 +656,17 @@ FLOOR_AFTER = 16
 #: DENOMINATOR again and for the same reason: it names no change-note tracker in
 #: any evaluated string, resolves no `__file__`, and its git comes from
 #: `gitrepo.py`, so 20 and 24 hold.
-SUITE_SIZE = 119
+#: 119 -> 120 when review-01b added `test_impossible_scope.py` (2026-09-10), the
+#: DENOMINATOR again. It DOES spell `docs/SUMMARY.md` and `docs/TESTS.md` in
+#: evaluated strings — its negative fixtures are three real notes copied out of
+#: the first — and is still not a reader of either, because the rule is a
+#: CONJUNCTION and this file resolves no `__file__`. It quotes `python3 -m
+#: autoloop.browser.chrome_restart` inside those fixtures too and is still not
+#: opaque: `_INTERPRETER_LITERALS` is matched against the WHOLE constant, a
+#: sentence containing the word is not equal to it, and the file reaches no
+#: `subprocess` entry point at all (its git comes from `gitrepo.py`). So 20 and
+#: 24 hold.
+SUITE_SIZE = 120
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
