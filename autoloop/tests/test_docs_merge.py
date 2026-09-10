@@ -53,6 +53,7 @@ exercise `push_exact`'s protected refusal rather than the integration path.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 from pathlib import Path
@@ -67,6 +68,14 @@ from autoloop.note_merge import MAX_NOTE_LINE_CHARS, NOTES_MARKER, resolve_note_
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import Task, TaskRegistry, TaskStore
 from autoloop.worktask import TaskExecution, TaskExecutionStore
+
+# The shipped counter, imported rather than re-read (conc-14). Two reasons, and
+# the second is the load-bearing one: the number this file checks the resolver
+# against must be the number Python actually binds, and the import is also the
+# graph EDGE that keeps the shape check below selected when that file changes —
+# without it a reformat of `suite_size.py` would narrow to its two consumers and
+# the check that the resolver can still read it would never run.
+from suite_size import SUITE_SIZE
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GITATTRIBUTES = REPO_ROOT / ".gitattributes"
@@ -1064,6 +1073,77 @@ def test_every_shipped_tracker_ends_with_an_append_only_section():
     for path in SHIPPED_TRACKERS:
         assert path.exists(), f"{path} is in NOTE_TRACKERS but does not exist"
         assert section_problems(path.name, path.read_text(encoding="utf-8")) == []
+
+
+def test_the_shipped_counter_file_has_the_shape_the_resolver_requires():
+    """The same precondition for the OTHER resolvable shape (conc-14).
+
+    `resolve_counter_bump` can only combine two branches' bumps if it can tell
+    the classification ledger from the code around it: one marker, comments
+    between, and the counter assignment as the last line. Checked against the
+    real file, so a reformat fails HERE — where it names the file and the rule —
+    rather than weeks later as `task_base_behind_head` parks coming back with no
+    explanation attached to them.
+    """
+    for rel in sorted(note_merge.COUNTER_FILES):
+        path = REPO_ROOT / rel
+        assert path.exists(), f"{rel} is in COUNTER_FILES but does not exist"
+        text = path.read_text(encoding="utf-8")
+        assert text.count(note_merge.COUNTER_MARKER) == 1, rel
+        _head, tail = note_merge.split_at_counter_marker(text)
+        side = note_merge._counter_side(tail)
+        assert side is not None, f"{rel} is not a ledger ending in a counter assignment"
+        _ledger, value = side
+        # The resolver's reading of the file and Python's must be the SAME
+        # number: a regex that matched a different line would otherwise write
+        # arithmetic on a value nothing else uses.
+        assert value == SUITE_SIZE, f"{rel}: the resolver read {value}, Python bound {SUITE_SIZE}"
+
+        # And it really resolves: two branches, each appending one line and
+        # raising the count by one, land on value + 2 with both lines kept.
+        stem = text[: -len(f"{note_merge.COUNTER_NAME} = {value}\n")]
+        ours = f"{stem}#: a line from mainline\n{note_merge.COUNTER_NAME} = {value + 1}\n"
+        theirs = f"{stem}#: a line from the task\n{note_merge.COUNTER_NAME} = {value + 1}\n"
+        combined = note_merge.resolve_counter_bump(text, ours, theirs, text)
+        assert combined is not None, f"{rel} would refuse a plain pair of bumps"
+        assert combined.endswith(f"{note_merge.COUNTER_NAME} = {value + 2}\n")
+        assert "#: a line from mainline\n" in combined
+        assert "#: a line from the task\n" in combined
+
+
+def test_the_counter_is_assigned_in_exactly_one_file():
+    """What single-sourcing that constant bought, as a checked fact rather than
+    a convention (conc-14).
+
+    It was declared in two test files, and `CLAUDE.md`'s own rule about
+    `MAX_NOTE_LINE_CHARS` applied verbatim — "a second copy agrees today and
+    silently disagrees the first time it moves". A second copy is also a second
+    CONFLICTED PATH, and one path nothing can resolve refuses every other
+    resolution in the same merge, which is how a carry-forward loses a reviewed
+    candidate.
+    """
+    homes: list[str] = []
+    unreadable: list[str] = []
+    for module in sorted((REPO_ROOT / "autoloop").rglob("*.py")):
+        try:
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):  # pragma: no cover - none today
+            unreadable.append(str(module.relative_to(REPO_ROOT)))
+            continue
+        for node in ast.walk(tree):
+            targets = getattr(node, "targets", []) or (
+                [node.target]
+                if isinstance(node, (ast.AugAssign, ast.AnnAssign))
+                else []
+            )
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == note_merge.COUNTER_NAME:
+                    homes.append(str(module.relative_to(REPO_ROOT)))
+
+    # Fail-closed on the scan itself: a glob that matched nothing, or a file it
+    # could not parse, must not report "only one home" having examined none.
+    assert unreadable == [], unreadable
+    assert homes == sorted(note_merge.COUNTER_FILES), homes
 
 
 @pytest.mark.parametrize("rel", TRACKERS)

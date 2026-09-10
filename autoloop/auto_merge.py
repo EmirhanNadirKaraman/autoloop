@@ -938,18 +938,21 @@ class AutoMerger:
         )
         return MERGED
 
-    # ---- the one auto-resolved conflict shape -------------------------------
+    # ---- the auto-resolved conflict shapes ----------------------------------
     #
-    # Reachable only from `_merge`'s conflict branch, and only for the two
-    # paths in `note_merge.NOTE_TRACKERS`. Read `note_merge.py`'s module
-    # docstring before changing anything here: the rule it implements is
-    # deliberately narrow, and every widening of it is a case where the sweep
+    # Reachable only from `_merge`'s conflict branch, and only for the paths in
+    # `note_merge.NOTE_TRACKERS` (both sides appended a change note) and
+    # `note_merge.COUNTER_FILES` (both sides raised the same hand-written
+    # counter for the test file they added). Read `note_merge.py`'s module
+    # docstring before changing anything here: the rules it implements are
+    # deliberately narrow, and every widening of one is a case where the sweep
     # stops asking a human.
 
     def _resolve_note_conflicts(self, task_id, candidate, conflicts, message) -> bool:
-        """Combine two branches' appended change notes. True ONLY when the
-        merge has been resolved AND committed here; False leaves the checkout
-        exactly as `git merge` left it, for `_abort` to restore.
+        """Combine what two branches each appended — a change note, or a
+        classification line beside the counter they both raised. True ONLY when
+        the merge has been resolved AND committed here; False leaves the
+        checkout exactly as `git merge` left it, for `_abort` to restore.
 
         The DECISION and the file handling live in
         `note_merge.combine_conflicted_notes`, which the base-refresh direction
