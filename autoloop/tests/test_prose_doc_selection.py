@@ -536,7 +536,11 @@ DOCS_ONLY_SELECTED = 20
 #: any evaluated string, resolves no `__file__`, and spawns nothing of its own
 #: (its git comes from `gitrepo.py`), so it is neither a reader nor on the opaque
 #: frontier and the same 20 hold.
-SUITE_SIZE = 119
+#: 119 -> 120 when stream-01b added `test_agent_action_log.py` (2026-09-10), the
+#: DENOMINATOR once more and for the same reason: it names no change-note
+#: tracker in any evaluated string, resolves no `__file__`, and spawns nothing
+#: of its own (its git comes from `gitrepo.py`), so the same 20 hold.
+SUITE_SIZE = 120
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():

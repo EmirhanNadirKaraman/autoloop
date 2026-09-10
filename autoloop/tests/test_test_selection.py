@@ -656,7 +656,11 @@ FLOOR_AFTER = 16
 #: DENOMINATOR again and for the same reason: it names no change-note tracker in
 #: any evaluated string, resolves no `__file__`, and its git comes from
 #: `gitrepo.py`, so 20 and 24 hold.
-SUITE_SIZE = 119
+#: 119 -> 120 when stream-01b added `test_agent_action_log.py` (2026-09-10), the
+#: DENOMINATOR once more and for the same reason: it names no change-note
+#: tracker in any evaluated string, resolves no `__file__`, and its git comes
+#: from `gitrepo.py`, so 20 and 24 hold.
+SUITE_SIZE = 120
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
