@@ -529,9 +529,18 @@ class AuditConfig:
     #: true): the LAST thing `load_config` does is call
     #: `audit.agents.set_default_action_log_dir` with
     #: `AutoloopConfig.action_log_dir` when this is on and `None` when it is
-    #: off. Every `ClaudeCliRunner` built afterwards without a directory of its
-    #: own — which is every production one, including the write-capable runner
-    #: `implement_executor.implement_agent_runner` builds per task — uses that.
+    #: off. The runner that picks it up is the SUPERVISED, write-capable one
+    #: `implement_executor.implement_agent_runner` builds per task — which is
+    #: the runner a real round runs, and which names no directory of its own.
+    #:
+    #: IT DOES NOT REACH THE AUDIT SUBAGENTS, deliberately. They are bounded by
+    #: an elapsed timeout rather than supervised, so they run under
+    #: `subprocess.run(capture_output=True)` and their output does not exist
+    #: until the process has exited: a file armed for them could never be the
+    #: live stream this setting offers, only one that looks like it. See
+    #: `audit.agents.INHERIT_ACTION_LOG_DIR` for that gate and for why an
+    #: explicit `action_log_dir=None` still means off.
+    #:
     #: A process-wide default is used because the two call sites that would
     #: otherwise carry the argument (`cli._build_executor` and that factory)
     #: were outside the authorized paths of the task that wired this; passing
@@ -2544,11 +2553,13 @@ def load_config(path: Path) -> AutoloopConfig:
         concurrency=concurrency,
         context=context,
     )
-    # THE LINE THAT MAKES `[audit] action_log` REACH A REAL ROUND. Every
-    # `ClaudeCliRunner` the loop builds — the write-capable one
-    # `implement_executor.implement_agent_runner` makes per task, and the
-    # read-only audit ones — names no log directory, so this process-wide
-    # default is what they use. See `AuditConfig.action_log`.
+    # THE LINE THAT MAKES `[audit] action_log` REACH A REAL ROUND. The
+    # write-capable `ClaudeCliRunner` that `implement_executor
+    # .implement_agent_runner` makes per task names no log directory, so this
+    # process-wide default is what it uses. The read-only audit runners are not
+    # supervised and therefore do not pick it up — `audit.agents
+    # .INHERIT_ACTION_LOG_DIR` says why a buffered run must not be handed a file
+    # that reads like a live stream. See `AuditConfig.action_log`.
     #
     # SET UNCONDITIONALLY, in both directions. Arming only when the flag is on
     # would leave a process that had loaded a `true` config earlier logging

@@ -24,6 +24,15 @@ constructs a runner by hand: a test that describes production rather than using
 it can pass while production stays inert, which is the failure this whole file
 exists to make impossible.
 
+It also grades HOW FAR that process-wide answer is allowed to travel, because a
+default that reaches every runner ever built is a setting nobody can predict
+from the call site. Two bounds, one test each: an explicit `action_log_dir=None`
+still means OFF while the process is armed, and an UNSUPERVISED runner that
+named no directory does not inherit at all — it is
+`subprocess.run(capture_output=True)`, so a file armed for it could only ever
+have been written after the process exited, which is the one thing this setting
+promises it is not.
+
 No real `claude` process is ever spawned and nothing ever really waits: the
 supervised path is driven by a fake spawn, a fake handle and a fake clock, the
 same way `test_stall_detector.py` drives it. One test uses real git
@@ -802,6 +811,110 @@ def test_an_explicit_directory_wins_over_the_armed_default(tmp_path):
 
     assert only_log(tmp_path / "explicit").exists()
     assert not (tmp_path / "state" / "action-logs").exists()
+
+
+def test_an_explicit_none_still_means_off_while_the_process_is_armed(tmp_path):
+    """`action_log_dir=None` meant "this runner logs nowhere" before a
+    process-wide default existed, and it still does.
+
+    A switch whose OFF position turns itself back on as soon as the operator
+    arms the process is a switch with no off position at all — and the caller
+    that wanted one runner quiet would have to disarm the whole loop to get it.
+    """
+    load_config(write_config(tmp_path, action_log=True))
+    clock = FakeClock()
+    spawn, _ = chatty_spawn(clock, exit_at=20.0)
+
+    runner = supervised_runner(tmp_path, spawn, clock, action_log_dir=None)
+    result = runner.run(SPEC)
+
+    assert result.ok
+    assert runner._action_log_dir is None
+    assert not (tmp_path / "state" / "action-logs").exists()
+
+
+def test_an_unsupervised_runner_does_not_inherit_the_armed_default(tmp_path, capsys):
+    """The read-only audit runners `cli._build_executor` builds are exactly this
+    shape — no `progress_probe`, no `action_log_dir=` — and they must stay off.
+
+    `subprocess.run(capture_output=True)` holds the whole run in a buffer and
+    hands it over once the process has EXITED, so a file armed for it could
+    never be the live stream `[audit] action_log` offers. Handing them one
+    anyway would ship a file that reads like a stream and is not, which is worse
+    than the log the operator did not get.
+    """
+    config = load_config(write_config(tmp_path, action_log=True))
+
+    def stub(argv, **kwargs):
+        class Proc:
+            returncode = 0
+            stdout = json.dumps({"result": "audited"})
+            stderr = "a warning\n"
+
+        return Proc()
+
+    runner = ClaudeCliRunner(tmp_path, runner=stub)
+    result = runner.run(SPEC)
+
+    assert result.raw_text == "audited"
+    assert runner._action_log_dir is None
+    assert not config.action_log_dir.exists()
+    assert capsys.readouterr().err == ""
+
+
+def test_naming_a_directory_still_logs_on_the_unsupervised_path(tmp_path):
+    """The gate bounds the inherited DEFAULT, not the parameter.
+
+    A caller that asks for a buffered log by name still gets one, and it still
+    carries `ACTION_LOG_BUFFERED_NOTICE` saying what it is — pinned here so the
+    fix above cannot quietly become "the unsupervised path can no longer log at
+    all", which would take `test_the_buffered_path_says_it_was_not_streamed`
+    down with it.
+    """
+    load_config(write_config(tmp_path, action_log=True))
+
+    def stub(argv, **kwargs):
+        class Proc:
+            returncode = 0
+            stdout = json.dumps({"result": "audited"})
+            stderr = ""
+
+        return Proc()
+
+    log_dir = tmp_path / "named"
+    ClaudeCliRunner(tmp_path, runner=stub, action_log_dir=log_dir).run(SPEC)
+
+    assert "NOT STREAMED" in only_log(log_dir).read_text()
+
+
+def test_the_cli_builds_the_production_runner_so_that_it_inherits():
+    """The gate above is only safe if production's write-capable factory really
+    is the supervised one. It is — and this reads `cli.py` to say so rather than
+    describing it, for the reason `test_audit_charters.py` scans the same
+    function: the property is about a call site, and a call site nobody checks
+    is how a wired feature goes back to being inert.
+
+    `policy=` is the whole of it: `implement_agent_runner` builds a
+    `WorkerTreeProbe` when it gets one, and a runner with a probe is a runner
+    that inherits the armed directory. The audit factory deliberately passes no
+    such thing, which is what keeps it buffered and unlogged.
+    """
+    source = (Path(__file__).resolve().parents[1] / "cli.py").read_text(encoding="utf-8")
+    build = source.split("def _build_executor(")[1].split("\ndef ")[0]
+
+    implement = build.split("agent_runner_factory=lambda root: implement_agent_runner(")
+    assert len(implement) == 2, "cli._build_executor no longer has one implement factory"
+    assert "policy=policy" in implement[1].split(")")[0], (
+        "the production per-task runner is built without a policy, so it has no "
+        "progress probe, so it no longer inherits the armed action log directory"
+    )
+
+    audit = build.split("agent_runner_factory=lambda root: ClaudeCliRunner(")
+    assert len(audit) == 2, "cli._build_executor no longer has one audit factory"
+    assert "policy" not in audit[1].split(")")[0], (
+        "the read-only audit runner is now supervised, so it would inherit the "
+        "armed directory and produce a buffered file that reads like a stream"
+    )
 
 
 def test_a_runner_already_built_keeps_the_state_it_started_with(tmp_path):
