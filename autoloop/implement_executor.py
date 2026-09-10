@@ -2567,6 +2567,22 @@ _ASSUMPTION_RE = re.compile(r"^[ \t]*assumption:[ \t]*(.+)$", re.IGNORECASE | re
 #: reading you took. The second is what keeps the first honest; an undisclosed
 #: assumption looks exactly like a misunderstanding by the time a reviewer sees
 #: the diff, and the review is the last point at which either can be caught.
+#:
+#: **DELIBERATELY UNCHANGED by review-01b, which is the task that gave one shape
+#: of these lines a consequence.** Since that change, an assumption reporting
+#: that the approved paths make the task impossible stops the next `revise`
+#: (`packet.reports_impossible_scope`, `orchestrator._revise_cannot_help`), and
+#: the obvious follow-up is to add an example of that shape here so agents write
+#: it. That would be a fabricated disclosure waiting to happen: the residual
+#: this text already accepts is that an agent reproducing the prompt VERBATIM is
+#: collected, bounded today by the fact that the only example line is the
+#: placeholder `<what you assumed, and what you would have asked>`, which a
+#: reviewer reads as an echo. An example naming real files and a real
+#: impossibility would echo as a REAL-LOOKING blocker — read back as evidence an
+#: agent produced, on the one line the loop now acts on. The recognizer instead
+#: matches what agents already write unprompted (measured on brw-19a,
+#: 2026-08-27), and a disclosure phrased outside it is simply not recognised,
+#: which leaves the loop behaving as it did before.
 _SMALLEST_REVERSIBLE_READING = (
     "If the task is ambiguous, do NOT stop to ask — this loop has no human in "
     "it to answer, and a question here would just stall the run. Take the "

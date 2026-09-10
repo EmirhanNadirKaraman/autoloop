@@ -120,6 +120,100 @@ _ENTRY_TRUNCATED = "… [shortened for this packet; the full line is in the exec
 #: can charge its cost against the budget above rather than guessing at it.
 _BULLET = "- "
 
+#: THE BOUNDARY HALF of an impossible-scope disclosure: the line names the
+#: task's APPROVED SCOPE as the wall it hit. Matched against one assumption
+#: line, lowercased and whitespace-collapsed, so `outside this task's approved
+#: paths` and `outside\n  the approved paths` read the same.
+#:
+#: Substrings rather than words because the agent writes this by hand and the
+#: possessive is unpredictable: `approved path` covers "approved paths",
+#: "approved path list" and "this task's approved paths" in one entry.
+IMPOSSIBLE_SCOPE_BOUNDARY_PHRASES = (
+    "approved path",
+    "approved scope",
+    "outside the scope",
+    "outside this task's scope",
+    "outside my scope",
+    "outside its scope",
+    "out of scope",
+)
+
+#: THE BLOCKED HALF, and the whole of what separates a disclosure `revise`
+#: cannot answer from one it can. Every entry is an explicit statement that the
+#: WORK cannot be done — never merely that a file was left alone, and never a
+#: bare "cannot", which agents write about their own knowledge ("I cannot tell
+#: which reading was meant") far more often than about their scope.
+#:
+#: **This requirement IS the fix for the false positive**, rather than a
+#: deny-list of "deliberately"/"untouched"/"left standing" beside it. A
+#: deny-list is the fail-open shape: an agent that writes "I deliberately did
+#: not touch X because this task cannot be completed inside its approved
+#: paths — I would have asked for Y" states a real blocker AND trips the
+#: deny-list, and the guard then switches itself off on the exact line it
+#: exists to catch. Requiring the positive claim cannot fail that way; it can
+#: only miss a blocker phrased with none of these, which leaves the loop
+#: behaving exactly as it did before this existed.
+#:
+#: Every entry binds the impossibility to DOING THE WORK, and the one that was
+#: dropped says why that matters: "cannot be resolved" is what an agent writes
+#: about an AMBIGUITY, which is the thing an `ASSUMPTION:` line exists for, so
+#: it would have fired on the ordinary disclosure this whole mechanism sits on
+#: top of. A bare "cannot" is excluded for the same reason.
+#:
+#: Three real lines from this repository are the negatives it must not match,
+#: and `autoloop/tests/test_impossible_scope.py` pins all three verbatim:
+#: `docs/SUMMARY.md`'s brw-19c hand-off (`:58`), brw-19a's own LEFT STANDING
+#: note (`:61`) and brw-19e's follow-up note (`:68`). Each names the approved
+#: paths, each describes a consequence, and each belongs to a task that
+#: COMPLETED — so a recognizer that fires on the boundary half alone would call
+#: three finished tasks impossible.
+IMPOSSIBLE_SCOPE_BLOCKED_PHRASES = (
+    "cannot be done",
+    "cannot be completed",
+    "cannot be finished",
+    "cannot be implemented",
+    "cannot be satisfied",
+    "cannot be met",
+    "cannot be made",
+    "cannot be fixed",
+    "cannot be delivered",
+    "cannot be carried out",
+    "cannot complete",
+    "can't be done",
+    "can't be completed",
+    "could not be done",
+    "could not be completed",
+    "unable to complete",
+    "not possible",
+    "no way to",
+    "impossible",
+)
+
+#: What the packet says above the list when one of those lines is standing.
+#: Addressed to the reviewer, because the reviewer is who kept answering
+#: `revise` to it — and it names the answers that CAN move such a task, so the
+#: notice is actionable rather than merely a warning.
+#:
+#: It is rendered INTO a packet and never read back out of one: the recognizer
+#: reads `TaskExecution.assumptions`, which is written from the agent's own
+#: output and from nothing a reviewer or this module says. A notice that could
+#: re-enter as evidence would be the echo `_ASSUMPTION_RE` was anchored against
+#: in the first place.
+#:
+#: Rendered VERBATIM — flush left, not re-indented into the list below it — for
+#: the same reason `STAT_ONLY_PACKET_BANNER` and the `OUT-OF-SCOPE PATHS`
+#: literal are: a reviewer-facing finding that a test or a grep has to
+#: reconstruct from an indent is one nothing can pin. It is also the one line of
+#: that section the LOOP wrote rather than the executor, and sitting at the
+#: heading's own column instead of among the executor's indented claims is what
+#: says so.
+IMPOSSIBLE_SCOPE_NOTICE = (
+    "AT LEAST ONE LINE BELOW REPORTS THAT THIS TASK CANNOT BE DONE INSIDE ITS\n"
+    "APPROVED PATHS. `revise` cannot answer that — the next round would be\n"
+    "handed the same scope. Widen the scope, decompose the task, or accept the\n"
+    "candidate as the part that was reachable."
+)
+
 #: The literal line the inline diff section starts with. `plan_chunked_delivery`
 #: locates `_INLINE_DIFF_HEADER + diff` inside the rendered payload and swaps it
 #: for a delivery notice, which is what lets the *sent* message stay small while
@@ -579,6 +673,65 @@ def _format_executor_report(execution: TaskExecution) -> str:
     )
 
 
+def reports_impossible_scope(assumption: str) -> bool:
+    """Does ONE assumption line report that the approved scope makes the task
+    impossible — the disclosure `revise` is the wrong answer to?
+
+    True only when the line carries BOTH halves: it names the approved scope
+    (`IMPOSSIBLE_SCOPE_BOUNDARY_PHRASES`) and it says the work cannot be done
+    (`IMPOSSIBLE_SCOPE_BLOCKED_PHRASES`). Either half alone is something else
+    entirely — the boundary half alone is the ordinary, correct hand-off note
+    every scoped task writes about a file it left alone, and the blocked half
+    alone is a claim about something other than scope.
+
+    ONE LINE at a time, deliberately: the two halves have to be in the same
+    disclosure. Scanning the whole accumulated list for the two phrases would
+    let round 1's "I left `x.py` alone, it is outside my approved paths" and
+    round 2's unrelated "this cannot be done without a network" combine into a
+    disclosure neither round made.
+
+    It reads the COLLECTED lines (`TaskExecution.assumptions`), which is to say
+    the literal `ASSUMPTION:` form and nothing else. That anchoring is
+    `implement_executor._ASSUMPTION_RE`'s and it is inherited here on purpose:
+    it is what already refuses a `- `/`* `/`> ` markup prefix, so an agent
+    quoting its own instructions cannot manufacture a blocker. Prose elsewhere
+    in the report is NOT scanned, and the miss that costs is the safe direction
+    — the loop then behaves exactly as it did before this existed.
+
+    Case-insensitive and whitespace-collapsed, because a line wrapped by the
+    agent's own formatting is the same disclosure as one that is not.
+    """
+    if not isinstance(assumption, str):
+        # A hand-edited or machine-mangled record can hold anything JSON can.
+        # Nothing to read is not a blocker; see `impossible_scope_disclosures`.
+        return False
+    text = " ".join(assumption.split()).lower()
+    if not text:
+        return False
+    return any(phrase in text for phrase in IMPOSSIBLE_SCOPE_BOUNDARY_PHRASES) and any(
+        phrase in text for phrase in IMPOSSIBLE_SCOPE_BLOCKED_PHRASES
+    )
+
+
+def impossible_scope_disclosures(assumptions) -> tuple[str, ...]:
+    """Every line in an accumulated assumption list that
+    `reports_impossible_scope`, in the order the record holds them.
+
+    THE ONE reader of that predicate, so the orchestrator's guard
+    (`_revise_cannot_help`) and this packet's own notice can never disagree
+    about which lines count — they ask the same function over the same record
+    field.
+
+    Tolerant of a record that is not a list of strings at all (`None`, a bare
+    string, a list with a number in it): a record nobody can read reports no
+    disclosure, which leaves the loop's behaviour exactly what it was before
+    this existed rather than parking a task on unreadable evidence.
+    """
+    if isinstance(assumptions, str) or not isinstance(assumptions, (list, tuple)):
+        return ()
+    return tuple(line for line in assumptions if reports_impossible_scope(line))
+
+
 def _shorten_entry(text: str) -> str:
     """One assumption, cut to `ASSUMPTION_MAX_CHARS_EACH` INCLUDING the marker
     that says it was cut — so the returned string is never longer than the
@@ -631,9 +784,23 @@ def _format_assumptions(execution: TaskExecution) -> str:
     its own. Both are stated in the rendering — a silently shortened list, or
     line, reads as complete — and both leave the record untouched, which is the
     point: it is the only copy of these lines that survives the next round.
+
+    **One line of this section is not a rendering choice but a finding**:
+    `IMPOSSIBLE_SCOPE_NOTICE`, printed when any recorded assumption reports
+    that the approved scope makes the task impossible. It is computed over the
+    WHOLE record, never over the `shown` subset below, because the two budgets
+    above drop the OLDEST entries first — and the disclosure that matters is
+    typically round 1's, which is exactly what gets dropped. A notice that
+    disappeared once the list grew would be the alarm switching itself off as
+    the evidence for it accumulated. It is emitted as the constant's own bytes,
+    unindented, so "the notice is present" is a substring of the rendering
+    rather than something a reader has to rebuild from an indent — see the
+    constant, and `test_impossible_scope.py`'s §2, which pins both the ordinary
+    case and the one where the disclosure itself did not fit.
     """
     if not execution.assumptions:
         return ""
+    blocked = impossible_scope_disclosures(execution.assumptions)
     shown: list[str] = []
     used = 0
     for text in reversed(execution.assumptions):
@@ -662,6 +829,7 @@ def _format_assumptions(execution: TaskExecution) -> str:
         "Assumptions the executor took where the task did not say (CLAIMED,\n"
         "not read from git — each is a choice it made instead of asking, and\n"
         "the code implementing it is in the diff below):\n"
+        + (IMPOSSIBLE_SCOPE_NOTICE + "\n" if blocked else "")
         + textwrap.indent("\n".join(lines), "  ")
     )
 

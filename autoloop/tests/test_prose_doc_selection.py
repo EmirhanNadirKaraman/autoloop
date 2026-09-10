@@ -470,6 +470,93 @@ DOCS_ONLY = tuple(sorted(TRACKERS))
 #: the ledger saying what every bump was for, which used to sit right here,
 #: moved with it (conc-14).
 DOCS_ONLY_SELECTED = 20
+#: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). Only
+#: the DENOMINATOR moved: the new file reads no tracker and spawns nothing, so a
+#: docs-only round still selects the same 20.
+#: 103 -> 104 when prov-01 added `test_codex_stdout_verdict.py` (2026-09-01),
+#: for the same reason and with the same effect: still the same 20.
+#: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01): it
+#: fakes the invocation boundary and reads no tracker, so still the same 20.
+#: 105 -> 106 when conc-02 added `test_config_concurrency.py` (2026-09-01):
+#: it loads configs from `tmp_path` strings and reads no tracker, so the same
+#: 20 once more — the DENOMINATOR only.
+#: 106 -> 107 when conc-05 added `test_lane_state.py` (2026-09-01): it works
+#: on lane paths and lease records under `tmp_path` and reads no tracker, so
+#: the same 20 once more — the DENOMINATOR only.
+#: 107 -> 108 when conc-06 added `test_fleet_supervisor.py` (2026-09-02): it
+#: plans against registries built in memory, names its trackers through
+#: `tasks.TRACKER_PATHS` rather than by spelling them, and resolves no
+#: `__file__` — so it reads no document under either half of the rule above and
+#: the same 20 hold. The DENOMINATOR only.
+#: 108 -> 109 when conc-11 added `test_fleet_throttle.py` (2026-09-02): it works
+#: on one small JSON record and two orchestrators under `tmp_path`, names its
+#: trackers not at all, resolves no `__file__`, and its only concurrency is
+#: `threading` — which is not a spawn under the opacity rule — so the same 20
+#: once more. The DENOMINATOR only.
+#: 109 -> 110 when conc-03b added `test_merge_rereview.py` (2026-09-03): it
+#: names no tracker, resolves no `__file__`, and its `run_git` hands an argv
+#: this cannot read to `subprocess.run` WITHOUT any interpreter literal in the
+#: file — `opaque` is `starts_an_interpreter or (interpreter_seen and
+#: unreadable)`, and both terms are False — so the same 20 once more. The
+#: DENOMINATOR only.
+#: 110 -> 111 when conc-04b added `test_lane_observed_checkout.py` (2026-09-03):
+#: the one document it names is `docs/AUTOLOOP.md`, which is not a change-note
+#: tracker, it resolves no `__file__`, and it borrows `gitrepo.run_git` with no
+#: interpreter literal of its own — so the same 20 once more. The DENOMINATOR
+#: only.
+#: 111 -> 112 when ctx-03 added `test_context_resolver.py` (2026-09-03): it does
+#: resolve its own `__file__`, and the one document it names is
+#: `autoloop/config.example.toml` — not a change-note tracker, so a docs-only
+#: round still reaches it through neither half of the rule — and its
+#: `CountingRunner` hands `subprocess.run` an unreadable argv with no interpreter
+#: literal in the file. The same 20 once more; the DENOMINATOR only.
+#: 112 -> 113 when conc-07 added `test_fault_isolation.py` (2026-09-03): the one
+#: document it names is `docs/AUTOLOOP.md`, which is not a change-note tracker,
+#: it resolves no `__file__`, and it spawns nothing at all — so it reads no
+#: document under either half of the rule and the same 20 hold. The DENOMINATOR
+#: only.
+#: 113 -> 114 when conc-08 added `test_lane_death_recovery.py` (2026-09-03), for
+#: conc-07's reason exactly: `docs/AUTOLOOP.md` is the only document it names, it
+#: resolves no `__file__`, and the git repositories it builds are spawned by
+#: `gitrepo.py`, not by anything this file binds. The same 20 hold; the
+#: DENOMINATOR only.
+#: 114 -> 115 when conc-10 added `test_fleet_end_to_end.py` (2026-09-08), again
+#: for conc-07's reason: `docs/AUTOLOOP.md` is the only document it names, it
+#: resolves no `__file__`, and it builds no repository and spawns nothing — its
+#: only concurrency is `threading`. The same 20 hold; the DENOMINATOR only.
+#: 115 -> 116 when ctx-05 added `test_context_packet.py` (2026-09-09), the
+#: DENOMINATOR again. It DOES spell `CLAUDE.md` in an evaluated string — the
+#: scope line a context packet renders unions the trackers in — but the reader
+#: rule is a CONJUNCTION: it resolves no `__file__`, so it cannot address the
+#: checkout it lives in and is not a reader of that tracker. It spawns nothing
+#: either (its git comes from `gitrepo.py`), so it is not on the opaque frontier
+#: and the same 20 hold.
+#: 116 -> 117 when conc-12 added `test_lane_hold_scheduling.py` (2026-09-09), the
+#: DENOMINATOR again and for conc-10's reason: it names no document at all, it
+#: resolves no `__file__`, and it builds no repository and spawns nothing — its
+#: only git is a three-method stub — so it is neither a reader nor on the opaque
+#: frontier and the same 20 hold.
+#: 116 -> 117 when ctx-07 added `test_context_closeout.py` (2026-09-09), the
+#: DENOMINATOR again, and this one does not even reach ctx-05's conjunction: it
+#: spells no change-note tracker in any evaluated string (`TRACKER_PATHS` is the
+#: identifier, not a path), and the module source it reads is reached as the
+#: ATTRIBUTE `sys.modules[...].__file__`, which is not the `ast.Name` the rule
+#: looks for. It spawns nothing of its own either, so the same 20 hold.
+#: 118 -> 119 when ctx-08 added `test_context_diagnostics.py` (2026-09-09), the
+#: DENOMINATOR again and for ctx-07's reason: it names no change-note tracker in
+#: any evaluated string, resolves no `__file__`, and spawns nothing of its own
+#: (its git comes from `gitrepo.py`), so it is neither a reader nor on the opaque
+#: frontier and the same 20 hold.
+#: 119 -> 120 when review-01b added `test_impossible_scope.py` (2026-09-10), the
+#: DENOMINATOR again, and this one is back inside ctx-05's conjunction rather
+#: than short of it: it DOES spell `docs/SUMMARY.md` and `docs/TESTS.md` in
+#: evaluated strings, because three of its negative fixtures are real change
+#: notes copied out of the first — and it is still not a reader, because it
+#: resolves no `__file__`. Nor is it opaque: the `python3 -m ...` inside those
+#: fixtures is part of a longer sentence, and the rule compares the WHOLE
+#: constant, so nothing here reaches a `subprocess` entry point. The same 20
+#: hold.
+SUITE_SIZE = 120
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
