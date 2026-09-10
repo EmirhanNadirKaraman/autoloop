@@ -556,6 +556,15 @@ DOCS_ONLY_SELECTED = 20
 #: fixtures is part of a longer sentence, and the rule compares the WHOLE
 #: constant, so nothing here reaches a `subprocess` entry point. The same 20
 #: hold.
+#: 119 -> 120 when stream-01b added `test_agent_action_log.py` (2026-09-10), the
+#: DENOMINATOR once more: it names no change-note tracker in any evaluated
+#: string, resolves no `__file__`, and spawns nothing of its own (its git comes
+#: from `gitrepo.py`), so it is neither a reader nor on the opaque frontier and
+#: the same 20 hold. It reaches `cli._build_executor` by CALLING it rather than
+#: by reading `cli.py` as text, which is why the `__file__` half is absent — the
+#: check it replaced did resolve one. It builds no `.md` name either, so
+#: `test_no_file_that_addresses_this_checkout_builds_a_document_name_dynamically`
+#: is unmoved too.
 SUITE_SIZE = 120
 
 

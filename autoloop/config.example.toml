@@ -412,6 +412,48 @@ validation_commands = [
 # never narrowed either). A reviewer who wants a full run therefore has to ask
 # for one; there is no directive field that grants it.
 test_selection = "reachable"
+# Stream the agent's ACTION LOG while the round is still running, so a live
+# round can be watched instead of waited out. The loop runs the agent CLI with
+# its output captured, which means that until the process exits the loop holds
+# a buffer nobody can see; with this on, the same output is ALSO appended to a
+# file as it is produced.
+#
+# IT REACHES A REAL ROUND (stream-01b, 2026-09-10): autoloop/cli.py's
+# _build_executor reads this key when it builds the loop's executors and passes
+# <state_dir>/action-logs to the write-capable agent runner a task's round runs
+# — or passes None when this is false. So `true` here means the NEXT round
+# writes a log while it works, and `false` means the loop behaves exactly as it
+# did before this key existed. Nothing is armed process-wide: the value travels
+# as an argument, from the config object to the runner, and nowhere else.
+#
+# IT DOES NOT APPLY TO THE READ-ONLY AUDIT SUBAGENTS. Those are bounded by an
+# elapsed timeout rather than watched for progress, so their output is buffered
+# by the process runner and does not exist until the run has ENDED — a file for
+# them could not be the live stream this setting offers, only something that
+# looks like one. They are left exactly as they are, on or off.
+#
+# WHERE: <state_dir>/action-logs/<task>-<round>.log — one file per round, named
+# by task and by the instant the round started, so rounds never overwrite each
+# other. The loop prints the path on stderr when it opens one. Under the state
+# directory rather than in the checkout, because a file written inside the
+# observed tree mid-round is reported as the agent writing where it may not.
+#
+# WHAT IT CONTAINS: everything the agent PROCESS printed on stdout and stderr —
+# its tool calls, reads, writes and commands as the CLI reports them. It is NOT
+# the model's reasoning and is not a thinking stream; do not read it as one.
+# How much of it arrives while the run is live is the CLI's decision: stderr
+# arrives throughout, and the `json` output format this loop asks for holds
+# stdout back until the process exits, so the stdout half lands at the end.
+#
+# WHAT IT COSTS WHEN IT BREAKS: nothing that can end a round. A directory that
+# cannot be created, a handle that refuses a write, a full disk — each is
+# swallowed, announced once on stderr, and the agent runs exactly as it would
+# have with this off. The file is capped (8 MiB of agent output) so a runaway
+# agent cannot fill the volume, and reaching the cap is recorded IN the file
+# rather than left to look like a run that finished.
+#
+# OFF by default. With it off the round behaves byte for byte as it always has.
+action_log = false
 
 [autonomy]
 # What the loop does when a TRANSPORT or ENVIRONMENT fault would otherwise park
