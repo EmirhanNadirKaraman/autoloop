@@ -35,9 +35,11 @@ candidates, so an eager merge at that moment would have parked thirteen of
 them.
 
 So the same predicate the operator's `merge-window` command uses gates this
-one: `cli._merge_window_blockers` — no unpublished candidate bound to the
-current base, no executing phase. It is CALLED, not reimplemented. A second
-copy that drifted by a single case is exactly how thirteen tasks get stranded.
+one: `cli._merge_window_blockers` — at `lanes = 1`, no unpublished candidate
+bound to the current base and no executing phase; above one lane, both of those
+are per-candidate obligations instead (see the next section, and conc-13 for
+the phase half). It is CALLED, not reimplemented. A second copy that drifted by
+a single case is exactly how thirteen tasks get stranded.
 A published candidate does not block: its reviewed object is durable on its
 own branch, so a moved base cannot discard it.
 
@@ -54,6 +56,12 @@ open (docs/AUTOLOOP.md, "Decision 6 — merging is serialised and rebase-aware")
 There the predicate reports a bound candidate as a `MergeObligation` instead,
 and this module is what makes that safe. Three steps, in this order and no
 other:
+
+(The executing-phase clause was the OTHER fleet-wide mutual exclusion, and
+conc-13 converted it the same way — for the same starvation and because it read
+lane 0's state file and spoke for the fleet from it. Nothing in this module
+changed for that: the safety it was buying is the three steps below, which is
+what made the conversion possible rather than merely desirable.)
 
 1. **Mark, before the merge.** Every bound candidate's record gets
    `rereview_owed_base` set (`_mark_rereview_owed`). A candidate that cannot be

@@ -965,6 +965,55 @@ that pin it need no edit. This is also why the merge candidate can be built
 early: it needs two execution *records*, which a test writes directly, not two
 live agents.
 
+#### The second fleet-wide mutual exclusion, converted (conc-13, 2026-09-10)
+
+conc-03 converted the bound-candidate clause and left the other one alone:
+
+```python
+_, state = _load_state(config)
+if state is not None and Phase(state.phase) is Phase.EXECUTING:
+    reasons.append("a phase is executing — an agent may be mid-write")
+```
+
+That clause was wrong twice above one lane. **Unsound:** `config.state_file` is
+*lane 0's* file (`state.lane_paths`), so it read one lane and spoke for the
+fleet — lanes 1..N−1 can be mid-write and it never noticed. **Starving:** lane 0
+is executing nearly all the time, so at N lanes the window essentially never
+opened — exactly the failure this section predicts for the *other* clause and
+prescribes the cure for. Measured 2026-09-09: two lanes, 5.5 hours, ctx-08 and
+ctx-09 completed, `autoloop/mainline` did not advance once; the only merge in
+that window was an operator's, by hand.
+
+The same sentence settles it, and the same machinery discharges it. Above one
+lane `cli._merge_window_blockers` reads **no lane's state file at all** — which
+is Decision 7's own rule, and `health._judge`'s own device — and each lane state
+in which "an agent may be mid-write" mattered is answered per candidate instead:
+
+| lane state when the base moves | what answers it |
+|---|---|
+| reviewed candidate bound to the head | the obligation: marked before the merge, carried forward after, refused at push time on its old approval |
+| worker tree DIRTY (an agent literally mid-write) | precondition 4 of `_carry_reviewed_candidate_past` refuses rather than merging over the residue; `auto_merge._park_carry_forward_refused` parks `task_base_behind_head`, and the worker and the record are untouched |
+| round with no candidate yet | skipped for want of a `candidate_sha`; its worker is a separate clone no merge into this checkout touches, and `_rebase_execution_if_stale`'s unreviewed arm re-bases it at the next dispatch |
+| base git cannot place | `BASE_UNVERIFIED`, still a blocker at every lane count |
+| candidate already behind the head | the note it has been since 2026-08-21 — moving the head cannot strand it further |
+
+`health.py`'s held-sweep paragraph is corrected in the same round: it claimed a
+window "closed because a phase is executing clears in minutes and is not
+reported", which is true at one lane and false at N, where it was the steady
+state.
+
+**That correction removes a CAUSE and does not supply a SIGNAL, and the
+paragraph now says so.** `held_merge_sweep` ages on a task the sweep could not
+JUDGE; `SWEEP_DEFERRED_EVENT` is in `merge_sweep.SWEEP_CLEARED_EVENTS`, so a
+sweep that keeps deferring for some other reason — a `BASE_UNVERIFIED`
+candidate, the merge token held by a sibling lane, a remote base that moved —
+clears that signal rather than ageing it, and is still visible only in the
+transcript. A multi-lane backlog stalled on a deferral remains unreported. That
+is a follow-up, not something this candidate closed.
+
+At `lanes = 1` the read, the reason string and the `merge-window` OPEN line are
+byte-identical to what they were, and no existing test needed an edit.
+
 ### Decision 7 — observability: N lanes, truthfully
 
 The brief's rule is the design: reporting the first lane's phase as the system's
