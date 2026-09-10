@@ -283,6 +283,20 @@ a plan rather than a gate on correctness: a splitter that refused what it could
 not analyse would stop the loop decomposing anything in a repository whose
 import graph is partly unreadable.
 
+**Both outcomes reach all three destinations — a warning and a did-not-run
+notice alike.** `SplitOrderReport.describe()` renders one of three things: the
+warning with its named edges, `SPLIT-ORDER CHECK DID NOT RUN — <reason>`, or
+`""` when the check ran and found nothing. The transcript event carries the
+structured keys above on every arm; `_apply_split` appends the rendered text,
+whenever it is non-empty, to the reviewer's report and to EVERY successor's
+`description`. The did-not-run notice belongs in a brief for the same reason it
+belongs in the record: it and a clean bill leave an identical empty
+`split_order_edges`, and the agent it matters to is the one whose part
+cannot succeed inside its own approved paths — that agent must be able to read
+that nobody checked the order rather than spend its attempts concluding the
+fault is its own. Only the `""` arm leaves a successor's brief byte-identical to
+the spec the reviewer wrote.
+
 ## Execution record retirement
 
 `executions/<task>.json` is meant to be retired WITH the work it describes:

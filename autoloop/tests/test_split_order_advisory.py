@@ -33,8 +33,9 @@ What breaks the claim if left untested, one section each:
   * the analysis must stay a pure function of the tree, and must reuse the
     graph the repository already builds rather than a second one (§4);
   * the warning must actually REACH the split record, the reviewer and the
-    parts' briefs, and split-01's atomic acceptance must be untouched by any of
-    it (§5).
+    parts' briefs — and so must the DID-NOT-RUN notice, which names no edge and
+    would otherwise be the one outcome that reached a brief as silence — while
+    split-01's atomic acceptance stays untouched by any of it (§5).
 
 §1-§4 build a plain directory of `.py` files: `build_import_graph` reads a tree,
 not a repository, so a git repo there would be six subprocesses proving nothing
@@ -725,6 +726,15 @@ def test_a_check_that_could_not_run_still_applies_the_plan_and_records_it(tmp_pa
     check did not look. A test asserting only the first would pass on a check
     that had silently switched itself off.
 
+    The did-not-run notice reaches ALL THREE destinations a warning reaches,
+    including every successor's brief. That is the half a first cut dropped: it
+    appended to the briefs only when the report was `flagged`, so a `ran=False`
+    — which by construction names no edge — vanished from every brief while the
+    transcript and the reviewer's report both carried it. The agent it matters
+    to is the one whose part cannot succeed inside its own approved paths, and
+    "nobody checked the order of this plan" is what stops it spending an attempt
+    budget concluding the fault must be its own.
+
     The fault raised is deliberately NOT one of the anticipated ones: it goes
     through `split_order_warnings`'s bare `except Exception`, which is the arm
     that has to hold if an advisory read of a plan is never to be able to park
@@ -748,10 +758,26 @@ def test_a_check_that_could_not_run_still_applies_the_plan_and_records_it(tmp_pa
     assert data["split_order_edges"] == []
     outbox = wiring.orch.state.outbox or ""
     assert "SPLIT-ORDER CHECK DID NOT RUN" in outbox
-    # the briefs are untouched: there is nothing actionable to tell an agent.
-    assert (
-        wiring.registry.get("t1-a").description == "one independently reviewable piece"
-    )
+
+    # and into every brief, read back from `tasks.json` as well as from memory:
+    # the child is dispatched by a LATER loop out of the persisted registry, so
+    # a notice that lived only in this process is no notice at all. The REASON
+    # is asserted with the header, because "did not run" without "why" is the
+    # panel nobody can act on.
+    reloaded = wiring.task_store.load()
+    for child_id in ("t1-a", "t1-b"):
+        brief = wiring.registry.get(child_id).description
+        assert brief.startswith("one independently reviewable piece")
+        assert "SPLIT-ORDER CHECK DID NOT RUN" in brief
+        assert "ZeroDivisionError" in brief
+        assert "accepted unchanged" in brief
+        assert reloaded.get(child_id).description == brief
+        # The SAME rendered sentence in both places, not two spellings of it.
+        # The reviewer re-orders from the report and the agent works from the
+        # brief; a check that told the two different things would be worse than
+        # one that said nothing.
+        appended = brief.removeprefix("one independently reviewable piece").strip()
+        assert appended and outbox.endswith(appended)
 
 
 def test_a_loop_that_cannot_name_a_checkout_answers_did_not_run(tmp_path):

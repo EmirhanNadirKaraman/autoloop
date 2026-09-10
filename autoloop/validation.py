@@ -1818,8 +1818,11 @@ def build_import_graph(root: Path) -> ImportGraph:
 # cannot be read, an unexpected exception anywhere in the analysis — answers
 # `ran=False` with a reason, and the caller applies the plan unchanged. The one
 # thing that must never happen is a silent pass, so `ran` and `not_run_reason`
-# are carried into the transcript and into the reviewer's report: a check that
-# did not run says so, in words, where a check that ran clean says nothing.
+# are carried into the transcript, into the reviewer's report AND into every
+# successor's brief — the same three destinations a warning reaches, because
+# "nobody checked the order of this plan" is worth as much to the agent whose
+# part cannot succeed as a named edge is. A check that did not run says so, in
+# words, everywhere a check that ran clean says nothing.
 # ---------------------------------------------------------------------------
 
 #: How many split-order edges the advisory names in full before it stops

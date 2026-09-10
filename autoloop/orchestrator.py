@@ -12894,10 +12894,23 @@ class Orchestrator:
         # Appended to EVERY child's brief, not only to the parts an edge names.
         # Which child is dispatched first is the scheduler's decision, and the
         # whole point is that the FIRST agent to run reads the inverted edge
-        # instead of spending its attempt budget rediscovering it. Empty when
-        # the check ran clean, so an unflagged plan leaves every brief
-        # byte-identical to the spec the reviewer wrote.
-        brief = f"\n\n{advisory}" if order.flagged else ""
+        # instead of spending its attempt budget rediscovering it.
+        #
+        # ANY non-empty advisory, which means the DID-NOT-RUN notice too and not
+        # only a warning. A check that never looked and a check that looked and
+        # found nothing name no edge either way, so from inside a part they are
+        # the same silence — and the agent that silence matters to is the one
+        # whose part cannot succeed inside its own approved paths: "nobody
+        # checked the order of this plan" is exactly the sentence that stops it
+        # spending four attempts deciding the fault must be its own. Gating this
+        # on `order.flagged` (as the first cut did) dropped every `ran=False`
+        # out of every brief while the transcript and the reviewer's report both
+        # carried it, which is the silent half of a fail-open check.
+        #
+        # `describe()` is `""` only when the check RAN and found nothing, so a
+        # clean plan still leaves every brief byte-identical to the spec the
+        # reviewer wrote.
+        brief = f"\n\n{advisory}" if advisory else ""
         inherited = self._nonneg_int(execution.attempt_count)
         child_depth = self._nonneg_int(parent.split_depth) + 1
         children = [
@@ -13145,6 +13158,11 @@ class Orchestrator:
             # including the did-not-run notice, which is the whole of "say when
             # it did not run". `advisory` is `""` only when the check ran and
             # found nothing, so a clean plan's report is unchanged.
+            #
+            # The SAME condition the briefs above are appended under, and the
+            # same rendered string: the reviewer re-orders from this report and
+            # the first agent works from the brief, so the two saying different
+            # things is worse than either saying nothing.
             state.outbox += "\n\n" + advisory
         state.last_response = None
         state.consecutive_failures = 0
