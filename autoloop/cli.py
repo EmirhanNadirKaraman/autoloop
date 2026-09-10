@@ -592,6 +592,23 @@ def _build_executor(
     # ALREADY acted on the flag, which is what survives `resume` deleting the
     # file mid-kill — see `implement_executor.AbortLedger`.
     abort_ledger = AbortLedger()
+    # THE WIRE that makes `[audit] action_log` reach a real round, resolved ONCE
+    # here — the only place that has both the operator's flag and the runner
+    # construction sites in one scope — and passed explicitly below.
+    #
+    # `None` when the flag is off, which is the default and is every config file
+    # written before the key existed: the runners then behave byte for byte as
+    # they did before the setting existed. A parameter rather than a
+    # process-wide default armed by `load_config`, so what a runner does is
+    # readable at the call site instead of depending on which config this
+    # process happened to read last.
+    #
+    # It reaches the WRITE-CAPABLE runners only. The read-only audit runners
+    # below are deliberately passed nothing: they are
+    # `subprocess.run(capture_output=True)`, so their output does not exist
+    # until the process has exited, and a file opened for them could only ever
+    # be written at the end — a log that reads like a live stream and is not.
+    action_log_dir = config.action_log_dir if config.audit.action_log else None
     audit_runner = ClaudeCliRunner(
         repo_root=git.repo_root,
         command=config.audit.agent_command,
@@ -643,6 +660,11 @@ def _build_executor(
             git.repo_root,
             command=config.audit.agent_command,
             timeout_seconds=config.audit.agent_ceiling_seconds,
+            # Passed here too although this binding is never reached, so the
+            # two write-capable construction sites do not disagree about what
+            # the operator asked for — an asymmetry here would be read as a
+            # decision rather than as the dead code it is.
+            action_log_dir=action_log_dir,
         ),
         # Same validation commands and agent CLI settings as the audit —
         # there is no separate `[implement]` config section (kept minimal;
@@ -682,6 +704,12 @@ def _build_executor(
             # keeps the round classified as an abort even if the flag is cleared
             # before the executor re-reads it.
             abort_ledger=abort_ledger,
+            # THE production wiring for `[audit] action_log`. This is the runner
+            # a task's round really runs, and it is supervised — so with the
+            # flag on the round's output is appended to this directory WHILE the
+            # agent is still working, which is the whole point of the setting.
+            # `None` with the flag off, and nothing is opened or printed.
+            action_log_dir=action_log_dir,
         ),
         # And once more on the executor itself, for the OTHER process group an
         # abort has to reach: the validation subprocess. The agent runs the
