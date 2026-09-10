@@ -536,7 +536,13 @@ DOCS_ONLY_SELECTED = 20
 #: any evaluated string, resolves no `__file__`, and spawns nothing of its own
 #: (its git comes from `gitrepo.py`), so it is neither a reader nor on the opaque
 #: frontier and the same 20 hold.
-SUITE_SIZE = 119
+#: 119 -> 120 when split-06 added `test_split_order_advisory.py` (2026-09-10),
+#: the DENOMINATOR again and for ctx-08's reason: it resolves no `__file__`, so
+#: the `.md` extension token it does spell attributes it no document, and it
+#: spawns nothing of its own — its git comes from `test_task_split.py`, and
+#: importing an opaque file does not make the importer opaque — so the same 20
+#: hold.
+SUITE_SIZE = 120
 
 
 def test_a_docs_only_round_selects_a_measured_fraction_of_the_suite():
