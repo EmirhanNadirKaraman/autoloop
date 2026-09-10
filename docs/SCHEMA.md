@@ -449,6 +449,23 @@ stopping, so a loop already stopped in `awaiting` — with a reviewer still
 holding its packet — would otherwise be offered the one control that archives
 that session.
 
+WHOSE PACKET IT IS is asked separately, and of a STOPPED loop too. Every refusal
+above is about stopping, so a loop already down in `awaiting` passes all of them
+— and `release` against the very task the reviewer is holding a packet for
+archives its execution record and quarantines the worker that approval would push
+from. `dashboard.session_holds` reads the task ids the saved session names —
+`current_task`, `task_execution`, `park_task_id`, the three
+`cli._session_names_task` reads — and every per-task control (`release`,
+`discard`, `retire`; anything with `needs == "task"`) refuses THAT task while
+`state.packet_outstanding_reason` is non-empty for the session naming it,
+running or not. It is task-scoped: another task's Release is exactly as
+available as it was. A session that owes a packet and names no task id anybody
+can read refuses EVERY task instead — an unattributable packet is not an absent
+one — and so does a lane directory nobody can list. A state file that is simply
+NOT THERE is not a session and holds nothing, which is `_lane_sessions`' own rule
+(a lane that has never run owes nothing; one that will not parse refuses) and
+matters because `reset --yes` archives that file.
+
 WHETHER THE LOOP MAY BE STOPPED is asked of every lane, not of lane 0.
 `dashboard._lane_sessions` walks `state_dir/lanes/` — the directory, never
 `[concurrency] lanes`, because a lane an operator's lowered cap cut out is still
