@@ -13,7 +13,6 @@ from pathlib import Path
 
 import tomllib
 
-from .audit.agents import set_default_action_log_dir
 from .codex.sandbox import DEFAULT_SANDBOX_ARGS
 from .errors import ConfigError
 from .notify import (
@@ -524,28 +523,26 @@ class AuditConfig:
     #: (`audit.agents.ClaudeCliRunner`, via its `action_log_dir=`) rather than
     #: on a mechanism nothing reaches.
     #:
-    #: HOW IT GETS THERE (stream-01b, 2026-09-10 — it was inert for one round
-    #: before this, and the paragraph saying so is gone because it is no longer
-    #: true): the LAST thing `load_config` does is call
-    #: `audit.agents.set_default_action_log_dir` with
-    #: `AutoloopConfig.action_log_dir` when this is on and `None` when it is
-    #: off. The runner that picks it up is the SUPERVISED, write-capable one
-    #: `implement_executor.implement_agent_runner` builds per task — which is
-    #: the runner a real round runs, and which names no directory of its own.
+    #: HOW IT GETS THERE (stream-01b, 2026-09-10): `cli._build_executor`
+    #: computes `config.action_log_dir if config.audit.action_log else None`
+    #: once and passes it to `implement_executor.implement_agent_runner`, which
+    #: forwards it to the `ClaudeCliRunner` it builds. That factory is the ONE
+    #: place a write-capable runner is constructed and the runner a real round
+    #: runs, so a `true` here reaches the next round and a `false` leaves every
+    #: runner exactly as it was.
     #:
-    #: IT DOES NOT REACH THE AUDIT SUBAGENTS, deliberately. They are bounded by
-    #: an elapsed timeout rather than supervised, so they run under
+    #: EXPLICITLY PASSED, never armed as a side effect of loading a config.
+    #: `load_config` mutates nothing outside the object it returns: a
+    #: process-wide default set at load time would make every runner's
+    #: behaviour depend on which config the process read LAST, which is not
+    #: something a reader of a construction site could predict.
+    #:
+    #: IT DOES NOT REACH THE AUDIT SUBAGENTS, deliberately — `cli.
+    #: _build_executor` passes them no directory at all. They are bounded by an
+    #: elapsed timeout rather than supervised, so they run under
     #: `subprocess.run(capture_output=True)` and their output does not exist
-    #: until the process has exited: a file armed for them could never be the
-    #: live stream this setting offers, only one that looks like it. See
-    #: `audit.agents.INHERIT_ACTION_LOG_DIR` for that gate and for why an
-    #: explicit `action_log_dir=None` still means off.
-    #:
-    #: A process-wide default is used because the two call sites that would
-    #: otherwise carry the argument (`cli._build_executor` and that factory)
-    #: were outside the authorized paths of the task that wired this; passing
-    #: `action_log_dir=` at those two sites instead would be strictly smaller
-    #: and nothing here forecloses it.
+    #: until the process has exited: a file opened for them could never be the
+    #: live stream this setting offers, only one that looks like it.
     #:
     #: IT IS AN ACTION LOG. It records what the agent process PRINTED — its tool
     #: calls, reads, writes and commands as the CLI reports them. It is not the
@@ -2553,21 +2550,9 @@ def load_config(path: Path) -> AutoloopConfig:
         concurrency=concurrency,
         context=context,
     )
-    # THE LINE THAT MAKES `[audit] action_log` REACH A REAL ROUND. The
-    # write-capable `ClaudeCliRunner` that `implement_executor
-    # .implement_agent_runner` makes per task names no log directory, so this
-    # process-wide default is what it uses. The read-only audit runners are not
-    # supervised and therefore do not pick it up — `audit.agents
-    # .INHERIT_ACTION_LOG_DIR` says why a buffered run must not be handed a file
-    # that reads like a live stream. See `AuditConfig.action_log`.
-    #
-    # SET UNCONDITIONALLY, in both directions. Arming only when the flag is on
-    # would leave a process that had loaded a `true` config earlier logging
-    # after it loaded a `false` one, which is a flag that cannot be turned off
-    # — the failure a default-off setting exists to avoid.
-    #
-    # LAST, after every check above and after the config object exists: a
-    # config that is REFUSED must arm nothing, and each `raise ConfigError`
-    # above returns before reaching this line.
-    set_default_action_log_dir(config.action_log_dir if config.audit.action_log else None)
+    # NO SIDE EFFECT HERE, deliberately, and `[audit] action_log` is the setting
+    # that most invites one. Loading a config file changes nothing outside the
+    # object it returns: `cli._build_executor` reads `audit.action_log` and
+    # `action_log_dir` off this object and passes the answer to the runner
+    # construction sites explicitly. See `AuditConfig.action_log`.
     return config

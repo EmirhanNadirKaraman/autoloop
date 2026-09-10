@@ -418,12 +418,13 @@ test_selection = "reachable"
 # a buffer nobody can see; with this on, the same output is ALSO appended to a
 # file as it is produced.
 #
-# IT REACHES A REAL ROUND (stream-01b, 2026-09-10): loading this file arms
-# autoloop/audit/agents.py's process-wide default with <state_dir>/action-logs
-# when this is true and clears it when it is false, and the write-capable agent
-# runner a task's round runs picks that default up. So `true` here means the
-# NEXT round writes a log while it works, and `false` means the loop behaves
-# exactly as it did before this key existed.
+# IT REACHES A REAL ROUND (stream-01b, 2026-09-10): autoloop/cli.py's
+# _build_executor reads this key when it builds the loop's executors and passes
+# <state_dir>/action-logs to the write-capable agent runner a task's round runs
+# — or passes None when this is false. So `true` here means the NEXT round
+# writes a log while it works, and `false` means the loop behaves exactly as it
+# did before this key existed. Nothing is armed process-wide: the value travels
+# as an argument, from the config object to the runner, and nowhere else.
 #
 # IT DOES NOT APPLY TO THE READ-ONLY AUDIT SUBAGENTS. Those are bounded by an
 # elapsed timeout rather than watched for progress, so their output is buffered
