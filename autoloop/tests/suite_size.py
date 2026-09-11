@@ -238,4 +238,12 @@ exists to hold still. Every document named below is named in a comment, which
 #: `__file__`, and its git comes from `gitrepo.py` with no interpreter literal
 #: anywhere in the file, so it is neither a reader nor on the opaque frontier:
 #: the docs-only 20 and the 20/24 pair both hold.
-SUITE_SIZE = 124
+#: 120 -> 121 when dash-08 added `test_action_log_panel.py` (2026-09-11), the
+#: DENOMINATOR only, for both selections: it names no change-note tracker in any
+#: evaluated string and resolves no `__file__`, so it reads no document under the
+#: conjunction; and its one spawn is `subprocess.run([node, path])` where `node`
+#: is `shutil.which("node")` — an argv the scan cannot read, but with no
+#: `python`/`python3` literal and no `sys.executable` anywhere in the file, so
+#: neither term of the opacity rule holds (its git comes from `gitrepo.py`). The
+#: docs-only 20 and the 20/24 pair hold.
+SUITE_SIZE = 125
