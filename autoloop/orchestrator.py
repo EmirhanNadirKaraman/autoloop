@@ -381,7 +381,7 @@ from .config import (
     lane_observed_checkout,
 )
 from .context import build_context, render_context
-from .context_index import ContextIndex, load_index
+from .context_index import ContextIndex, build_index
 from .context_packet import (
     CloseoutItem,
     CloseoutPlan,
@@ -391,6 +391,7 @@ from .context_packet import (
     prompt_section,
     record_round_packet,
 )
+from .context_records import repository_record_store
 # THE ROUND BOUNDARY'S DELIVERY HOP for the context packet (ctx-05). Imported BY
 # NAME, at module import, on purpose: this loop's single `TaskExecutor` is
 # `cli._DispatchingExecutor` in production — a router forwarding `execute` and
@@ -3452,16 +3453,22 @@ class Orchestrator:
         #: (`inbox.TaskInbox`). Optional: `None` (most tests) simply means
         #: nothing is drained, exactly as before this existed.
         self._task_inbox = task_inbox
-        #: Where this loop's CONTEXT RECORDS live, and what those files are
-        #: called in the repository (`context_records.ContextRecordStore`).
-        #: `None` means NO RECORD DIRECTORY IS WIRED INTO THIS LOOP — which is
-        #: every production run today, and deliberately so: ctx-03 fixed the
-        #: record shape and left the location to a later round, `cli` passes
-        #: nothing here, and `context_packet.render_context_packet` is handed the
-        #: matching `index=None` at every dispatch. The two must stay in step —
-        #: a closeout resolving records a packet never selected would be
-        #: verifying claims no round was shown. `_close_out_context` says so in
-        #: the transcript rather than skipping quietly.
+        #: An EXPLICIT context record store, overriding the one this loop would
+        #: otherwise derive (`_context_record_store`). `None` — which is every
+        #: production construction, `cli._build_orchestrator` included — does NOT
+        #: mean "no records": since ctx-16 the store is derived from
+        #: `[context] records_dir` inside the tree this loop observes, because
+        #: that is the only place it can be lane-correct (`__init__` below is
+        #: where `ObservedCheckout.for_lane` picks this lane's own clone, so a
+        #: directory a caller computed outside would name lane 0's records for
+        #: every lane).
+        #:
+        #: What it is FOR is the deployment or the test that wants a different
+        #: directory, including a loop-private writing one — the two halves stay
+        #: in step either way, because `_context_record_store` is the single
+        #: accessor the dispatch's packet and the closeout that grades it both
+        #: read. A closeout resolving records a packet never selected would be
+        #: verifying claims no round was shown.
         self._context_records = context_records
         #: monotonic timestamp of the last browser restart, for the cooldown.
         self._last_browser_restart = None
@@ -9504,23 +9511,86 @@ class Orchestrator:
         """
         return ContextPacketStore(self._config.context_packets_dir)
 
-    def _context_record_index(self) -> ContextIndex | None:
-        """The index of this loop's context records, or `None` when no record
-        store is wired into it (ctx-07).
+    def _context_record_store(self):
+        """WHERE this loop's context records live, or `None` when none are wired.
 
-        THE one place a record directory is read for a dispatch, so the packet a
-        round is given and the closeout that grades that round are looking at the
-        same directory by construction rather than by two callers agreeing.
+        THE one accessor, for the reason `_context_packets` is built per call
+        rather than held: the location is computed from a config and an observed
+        checkout that a `reset` or a lane switch can re-resolve, and a second
+        copy taken at construction is exactly the drift
+        `config.resolve_state_dir` is written against.
+
+        Since ctx-16 the ordinary answer is a `RepositoryContextRecordStore` over
+        `[context] records_dir` INSIDE THE OBSERVED CHECKOUT — the records are
+        the target repository's own files, versioned and reviewed with it — and
+        it cannot write, which is what makes a directory inside that tree safe to
+        name at all. Its `directory` is the LOCATION (what the location guard
+        resolves and the closeout transcript names); what it READS is git
+        objects at the revision a caller hands `load`, never that working tree —
+        see `_context_record_index`. An explicitly passed store still wins
+        (`__init__`), so a deployment or a test can point the loop at a
+        loop-private writing directory.
+
+        `None`, i.e. "no record store is wired into this loop", for a
+        `records_dir` turned off with `""` and for an observed checkout this
+        cannot resolve. Both are reported rather than papered over: the closeout
+        logs `no_context_record_store` and the packet says no index is wired.
+        """
+        if self._context_records is not None:
+            return self._context_records
+        try:
+            root = self._observation_git().repo_root
+            records_dir = self._config.context.records_dir
+        except (OSError, ValueError, AttributeError, GitError):
+            # FAIL CLOSED on a checkout or a config that will not answer. A store
+            # built on a root nobody could read is a directory this loop cannot
+            # vouch for, and reading records out of the wrong tree is worse than
+            # reading none and saying so. `AttributeError` covers the minimal
+            # hand-built config a test may hold: such a loop gets the reported
+            # "no record store is wired" rather than a traceback out of a
+            # dispatch.
+            return None
+        return repository_record_store(root, records_dir)
+
+    def _context_record_index(
+        self, worktree_git: GitGateway, base_sha: str
+    ) -> ContextIndex | None:
+        """The index of this loop's context records AS THEY STAND AT `base_sha`
+        in the worker `worktree_git` is rooted at, or `None` when no record
+        store is wired into it (ctx-07, ctx-16).
+
+        THE one place records are read for a dispatch, and it reads them the way
+        the closeout re-reads them (`context_packet.plan_round_closeout` makes
+        the same `store.load(worktree_git, base_sha)` call), so the packet a
+        round is given and the closeout that grades that round are looking at
+        the same bytes by construction rather than by two callers agreeing.
         `None` is not an empty index and is not rendered as one — see
         `context_packet.render_context_packet`, which reports "no index is wired"
         distinctly from "a directory somebody named and put nothing in".
 
-        Re-read per dispatch rather than cached: a record file is an ordinary
-        file in a repository somebody may have just merged, and a cached index
-        would hand a round a selection the tree no longer holds.
+        WHY THE WORKER AND THE BASE, and not the observed checkout's directory:
+        the packet says `task_base_sha: <base_sha>` and every other line of it
+        is read from the worker at that commit (`context_packet`'s discipline),
+        so the record bytes have to come from there too. The observed working
+        tree is whatever its branch is at NOW — later than the base whenever
+        the branch advanced after the task was cut, which a resumed round on a
+        reused worker does by design (`_rebase_execution_if_stale`, wrk-01) and
+        an operator committing mid-dispatch does by accident — and quoting those
+        bytes under the base's sha would be provenance that lies. The
+        repository-backed store therefore reads git objects at `base_sha`,
+        which are immutable, and only a loop-private store (which has no
+        revision to read) still answers off its directory. Neither reads the
+        observed checkout's working tree.
+
+        Re-read per dispatch rather than cached, still: a revise round after a
+        base move must get the records at the NEW base, and `base_sha` is read
+        off the execution record at the moment this runs.
         """
-        store = self._context_records
-        return load_index(store.directory) if store is not None else None
+        store = self._context_record_store()
+        if store is None:
+            return None
+        loaded, problems = store.load(worktree_git, base_sha)
+        return build_index(loaded, problems)
 
     def _context_packet_text(self, execution: TaskExecution) -> str:
         """The stored text of the context packet `execution`'s digest names, or
@@ -10890,21 +10960,33 @@ class Orchestrator:
                 execution,
                 worktree_git,
                 self._context_packets(),
-                # The index this loop's record store holds, or `None` when no
-                # store is wired — which is every production run today, because
-                # ctx-03 fixed the record SHAPE and deliberately not its
-                # location and `cli` names no directory. The packet then SAYS so
-                # and reports every cited id as unresolved rather than resolving
-                # it to silence (`context_packet.render_context_packet`).
+                # The index this loop's record store holds AT THIS ROUND'S BASE,
+                # read out of the worker's object database, or `None` when no
+                # store is wired — since ctx-16 that is the deployment which
+                # turned records off with `[context] records_dir = ""`, not the
+                # ordinary run, which reads the target repository's own
+                # `docs/context` as it stands at `task_base_sha`. The packet
+                # SAYS which of the two it got, and reports every cited id as
+                # unresolved rather than resolving it to silence
+                # (`context_packet.render_context_packet`).
+                #
+                # The base and the worker are the ones every other line of the
+                # packet is read from, so the record bytes and the provenance
+                # line above them name one commit. The observed checkout's
+                # working tree is deliberately NOT what is read: it is a later
+                # commit than the base on any round whose base stayed put while
+                # the branch moved, and quoting it under the base's sha is the
+                # drift `_context_record_index` is written against.
                 #
                 # ONE accessor for both halves, deliberately: the closeout at
-                # completion re-resolves this same selection and confirms it
+                # completion re-resolves this same selection, through the same
+                # `store.load(worktree_git, task_base_sha)`, and confirms it
                 # against the packet these bytes went into
                 # (`context_packet.selection_was_shown`). Two sources of "which
                 # records exist" would disagree on the first round that had any,
                 # and the closeout would then refuse every task forever while
                 # looking configured.
-                self._context_record_index(),
+                self._context_record_index(worktree_git, execution.task_base_sha),
                 max_records=self._config.context.max_records,
             )
             self._log(
@@ -15329,25 +15411,31 @@ class Orchestrator:
         never fires is the failure this whole roadmap item is about.
         """
         try:
-            store = self._context_records
+            store = self._context_record_store()
             if store is None:
-                # The ordinary production answer today. Logged rather than
-                # returned silently: "no record directory is wired into this
-                # loop" and "the closeout stopped working" must not look alike.
+                # Since ctx-16 this is the DELIBERATELY-OFF deployment
+                # (`[context] records_dir = ""`) or an observed checkout that
+                # would not answer — not the ordinary run, which derives a
+                # repository-backed store. Logged rather than returned silently:
+                # "no record directory is wired into this loop" and "the closeout
+                # stopped working" must not look alike.
                 self._log(
                     "context_closeout_skipped",
                     data={"task_id": task_id, "reason": "no_context_record_store"},
                 )
                 return
-            if self._store_is_inside_the_observed_checkout(store):
+            if self._store_would_write_inside_the_observed_checkout(store):
                 # NOTHING IS WRITTEN INSIDE THE CHECKOUT — port-01's rule, and
                 # the same one `context_packet`'s module docstring states for the
                 # packet store. A record file written into the observed tree is
                 # an uncommitted file the loop cannot commit, and the NEXT
                 # write-capable dispatch refuses to start against a dirty
                 # observed checkout (`primary_checkout_dirty`, loop-fatal). So a
-                # store wired there is refused here, loudly, instead of being
-                # honoured once and parking the whole loop afterwards.
+                # WRITING store wired there is refused here, loudly, instead of
+                # being honoured once and parking the whole loop afterwards. The
+                # repository-backed store ctx-16 wires reads that same tree and
+                # is not refused, because it writes nothing into it — see
+                # `_store_would_write_inside_the_observed_checkout`.
                 self._log(
                     "context_closeout_refused",
                     data={
@@ -15395,9 +15483,33 @@ class Orchestrator:
                     data={"task_id": task_id, "reason": refusal},
                 )
                 return
+            writes_directly = self._store_writes_directly(store)
             written: list[str] = []
             unwritten: list[CloseoutItem] = []
+            notes = list(plan.notes)
             for update in plan.updates:
+                if not writes_directly:
+                    # DESIGN A (ctx-16): this record is a file of the target
+                    # repository, so the update travels through review like every
+                    # other change to that repository — it JOINS the follow-up
+                    # whose `approved_paths` are exactly these record files. A
+                    # DEFERRAL IS NOT A FAILED WRITE and does not borrow that
+                    # wording: one says the loop declined to author a repository
+                    # file, the other says a write it was authorized to make did
+                    # not happen, and a reader repairing the second when it is the
+                    # first repairs nothing.
+                    unwritten.append(
+                        CloseoutItem(
+                            update.record.id,
+                            update.repo_path,
+                            f"{update.reason} — the record file "
+                            f"{update.repo_path or '(unnameable in this store)'} "
+                            "is versioned and reviewed with the repository, so "
+                            "the closeout does not write it; a round a reviewer "
+                            "approves does",
+                        )
+                    )
+                    continue
                 if store.write(update.record, update.filename) is None:
                     # A write that failed is still a record needing attention,
                     # so it JOINS the follow-up rather than becoming a line
@@ -15413,6 +15525,17 @@ class Orchestrator:
                     )
                     continue
                 written.append(update.repo_path or update.filename)
+            if plan.updates and not writes_directly:
+                # `updated: []` now has three readings — nothing was touched,
+                # everything was deferred, a write failed — and `needs_attention`
+                # alone separates only the first. Said in words so the transcript
+                # does not need the reader to know which store is wired.
+                notes.append(
+                    f"{len(plan.updates)} record(s) this round verified were left "
+                    "to the follow-up rather than written: context records live in "
+                    "the target repository, where this loop reads them and a "
+                    "reviewed round writes them"
+                )
             items = tuple(plan.follow_up) + tuple(unwritten)
             filed, skipped = self._file_context_follow_up(
                 task, items, execution.published_sha
@@ -15426,7 +15549,15 @@ class Orchestrator:
                     "needs_attention": [item.record_id for item in items],
                     "follow_up_task": filed,
                     "follow_up_skipped": skipped,
-                    "notes": list(plan.notes),
+                    "notes": notes,
+                    # WHICH store answered, so a transcript can be read without
+                    # the config beside it: `records` is the store's directory
+                    # (its LOCATION — the repository-backed store reads that
+                    # directory out of git at `task_base_sha`, never off disk,
+                    # see `_context_record_index`) and `writes_directly` says
+                    # whether `updated` could ever have been non-empty.
+                    "records": str(store.directory),
+                    "writes_directly": writes_directly,
                 },
             )
         except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
@@ -15435,16 +15566,41 @@ class Orchestrator:
                 data={"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"},
             )
 
-    def _store_is_inside_the_observed_checkout(self, store) -> bool:
+    def _store_writes_directly(self, store) -> bool:
+        """Does `store` put record bytes on disk when the closeout asks it to?
+
+        ONE accessor for the question, read by the location guard below and by
+        the update loop above — two `getattr` calls would drift, and the first
+        round after they did would either dirty the observed checkout or defer an
+        update it could have written.
+
+        DEFAULTS TO TRUE for an object that does not answer: an unknown store is
+        treated as one that WOULD dirty a tree, so the guard below refuses it if
+        it sits inside the observed checkout. Defaulting the other way would let
+        any object without the attribute switch that guard off.
+        """
+        return bool(getattr(store, "writes_directly", True))
+
+    def _store_would_write_inside_the_observed_checkout(self, store) -> bool:
         """Would writing a record land inside the tree the loop watches?
 
-        FAIL CLOSED: a path this cannot resolve answers `True`, i.e. "do not
-        write". The cost of a wrong `True` is a closeout that reports a refusal;
-        the cost of a wrong `False` is a file in the observed checkout that the
-        next write-capable dispatch parks the whole loop over. Those are not
-        comparable, and this is the same asymmetry `_prepare_write_capable_worker`
-        applies to the dirty check it protects.
+        TWO questions, and the first one is cheap: a store that writes NOTHING
+        cannot leave an uncommitted file wherever it sits, so the repository-
+        backed store ctx-16 wires — whose directory is `[context] records_dir`
+        inside that very tree — is not refused. Reading a committed file does not
+        dirty a checkout, and nothing is excluded from the escape detector to
+        make that true: it still watches that tree completely, which is the
+        property port-01 moved `state_dir` out to get.
+
+        FAIL CLOSED on the second question: a path this cannot resolve answers
+        `True`, i.e. "do not write". The cost of a wrong `True` is a closeout that
+        reports a refusal; the cost of a wrong `False` is a file in the observed
+        checkout that the next write-capable dispatch parks the whole loop over.
+        Those are not comparable, and this is the same asymmetry
+        `_prepare_write_capable_worker` applies to the dirty check it protects.
         """
+        if not self._store_writes_directly(store):
+            return False
         try:
             observed = Path(self._observation_git().repo_root).expanduser().resolve()
             return Path(store.directory).expanduser().resolve().is_relative_to(observed)

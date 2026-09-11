@@ -2058,37 +2058,90 @@ outcome is one of four entries — including the ones where it did nothing.
 
 | Entry | What happened |
 |---|---|
-| `context_closeout` | it ran: `updated` names the record files written, `needs_attention` the records it did not write, `follow_up_task` the one task it filed (or `follow_up_skipped` saying why it filed none), `notes` every reason it did less than it might have |
-| `context_closeout_skipped` | it was not asked — no record store is wired into this loop, no execution record, or no published commit |
+| `context_closeout` | it ran: `updated` names the record files written (always empty for the repository-backed store — see below), `needs_attention` the records it did not write, `follow_up_task` the one task it filed (or `follow_up_skipped` saying why it filed none), `notes` every reason it did less than it might have, `records` the directory the index came from and `writes_directly` whether that store writes at all |
+| `context_closeout_skipped` | it was not asked — no record store is wired into this loop (`[context] records_dir = ""`), no execution record, or no published commit |
 | `context_closeout_refused` | it was asked and would not answer: the packet could not be read back, the base no longer resolves, or the selection resolved now is not the one the round's packet showed |
 | `context_closeout_error` | a bug. Logged and swallowed, like `_mark_task_completed` and `_auto_merge_after_completion` on either side of it — the push has landed, and bookkeeping never undoes durable work |
 
-**`context_closeout_skipped: no_context_record_store` is what every production
-run writes today**, and that is the honest state rather than a defect: ctx-03
-fixed the record shape and deliberately not its location, and nothing has named
-a directory since. Wiring one store (`Orchestrator(context_records=...)`) lights
-both halves at once — `_context_record_index` feeds the same directory to the
-packet a round is given and to the closeout that grades it, which is why there
-is one accessor and not two.
+### Where the records live, and who writes them
 
-Two things whoever wires that directory has to know.
+`context_closeout_skipped: no_context_record_store` used to be what every
+production run wrote — thirteen tasks of machinery with no store to point at.
+ctx-16 answered the location question, and the answer is the whole design:
 
-**It may not be inside the observed checkout**, and a store that is gets a
-`context_closeout_refused` before anything is written. This is port-01's rule —
-the same one the packet store follows — arriving at a new writer: a record file
-written into the observed tree is an uncommitted file the loop cannot commit, and
-the next write-capable dispatch refuses to start against a dirty observed
-checkout (`primary_checkout_dirty`, loop-fatal). So the directory lives outside
-the tree and `repo_prefix` says what its files are CALLED in the repository,
-which is the only thing the scope check needs.
+**Records are files of the TARGET REPOSITORY**, at `[context] records_dir`
+(`docs/context` by default, ctx-02's own spelling). They are versioned,
+reviewed and travel with the commit they describe, which is most of their value:
+knowledge about a project kept beside this loop's `state_dir` would be
+unversioned, unreviewed, and would vanish the moment the loop were pointed at a
+different checkout. `orchestrator._context_record_store` derives the store from
+that key and the tree this lane observes — one accessor, so the packet a round is
+given and the closeout that grades it read the same store by construction
+rather than by two callers agreeing.
 
-The limit those two together leave, stated rather than left to be found: the
-follow-up's `approved_paths` names a REPOSITORY path (`docs/context/x.json`)
-while the directory the loop reads and writes is outside the tree. This round
-makes the scope question askable and answers it with the shared matcher; it does
-not decide where records live, so whoever wires a directory still has to
-reconcile the two — by committing the store, or by syncing it — and that is the
-roadmap item after this one, not something this one quietly assumes.
+**And they are read OUT OF GIT AT THE ROUND'S BASE, never off the observed
+working tree.** The packet says `task_base_sha: <sha>` and the resolver grades
+every record's staleness against that commit, so the record bytes have to come
+from it too: `orchestrator._context_record_index` and
+`context_packet.plan_round_closeout` both call
+`store.load(worktree_git, task_base_sha)`, and for the repository-backed store
+that is `context_records.load_records_at` — the `*.json` blobs directly under
+`records_dir` in the tree of that commit, read through the WORKER's own gateway
+(the discipline every other line of the packet already follows). The observed
+working tree is whatever commit its branch is at *now*, which is later than the
+base whenever the branch advanced after the task was cut — a resumed round on a
+reused worker keeps its stale base by design (`_rebase_execution_if_stale`,
+wrk-01), an operator committing mid-dispatch does it by accident — and a packet
+quoting those later bytes under the base's sha would be provenance that lies.
+Git objects at a sha are immutable, so the dispatch and the closeout read the
+same bytes however far the checkout has moved in between, and the closeout's
+"the selection resolved now is not the one this round's packet showed" refusal
+can no longer be caused, for this store, by the branch moving. Handed no
+revision, the store answers one problem saying so rather than reading the tree:
+the fallback is the fail-open this paragraph exists to refuse. (A loop-private
+`ContextRecordStore` has no revision to read at and answers its directory as it
+stands, whatever sha it is handed — it is unversioned, which is the arrangement
+design A chose against, and it still may not sit inside the observed checkout
+because it writes.)
+
+**The loop READS that directory and never writes it, and a reviewed round writes
+it.** A record file written into the observed tree is an uncommitted file the
+loop cannot commit — the closeout runs *after* the push, so there is no commit
+left to put it in — and the next write-capable dispatch refuses to start against
+a dirty observed checkout (`primary_checkout_dirty`, loop-fatal). That is
+port-01's rule, and nothing is excluded from the escape detector to work around
+it: the detector still watches that tree completely, and reading a committed file
+does not dirty it. So `context_records.RepositoryContextRecordStore.write`
+refuses unconditionally, and every record the closeout would have advanced is
+named in the ONE narrow follow-up task instead, whose `approved_paths` are
+exactly those record files. Its agent writes them, a reviewer reads them, and
+they are committed like any other change.
+
+Reading a `context_closeout` entry for such a store: `updated` is always `[]`,
+`writes_directly` is `false`, `records` names the store's directory (its
+location — read at the round's `task_base_sha` out of git, as above, not off
+that path on disk), and a `notes` line says how many records were left to the
+follow-up. `updated:
+[]` on its own has three readings — nothing was touched, everything was deferred,
+a write failed — so the note is what separates them, and a deferral never borrows
+the "the write failed" wording a real failed write carries.
+
+**A WRITING store may still not be inside the observed checkout**, and one that
+is gets a `context_closeout_refused` before anything is written
+(`_store_would_write_inside_the_observed_checkout`). That is the same rule as
+above, asked of the store that *can* write: `ContextRecordStore` is the
+loop-private general case, it sits outside the tree, and its `repo_prefix` says
+what its files are CALLED in the repository so the scope check has a path to
+match.
+
+**A repository that has written no records reads as EMPTY, not as unwired.**
+`docs/context/` does not exist in most checkouts, including this one; the packet
+then says `0 indexed, 0 duplicated id(s), 1 unreadable` and names the directory
+that is missing, and the closeout still runs and reports that it found nothing.
+"There is no record mechanism" and "this repository has written no records" are
+different repairs and must not look alike. `[context] records_dir = ""` is the
+supported way to get the first one back, and only then does
+`no_context_record_store` appear.
 
 **A push an earlier process never finished gets no closeout.** The one call site
 is `_dispatch_task_push`; the stale-record reconciliation that completes such a

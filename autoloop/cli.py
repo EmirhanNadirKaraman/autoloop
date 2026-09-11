@@ -500,18 +500,21 @@ def _recorded_out_of_scope_paths(execution_store: TaskExecutionStore):
 #: What the CONTEXT RECORD tier gets to say in this deployment, because it has
 #: no producer to say anything else (ctx-06).
 #:
-#: `context_packet.render_context_packet` says the same of the packet it renders,
-#: and `docs/SCHEMA.md` records why: ctx-03 fixed the record SHAPE and
-#: deliberately not its location, so nothing in this loop names a directory to
-#: read records from. Said OUT LOUD, into the audit report, rather than left as
-#: an empty tier — a generator that compared nothing and a generator that
-#: compared a tier which agreed must not look alike to a reviewer. This is the
-#: same "nothing was read is not nothing was found" distinction `repo_evidence`
-#: draws, one tier up.
+#: STILL TRUE AFTER ctx-16, and narrowed to say why. That round wired a record
+#: store into the DISPATCH and the CLOSEOUT — `orchestrator._context_record_store`
+#: over `[context] records_dir` — and did not reach the audit's task generator,
+#: which takes its inputs from `_planning_sources` below and is handed no index
+#: there. So an index now exists in the loop and this tier is still not fed one:
+#: those are different sentences and the note says the second. Said OUT LOUD,
+#: into the audit report, rather than left as an empty tier — a generator that
+#: compared nothing and a generator that compared a tier which agreed must not
+#: look alike to a reviewer. This is the same "nothing was read is not nothing
+#: was found" distinction `repo_evidence` draws, one tier up.
 CONTEXT_TIER_UNWIRED_NOTE = (
-    "the CONTEXT RECORD tier was not compared: no context record index is wired "
-    "into this loop (ctx-03 fixed the record shape and not its location), so "
-    "whether a record disagrees with this audit is UNKNOWN, not absent."
+    "the CONTEXT RECORD tier was not compared: the audit's task generator is fed "
+    "no context record index (ctx-16 wired one for a round's packet and its "
+    "closeout, and not for this tier), so whether a record disagrees with this "
+    "audit is UNKNOWN, not absent."
 )
 
 
@@ -4813,11 +4816,14 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
     stores the text beside it. That digest is the anchor this command reports
     against: the answer is the stored packet that hashes to it, or a re-render
     that reproduces it, and `context_packet.provenance_verdict` says which was
-    available. It is NOT "whatever a fresh resolution produces now" — the record
-    directory can change between the dispatch and the question, and a loop
-    embedded with its own record store (`Orchestrator(context_records=...)`,
-    which no config names and this command therefore cannot see) resolved against
-    a directory this process cannot read.
+    available. It is NOT "whatever a fresh resolution produces now" — a
+    loop-private record directory can change between the dispatch and the
+    question, and a loop embedded with its own store
+    (`Orchestrator(context_records=...)`, which no config names) resolved against
+    a directory this process cannot read at all. (The repository-backed store
+    ctx-16 wires reads git objects at the round's own base, which do not change;
+    this command still re-renders with no index, because config alone cannot
+    tell it WHICH store the loop dispatched with — see the comment below.)
 
     **IT CALLS THE RESOLVER; IT DOES NOT REIMPLEMENT ONE.** The re-resolution it
     prints beside the recorded packet comes out of
@@ -4900,14 +4906,22 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
                 task,
                 execution,
                 GitGateway(Path(worker), PolicyEngine(config.policy)),
-                # NO RECORD INDEX IS WIRED INTO THIS COMMAND, and none can be:
-                # no config names a record directory, so there is nothing here to
-                # read. That is exactly why this re-render is a COMPARISON and the
-                # recorded packet is the answer — a loop embedded with
-                # `Orchestrator(context_records=...)` dispatched against a
-                # directory this process cannot see, and presenting a `None`-index
-                # re-resolution as that round's selection would be the
-                # disagreement this command must not be able to produce.
+                # NO RECORD INDEX IS WIRED INTO THIS COMMAND, deliberately, and
+                # ctx-16 naming `[context] records_dir` does not change that.
+                # The loop reads the repository's records out of git at the
+                # round's own base (`orchestrator._context_record_index`), so
+                # those bytes have NOT moved on — but this command cannot tell
+                # from config alone whether the loop dispatched with that store
+                # or with an explicit loop-private one it cannot read
+                # (`Orchestrator(context_records=...)`), and guessing the
+                # repository store would present a re-resolution the round may
+                # never have had under the heading of what it actually got. That
+                # is exactly why this re-render is a COMPARISON and the RECORDED
+                # PACKET is the answer; presenting any re-resolution as that
+                # round's selection would be the disagreement this command must
+                # not be able to produce. Which index the loop dispatched with is
+                # therefore a labelled limit of the comparison, printed with it,
+                # and never a silent substitution.
                 None,
                 max_records=config.context.max_records,
             )

@@ -222,4 +222,13 @@ exists to hold still. Every document named below is named in a comment, which
 # Append below this line. One line per test file added, saying what the new file
 # does to BOTH selections — the docs-only 20 in `test_prose_doc_selection.py`
 # and the 20/24 pair in `test_test_selection.py` — and then bump the counter.
-SUITE_SIZE = 122
+#: 122 -> 123 when ctx-16 added `test_config_context_records.py` (2026-09-11),
+#: the DENOMINATOR only. It DOES resolve its own `__file__` — it loads
+#: `autoloop/config.example.toml`, exactly as `test_config_concurrency.py` and
+#: `test_context_resolver.py` do — but the reader rule is a CONJUNCTION over
+#: change-note trackers, and the only documents it spells are that example file
+#: and the repository-relative `docs/context` a record store points at, neither
+#: of which is one. It spawns nothing at all (no repository, no subprocess, no
+#: interpreter literal), so it is not on the opaque frontier either: the
+#: docs-only 20 and the 20/24 pair both hold.
+SUITE_SIZE = 123

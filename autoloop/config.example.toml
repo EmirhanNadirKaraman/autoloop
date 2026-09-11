@@ -916,6 +916,43 @@ lanes = 1
 rate_limit_release_jitter_seconds = 5.0
 
 [context]
+# WHERE CONTEXT RECORDS LIVE — a directory OF THE REPOSITORY THIS LOOP WORKS ON,
+# repository-relative, spelled as git spells it (ctx-16).
+#
+# The records are versioned and reviewed like every other file in that
+# repository, and they travel with the commit they describe. That is the whole
+# reason this is not a filesystem path: knowledge kept beside the loop's state
+# directory would be unversioned, unreviewed, and would vanish the moment the
+# loop were pointed at a different checkout.
+#
+# THE LOOP READS THIS DIRECTORY AND NEVER WRITES IT. It is inside the observed
+# checkout, which nothing this loop writes may touch — a file written there is
+# one the loop cannot commit, and the next write-capable dispatch refuses to
+# start against the dirty tree. So a completed round that leaves a record needing
+# an update NAMES it in one narrow follow-up task whose approved paths are
+# exactly those record files, and the agent of that round writes them under
+# review. `context_closeout` in the transcript is where you read which happened.
+#
+# AND IT READS IT OUT OF GIT, AT THE ROUND'S OWN BASE COMMIT — not off the
+# working tree. A round's context packet names `task_base_sha` as the commit it
+# was rendered from, so the record bytes in it are the `*.json` files directly
+# under this directory in THAT commit's tree, read from the task's worker
+# repository. The observed working tree can be a later commit than the base
+# (a resumed round keeps its base while the branch moves on), and quoting its
+# bytes under the base's sha would be provenance that lies. The closeout at
+# completion re-reads the same commit, so the two cannot disagree because the
+# branch moved in between.
+#
+# A directory that does not exist yet is not an error: every packet then says so
+# and reports each cited record id as unresolved, which is how a repository that
+# has written no records reads.
+#
+# "" wires no record store at all — the pre-ctx-16 behaviour, where the closeout
+# logs `context_closeout_skipped: no_context_record_store` for every task. Any
+# other unusable value (an absolute path, a `..` segment, a backslash) is REFUSED
+# at load rather than read as "": a typo must not look like a decision.
+records_dir = "docs/context"
+
 # The most context records ONE selection may return (ctx-03).
 #
 # A selection starts from the record ids a task names explicitly and expands

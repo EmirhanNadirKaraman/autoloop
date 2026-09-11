@@ -369,11 +369,32 @@ packet alike; see `docs/SECURITY.md` S33 for the two controls.
 
 ## Context record
 
-One JSON object per file, `*.json`, in a directory the CALLER names — ctx-03
-fixes the SHAPE and deliberately not the location: `context_resolver.
-resolve_context` is pure given its inputs the way `context.build_context` is,
-and wiring a directory (and `Task.context_ids`) into the loop is ctx-04's.
-Read by `context_records.load_records`, indexed by `context_index.load_index`.
+One JSON object per file, `*.json`. ctx-03 fixed the SHAPE and left the location
+open; ctx-16 answered it: the files live IN THE TARGET REPOSITORY at
+`[context] records_dir` (`docs/context` by default), where they are versioned and
+reviewed with the repository they describe. `context_resolver.resolve_context`
+stays pure given its inputs the way `context.build_context` is — the config key
+is repository-relative and only says which directory of the target repository
+`context_records.repository_record_store` turns into an index.
+READ OUT OF GIT AT THE ROUND'S BASE: the store's `load(worktree_git,
+task_base_sha)` is `context_records.load_records_at`, which lists the `*.json`
+blobs directly under that directory in the tree of `task_base_sha` and reads
+them through the worker's own gateway — never the observed checkout's working
+tree, which is a later commit than the base on any round whose base stayed put
+while the branch moved. So the bytes a packet quotes are the bytes of the commit
+its `task_base_sha` line names, and the closeout re-reads the same immutable
+objects. A loop-private `ContextRecordStore` is read off its own directory
+(`context_records.load_records`, `context_index.load_index`) — it has no
+revision to read at.
+
+THE LOOP READS THEM AND NEVER WRITES THEM. `RepositoryContextRecordStore.write`
+refuses unconditionally: the directory is inside the observed checkout, the
+closeout runs after the push has landed, and a file left there is one the loop
+cannot commit and the next write-capable dispatch refuses to start against. A
+record the closeout would have advanced is named in the narrow follow-up task
+instead, whose `approved_paths` are exactly those record files, and the agent of
+that reviewed round writes them. The loop-private `ContextRecordStore` still
+writes, and still may not sit inside that tree.
 
 `id` (required, unique across the directory, compared verbatim — a padded value
 is refused rather than stripped), `kind` (required; `decision` | `feature` |

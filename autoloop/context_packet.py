@@ -77,8 +77,9 @@ foreign string is collapsed to one line (`_one_line`), the number of records is
 bounded by `[context] max_records` (25 by default, and the resolver reports
 every record that budget drops), and the rest is a fixed set of headings. What
 is NOT bounded is the number of source paths ONE record declares. That is
-operator-authored data, no record directory is wired yet, and nothing has ever
-measured a packet — so this deliberately ships with no truncation at all:
+operator-authored data, the record directory ctx-16 wired starts empty in every
+repository that has not written one, and nothing has ever measured a packet — so
+this deliberately ships with no truncation at all:
 `packet.ASSUMPTIONS_MAX_CHARS` is the shape a bound would take, and it exists
 because a real 40,056-character send failed, which is the standard a second one
 should meet. A bound must be applied HERE if it is applied at all, so the worker
@@ -110,7 +111,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .context_index import ContextIndex, build_index
-from .context_records import ContextRecord, ContextRecordStore, load_records
+from .context_records import ContextRecord, ContextRecordStore
 from .context_resolver import (
     BUDGET_DROPPED,
     CONTRADICTION,
@@ -458,13 +459,14 @@ def render_packet_with_resolution(
     recorded: one function called at two times is still two invocations, and only
     the digest can say they produced the same bytes.
 
-    `index=None` means NO RECORD INDEX IS WIRED INTO THIS LOOP YET — ctx-03
-    fixed the record SHAPE and deliberately not its location, and nothing has
-    named a directory since. It is rendered as an EMPTY index and SAID SO on the
-    `context_records:` line, so every id the task cites is reported as an
-    unresolved question rather than quietly resolving to nothing. That is one
-    argument away from live: a later round that decides where records live
-    passes an index here and changes nothing else.
+    `index=None` means NO RECORD INDEX IS WIRED INTO THIS LOOP — since ctx-16
+    named `[context] records_dir` that is a deployment which turned records off
+    with `""`, or a caller with no repository to read them from
+    (`cli`'s `context explain`), rather than the ordinary run. It is rendered as
+    an EMPTY index and SAID SO on the `context_records:` line, so every id the
+    task cites is reported as an unresolved question rather than quietly
+    resolving to nothing — and a deployment with an empty record DIRECTORY still
+    reads differently from one with no record mechanism at all.
 
     Never raises for a repository that cannot answer. A base that does not
     resolve, a tree that cannot be listed, a record whose commit is gone — each
@@ -1549,11 +1551,14 @@ def selection_was_shown(
 
     The check that makes the claim's first clause a comparison rather than an
     assertion. A closeout re-resolves the round's seeds against the round's own
-    base, which is deterministic given the same index — but the index is a
-    DIRECTORY, and a directory can have changed since the round was dispatched.
-    Rendering the same block and finding it inside the stored packet proves the
-    two selections are identical, count and all, without parsing anything out of
-    the packet.
+    base, which is deterministic given the same index — but a loop-private
+    store's index is a DIRECTORY, and a directory can have changed since the
+    round was dispatched. (The repository-backed store reads git objects at the
+    base, which cannot change; the comparison is kept for it anyway, because a
+    check that is skipped for the store it should never fail on is a check that
+    is one refactor away from being skipped for the other.) Rendering the same
+    block and finding it inside the stored packet proves the two selections are
+    identical, count and all, without parsing anything out of the packet.
 
     Deliberately a containment test on loop-rendered bytes and NOT a parse: the
     packet holds record titles, invariants and paths written outside this
@@ -1976,6 +1981,16 @@ def plan_round_closeout(
     nothing and files nothing. A closeout that guessed at the selection would be
     writing verification commits onto records this round never saw.
 
+    THE RECORDS ARE READ THE WAY THE PACKET READ THEM — `store.load(worktree_git,
+    base_sha)`, the same call `orchestrator._context_record_index` makes at
+    dispatch. For the repository-backed store that is the worker's object
+    database at the base, which is immutable, so the confirmation below cannot
+    fail for that store because the observed branch advanced in between; it can
+    still fail for a loop-private store, whose directory is live, and for a
+    base that moved (`_rebase_execution_if_stale`), which re-renders the packet
+    anyway. Reading the store's directory here while the packet read git would
+    have refused every closeout on exactly the rounds ctx-16's fix is for.
+
     A refusal is not an exception: the caller runs on a path where a push has
     already landed (`orchestrator._dispatch_task_push`), and every failure there
     is a log rather than a park.
@@ -1989,7 +2004,7 @@ def plan_round_closeout(
             "its execution record carries, so the selection it was given cannot "
             "be confirmed"
         )
-    loaded, problems = load_records(store.directory)
+    loaded, problems = store.load(worktree_git, base_sha)
     index = build_index(loaded, problems)
     try:
         tree = worktree_git.tree_of(base_sha)
