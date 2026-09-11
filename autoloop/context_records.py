@@ -50,6 +50,24 @@ is missing the one record that contradicted it, and says nothing. Both loaders
 below hand every file's bytes to ONE parser (`_parse_record_bytes`), so a
 malformed record becomes the same problem whether it was read off a disk or out
 of a blob.
+
+**AND A RECORD IS VALIDATED, NOT MERELY PARSED (ctx-14, porting ctx-02's checks
+onto this module).** A record that parses is still prose nobody can check until
+its citations are RESOLVED: `last_verified_commit` must be an object the
+repository holds, `superseded_by` must name a record that is actually present,
+and every `related_ids` entry must name one too. Those are `verify_records`
+below, run by both loaders after parsing — so they run on the store, whatever a
+caller built on top of it — and every failure is one more `RecordProblem` for a
+record that is then NOT returned. The shape half (a kind's required fields, the
+title cap, a commit spelled as one commit) is refused at parse time in
+`record_from_mapping`, which is also what `ContextRecordStore.write` re-reads a
+record through before it touches the disk.
+
+EVERY CHECK FAILS CLOSED. A check that cannot run — no gateway to resolve a
+commit in, a gateway that raises, a gateway without the probe — reports the
+record as unverifiable rather than passing it, because "the check could not run"
+and "the check ran and passed" are the two answers this file exists to keep
+apart. The starvation cases and what each does are listed on `verify_records`.
 """
 
 from __future__ import annotations
@@ -57,9 +75,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from .errors import GitError
 
@@ -73,6 +93,68 @@ from .errors import GitError
 #: every result is returned in, so this tuple's own spelling never matters —
 #: the comparison is on the string.
 RECORD_KINDS: tuple[str, ...] = ("decision", "feature", "incident", "lesson")
+
+#: What a KIND has to carry to be checkable — ctx-02's required sections,
+#: expressed against this module's fields rather than Markdown headings. Every
+#: kind needs a `title` (the one line a reviewer reads; the packet renders
+#: `(no title)` for a record without one, which is a record nobody can review).
+#: Beyond that, each kind requires the field its own claim is MADE OF:
+#:
+#: * `feature` — a documented invariant over files (`context_packet.
+#:   VERIFIABLE_KINDS`: "records whose claim is about FILES"), so `invariant`
+#:   and `source_paths`;
+#: * `incident` — what happened to which files, so `source_paths`; an incident
+#:   need assert no invariant (`context_resolver._report_contradictions` skips a
+#:   record that asserts none, and ctx-03's own tests hold an incident that way);
+#: * `decision` — a checkable assertion, `invariant`, which is what a successor
+#:   supersedes and what two records can disagree about;
+#: * `lesson` — the title alone. `context_packet._lesson_for` writes lessons with
+#:   an empty invariant and no source paths ON PURPOSE (a lesson is not a claim
+#:   about files and must never contradict a record a person wrote), so a lesson
+#:   requiring either would refuse the only lesson this loop ever authors.
+#:
+#: A kind absent from this table is refused by `record_from_mapping` rather than
+#: waved through with no rule: the table and `RECORD_KINDS` are pinned to agree
+#: by `test_context_record_checks.py`, and a mismatch fails closed in between.
+REQUIRED_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "decision": ("title", "invariant"),
+        "feature": ("title", "invariant", "source_paths"),
+        "incident": ("title", "source_paths"),
+        "lesson": ("title",),
+    }
+)
+
+#: The longest `title` a record may carry — ctx-02's `MAX_SUMMARY_CHARS`, applied
+#: to the field that IS this module's summary. A title is rendered on one line of
+#: every packet and every resolution block; one that runs to a paragraph is a
+#: record whose claim has moved out of the fields that are checked and into prose
+#: that is not. Exactly this many characters passes; one more is refused.
+MAX_SUMMARY_CHARS = 200
+
+#: The states a record can be in, and the only two — ctx-02's `STATUSES`, cut
+#: to what this module's fields can actually distinguish. A record is
+#: `superseded` because `superseded_by` is non-empty and `active` otherwise
+#: (`ContextRecord.status`); that is DERIVED and never asserted, so a file
+#: carrying a `status` key is refused as an unknown key rather than read as a
+#: claim. ctx-02's `resolved` and `retired` are deliberately not here: nothing in
+#: this loop decides either (the closeout files a follow-up instead), and a
+#: vocabulary entry nothing reads is a claim nobody checks.
+STATUS_ACTIVE = "active"
+STATUS_SUPERSEDED = "superseded"
+STATUSES: tuple[str, ...] = (STATUS_ACTIVE, STATUS_SUPERSEDED)
+
+#: How `last_verified_commit` must be spelled when it is given at all: one full
+#: lowercase object id — 40 hex for SHA-1, 64 for a SHA-256 repository, the
+#: same pair `tasks._COMMIT_SHA_RE` accepts — the spelling git prints and the
+#: closeout writes (`published_sha`). `HEAD`, a branch name or an abbreviation
+#: would each RESOLVE — `cat-file -e` accepts any revision expression — and
+#: each names a different commit at a different time or in a different clone,
+#: so "verified against X" would be a claim that moves. Lowercase only because
+#: the closeout compares this field VERBATIM against the sha it published, and
+#: an uppercase spelling would be rewritten as if it were a different commit.
+#: Used with `fullmatch`: a `$` anchor would forgive a trailing newline.
+_FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 #: The extension `load_records` reads. One record per file, so a directory can
 #: hold notes, a README or an index without any of them being read as a record.
@@ -126,18 +208,31 @@ class ContextRecord:
     #: pulls B in when this record is selected, and does NOT pull this record
     #: in when B is.
     related_ids: tuple[str, ...] = ()
-    #: The commit `source_paths` were last checked against.
+    #: The commit `source_paths` were last checked against. Spelled as one full
+    #: object id (`_FULL_SHA`) or empty, and RESOLVED by the loader through the
+    #: worker's gateway (`verify_records`): a record naming a commit the
+    #: repository does not hold, or an object that is not a commit, is not
+    #: loaded, because that citation is exactly the prose nobody can check.
     last_verified_commit: str = ""
     #: The id of the record that replaces this one. NON-EMPTY IS THE WHOLE
     #: ASSERTION: a record is superseded because it says so, whether or not the
     #: successor can be resolved. Gating it on resolving the successor would
     #: mean a dangling id turns a retired record back into an active one, which
-    #: is exactly the "never returned as active" guarantee inverted.
+    #: is exactly the "never returned as active" guarantee inverted. The loader
+    #: goes one step further and REFUSES a record whose successor no record file
+    #: declares (`verify_records`) — refused is still not active, and the
+    #: resolver's `dangling_supersession` stays as the answer for an index built
+    #: from records that never went through a loader.
     superseded_by: str = ""
 
     @property
     def is_superseded(self) -> bool:
         return bool(self.superseded_by)
+
+    @property
+    def status(self) -> str:
+        """One of `STATUSES`, derived from `superseded_by` and nothing else."""
+        return STATUS_SUPERSEDED if self.is_superseded else STATUS_ACTIVE
 
     @property
     def order_key(self) -> tuple[str, str]:
@@ -255,6 +350,14 @@ def record_from_mapping(data: Mapping) -> ContextRecord:
     asserting nothing about no files, which is a claim that can never be found
     stale, missing or contradictory. A silently ignored key is a guard that
     switched itself off.
+
+    STRICT about SHAPE too, since ctx-14: the fields `REQUIRED_FIELDS` names for
+    the record's kind must be non-empty, `title` is capped at
+    `MAX_SUMMARY_CHARS`, and a non-empty `last_verified_commit` must be one full
+    lowercase object id (`_FULL_SHA`). Each is refused here, naming the record,
+    rather than loaded as a record that looks complete and is not. Whether that
+    commit EXISTS is not a shape question and is asked by `verify_records`,
+    which has a gateway to ask it of.
     """
     if not isinstance(data, Mapping):
         raise ContextRecordError(f"a record must be a JSON object, got {data!r}")
@@ -270,21 +373,51 @@ def record_from_mapping(data: Mapping) -> ContextRecord:
         raise ContextRecordError(
             f"kind must be one of {list(RECORD_KINDS)}, got {kind!r}"
         )
+    required = REQUIRED_FIELDS.get(kind)
+    if required is None:
+        # A kind with no required-field rule is refused, not waved through: the
+        # table and `RECORD_KINDS` are meant to agree, and the gap between them
+        # must not be a record that loads with nothing checked.
+        raise ContextRecordError(
+            f"kind {kind!r} has no required-field rule in REQUIRED_FIELDS, so "
+            "no record of that kind can be validated"
+        )
     source_paths = _require_string_tuple(data, "source_paths")
     for path in source_paths:
         _check_source_path(path)
-    return ContextRecord(
+    title = _require_clean_string(data, "title", required=False)
+    if len(title) > MAX_SUMMARY_CHARS:
+        raise ContextRecordError(
+            f"title is {len(title)} characters, over the {MAX_SUMMARY_CHARS} a "
+            "one-line summary may have — a claim that needs a paragraph belongs "
+            "in a field that is checked, not in the title"
+        )
+    commit = _require_clean_string(data, "last_verified_commit", required=False)
+    if commit and not _FULL_SHA.fullmatch(commit):
+        raise ContextRecordError(
+            f"last_verified_commit must be one full lowercase object id (40 hex, "
+            f"or 64 in a SHA-256 repository) or empty, got {commit!r} — a ref, an "
+            "abbreviation or an uppercase spelling names a different commit at a "
+            "different time or in a different clone"
+        )
+    record = ContextRecord(
         id=record_id,
         kind=kind,
-        title=_require_clean_string(data, "title", required=False),
+        title=title,
         invariant=_require_clean_string(data, "invariant", required=False),
         source_paths=source_paths,
         related_ids=_require_string_tuple(data, "related_ids"),
-        last_verified_commit=_require_clean_string(
-            data, "last_verified_commit", required=False
-        ),
+        last_verified_commit=commit,
         superseded_by=_require_clean_string(data, "superseded_by", required=False),
     )
+    missing = [field for field in required if not getattr(record, field)]
+    if missing:
+        raise ContextRecordError(
+            f"a {kind} record must carry {list(required)}, and {record_id!r} "
+            f"leaves {missing} empty — without it the record makes no claim "
+            "this kind can be checked on"
+        )
+    return record
 
 
 def record_to_mapping(record: ContextRecord) -> dict:
@@ -335,11 +468,13 @@ def superseded_record(record: ContextRecord, successor_id: str) -> ContextRecord
         that as a dangling supersession, and the record would be retired into
         itself with nothing to read instead.
 
-    Whether the successor EXISTS is deliberately not asked here: this module
-    holds no index (`context_index` does), and `ContextRecord.superseded_by`
+    Whether the successor EXISTS is deliberately not asked here: this function
+    holds one record, not the directory, and `ContextRecord.superseded_by`
     states that a dangling successor must not turn a retired record back into an
-    active one — so an unresolvable one is a finding rather than a refusal, and
-    only a caller holding an index can raise it.
+    active one. It is asked where the whole directory is in hand — the loader's
+    `verify_records`, which refuses the superseded record on the next load if
+    the caller never wrote the successor's file — and by the resolver, as a
+    finding, for an index built without a loader.
 
     NOT called by the closeout, and that is the point rather than an omission:
     `context_packet.classify_closeout` never supersedes anything, because the
@@ -514,13 +649,16 @@ class ContextRecordStore:
         DISK, because that is the only place a loop-private store's files exist.
 
         `git` and `rev` are accepted so that every caller asks every store the
-        same question (`store.load(worktree_git, task_base_sha)`), and they are
+        same question (`store.load(worktree_git, task_base_sha)`). `rev` is
         deliberately IGNORED here: this store is not versioned, so there is no
-        revision of it to read. The repository-backed subclass is the one for
-        which the two arguments decide which bytes come back, and its override
-        says so.
+        revision of it to read. `git` is NOT ignored — it is the gateway the
+        records' own commit citations are resolved through (`verify_records`),
+        and handed `None` the loader reports every record naming a commit as
+        unverifiable rather than accepting it. The repository-backed subclass is
+        the one for which the two arguments also decide which BYTES come back,
+        and its override says so.
         """
-        return load_records(self.directory)
+        return load_records(self.directory, git)
 
 
 class RepositoryContextRecordStore(ContextRecordStore):
@@ -585,6 +723,11 @@ class RepositoryContextRecordStore(ContextRecordStore):
         tree — because the working tree is the one source this class exists not
         to read, and a caller that forgot the revision would otherwise get the
         exact provenance drift back under a store that claims to have fixed it.
+
+        The same gateway then resolves every record's commit citation
+        (`verify_records`, inside `load_records_at`): the worker's object
+        database holds the history the records describe, so a commit a record
+        cites and the worker cannot find is a citation nobody can check.
         """
         if git is None or not rev:
             missing = "no revision" if git is not None else "no repository"
@@ -674,10 +817,13 @@ def clean_repo_prefix(prefix) -> str:
     return cleaned
 
 
-def load_records(directory) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
-    """Every `*.json` in `directory`, read once, in FILE NAME order — the reader
-    for a directory ON DISK, i.e. a loop-private `ContextRecordStore`.
-    `load_records_at` below is the same reader for a directory IN A COMMIT.
+def load_records(
+    directory, git=None
+) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
+    """Every `*.json` in `directory`, read once, in FILE NAME order, and then
+    VERIFIED through `git` — the reader for a directory ON DISK, i.e. a
+    loop-private `ContextRecordStore`. `load_records_at` below is the same
+    reader for a directory IN A COMMIT.
 
     Returns `(records, problems)` and never raises for a bad file: one
     unreadable record must not take the other forty with it, and it must not
@@ -690,6 +836,13 @@ def load_records(directory) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProbl
     rather than an exception: the caller is handed an empty index that reports
     why it is empty, which is strictly louder than an empty index that does
     not. Every seed then resolves to `unknown_record` on top of it.
+
+    `git` is the gateway the records' commit citations are resolved in
+    (`verify_records`); the loop hands the worker's. It DEFAULTS TO `None` so
+    the signature every caller had still works, and `None` is not "skip the
+    check": a record naming a commit is then reported as unverifiable and is not
+    returned, while records naming no commit load as before. A caller reading a
+    directory of records that cite commits has to say where those commits live.
     """
     directory = Path(directory)
     problems: list[RecordProblem] = []
@@ -711,7 +864,7 @@ def load_records(directory) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProbl
             problems.append(RecordProblem(path.name, f"unreadable: {exc}"))
             continue
         _collect(_parse_record_bytes(path.name, raw), records, problems)
-    return tuple(records), tuple(problems)
+    return _verified(records, problems, git)
 
 
 def load_records_at(
@@ -750,6 +903,12 @@ def load_records_at(
     recurse) and a loader that found records the other one would not is two
     answers to "what is in this directory". A submodule or a tree under a
     `.json` name is reported by name rather than read as bytes.
+
+    Then VERIFIED through the same `git` (`verify_records`), exactly as
+    `load_records` verifies a directory on disk: the records at `rev` cite
+    commits, successors and relations, and each citation is resolved before the
+    record is returned. A gateway that could list the tree but cannot answer
+    `object_exists` reports the citing records rather than passing them.
     """
     given = prefix
     prefix = clean_repo_prefix(prefix)
@@ -811,7 +970,174 @@ def load_records_at(
             problems.append(RecordProblem(name, f"unreadable: {_one_line(exc)}"))
             continue
         _collect(_parse_record_bytes(name, raw), records, problems)
-    return tuple(records), tuple(problems)
+    return _verified(records, problems, git)
+
+
+def _verified(
+    records: list, problems: list, git
+) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
+    """The last step of BOTH loaders: `verify_records` over what parsed, with
+    its problems joined to the parse problems and the whole list put in
+    `RecordProblem.order_key` order — so a file's problem sorts under its name
+    whether the file failed to parse or parsed and failed a check."""
+    accepted, refused = verify_records(records, git)
+    return accepted, tuple(sorted(list(problems) + list(refused), key=lambda p: p.order_key))
+
+
+#: The exceptions a gateway can raise while being asked about one object, each
+#: of which is "the check could not run" and none of which may escape a loader
+#: that promises never to raise. `GitError` is git refusing or dying, `OSError`
+#: a worker directory that vanished under `subprocess`, and `AttributeError` a
+#: gateway WITHOUT the probe — a test double, or an object that is not a
+#: `GitGateway` at all. The third is caught on purpose and named in the
+#: problem: a gateway that cannot be asked is a gateway that cannot answer, and
+#: the fail-closed direction for it is the same as for one that raises.
+_GATEWAY_FAILURES = (GitError, OSError, AttributeError)
+
+
+def verify_records(
+    loaded, git
+) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
+    """`(accepted, problems)` — the records among `loaded` whose citations all
+    RESOLVE, and one problem per citation that did not, naming the file.
+
+    THE CHECKS, each ctx-02's, each expressed over this module's fields:
+
+    * `last_verified_commit`, when non-empty, is an object `git` holds
+      (`object_exists`) and one `cat-file commit` reads — a commit, or a tag
+      over one (`read_commit`). Asked ONCE per distinct commit
+      (`_verify_commits`), so forty records verified at one commit cost one
+      pair of probes;
+    * `superseded_by`, when non-empty, names a record some file in THIS load
+      parsed as, and not the record itself;
+    * every `related_ids` entry names a record some file in this load parsed as.
+
+    Citations are checked against the PARSED set, not the accepted one, and
+    that is deliberate: a record refused for its own commit does not make every
+    record that relates to it unreadable in turn. One bad citation refuses one
+    record and is reported once, at its source; the resolver still reports the
+    edge INTO a refused record as `unknown_record` when it follows it.
+
+    A record that fails any check is NOT among `accepted`. That is what makes
+    the problem honest — the resolver renders every index problem as a record
+    that "is in no index and can be selected by nothing", and a problem for a
+    record that was indexed anyway would be a sentence the reader cannot act on.
+
+    ONE EXCEPTION, for the reason `context_index` gives: every copy of an id
+    that MORE THAN ONE file declares is passed through to `accepted` whatever
+    its checks said, with its problems reported as well. Dropping only the copy
+    that failed would leave the other as the sole record under that id — a
+    duplicate resolved by which file happened to verify, which is exactly the
+    "one of them wins" the index refuses to let happen. Passed through, both
+    reach `build_index`, which indexes the id under neither and names both
+    files; such a copy is in no index either way, so its problem line still
+    reads true.
+
+    WHAT STARVES EACH CHECK, AND WHAT IT DOES — none of these passes:
+
+    * `git is None` — every record naming a commit is reported as unverifiable
+      ("no repository was given") and refused; records naming no commit are
+      unaffected, because they cite nothing;
+    * `git.object_exists` raises (`_GATEWAY_FAILURES`) — the same, with the
+      error on the problem, per distinct commit; a gateway that answers for one
+      commit and dies on another refuses only the records at the second;
+    * `git.object_exists` answers `False` — "does not exist", refused;
+    * the object exists but `git.read_commit` raises — a blob or a tree id
+      where a commit belongs; "not a commit", refused;
+    * the successor / relation checks need no gateway and cannot be starved of
+      one; what they can lack is the successor's FILE, and a successor whose
+      file did not parse counts as absent (its own problem says why).
+
+    Never raises. A loader above this promises the same, and keeps it here.
+    """
+    loaded = tuple(loaded)
+    copies: dict[str, int] = {}
+    for entry in loaded:
+        copies[entry.record.id] = copies.get(entry.record.id, 0) + 1
+    declared = set(copies)
+    verdicts = _verify_commits(loaded, git)
+    accepted: list[LoadedRecord] = []
+    problems: list[RecordProblem] = []
+    for entry in loaded:
+        record = entry.record
+        found: list[str] = []
+        if record.last_verified_commit:
+            reason = verdicts.get(record.last_verified_commit, "")
+            if reason:
+                found.append(
+                    f"last_verified_commit {record.last_verified_commit} {reason} "
+                    "— a citation that cannot be resolved is refused, not accepted"
+                )
+        successor = record.superseded_by
+        if successor:
+            if successor == record.id:
+                found.append(
+                    f"superseded_by names the record itself ({record.id!r}), which "
+                    "retires it into nothing anybody can read instead"
+                )
+            elif successor not in declared:
+                found.append(
+                    f"superseded_by names {successor!r}, and no record file in this "
+                    "load declares that id — a supersession nobody can follow"
+                )
+        for related in record.related_ids:
+            if related not in declared:
+                found.append(
+                    f"related_ids names {related!r}, and no record file in this "
+                    "load declares that id — a relation the resolver could never "
+                    "follow"
+                )
+        if found:
+            problems.extend(RecordProblem(entry.source, message) for message in found)
+            if copies[record.id] == 1:
+                continue
+            # A copy of a duplicated id falls through: see the docstring. The
+            # index refuses the id under every file, so nothing wins here.
+        accepted.append(entry)
+    return tuple(accepted), tuple(problems)
+
+
+def _verify_commits(loaded, git) -> dict[str, str]:
+    """`{commit: reason}` for every DISTINCT non-empty `last_verified_commit`
+    among `loaded` that does not resolve in `git`; a resolving commit has no
+    entry. `git is None` is a reason for all of them, and no probe is made."""
+    commits = sorted({e.record.last_verified_commit for e in loaded if e.record.last_verified_commit})
+    verdicts: dict[str, str] = {}
+    if not commits:
+        return verdicts
+    if git is None:
+        for commit in commits:
+            verdicts[commit] = (
+                "could not be verified: no repository was given to resolve it in"
+            )
+        return verdicts
+    for commit in commits:
+        try:
+            exists = git.object_exists(commit)
+        except _GATEWAY_FAILURES as exc:
+            verdicts[commit] = (
+                f"could not be verified: the repository gateway did not answer "
+                f"({type(exc).__name__}: {_one_line(exc)})"
+            )
+            continue
+        if exists is not True:
+            # `False` is git's own "not here"; anything else is an object that is
+            # not a gateway answering the question asked, which is a starved
+            # check and reads the same way.
+            verdicts[commit] = (
+                "does not exist in the repository it was resolved in"
+                if exists is False
+                else f"could not be verified: the gateway answered {exists!r} instead of True/False"
+            )
+            continue
+        try:
+            # `cat-file commit`: dies for a blob or a tree id written where a
+            # commit belongs, and dereferences a tag to the commit under it —
+            # which is exactly the set of ids the resolver can take a tree of.
+            git.read_commit(commit)
+        except _GATEWAY_FAILURES as exc:
+            verdicts[commit] = f"exists but is not a commit ({_one_line(exc)})"
+    return verdicts
 
 
 def _parse_record_bytes(name: str, raw: bytes) -> LoadedRecord | RecordProblem:

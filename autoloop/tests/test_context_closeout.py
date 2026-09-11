@@ -104,11 +104,18 @@ PREFIX = "docs/context"
 
 
 def record(record_id="feat", kind="feature", **kwargs) -> ContextRecord:
+    """A record complete for every kind (`REQUIRED_FIELDS`) and VERIFIED AT NO
+    COMMIT. Since ctx-14 the loader resolves a record's `last_verified_commit`
+    through the worker's gateway and refuses one it cannot find, so a fake sha
+    here would make every record this file writes to a store unreadable on the
+    round that loads it. An empty commit cites nothing, loads, and is exactly
+    the "never verified" record the closeout advances — a test that wants a
+    commit on the record says which."""
     fields = {
         "title": "feature.py greets exactly once",
         "invariant": "feature.py greets exactly once",
         "source_paths": ("feature.py",),
-        "last_verified_commit": "a" * 40,
+        "last_verified_commit": "",
     }
     fields.update(kwargs)
     return ContextRecord(id=record_id, kind=kind, **fields)
@@ -172,11 +179,14 @@ def plan_for(
 
 def test_a_record_round_trips_through_the_mapping_it_is_written_as():
     """The write format is the read format. A field this dropped would be a
-    field an update silently deleted from every record it touched."""
+    field an update silently deleted from every record it touched.
+
+    `empty` carries the one field a lesson must (`REQUIRED_FIELDS`, ctx-14) and
+    nothing else, so every OTHER field round-trips from its empty value."""
     full = record(
         related_ids=("other",), superseded_by="successor", last_verified_commit="c" * 40
     )
-    empty = ContextRecord(id="bare", kind="lesson")
+    empty = ContextRecord(id="bare", kind="lesson", title="bare")
     for item in (full, empty):
         assert record_from_mapping(record_to_mapping(item)) == item
     # Every field is present even when empty, so a record file SAYS it names no
@@ -315,7 +325,7 @@ def test_a_touched_feature_record_in_scope_advances_to_the_published_commit(tmp_
 
 
 def test_the_record_the_plan_started_from_is_not_mutated(tmp_path):
-    original = record()
+    original = record(last_verified_commit="a" * 40)
     plan = plan_for(tmp_path, original)
 
     assert original.last_verified_commit == "a" * 40
@@ -861,7 +871,12 @@ def test_a_completed_round_in_scope_advances_the_record_to_the_published_commit(
 
     execution = execution_store.load(task.id)
     assert execution.published_sha != ""
-    stored = load_index(record_store.directory).get("feat")
+    # Read back the way the loop reads it, through a gateway that holds the
+    # published commit: the record now cites one, and the loader refuses a
+    # citation it cannot resolve (ctx-14) — a `load_index` with no gateway
+    # would report the record rather than return it.
+    stored = build_index(*record_store.load(gateway(repo_root))).get("feat")
+    assert stored is not None
     assert stored.last_verified_commit == execution.published_sha
     assert stored.invariant == record().invariant  # nothing else was rewritten
     assert inbox.pending() == []  # nothing was left over to file

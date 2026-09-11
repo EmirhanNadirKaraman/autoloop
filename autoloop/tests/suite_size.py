@@ -231,4 +231,11 @@ exists to hold still. Every document named below is named in a comment, which
 #: of which is one. It spawns nothing at all (no repository, no subprocess, no
 #: interpreter literal), so it is not on the opaque frontier either: the
 #: docs-only 20 and the 20/24 pair both hold.
-SUITE_SIZE = 123
+#: 123 -> 124 when ctx-14 added `test_context_record_checks.py` (2026-09-11),
+#: the DENOMINATOR only. It names no change-note tracker in any evaluated string
+#: — the one document-shaped string it spells is the repository-relative
+#: `docs/context` a record store points at, which is not one — resolves no
+#: `__file__`, and its git comes from `gitrepo.py` with no interpreter literal
+#: anywhere in the file, so it is neither a reader nor on the opaque frontier:
+#: the docs-only 20 and the 20/24 pair both hold.
+SUITE_SIZE = 124
