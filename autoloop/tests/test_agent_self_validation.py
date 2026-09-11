@@ -12,7 +12,11 @@ the one that proves the claim**: it drives whole `execute()` rounds in which the
 stand-in agent uses nothing but Write (to ask) and Read (to collect) — the two
 tools a real implement subagent already has — and checks what the agent got, what
 really launched, and what the round reported. Section 9 covers the states an
-agent can leave the rendezvous in.
+agent can leave the rendezvous in. Sections 10 to 12 came later and each names
+its own task at its header: the hand-back and the withhold (advis-01), the
+per-round pytest cache and `--lf` (val-08), and WHICH TESTS an advisory run
+executes, decided when the agent asks rather than when the channel is bound,
+plus what a narrowed answer still covers (val-07).
 
 No `claude` CLI and no real validation binary is ever launched: the command
 runner is a recording stub, which is also what makes "the agent supplied none
@@ -60,6 +64,8 @@ from autoloop.validation import (
     CACHE_DIR_INI,
     NOT_RUN,
     RERUN_SELECTION_FLAGS,
+    TREE_STATE_UNKNOWN,
+    TestSelection,
     run_validation_commands,
 )
 
@@ -74,6 +80,58 @@ from test_implement_executor import (
 
 RUFF = ("ruff", "check", ".")
 SUITE = ("python3", "-m", "pytest", "autoloop/tests")
+
+#: A tiny repository with an IMPORT GRAPH in it, for §12 — request-time
+#: selection reads one off the filesystem, so a fake tree would prove a fake
+#: graph. Four test files, and which two of them a change to `pkg/publisher.py`
+#: reaches is a REACHABILITY answer rather than a filename one: `test_smoke`
+#: imports it directly, `test_orchestra` gets there through `pkg/orchestrator`,
+#: and `test_lonely` and `test_unrelated` never do.
+#:
+#: Spelled here rather than imported from `test_test_selection.py`, which owns
+#: the same shape, and the reason is this repository's own selector: a test
+#: module that imports another gives every round that selects the imported file
+#: an extra selected file, and the two measured narrowing ratios in
+#: `test_prose_doc_selection.py` and `test_test_selection.py` are asserted as
+#: exact numbers. A fixture is not worth moving a number that grades the loop.
+SCAFFOLD_FILES: tuple[tuple[str, str], ...] = (
+    ("pkg/__init__.py", ""),
+    ("pkg/publisher.py", "def publish():\n    return 1\n"),
+    (
+        "pkg/orchestrator.py",
+        "from .publisher import publish\n\n\ndef run():\n    return publish()\n",
+    ),
+    ("pkg/lonely.py", "def unused():\n    return 0\n"),
+    ("suite/conftest.py", "import pytest\n"),
+    (
+        "suite/test_smoke.py",
+        "from pkg.publisher import publish\n\n\ndef test_publish():\n"
+        "    assert publish()\n",
+    ),
+    (
+        "suite/test_orchestra.py",
+        "from pkg.orchestrator import run\n\n\ndef test_run():\n    assert run()\n",
+    ),
+    (
+        "suite/test_lonely.py",
+        "from pkg.lonely import unused\n\n\ndef test_unused():\n"
+        "    assert unused() == 0\n",
+    ),
+    ("suite/test_unrelated.py", "def test_arithmetic():\n    assert 1 + 1 == 2\n"),
+)
+
+#: The configured pytest command those tests are reached through. `-n auto` and
+#: the cache policy are declared so the launched argv differs from this one only
+#: where a test below says it does.
+SCAFFOLD_SUITE = ("python3", "-m", "pytest", "suite", "-q", "-n", "auto", "-p", "no:cacheprovider")
+
+
+def scaffold_repo(root: Path, branch: str = "autoloop/val-7") -> Path:
+    """`SCAFFOLD_FILES`, committed, in a real git repository — so `git status`
+    reports only what a test goes on to change."""
+    return make_repo_from_template(
+        root, branch=branch, files=SCAFFOLD_FILES, email="t@e.c", name="T"
+    )
 
 
 # ---- reading the cache policy off an argv (val-08) --------------------------
@@ -382,12 +440,13 @@ def test_the_advisory_run_and_the_executors_own_run_launch_the_same_thing(
 
     EQUALITY here is the WIDENED case, not the general contract. This task
     declares both its own `validation` and a `validation_cwd`, either of which
-    makes `_select_validation` hand the resolved list back verbatim, so the two
-    runs launch identical argv. The general relation since val-04 (2026-08-27)
-    is ⊇ — the advisory run is never narrower than the executor's own, and is
-    strictly larger on a round that narrowed. That direction is pinned in
-    `test_test_selection.py::test_the_authoritative_run_is_never_wider_than_an_advisory_one`;
-    what is pinned HERE is that both ends read the same two functions.
+    makes `_select_validation` hand the resolved list back verbatim — at BOTH
+    ends since val-07 (2026-09-11), which put the advisory run through that same
+    method at request time — so the two runs launch identical argv. On a round
+    that does narrow they select the same tests while the tree has not moved,
+    pinned in `test_test_selection.py::test_an_advisory_run_selects_the_same_
+    tests_the_verdict_run_does`, and §12 here grades what happens when it has.
+    What is pinned HERE is that both ends read the same two functions.
 
     Since val-08 (2026-08-31) the two differ in ONE respect and the equality is
     taken modulo exactly that: the advisory run relocates pytest's cache
@@ -866,43 +925,49 @@ def test_the_tool_description_states_that_it_is_advisory_and_capped():
     assert "argument" in description
 
 
-def test_the_description_never_promises_the_verdict_run_is_always_narrowed():
-    """The claim the agent reads has to hold on EVERY round, including the ones
-    where nothing narrows (val-04 revision, 2026-08-27).
+def test_the_description_never_promises_a_containment_that_does_not_hold():
+    """The claim the agent reads has to hold on EVERY round, and TWO earlier
+    versions of this sentence did not (val-04 revision 2026-08-27; val-07
+    2026-09-11).
 
     The first draft said the executor's own run "is NARROWED to the tests your
-    changed paths reach, so it is a subset of what runs here". That is false the
-    moment `_select_validation` widens — a task-declared `validation` or
-    `validation_cwd`, `[audit] test_selection = "full"`, a module the round
-    deleted, a pytest command that cannot be retargeted, a selection of zero
-    test files, or the selector raising — and on those rounds the verdict run
-    takes the SAME resolved list this one takes. An agent told "it is a subset"
-    is being told something the round it is in may already have falsified.
+    changed paths reach, so it is a subset of what runs here", which is false
+    the moment `_select_validation` widens. Its replacement said this run takes
+    "every command this round validates with, in full" and is therefore never
+    narrower than the verdict run — true while the advisory run WAS always the
+    whole list, and false since val-07 re-resolves it from the agent's own
+    changed paths at request time. An agent told either sentence is being told
+    something the round it is in may already have falsified.
 
-    Asserted in both directions, like
-    `test_test_selection.py::test_the_pre_commit_evidence_no_longer_claims_a_
-    full_run`: the negative alone would pass if the old sentence came back in a
-    different casing, and the positive alone would pass if it came back BESIDE
-    the new one. The four properties the descriptor already carried are
-    re-asserted here too, because the easiest way to break this text is to lose
-    one of them while rewriting the sentence next to it.
+    What the text may promise now is the conditional the code enforces: while
+    the tree stands as it did when the answer was given, the verdict run selects
+    nothing this run did not run — and once it moves, nothing at all. Asserted
+    in both directions, like `test_test_selection.py::test_the_pre_commit_
+    evidence_no_longer_claims_a_full_run`: the negative alone would pass if an
+    old sentence came back in a different casing, and the positive alone would
+    pass if it came back BESIDE the new one. The four properties the descriptor
+    already carried are re-asserted here too, because the easiest way to break
+    this text is to lose one of them while rewriting the sentence next to it.
     """
     description = advisory_tool_descriptor(max_calls=2)["description"]
     lowered = description.lower()
 
-    # The relation, in the conditional form that is true on every round.
-    assert "never wider" in lowered, "the ⊇ relation is stated"
-    assert "may be narrowed" in lowered, "and stated as a possibility, not a fact"
-    # The advisory run's OWN half of the relation: it takes the list whole.
-    # Asserted on the distinguishing clause, not on "in full" — that appears
-    # twice (here and in the widened-authoritative case), so the looser needle
-    # would stay green with this half deleted.
-    assert "every command this round validates with" in lowered
+    # WHAT RUNS: selected at request time, and the fail-closed direction named
+    # beside it so the agent can tell the two answers apart.
+    assert "decided when you ask" in lowered
+    assert "the configured list runs in full instead" in lowered
+    assert "how many test files" in lowered, "the answer's own disclosure is promised"
+
+    # WHAT IT COVERS: the containment, and the condition it is under.
+    assert "snapshot" in lowered
+    assert "selects no test this run did not run" in lowered
+    assert "edit anything afterwards and it covers none of that run" in lowered
 
     # The unconditional claims, in both the shipped casing and any other.
     assert "is narrowed to the tests" not in lowered
     assert "subset of what runs here" not in lowered
-    assert "NARROWED" not in description, "no unconditional emphasis either"
+    assert "never wider" not in lowered, "the old unconditional ⊇ is gone"
+    assert "every command this round validates with" not in lowered
 
     # Still true of the same string, and still the string the brief renders.
     assert "ADVISORY" in description
@@ -2836,6 +2901,688 @@ def test_the_executor_passes_the_repo_root_so_a_declared_cwd_cannot_widen_the_ch
     assert runner.calls and runner.calls[0]["cwd"] == str(backend)
     assert ("-p", "no:cacheprovider") in pairs(runner.calls[0]["argv"])
     assert "pytest cache could not be used" in text
+
+
+# ---- 12: the advisory run is SELECTED at request time (val-07) --------------
+#
+# PLACEMENT, said out loud because it is not where a reader would look: this
+# block sits between §11c and §11d rather than at the end of the file. Section
+# 11 (val-08's per-round pytest cache) runs on either side of it, and pytest
+# does not care, but a reader does — §11d to §11f below are still §11. It was
+# written in place rather than moved because the move is 670 lines of by-hand
+# retyping in a round with no shell, and a silent transcription error in a test
+# file costs more than the wart.
+#
+# Until 2026-09-11 every advisory run took the resolved command list WHOLE:
+# 40 rounds, 95 runs, every one of them every test file in the checkout (92 of
+# 92 when that was measured on 2026-08-27; `suite_size.SUITE_SIZE` is larger
+# now), ~10 minutes a pass. The binding happens before the agent has written
+# anything, which is why — but the REQUEST does not, and by then `git status` in
+# the worker repo answers exactly the question the selector asks.
+#
+# What that trades is the containment the agent's brief leaned on. These grade
+# both halves: the narrowing really fires and really names itself, every way of
+# not knowing runs the full list instead, and a green narrowed answer is
+# reported as covering the verdict run ONLY while the tree it was made from
+# still stands. The verdict run itself must be untouched, which §12d asserts by
+# comparing a round that narrowed its advisory run against one that never asked.
+
+
+def scaffold_executor(main_repo, worker, runner, commands, **kwargs):
+    """An executor over a REAL scaffolded worker repo, with a REAL import graph.
+
+    Selection reads the graph off the filesystem, so a fake tree would prove a
+    fake graph and a fake selection — see `SCAFFOLD_FILES`.
+    """
+    return build_executor(
+        main_repo,
+        worker,
+        make_agent_runner_factory(),
+        validation=commands,
+        command_runner=runner,
+        **kwargs,
+    )
+
+
+def pytest_argvs(calls):
+    return [call["argv"] for call in calls if "pytest" in call["argv"]]
+
+
+def named_test_files(argv):
+    return sorted(token for token in argv if token.endswith(".py"))
+
+
+# ---- 12a: it narrows, and it says what it narrowed to -----------------------
+
+
+def test_an_advisory_request_after_an_edit_runs_only_that_modules_tests(
+    main_repo, tmp_path
+):
+    """THE CLAIM. The agent has edited one module; the run it asks for is that
+    module's tests, not the repository's.
+
+    The fixture's graph is the point: `suite/test_smoke.py` imports the changed
+    module directly, `suite/test_orchestra.py` reaches it through
+    `pkg/orchestrator.py`, and `suite/test_lonely.py` and
+    `suite/test_unrelated.py` reach it not at all. So 2 of 4 is a REACHABILITY
+    answer rather than a filename one, and the count is asserted because "it
+    named some files" would pass for a selection that dropped a test which
+    exercises the change.
+    """
+    worker = scaffold_repo(tmp_path / "worker")
+    (worker / "pkg" / "publisher.py").write_text("def publish():\n    return 2\n")
+    runner = RecordingRunner()
+    executor = scaffold_executor(main_repo, worker, runner, (RUFF, SCAFFOLD_SUITE))
+
+    text = executor._advisory_for(make_task(), worker_git(worker)).run()
+
+    launched = pytest_argvs(runner.calls)
+    assert len(launched) == 1
+    assert named_test_files(launched[0]) == [
+        "suite/test_orchestra.py",
+        "suite/test_smoke.py",
+    ]
+    assert "suite" not in launched[0], "the whole-tree path survived the narrowing"
+    assert RUFF in [call["argv"] for call in runner.calls], "ruff is untouched"
+
+    # And the agent is TOLD, in the answer it reads: what happened, how much of
+    # the suite it covered, and which paths the decision was made from.
+    assert "NARROWED" in text
+    assert "2 of 4 test file(s)" in text
+    assert "pkg/publisher.py" in text
+    assert "SNAPSHOT" in text
+    assert "PASSED" in text
+
+
+def test_an_advisory_request_before_any_edit_behaves_exactly_as_today(
+    main_repo, tmp_path
+):
+    """The state every round is in before the agent's first edit: nothing is
+    dirty, so there is nothing to select from and the selector says so. The
+    configured list runs WHOLE, which is what every advisory run did before
+    val-07, and the answer does not claim a narrowing it did not make."""
+    worker = scaffold_repo(tmp_path / "worker")
+    runner = RecordingRunner()
+    executor = scaffold_executor(main_repo, worker, runner, (RUFF, SCAFFOLD_SUITE))
+
+    text = executor._advisory_for(make_task(), worker_git(worker)).run()
+
+    assert [call["argv"] for call in runner.calls][0] == RUFF
+    launched = pytest_argvs(runner.calls)
+    assert len(launched) == 1
+    assert "suite" in launched[0], "the configured whole-tree path ran"
+    assert named_test_files(launched[0]) == [], "no individual file was named"
+    assert "FULL configured list" in text
+    assert "no changed paths" in text
+    assert "NARROWED" not in text
+
+
+# ---- 12b: every way of not knowing runs the FULL list, and says which -------
+
+
+def test_a_worker_that_is_not_a_git_repository_runs_the_full_list_and_says_so(
+    main_repo, tmp_path
+):
+    """FAIL CLOSED on the input the whole feature rests on. `git status` cannot
+    be read here at all, so there is no changed-path set — and a selector given
+    an empty one would narrow on a guess that happens to look like "nothing
+    changed"."""
+    not_a_repo = tmp_path / "loose"
+    not_a_repo.mkdir()
+    runner = RecordingRunner()
+    executor = scaffold_executor(main_repo, not_a_repo, runner, (RUFF, SCAFFOLD_SUITE))
+
+    text = executor._advisory_for(
+        make_task(), GitGateway(not_a_repo, PolicyEngine(PolicyConfig()))
+    ).run()
+
+    launched = pytest_argvs(runner.calls)
+    assert len(launched) == 1
+    assert "suite" in launched[0] and named_test_files(launched[0]) == []
+    assert "FULL configured list" in text
+    assert "changed paths could not be read" in text
+    assert "NARROWED" not in text
+
+
+def test_a_selector_that_raises_runs_the_full_list_and_says_so(
+    main_repo, tmp_path, monkeypatch
+):
+    """The selector itself is the second input, and it reads an import graph off
+    a filesystem that can fail in ways this cannot enumerate. `_select_validation`
+    already turns any such failure into a WIDENED result naming it — this pins
+    that the advisory path takes that answer literally rather than narrowing to
+    whatever partial selection came back."""
+    worker = scaffold_repo(tmp_path / "worker")
+    (worker / "pkg" / "publisher.py").write_text("def publish():\n    return 2\n")
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("the import graph fell over")
+
+    monkeypatch.setattr(implement_executor, "select_validation_commands", explode)
+    runner = RecordingRunner()
+    executor = scaffold_executor(main_repo, worker, runner, (RUFF, SCAFFOLD_SUITE))
+
+    text = executor._advisory_for(make_task(), worker_git(worker)).run()
+
+    launched = pytest_argvs(runner.calls)
+    assert len(launched) == 1
+    assert "suite" in launched[0] and named_test_files(launched[0]) == []
+    assert "FULL configured list" in text
+    assert "the selector itself failed" in text
+    assert "NARROWED" not in text
+
+
+def test_a_tree_whose_state_cannot_be_established_runs_the_full_list_and_says_so(
+    main_repo, tmp_path
+):
+    """The THIRD input, and the one that is this task's own: a narrowing whose
+    coverage can never afterwards be checked trades the guarantee for nothing,
+    so it is not taken.
+
+    Driven by a real shape rather than a patch: a SYMLINK in the worker tree is
+    reported by `git status -uall` as a changed path, and
+    `validation.worker_tree_state` refuses to digest one — its target may not
+    even be inside the repository. The selector would have narrowed happily.
+    """
+    worker = scaffold_repo(tmp_path / "worker")
+    (worker / "pkg" / "publisher.py").write_text("def publish():\n    return 2\n")
+    (worker / "pkg" / "linked.py").symlink_to(tmp_path / "elsewhere.py")
+    runner = RecordingRunner()
+    executor = scaffold_executor(main_repo, worker, runner, (RUFF, SCAFFOLD_SUITE))
+
+    text = executor._advisory_for(make_task(), worker_git(worker)).run()
+
+    launched = pytest_argvs(runner.calls)
+    assert len(launched) == 1
+    assert "suite" in launched[0] and named_test_files(launched[0]) == []
+    assert "FULL configured list" in text
+    assert "state could not be established" in text
+
+
+def test_a_channel_bound_without_a_resolver_runs_the_full_list(tmp_path):
+    """The constructor's own default, which is what a transport or a test that
+    builds this directly gets. Unwired means WIDE: the configured list, exactly
+    as before val-07 — never a narrowing made from a resolver that is not
+    there."""
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(RUFF, SUITE), cwd=tmp_path, command_runner=runner
+    )
+
+    text = service.run()
+
+    assert [call["argv"] for call in runner.calls][0] == RUFF
+    launched = pytest_argvs(runner.calls)[0]
+    assert "autoloop/tests" in launched and named_test_files(launched) == []
+    assert "FULL configured list" in text
+    assert "nothing to narrow from" in text
+
+
+def test_a_resolver_that_misbehaves_never_shrinks_or_breaks_the_run(tmp_path):
+    """Three ways a resolver can be wrong, and all three land on the configured
+    list rather than on a smaller run or an exception into the watcher thread.
+
+    The empty answer is the one worth the line: `run_validation_commands`
+    reports an empty list as PASSED, so a scope with no commands in it would be
+    a green answer to a run that executed nothing — the fail-open this whole
+    channel exists to refuse.
+    """
+    for resolver, needle in (
+        (lambda commands: 1 / 0, "could not be established"),
+        (lambda commands: "not a scope at all", "could not be established"),
+        (
+            lambda commands: implement_executor.AdvisoryScope(
+                commands=(), narrowed=True, tree_state="abc", detail="ignored"
+            ),
+            "no command to run",
+        ),
+    ):
+        runner = RecordingRunner()
+        service = AdvisoryValidation(
+            commands=(RUFF, SUITE),
+            cwd=tmp_path,
+            command_runner=runner,
+            scope_resolver=resolver,
+        )
+
+        text = service.run()
+
+        assert len(runner.calls) == 2, "both configured commands ran"
+        assert runner.calls[0]["argv"] == RUFF
+        launched = pytest_argvs(runner.calls)[0]
+        assert "autoloop/tests" in launched and named_test_files(launched) == []
+        assert "FULL configured list" in text
+        assert needle in text
+        assert service.last_run_ok is True
+        assert service.last_run_was_narrowed is False
+
+
+def test_a_shorter_list_is_a_narrowing_whatever_the_resolver_calls_it(tmp_path):
+    """The one fail-open available inside this seam, closed by DERIVING the
+    flag rather than believing it.
+
+    A scope that runs less than the configured list while reporting
+    `narrowed=False` would be granted UNCONDITIONAL coverage by
+    `covers_verdict` — the relation that belongs to a run which really took the
+    whole list — and the round would tell the reviewer a subset covered the
+    verdict run. `_resolve_scope` compares the list it is about to launch
+    against the one it holds, so the flag can only ever be turned ON.
+    """
+    runner = RecordingRunner()
+    service = AdvisoryValidation(
+        commands=(RUFF, SUITE),
+        cwd=tmp_path,
+        command_runner=runner,
+        scope_resolver=lambda commands: implement_executor.AdvisoryScope(
+            commands=(RUFF,),
+            narrowed=False,
+            tree_state="same-tree",
+            detail="claims to be a full run",
+        ),
+    )
+    service.expose()
+    service.run()
+    service.record_verdict_run(
+        "a-tree-that-moved",
+        TestSelection(commands=(RUFF,), widened=False, reason="", selected=("t.py",)),
+    )
+
+    assert [call["argv"] for call in runner.calls] == [RUFF], "it really ran less"
+    assert service.last_run_was_narrowed is True
+    assert service.covers_verdict() is False
+    assert "covers NOTHING" in service.note()
+
+
+def test_a_rerun_is_never_narrowed_on_top_of_lf(tmp_path):
+    """`--lf` already re-selects the last run's failures, from a cache recorded
+    against a possibly different diff. Stacking a path narrowing onto it could
+    hide the very failure the confirm step exists to re-check, and two
+    narrowings disclosed as one sentence are not disclosed at all."""
+    asked = []
+
+    def resolver(commands):
+        asked.append(commands)
+        return implement_executor.AdvisoryScope(
+            commands=(("python3", "-m", "pytest", "suite/test_smoke.py"),),
+            narrowed=True,
+            tree_state="abc",
+            detail="narrowed",
+        )
+
+    runner = CacheWritingRunner(returncodes=(1, 0))
+    service = AdvisoryValidation(
+        commands=(SUITE,), cwd=tmp_path, command_runner=runner, scope_resolver=resolver
+    )
+
+    service.run()
+    second = service.run()
+
+    assert rerun_flags(runner.calls[1]["argv"]), "the confirm step really was a rerun"
+    assert "autoloop/tests" in runner.calls[1]["argv"], "the rerun kept the whole list"
+    assert len(asked) == 1, "the rerun did not even ask for a narrowing"
+    assert "RERUN" in second and "NARROWED to your changed paths" not in second
+    assert service.last_run_was_narrowed is False
+
+
+# ---- 12c: what a narrowed run still COVERS ---------------------------------
+
+
+class EditingRendezvousRunner(RendezvousAgentRunner):
+    """`RendezvousAgentRunner`, plus edits on both sides of the ask.
+
+    The distinction this whole block turns on is WHEN an edit happens relative
+    to the request: `before` is what the advisory run selects from, and `after`
+    is what moves the tree out from under that selection. The base class already
+    writes `write_files` after asking, and is left alone — spelling both sides
+    here is what makes each test say which case it is driving.
+    """
+
+    def __init__(self, *, before=None, after=None, **kwargs):
+        super().__init__(**kwargs)
+        self.before = before or {}
+        self.after = after or {}
+
+    def _write(self, files):
+        for rel, content in files.items():
+            path = self.worker_repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    def run(self, spec):
+        self._write(self.before)
+        result = super().run(spec)
+        self._write(self.after)
+        return result
+
+
+def narrowing_round(main_repo, tmp_path, *, before, after, runner=None):
+    """One REAL round whose agent asks for validation, with edits on both sides.
+
+    Returns `(outcome, runner, worker, agent)` — the round's outcome, every
+    launch the command runner saw in order, the worker repository, and the
+    stand-in agent (whose `answers` hold the text it really read back).
+    """
+    worker = scaffold_repo(tmp_path / "worker")
+    runner = runner if runner is not None else RecordingRunner()
+    agent = {}
+
+    def factory(root):
+        agent["runner"] = EditingRendezvousRunner(
+            worker_repo=root, asks=1, before=before, after=after
+        )
+        return agent["runner"]
+
+    executor = build_executor(
+        main_repo,
+        worker,
+        factory,
+        validation=(RUFF, SCAFFOLD_SUITE),
+        command_runner=runner,
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+    return outcome, runner, worker, agent["runner"]
+
+
+def test_an_unmoved_tree_lets_the_narrowed_run_cover_the_verdict(main_repo, tmp_path):
+    """The conditional guarantee, on the side where it HOLDS.
+
+    The agent edits, asks, and edits nothing afterwards. Selection is
+    deterministic over (commands, changed paths, tree), so the verdict run is
+    handed the same three inputs and selects exactly what the advisory run
+    already executed — which is the old containment, now stated as the condition
+    it always depended on.
+    """
+    outcome, runner, _worker, agent = narrowing_round(
+        main_repo,
+        tmp_path,
+        before={"pkg/publisher.py": "def publish():\n    return 2\n"},
+        after={},
+    )
+
+    assert outcome.status == "ok"
+    assert "NARROWED" in agent.answers[0], "the advisory run really narrowed"
+    advisory, verdict = pytest_argvs(runner.calls)
+    assert named_test_files(advisory) == named_test_files(verdict)
+    assert "it covers that run" in outcome.summary
+    assert "covers NOTHING" not in outcome.summary
+
+
+def test_a_tree_that_moved_after_the_advisory_run_covers_nothing(main_repo, tmp_path):
+    """The side where it does NOT hold, and the reason this task could not just
+    narrow and say nothing.
+
+    The agent edits `pkg/publisher.py`, asks — and then edits `pkg/lonely.py`,
+    which no selected test reaches. The verdict run therefore selects a test the
+    advisory run never executed, and a summary reporting "its last run PASSED"
+    with nothing else would be a check that passed because it looked at less.
+
+    Both halves are asserted: the round says the advisory result covers nothing,
+    and the executor RAN ANYWAY — the verdict is never skipped, shortened or
+    stood in for by any advisory result, whatever its coverage.
+    """
+    outcome, runner, _worker, agent = narrowing_round(
+        main_repo,
+        tmp_path,
+        before={"pkg/publisher.py": "def publish():\n    return 2\n"},
+        after={"pkg/lonely.py": "def unused():\n    return 9\n"},
+    )
+
+    assert outcome.status == "ok"
+    assert "NARROWED" in agent.answers[0]
+    advisory, verdict = pytest_argvs(runner.calls)
+    assert "suite/test_lonely.py" not in advisory, "the advisory run predates that edit"
+    assert "suite/test_lonely.py" in verdict, "the verdict run selected from the wider diff"
+    assert "covers NOTHING" in outcome.summary
+    assert outcome.validation.startswith("ruff check .: PASS"), "the verdict run happened"
+
+
+def test_a_round_that_never_reached_its_verdict_run_claims_no_coverage(tmp_path):
+    """The third state, and the one a guard like this quietly fails open into:
+    `record_verdict_run` was never called at all. That is neither "covers" nor
+    "moved" — there is no verdict run for anything to cover — and it must read
+    as covering nothing rather than as silence."""
+    service = AdvisoryValidation(
+        commands=(RUFF,),
+        cwd=tmp_path,
+        command_runner=RecordingRunner(),
+        scope_resolver=lambda commands: implement_executor.AdvisoryScope(
+            commands=commands,
+            narrowed=True,
+            tree_state="a-real-digest",
+            detail="narrowed",
+            selected=frozenset({"suite/test_smoke.py"}),
+            considered=("pkg/publisher.py",),
+            total_test_files=4,
+        ),
+    )
+    service.expose()
+    service.run()
+
+    assert service.covers_verdict() is False
+    note = service.note()
+    assert "NARROWED to 1 of 4 test file(s)" in note
+    assert "covering NOTHING" in note
+    assert "never established" in note
+
+
+def test_coverage_is_refused_when_the_tree_state_was_never_readable(tmp_path):
+    """The fail-open with the shortest path to shipping: a digest that could not
+    be taken is the empty string, and `""  == ""` is True. `tree_states_match`
+    refuses an unknown state on EITHER side, so two failed reads never agree
+    with each other — this drives both sides of that."""
+    service = AdvisoryValidation(
+        commands=(RUFF,),
+        cwd=tmp_path,
+        command_runner=RecordingRunner(),
+        scope_resolver=lambda commands: implement_executor.AdvisoryScope(
+            commands=commands,
+            narrowed=True,
+            tree_state=TREE_STATE_UNKNOWN,
+            detail="narrowed",
+            selected=frozenset({"suite/test_smoke.py"}),
+            considered=("pkg/publisher.py",),
+            total_test_files=4,
+        ),
+    )
+    service.expose()
+    service.run()
+    service.record_verdict_run(
+        TREE_STATE_UNKNOWN,
+        TestSelection(
+            commands=(RUFF,),
+            widened=False,
+            reason="",
+            selected=("suite/test_smoke.py",),
+            total_test_files=4,
+        ),
+    )
+
+    assert service.covers_verdict() is False
+    assert "covers NOTHING" in service.note()
+
+
+def test_a_full_advisory_run_still_covers_a_narrowed_verdict_run(tmp_path):
+    """The relation that did NOT change, kept on the fail-closed path where it
+    matters most: a run that took the configured list whole contains every
+    command the verdict run can select out of it, whatever the tree did
+    afterwards. Otherwise every fail-closed round would report itself as having
+    proved nothing, which would be false and would make the fallback look like a
+    failure."""
+    service = AdvisoryValidation(
+        commands=(RUFF,), cwd=tmp_path, command_runner=RecordingRunner()
+    )
+    service.run()
+    service.record_verdict_run(
+        "a-different-tree",
+        TestSelection(
+            commands=(RUFF,),
+            widened=False,
+            reason="",
+            selected=("suite/test_smoke.py",),
+            total_test_files=4,
+        ),
+    )
+
+    assert service.covers_verdict() is True
+    assert service.last_run_was_narrowed is False
+
+
+def test_a_run_that_never_completed_covers_nothing_either(tmp_path):
+    """The FULL-list branch of `covers_verdict` grants coverage unconditionally
+    — rightly, since such a run contains every command the verdict can select —
+    and that shortcut would fire for a run whose launcher RAISED, which got as
+    far as it got and proves nothing. The scope is recorded `completed=False`
+    and the predicate refuses it before it reaches any of that."""
+    service = AdvisoryValidation(
+        commands=(RUFF,), cwd=tmp_path, command_runner=ExplodingRunner()
+    )
+
+    text = service.run()
+
+    assert "could not complete" in text and "PASSED" not in text
+    assert service.last_run_ok is False
+    service.record_verdict_run(
+        "any-tree",
+        TestSelection(commands=(RUFF,), widened=False, reason="", selected=("t.py",)),
+    )
+    assert service.covers_verdict() is False
+
+
+def test_a_narrowed_run_whose_verdict_selects_more_covers_nothing(tmp_path):
+    """The direct check of the invariant, independent of the tree digest. A
+    change that moves the SELECTION without moving any changed file — a `.py`
+    file the checkout ignores appearing in the import graph, say — leaves the
+    digests equal, and this is what still catches it."""
+    service = AdvisoryValidation(
+        commands=(RUFF,),
+        cwd=tmp_path,
+        command_runner=RecordingRunner(),
+        scope_resolver=lambda commands: implement_executor.AdvisoryScope(
+            commands=commands,
+            narrowed=True,
+            tree_state="same-tree",
+            detail="narrowed",
+            selected=frozenset({"suite/test_smoke.py"}),
+            considered=("pkg/publisher.py",),
+            total_test_files=4,
+        ),
+    )
+    service.expose()
+    service.run()
+    service.record_verdict_run(
+        "same-tree",
+        TestSelection(
+            commands=(RUFF,),
+            widened=False,
+            reason="",
+            selected=("suite/test_smoke.py", "suite/test_lonely.py"),
+            total_test_files=4,
+        ),
+    )
+
+    assert service.covers_verdict() is False
+    assert "covers NOTHING" in service.note()
+
+    # And the same run against a verdict that selects a SUBSET of what it ran
+    # does cover it — the assertion that stops the check above being satisfied
+    # by refusing everything.
+    service.record_verdict_run(
+        "same-tree",
+        TestSelection(
+            commands=(RUFF,),
+            widened=False,
+            reason="",
+            selected=("suite/test_smoke.py",),
+            total_test_files=4,
+        ),
+    )
+    assert service.covers_verdict() is True
+
+
+# ---- 12d: the VERDICT run is untouched -------------------------------------
+
+
+def test_the_verdict_runs_selection_and_digest_are_unchanged_by_this_task(
+    main_repo, tmp_path
+):
+    """MUST NOT CHANGE, asserted by comparison rather than by inspection.
+
+    Two rounds over identical trees making the identical change: one whose agent
+    asks for an advisory run (which narrows) and one whose agent never asks at
+    all. Every argv the executor's OWN run launches, and the whole
+    `validation` string it records — the per-command `PASS`/`FAIL` account,
+    `failure_digest` output included, plus the selection evidence — must be
+    byte-for-byte the same. If request-time narrowing could leak into the
+    verdict run in any way, these two would differ.
+
+    The failing return code is deliberate: `failure_digest` only appears in a
+    summary when a command failed, so a green pair would compare a string that
+    never exercises it.
+    """
+    change = {"pkg/publisher.py": "def publish():\n    return 2\n"}
+
+    # Four launches, in order: the advisory run's ruff and pytest, then the
+    # executor's own two. Only the last fails, so the comparison below is
+    # between two identical FAILING verdict runs rather than two rounds that
+    # stopped at `ruff`.
+    asked_runner = RecordingRunner(returncodes=(0, 0, 0, 1))
+    asked_outcome, _runner, _worker, agent = narrowing_round(
+        main_repo, tmp_path / "asked", before=change, after={}, runner=asked_runner
+    )
+
+    quiet_worker = scaffold_repo(tmp_path / "quiet" / "worker")
+    quiet_runner = RecordingRunner(returncodes=(0, 1))
+    quiet_executor = build_executor(
+        main_repo,
+        quiet_worker,
+        make_agent_runner_factory(write_files=change),
+        validation=(RUFF, SCAFFOLD_SUITE),
+        command_runner=quiet_runner,
+        # The round would otherwise be handed back and then WITHHELD for its
+        # zero requests, and a withheld round never reaches the verdict run
+        # this test exists to compare against.
+        advisory_zero_call_returns=0,
+    )
+    quiet_outcome = quiet_executor.execute(implement_directive(), make_task())
+
+    assert "NARROWED" in agent.answers[0], "the advisory half really narrowed"
+    # The advisory run is the first TWO launches of the asked round — one per
+    # configured command, `ruff` then pytest — and everything after them is the
+    # executor's own run.
+    asked_verdict = [call["argv"] for call in asked_runner.calls][2:]
+    quiet_verdict = [call["argv"] for call in quiet_runner.calls]
+    assert asked_verdict == quiet_verdict
+    assert asked_outcome.validation == quiet_outcome.validation
+    assert "FAIL" in asked_outcome.validation, "the digest path was really exercised"
+    assert "test selection: SUBSET" in asked_outcome.validation
+
+
+def test_a_round_whose_advisory_run_was_full_reports_exactly_what_it_always_did(
+    main_repo, worker_repo
+):
+    """The other half of "must not change": a round whose advisory run took the
+    configured list whole — every round before val-07, and every fail-closed
+    round after it — says about the channel exactly what it said before. The
+    narrowing caveat is silent unless there was a narrowing."""
+    runner = RecordingRunner()
+
+    def factory(root):
+        return RendezvousAgentRunner(
+            worker_repo=root, asks=1, write_files={"feature.py": "x = 1\n"}
+        )
+
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=runner
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert (
+        " Agent self-validation: the agent ran the suite 1 time(s); its last run "
+        "PASSED. Advisory only; the validation summary recorded for this round "
+        "is the executor's own run."
+    ) in outcome.summary
+    assert "NARROWED" not in outcome.summary
 
 
 def test_a_temp_root_symlinked_into_the_tree_is_refused_too(worker_repo, tmp_path):
