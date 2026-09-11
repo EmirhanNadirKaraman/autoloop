@@ -102,6 +102,7 @@ import inspect
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -159,6 +160,12 @@ from .tasks import (
     TaskState,
     satisfies_dependency,
 )
+# The action-log WRITER's own file-name rule (stream-01), imported rather than
+# restated: the panel `action_log_tail` feeds looks for the file
+# `ClaudeCliRunner._open_action_log` writes, and a second copy of the slug rule
+# would find it until the day the rule moved. `audit.agents` pulls in `stall`
+# and `validation_env`, both pure Python and both already loaded by `config`.
+from .audit.agents import action_log_slug
 
 #: Reserved status roles (dataviz palette). Never reused for anything else, and
 #: every use in the page ships an icon + label so state is never colour-alone.
@@ -769,6 +776,458 @@ def unit_panel(state: dict) -> dict:
         "round_label": str(review_round) if has_round else UNIT_UNKNOWN,
         "candidate_label": candidate or NO_CANDIDATE_YET,
     }
+
+
+# ---- the ACTION log of the round executing right now (dash-08) ---------------
+#
+# `worker_progress` above answers "is it working"; this answers "what is it
+# doing", and the two render side by side because neither is the other. A round
+# that has written 400 lines of the wrong thing is indistinguishable from a
+# productive one by line count alone, and waiting 25 minutes to find out which
+# it was is the cost this panel exists to remove.
+#
+# WHAT IT IS, and the label is load-bearing: an ACTION log — tool calls, files
+# read and written, commands run. It is NOT the model's reasoning. The headless
+# CLI exposes no reasoning stream at all, so a panel titled "thinking" would
+# promise introspection and deliver a command trace, which is worse than showing
+# nothing at all.
+#
+# stream-01 WRITES the file. Nothing here writes it, nothing here takes a lock,
+# and nothing here reads more than the end of it: a 25-minute round produces a
+# large log and this page polls every two seconds, so the whole file must never
+# reach it. Being one of several readers of a file a live round is appending to
+# also means a partial last line, a moment where the read fails, and a file that
+# does not exist yet are all ORDINARY — and the panel has to tell them apart on
+# screen, because an empty box says none of them.
+
+#: The field on `state.task_execution` that would name the round's action log
+#: outright. Honoured ahead of the convention below whenever it is present.
+#:
+#: NOTHING IN THIS TREE WRITES IT TODAY. `worktask.TaskExecution` has no such
+#: field and the record is `asdict()` of that dataclass, so in production this
+#: branch is never taken and the convention is the only path. It is kept as the
+#: seam a writer that records where it wrote would use — the runner knows the
+#: path (`ClaudeCliRunner._open_action_log`), and putting it on the record is a
+#: `worktask.py` + `implement_executor.py` change, outside this panel's scope —
+#: and because a reader that insisted on its own convention would go on saying
+#: "nothing written yet" beside a busy round the day the file moved. Spelled
+#: once, here. A recorded path is taken as the writer's own statement that it
+#: opened a log, so neither the dispatch-time filter nor the `off` sentence
+#: below applies to it.
+ACTION_LOG_PATH_FIELD = "action_log_path"
+
+#: Where the log is looked for when the record names none: the directory
+#: `config.action_log_dir` resolves to — `<state_dir>/action-logs`, restated
+#: here because that property needs a loaded `AutoloopConfig` and this page
+#: resolves the state dir on its own — holding ONE FILE PER ROUND, named by
+#: `audit.agents.ClaudeCliRunner._open_action_log` as
+#: `<action_log_slug(task_id)>-<action_log_round_stamp()>.log`, the stamp being
+#: `YYYYmmddTHHMMSS.ffffff-<pid>-<n>` (UTC). The round in flight is the NEWEST
+#: of a task's files STAMPED AT OR AFTER THIS DISPATCH (`_dispatch_stamp`): one
+#: runner is one round, and the stamp is fixed-width and UTC, so the names sort
+#: in round order and no `stat` per entry is needed — but a task run twice
+#: leaves two files, and "newest" alone would show the previous round's until
+#: this one opened its own.
+#:
+#: Round 1 of dash-08 guessed `<task_id>.log` against a writer that was not in
+#: the tree yet; the writer landed with the base refresh and the guess matched
+#: nothing, so a busy round read "nothing written yet" beside the file it was
+#: writing. `test_action_log_panel.py` now opens a log through the REAL writer
+#: and asserts this reader finds it, so the two cannot drift apart silently
+#: again. Every absent state below still NAMES WHAT IT LOOKED FOR.
+ACTION_LOG_DIRNAME = "action-logs"
+ACTION_LOG_SUFFIX = ".log"
+ACTION_LOG_STAMP = r"\d{8}T\d{6}\.\d{6}-\d+-\d+"
+
+#: How much of the writer's stamp is compared against the dispatch time:
+#: `YYYYmmddTHHMMSS`, the whole-second prefix. `state.current_task.started_at`
+#: is `utcnow_iso()` at second precision, so that is the finest comparison the
+#: two can honestly share.
+ACTION_LOG_STAMP_SECONDS = len("YYYYmmddTHHMMSS")
+
+#: The config key that turns the writer on, as the `off` sentence names it, and
+#: its documented default. `AuditConfig.action_log` is `False` unless the
+#: operator sets it, and `cli._build_executor` hands the runner no directory
+#: then — so with a default config NO round ever writes a log, and "nothing
+#: written yet" beside such a round would promise a file that is never coming.
+ACTION_LOG_SETTING = "[audit] action_log"
+
+#: How much of the END of the log is read, and how many of the lines inside that
+#: window are shown. The BYTE budget is the real bound and the line count is
+#: cosmetic: a log with no newline in it at all would make a line count
+#: unbounded, and this reader must cost the same on a 4KB log and a 400MB one.
+#: The file is never read whole and is never held in memory whole — the reader
+#: seeks to `size - ACTION_LOG_TAIL_BYTES` and reads forward from there.
+ACTION_LOG_TAIL_BYTES = 64 * 1024
+ACTION_LOG_TAIL_LINES = 40
+
+#: The six states this panel can be in, and the only six. `lines` is the
+#: working case; the other five are each a DIFFERENT absence, and rendering any
+#: of them as an empty box would tell an operator nothing. `missing` means the
+#: round has written nothing yet, `off` means it never will because the writer
+#: is not switched on, `empty` means it opened the file and has logged nothing
+#: into it, `unreadable` means something is there this page could not see, and
+#: `unlocatable` means there is nowhere to look at all.
+#:
+#: `off` is the one a DEFAULT config produces, and it is the reason "nothing
+#: written yet" is not enough: `[audit] action_log` is false unless set, so the
+#: most ordinary deployment there is would otherwise read a sentence that says
+#: "wait" beside every round, forever. It is decided only after discovery came
+#: back empty — a log that IS there is shown whatever the config says now,
+#: because the loop reads the setting once at start and the file is the fact.
+ACTION_LOG_STATES = ("lines", "empty", "missing", "off", "unreadable", "unlocatable")
+
+#: The sentence each state shows, pinned HERE rather than in `PAGE` — the same
+#: rule the unit tiles (`UNIT_STATES`) and the state-dir banner
+#: (`STATE_DIR_UNRESOLVED`) follow, and it buys the same thing: the page cannot
+#: invent a word for a state, and each empty state is assertable in Python
+#: instead of grep-able in a JavaScript string. Each of the first three ends
+#: mid-sentence because the PATH is appended: "nothing written yet" is not
+#: self-diagnosing and "nothing written yet at <path>" is.
+ACTION_LOG_MISSING = (
+    "Nothing written yet — this round has not created an action log. Looked at: "
+)
+ACTION_LOG_EMPTY = (
+    "The action log exists and is EMPTY — the round has started and has logged "
+    "nothing into it yet, which is not the same as no log at all. Read from: "
+)
+ACTION_LOG_UNREADABLE = (
+    "The action log could NOT BE READ, which is not the same as nothing being "
+    "there — something exists and this page could not see it: "
+)
+ACTION_LOG_UNLOCATABLE = (
+    "There is nowhere to look for this round's action log: the execution record "
+    f"names no `{ACTION_LOG_PATH_FIELD}` and the state directory could not be "
+    "resolved, so this panel is empty because nothing could be read — not "
+    "because nothing is happening."
+)
+#: A template rather than a prefix: the config file sits mid-sentence. Says
+#: "restart" because `cli._build_executor` resolves the setting ONCE when the
+#: loop starts, so editing the file changes nothing for the loop that is
+#: running — and a sentence that implied otherwise would send an operator to
+#: watch a panel that cannot change.
+ACTION_LOG_OFF = (
+    "The action log is OFF — `{setting}` is not `true` in {config}, so no round "
+    "writes one and nothing will appear here: set it to `true` and restart the "
+    "loop, which reads it once at start. Looked at: {looked_for}"
+)
+#: Appended to `missing` when the setting IS on in the file: "nothing written
+#: yet" then has a second reading besides "the runner has not opened it yet" —
+#: the loop was started before the key was set and resolved it as off — and
+#: the operator who waits through a whole round on the first reading deserves
+#: the second in the same sentence.
+ACTION_LOG_SETTING_ON = (
+    f" `{ACTION_LOG_SETTING}` is `true` in the config as it stands; the loop "
+    "reads it once at start, so a loop started before it was set writes none "
+    "until restarted."
+)
+#: Appended to `missing` by a caller that did not establish the setting
+#: (`collect` always does). Without it "nothing written yet" would be read as
+#: "keep waiting" by someone whose config has the writer off.
+ACTION_LOG_SETTING_UNCHECKED = (
+    f" Whether `{ACTION_LOG_SETTING}` is on was not checked here; it is false "
+    "by default, and then no round writes a log at all."
+)
+#: Appended to `missing` and `off` when the directory holds this task's log
+#: from an EARLIER round — a revision dispatched after a review, or a retry —
+#: and none from this one. That file is named and NOT shown: its stamp predates
+#: this dispatch, and a previous round's trace under "this round's log" is the
+#: stale tail this panel must never render.
+ACTION_LOG_OLDER_ROUND = (
+    " The newest log there, {path}, is from an EARLIER round of this task — its "
+    "stamp predates this dispatch ({since} UTC) — and is not shown."
+)
+#: Says "this round's log", not "the log this round is writing": the record
+#: outlives the agent — it stands through `delivering` and `awaiting`, which is
+#: most of a task's life — and the file is closed for all of that.
+ACTION_LOG_TAIL_NOTE = "The tail of this round's log — "
+ACTION_LOG_TRUNCATED = " Earlier lines are NOT shown: only the end of the file is read."
+
+
+#: How the log is opened: read-only, and NON-BLOCKING so that a fifo at the
+#: path returns a descriptor instead of a reader that waits for a writer that
+#: never comes. `O_NOCTTY` costs nothing and covers a tty at the path the same
+#: way. Neither flag changes how a regular file reads.
+_TAIL_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                    | getattr(os, "O_NOCTTY", 0))
+
+
+def _tail_bytes(path: Path, budget: int) -> tuple[bytes, bool]:
+    """The last `budget` bytes of `path`, and whether anything was skipped.
+
+    ONE `os.open`, and everything after it asks the DESCRIPTOR — `fstat`, then
+    `lseek` to at most `budget` before the end, then a bounded read — so the
+    cost is the budget and never the file size, and nothing here can be
+    answered about one file and performed on another. A `stat` of the PATH
+    followed by an open of the PATH is two lookups, and whatever is at the
+    path can change between them: replace the log with a fifo in that window
+    and a blocking open waits for a writer forever, on every poll. The review
+    of round 1 named exactly that. So the open is non-blocking
+    (`_TAIL_OPEN_FLAGS`), the thing it returned is checked with `fstat`, and
+    anything that is not a regular file is refused BEFORE a byte is read.
+
+    Raises `OSError`, which the caller renders as its own state — a read that
+    failed is not a file that is empty. The refusal is one too, and it names
+    what was found, because "could not be read" without a reason sends an
+    operator to look for a permission fault that is not there.
+    """
+    fd = os.open(path, _TAIL_OPEN_FLAGS)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"not a regular file ({stat.filemode(info.st_mode)}), "
+                          "so nothing was read from it")
+        start = max(0, info.st_size - budget)
+        # ALWAYS seek, `start == 0` included, and never read from wherever the
+        # descriptor happens to sit: an earlier version measured the size by
+        # seeking to EOF and seeked back only when there was something to
+        # skip, which reported every log smaller than the budget as "the round
+        # has logged nothing" until the first run of `test_action_log_panel.py`
+        # caught it.
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = budget
+        # A read may return short of what was asked; loop until the budget is
+        # spent or the file ends, and never ask for more than the budget.
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks), start > 0
+    finally:
+        os.close(fd)
+
+
+def _action_log_glob(directory: Path, task_id: str) -> str:
+    """What `_round_logs` looks for, as the sentence names it."""
+    return str(directory / f"{action_log_slug(task_id)}-*{ACTION_LOG_SUFFIX}")
+
+
+def _round_logs(directory: Path, task_id: str) -> list[tuple[str, str]]:
+    """`(stamp, name)` for every round log of `task_id` under `directory`,
+    oldest first.
+
+    ONE directory listing and no `stat` per entry: the writer's stamp is UTC
+    and its date-time half is fixed-width, so name order is round order (the
+    pid and counter after it are a tiebreak inside one microsecond, which two
+    rounds of one task never share). The match is the writer's whole shape
+    (`ACTION_LOG_STAMP`), not a prefix — a task whose slug is a prefix of
+    another's (`dash` and `dash-08`) must not be shown the other's log. Raises
+    what `os.listdir` raises: `FileNotFoundError` for a directory nothing has
+    created yet, any other `OSError` for one that exists and could not be
+    listed.
+    """
+    slug = re.escape(action_log_slug(task_id))
+    shape = re.compile(rf"^{slug}-({ACTION_LOG_STAMP}){re.escape(ACTION_LOG_SUFFIX)}$")
+    found = []
+    for name in os.listdir(directory):
+        match = shape.match(name)
+        if match:
+            found.append((match.group(1), name))
+    return sorted(found, key=lambda entry: entry[1])
+
+
+def _dispatch_stamp(state: dict, task_id: str) -> str:
+    """When THIS dispatch of `task_id` began, as the writer's stamp would spell
+    it (`YYYYmmddTHHMMSS`, UTC), or `""` when that cannot be established.
+
+    Read off `state.current_task.started_at`, and only when `current_task`
+    names the same task — the guard `worker_progress` already applies, for the
+    reason it gives: `current_task` outlives its round and can name another
+    task, whose dispatch time would date this one from somewhere else. Written
+    by `utcnow_iso()` at dispatch, BEFORE the executor builds the runner whose
+    construction stamps the log, so this round's log always stamps at or after
+    it and an earlier round's always stamps before.
+
+    `""` is the FAIL-OPEN answer on purpose and the caller treats it as "do not
+    filter": hiding a live round's log because a stamp would not parse is
+    worse than showing an old one, and the sentence for a shown log names the
+    file, so an operator can still tell.
+    """
+    current = state.get("current_task") or {}
+    if str(current.get("task_id") or "") != task_id:
+        return ""
+    try:
+        stamp = datetime.fromisoformat(str(current.get("started_at") or ""))
+    except (TypeError, ValueError):
+        return ""
+    if stamp.tzinfo is None:  # `utcnow_iso()` is tz-aware; older stamps may not be
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+def _action_log_setting(repo: Path) -> tuple[bool | None, Path]:
+    """Whether `[audit] action_log` is on in this checkout's config, and the
+    file that was read to say so.
+
+    `True`/`False` when the file parsed — absent key and absent section are
+    `False`, the documented default. `None` when it could not be read or did
+    not parse: the setting is then UNKNOWN, and the panel must not claim "off"
+    from a file it never saw any more than it may claim "nothing written yet"
+    from one that says off. `_config_toml` collapses both into `{}`, so the
+    reason is asked for the way `_state_dir` asks (`_config_problem`).
+
+    What is read is the file as it stands NOW. The loop resolved it once at
+    start (`cli._build_executor`), so the two can differ after an edit; the
+    `off` sentence says so, and a log that is found is shown regardless.
+    """
+    path = repo / ".autoloop" / "config.toml"
+    data = _config_toml(repo)
+    if not data and _config_problem(repo):
+        return None, path
+    section = data.get("audit")
+    value = section.get("action_log") if isinstance(section, dict) else None
+    return value is True, path
+
+
+def action_log_tail(state: dict, state_dir: Path | None = None, *,
+                    max_bytes: int | None = None,
+                    max_lines: int | None = None,
+                    enabled: bool | None = None,
+                    config_path: Path | str | None = None) -> dict | None:
+    """The tail of the action log of the round executing RIGHT NOW.
+
+    `None` means no round is executing, and the page then renders no panel at
+    all — never the last round's tail. That is the same source and the same
+    condition `worker_progress` and `unit_panel` use (`state.task_execution`,
+    cleared the moment a candidate is published), so the three can never
+    disagree about which round is in flight.
+
+    Otherwise a dict whose `state` is one of `ACTION_LOG_STATES` and whose
+    `note` is the sentence for it, path included. The five non-`lines` states
+    are kept apart deliberately: "no log yet", "no log ever, the writer is
+    off", "an empty log", "a log I could not read" and "nowhere to look" call
+    for five different reactions, and an empty box supports none of them.
+
+    The file is the one the execution record names (`ACTION_LOG_PATH_FIELD`),
+    or else the newest of THIS DISPATCH's round logs under
+    `<state_dir>/action-logs` by the WRITER's own naming (`_round_logs`, one
+    directory listing). "This dispatch's" is decided by stamp against
+    `_dispatch_stamp`: a task run twice leaves two logs, and between a
+    revision's dispatch and its runner opening a file — or for the whole round,
+    when the writer was on last time and is off now — the newest file on disk
+    is the PREVIOUS round's. Shown under "this round's log" that is exactly
+    the stale tail the page must not render, so it is named instead
+    (`ACTION_LOG_OLDER_ROUND`) and the state is `missing`. No parseable
+    dispatch stamp means no filter: newest wins, and the sentence names it.
+
+    `enabled` is `[audit] action_log` as the caller established it —
+    `collect` passes `_action_log_setting`'s answer — and it decides one thing
+    only: whether an EMPTY discovery reads `missing` ("nothing written yet") or
+    `off` ("nothing will be"). `True` adds that the loop reads the key at
+    start, since a loop older than the setting writes none either; `None`
+    means it was not established, and the `missing` sentence then says so
+    rather than implying "wait". A log that was found is shown whatever
+    `enabled` says; the file is the fact.
+
+    READ-ONLY AND LOCK-FREE, like the rest of this module: that listing, one
+    NON-BLOCKING open, one `fstat` of the descriptor it returned, and one
+    bounded read from that same descriptor (`_tail_bytes`). Nothing is
+    written, no lock is taken, and a scheduler hitting this mid-round is safe.
+    The file itself is looked up exactly ONCE, by the open — not
+    `Path.is_file()` first, which SWALLOWS `OSError` and answers `False` so a
+    permission fault would render as "nothing written yet", the fail-open this
+    panel is about; and not `os.stat` first either, which round 1 did and the
+    review caught: a fifo put at the path between that stat and the open makes
+    a blocking open wait for a writer forever, on every poll. Anything that is
+    not a regular file is refused after the open and before a byte is read,
+    and a page that says it could not read is better than one that hangs.
+    """
+    execution = state.get("task_execution") or {}
+    task_id = str(execution.get("task_id") or "")
+    if not task_id:
+        return None
+
+    max_bytes = ACTION_LOG_TAIL_BYTES if max_bytes is None else max_bytes
+    max_lines = max(0, ACTION_LOG_TAIL_LINES if max_lines is None else max_lines)
+    view = {"task_id": task_id, "path": "", "lines": [], "tail": "",
+            "truncated": False, "max_lines": max_lines}
+
+    recorded = str(execution.get(ACTION_LOG_PATH_FIELD) or "").strip()
+    if recorded:
+        path = Path(recorded)
+    elif state_dir is not None:
+        # The writer's directory, listed once for this task's round logs.
+        # `path` in the payload is a GLOB on the absent branches here — it is
+        # what was looked for, which is what the sentence needs — and a real
+        # file only once one was found.
+        directory = Path(state_dir) / ACTION_LOG_DIRNAME
+        looked_for = _action_log_glob(directory, task_id)
+        try:
+            logs = _round_logs(directory, task_id)
+        except FileNotFoundError:
+            logs = []
+        except OSError as exc:
+            return {**view, "path": looked_for, "state": "unreadable",
+                    "note": f"{ACTION_LOG_UNREADABLE}{directory}: {_one_line(exc)}"}
+        since = _dispatch_stamp(state, task_id)
+        current = [name for stamp, name in logs
+                   if not since or stamp[:ACTION_LOG_STAMP_SECONDS] >= since]
+        if not current:
+            # Nothing from THIS dispatch. Which absence it is depends on the
+            # setting, and an older round's file is named, never shown.
+            if enabled is False:
+                config = str(config_path) if config_path else "the loop's config.toml"
+                note = ACTION_LOG_OFF.format(setting=ACTION_LOG_SETTING, config=config,
+                                             looked_for=looked_for)
+                absent = "off"
+            else:
+                note = ACTION_LOG_MISSING + looked_for
+                absent = "missing"
+            if logs:
+                note += ACTION_LOG_OLDER_ROUND.format(path=directory / logs[-1][1],
+                                                      since=since)
+            if enabled is True:
+                note += ACTION_LOG_SETTING_ON
+            elif enabled is None:
+                note += ACTION_LOG_SETTING_UNCHECKED
+            return {**view, "path": looked_for, "state": absent, "note": note}
+        path = directory / current[-1]
+    else:
+        return {**view, "state": "unlocatable", "note": ACTION_LOG_UNLOCATABLE}
+
+    view["path"] = str(path)
+    try:
+        data, skipped = _tail_bytes(path, max_bytes)
+    except FileNotFoundError:
+        # Caught FIRST, and on its own: this is the one absence that means
+        # "wait", and folding it into the branch below would render a log
+        # stream-01 has not created yet as "could not be read". On the
+        # discovered path it is a file the listing saw and the open did not —
+        # rotated away between the two, which the next poll resolves.
+        return {**view, "state": "missing", "note": ACTION_LOG_MISSING + str(path)}
+    except OSError as exc:
+        return {**view, "state": "unreadable",
+                "note": f"{ACTION_LOG_UNREADABLE}{path}: {_one_line(exc)}"}
+    if not data:
+        return {**view, "state": "empty", "note": ACTION_LOG_EMPTY + str(path)}
+
+    # `replace`, never strict: this is arbitrary bytes an agent printed, and a
+    # log that happens to hold one invalid sequence must not blank the panel.
+    # The window also starts mid-character by construction, which is exactly
+    # what the replacement character is for.
+    lines = data.decode("utf-8", "replace").splitlines()
+    if skipped and len(lines) > 1:
+        # After a mid-file seek the first line is the END of a line whose start
+        # was skipped. Dropped, because a fragment shown as a line reads as a
+        # command that was never run — but KEPT when it is the only one, since a
+        # single enormous line truncated is still more than a blank panel.
+        lines = lines[1:]
+    truncated = skipped or len(lines) > max_lines
+    lines = lines[-max_lines:] if max_lines else []
+    return {**view, "state": "lines", "lines": lines,
+            # Joined HERE rather than in the template. `PAGE` is a plain Python
+            # string, so a `"\n"` written inside the served script is decoded on
+            # the way out and splits that JS literal across two physical lines —
+            # the whole script then fails to parse and the page silently blanks
+            # (docs/COMMON_ERRORS.md). One joined string reaches the DOM through
+            # `textContent` and no newline literal ever enters the script.
+            "tail": "\n".join(lines),
+            "truncated": truncated,
+            "note": f"{ACTION_LOG_TAIL_NOTE}{len(lines)} line(s) from {path}."
+                    + (ACTION_LOG_TRUNCATED if truncated else "")}
 
 
 def _config_toml(repo: Path) -> dict:
@@ -4273,6 +4732,10 @@ def collect(repo: Path) -> dict:
     # two sweeps of the execution records and could disagree with each other
     # inside one payload.
     window = merge_window(repo)
+    # Whether the loop's writer is switched on at all, off the config this page
+    # already reads. Asked ONCE here rather than inside `action_log_tail`, which
+    # takes a state dir and not a checkout and must stay callable without one.
+    action_log_on, action_log_config = _action_log_setting(repo)
     return {
         "health": {"role": health[0], "label": health[1], "pids": pids,
                    "lock_pid": lock_pid, "lock_alive": lock_alive},
@@ -4303,6 +4766,18 @@ def collect(repo: Path) -> dict:
         # `None` when nothing is executing — the page then renders no figures at
         # all rather than the last round's. See `worker_progress`.
         "progress": worker_progress(state),
+        # The tail of the ACTION log the same round is writing, `None` on the
+        # same condition and off the same `state` dict, so the figures and the
+        # trace beside them can never describe two different rounds. `sd` is
+        # the directory resolved above, threaded rather than re-resolved, so
+        # the convention path is looked for where everything else was read
+        # (port-06). Raw text: the page puts it in the DOM as text, and
+        # escaping it here as well would show `&lt;` for every `<` the agent
+        # printed. `[audit] action_log` is read off the same config, so an
+        # empty directory beside a default config reads `off` — "nothing will
+        # be written" — and not "nothing written yet". See `action_log_tail`.
+        "action_log": action_log_tail(state, sd, enabled=action_log_on,
+                                      config_path=action_log_config),
         "audit": {"run": run_dir.name if run_dir else None, "completed": completed},
         "events": events,
         "blockers": blockers,
@@ -4570,6 +5045,13 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);
      font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .muted{color:var(--ink2)}.empty{color:var(--ink2);font-style:italic;font-size:13px}
 .scroll{overflow-x:auto}
+/* The action-log tail: a bounded scroll box in the same monospace as `code`,
+   wrapped so one long command line never widens the page. The height bound is
+   what makes a 40-line tail readable beside the progress figures rather than
+   below the fold. No colour role: a command trace is not a health verdict. */
+#actionlog{margin:0;max-height:24em;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;
+     font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);
+     background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
 /* pipeline */
 /* height:auto, not a fixed px: the viewBox owns the aspect ratio, so the
    container is sized to its content instead of letterboxing ~48px of dead
@@ -4894,6 +5376,28 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
   <section id="progressbox" style="display:none">
     <h2>Live progress — read from the worker repo, not from the agent</h2>
     <div id="progress"></div>
+  </section>
+
+  <!-- The ACTION LOG of the same round, directly under its progress figures:
+       the figures say whether it is working, this says what it is doing.
+       STATIC markup and hidden by default for the same reasons `#progressbox`
+       is — `render()` never rewrites it, and an idle loop shows nothing here,
+       never the last round's tail.
+
+       THE HEADING IS LOAD-BEARING. This file is a trace of tool calls, files
+       read and written and commands run. It is NOT the model's reasoning: the
+       headless CLI exposes none, so a panel titled "thinking" would promise
+       introspection and deliver a command trace. Call it what it is.
+
+       The tail is the one place on this page where genuinely unpredictable
+       text arrives — whatever the agent printed — and it reaches the DOM
+       through `textContent` ONLY (`renderActionLog`). No template literal, no
+       `esc()`-then-`innerHTML`, no `<br>` join: `textContent` cannot be
+       markup, whatever the bytes are. -->
+  <section id="actionlogbox" style="display:none">
+    <h2>Action log — tool calls, files read and written, commands run. Not the model's reasoning: the CLI exposes none</h2>
+    <p id="actionlognote" class="muted" style="font-size:12px;margin:0 0 8px"></p>
+    <pre id="actionlog"></pre>
   </section>
 
   <section>
@@ -5362,6 +5866,52 @@ function renderProgress(p){
     + `${esc(fmtDur(p.elapsed_seconds))} since dispatch</div>`
     + `<p class="muted" style="font-size:12px;margin:6px 0 0">${why}</p>`;
 }
+
+// ACTION_LOG_START
+// The action log of the round executing now, beside the figures above. The
+// payload's `state` is one of the backend's `ACTION_LOG_STATES` and its `note`
+// is the backend's sentence for it, path included — this function spells no
+// state of its own, and for every state but `lines` the note IS the panel: a
+// log that does not exist yet, one that never will because the writer is off,
+// an empty one and one that could not be read are four different sentences,
+// never one empty box.
+//
+// EVERYTHING here goes through `textContent`, and that is the whole of the
+// escaping. The tail is whatever the agent printed — angle brackets, quotes,
+// `${}`, anything — and `textContent` renders bytes as characters, so there is
+// no markup to escape and no `esc()` call that could be forgotten. Never
+// `innerHTML`, not even with `esc()` in front of it: that is one refactor away
+// from raw interpolation, and this is the one panel where that would matter.
+function renderActionLog(a){
+  const box = document.getElementById("actionlogbox");
+  const note = document.getElementById("actionlognote");
+  const pre = document.getElementById("actionlog");
+  // Falsy means NO round is executing. Hide the section AND clear both nodes:
+  // a stale tail beside an idle loop reads as a round in flight, and a hidden
+  // node that still holds the last round's text is one CSS rule from showing
+  // it again.
+  if (!a) { box.style.display = "none"; note.textContent = ""; pre.textContent = ""; return; }
+  box.style.display = "";
+  note.textContent = a.note || "";
+  // Only the working state has a box at all. The other four are a sentence,
+  // and an empty box under that sentence would read as "the log is empty" —
+  // which is exactly one of the states it would be misreporting.
+  if (a.state !== "lines") { pre.style.display = "none"; pre.textContent = ""; return; }
+  // Keep the newest lines in view as the round appends — but only when the
+  // operator was already reading the bottom. Someone who scrolled up to read
+  // an earlier command is not yanked back down by the next poll.
+  const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 4;
+  pre.style.display = "";
+  // Written only when it changed: this runs on every poll, outside the page's
+  // change guard, and rewriting an identical text node would throw away the
+  // operator's scroll position and text selection for nothing.
+  const tail = a.tail || "";
+  if (pre.textContent !== tail) {
+    pre.textContent = tail;
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+  }
+}
+// ACTION_LOG_END
 
 // ---- the summary, at the top -------------------------------------------------
 // The three questions an operator arrives with — how much is done, how much is
@@ -6491,9 +7041,15 @@ function render(d, force){
   // poll — and is rendered BELOW, before the guard, so the live figures move
   // without rebuilding the rest of the page.
   const {served_at, progress, ...rest} = d;
-  const sig = JSON.stringify(rest);
+  // `action_log` is excluded for the same reason `progress` is: a live round
+  // appends to its log continuously, so its tail changes on nearly every poll
+  // and would fire the guard every 2s. Rendered below, before the guard, so the
+  // trace moves without rebuilding the page around it.
+  const {action_log, ...signed} = rest;
+  const sig = JSON.stringify(signed);
   document.getElementById("served").textContent = `updated ${esc(served_at)}`;
   renderProgress(progress);
+  renderActionLog(action_log);
   // A stale process serves the old PAGE forever, which looks exactly like a
   // missing feature. Say so instead of letting someone wonder.
   //
