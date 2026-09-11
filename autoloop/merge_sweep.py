@@ -314,7 +314,12 @@ obligations this process cannot discharge DEFERS (`AutoMerger` fails closed on a
 missing carry-forward), which stops the sweep at that branch through
 `_CONTINUE_ON` exactly as any other deferral does; and a carry-forward that
 REFUSES parks the task it is about without changing the merge's outcome, so it
-neither halts the sweep nor merges anything extra.
+neither halts the sweep nor merges anything extra. Since conc-15 a carry-forward
+that meets a DIRTY worker — the owning lane's agent mid-write — is DEFERRED
+rather than parked: the head is written onto that task's record
+(`TaskExecution.carry_deferred_head`) and the owning lane retries it when its
+round commits. To the sweep that is the same non-event a park was: the merge's
+outcome is unchanged, the sweep carries on, and nothing here reads the field.
 
 ## No state of its own
 

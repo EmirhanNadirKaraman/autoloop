@@ -347,8 +347,10 @@ from . import environment
 from . import escape_detector
 from . import note_merge
 from .auto_merge import (
+    CARRY_FORWARD_BLOCKER_CODE,
     UPGRADE_PENDING,
     AutoMerger,
+    CarryDeferral,
     MergeDeferral,
     MergeDeferralStore,
     UpgradeStore,
@@ -467,7 +469,7 @@ from .health import (
     stranded_fault_rounds,
 )
 from .lock import LaneLease
-from .merge_sweep import MergeToken
+from .merge_sweep import MergeToken, merges_are_serialised
 from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import (
@@ -654,6 +656,23 @@ UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE = (
     "repository either — so no review packet could be rebuilt from it, and the "
     "loop archived the record and returned the task to the queue rather than "
     "waiting for an operator to do the same by hand."
+)
+
+#: The ONE refusal of `_carry_reviewed_candidate_past` that is TRANSIENT, named
+#: once so it can be told apart by equality (conc-15). Precondition 4 of that
+#: method refuses to merge a moved head over a worker repository holding
+#: uncommitted changes — correctly: that residue is an agent's unreviewed work.
+#: But the worker is dirty only WHILE the agent is writing and goes clean the
+#: moment the round commits, so a merge that meets this refusal DEFERS the carry
+#: to the end of that round (`_carry_execution_past_for_merge` returns an
+#: `auto_merge.CarryDeferral`) instead of parking `task_base_behind_head`, which
+#: converted a state that resolves itself in minutes into one that waited for an
+#: operator verb. Every OTHER refusal — a genuine conflict above all — is not
+#: transient and parks exactly as before. Compared with `==`, never by
+#: substring: a refusal that merely mentions uncommitted changes must park.
+WORKER_DIRTY_CARRY_REFUSAL = (
+    "its worker repository has uncommitted changes, and merging over them could "
+    "destroy work no reviewer has seen"
 )
 
 #: The four identifiers an approval binds an operator changeset by, named ONCE
@@ -10056,7 +10075,18 @@ class Orchestrator:
         own: the round is ending either way, and taking the process down at the
         moment an operator is waiting for it to stop would be the worse ending.
         Whatever failed is named in the record rather than raised.
+
+        A carry-forward a merge deferred to this round's end is DROPPED first
+        (conc-15): the killed round committed nothing, so the worker holds the
+        residue this abort preserves and there is no clean tree to retry on.
+        The obligation does not dangle — the next dispatch reconciles the base
+        through `_rebase_execution_if_stale`, exactly as before the deferral
+        existed — and the re-review marker stays, so nothing is pushable on an
+        old approval in the meantime.
         """
+        self._drop_deferred_carry_forward(
+            execution, task, "the operator aborted the round in flight"
+        )
         refunded = refund_attempt(execution)
         if refunded:
             self._execution_store.save(execution)
@@ -10553,6 +10583,19 @@ class Orchestrator:
 
         execution = self._execution_store.load(task.id)
         resumed = execution is not None
+        if execution is not None:
+            # A carry-forward deferred to the end of a round that never reached
+            # one of its exits — the process died in it, or a `GitError` left
+            # it through `_handle_git_failure`. It is scoped to that round and
+            # not this one: the stale-base reconciliation a few lines down is
+            # what carries this record now, on a worker it has just probed. A
+            # comparison against `""` on every record that carries none.
+            self._drop_deferred_carry_forward(
+                execution,
+                task,
+                "found at dispatch: the round it was deferred through did not "
+                "reach one of its exits",
+            )
         # THE CONTROLLED BOUNDARY for the loop-owned observed checkout
         # (esc-02). Everything below either reads that tree or seeds a worker
         # repository from it, so it is brought to the primary checkout's
@@ -11074,10 +11117,18 @@ class Orchestrator:
                 # never prevention.
                 outcome = self._execute_with_escape_detection(directive, task)
                 execute_watch.stop()
+                # THE ONE WINDOW in which another lane may have written this
+                # record — a merge that moved the head while the agent was
+                # writing (conc-15). Read back BEFORE any save below, the
+                # escape path's included, or the first of them overwrites it.
+                self._absorb_merge_marks(execution, task)
                 if outcome is None:
                     # Escape detected, already parked. A TASK attempt: the agent
                     # wrote outside its worker repository, which is the work
                     # misbehaving, not the environment failing it.
+                    self._drop_deferred_carry_forward(
+                        execution, task, "the round ended in an escape park"
+                    )
                     self._finalise_attempt(
                         execution, ATTEMPT_TASK, "checkout_escape_detected"
                     )
@@ -11085,6 +11136,7 @@ class Orchestrator:
             else:
                 outcome = self._executor.execute(directive, task)
                 execute_watch.stop()
+                self._absorb_merge_marks(execution, task)
         finally:
             # ALWAYS, including the escape-detection return above and any
             # exception out of the executor: a packet left in the slot is a
@@ -11143,6 +11195,16 @@ class Orchestrator:
             # unreadable worker repo and an agent that changed no files all
             # leave it empty and stay task attempts, which is what keeps a
             # task that simply cannot pass its own tests bounded.
+            #
+            # No commit, so no clean tree: a carry-forward a merge deferred to
+            # this round's end is dropped (conc-15), and the next dispatch's
+            # stale-base reconciliation carries the record instead.
+            self._drop_deferred_carry_forward(
+                execution,
+                task,
+                "the round ended without a commit: "
+                + (f"fault {outcome.fault_kind}" if outcome.fault_kind else "executor_reported_failure"),
+            )
             if outcome.fault_kind:
                 self._finalise_attempt(execution, ATTEMPT_FAULT, outcome.fault_kind)
             else:
@@ -11329,6 +11391,9 @@ class Orchestrator:
             # separate and ordered, which `test_blockers.py::test_environment_
             # drift_is_loop_fatal_not_a_task_refusal` pins by reading this
             # method's source.
+            self._drop_deferred_carry_forward(
+                execution, task, "the commit was refused: worker_environment_drift"
+            )
             self._finalise_attempt(execution, ATTEMPT_FAULT, "worker_environment_drift")
             self._intent_store.clear(task.id)
             state.last_response = None
@@ -11349,6 +11414,7 @@ class Orchestrator:
             # operator, so this one does too rather than escaping as a raw
             # error: the commit did not happen, nothing was rolled back, and a
             # human needs to look at why the task's environment moved.
+            self._drop_deferred_carry_forward(execution, task, "the commit was refused")
             self._finalise_attempt(execution, ATTEMPT_TASK, "commit_refused")
             self._intent_store.clear(task.id)
             state.last_response = None
@@ -14243,8 +14309,8 @@ class Orchestrator:
         # crashed process, before ITS executor call) — either way the count
         # on disk is already correct and must not be bumped again here.
         #
-        # What this method DOES do to the attempt record is STAMP it. All three
-        # of its exits report a TASK outcome, and every one of them does so on
+        # What this method DOES do to the attempt record is STAMP it. Its three
+        # ordinary exits report a TASK outcome, and every one of them does so on
         # purpose:
         #
         #   * post-commit verification failed — a structural refusal. The
@@ -14258,6 +14324,11 @@ class Orchestrator:
         #   * the packet went out — the round produced work and reached the
         #     reviewer. This is the case `attempt_count` was invented for.
         #
+        # The fourth exit, reachable only above one lane, is a deferred
+        # carry-forward that still refuses once the worker is clean
+        # (`_settle_deferred_carry_forward`, conc-15); it stamps FAULT, for
+        # `worker_environment_drift`'s reason — the head moved under the round.
+        #
         # A round the loop opened on the FAULT budget (a redo of a review some
         # session-ending fault destroyed) reports the same three outcomes and is
         # settled by the same rule in `_settle_attempt`: reaching the reviewer
@@ -14269,6 +14340,16 @@ class Orchestrator:
         # the attempt the DEAD process opened is stamped `task` here, so the
         # reconciliation in `_dispatch_task_postcommit` can never later see it
         # as unfinished and refund a round that genuinely committed.
+        #
+        # FIRST, before the gate below reads anything off the record: the
+        # carry-forward a merge deferred to this round's end (conc-15). The
+        # commit above is what made the worker clean, so this is the one moment
+        # the deferred carry can run — and it has to run BEFORE `_verify_
+        # committed` and the packet, because both read `task_base_sha..
+        # candidate_sha` and the carry moves both ends. A `False` here is a
+        # park already written. Nothing at `lanes = 1`: the field is empty.
+        if not self._settle_deferred_carry_forward(execution, state, task):
+            return
         failures, validation_summary = self._verify_committed(execution, worktree_git)
         state.last_validation = validation_summary
         # `review_round` counts REVIEWS, not commit attempts. It is incremented
@@ -19151,7 +19232,14 @@ class Orchestrator:
              same reason.
           4. The worker is CLEAN. Merging over uncommitted residue is exactly
              the quiet discard the refusal exists to prevent — and for a
-             resumed round that residue IS the work being resumed.
+             resumed round that residue IS the work being resumed. This is
+             the ONE transient precondition, and it is refused with the
+             module-level `WORKER_DIRTY_CARRY_REFUSAL` verbatim so the merge
+             path can tell it apart by equality and DEFER instead of parking
+             (conc-15, `_carry_execution_past_for_merge`). From this
+             dispatch-time caller it still parks: the worker holding a
+             resumed round's residue is dirty until that round commits, and
+             the round has not started yet.
           5. The branch tip contains `candidate_sha`. This is what makes "the
              approval binding survives" a checked fact rather than an
              assumption about which commit the branch happens to be sitting on.
@@ -19254,10 +19342,7 @@ class Orchestrator:
         worker = GitGateway(Path(worktree_path), self._policy, env=worker_env())
         try:
             if worker.is_dirty():
-                return (
-                    "its worker repository has uncommitted changes, and merging "
-                    "over them could destroy work no reviewer has seen"
-                )
+                return WORKER_DIRTY_CARRY_REFUSAL
             tip = worker.head_sha()
             if not worker.is_descendant(tip, candidate):
                 return (
@@ -19401,6 +19486,13 @@ class Orchestrator:
         must never stop a working loop. A clone that cannot be brought to `head`
         is returned as a refusal, so the cost is one parked task instead of a
         stopped fleet.
+
+        **A dirty worker is answered with a `CarryDeferral`, not a refusal**
+        (conc-15) — see `_carry_execution_past_for_merge`, which is the whole of
+        this method past the record load. It is split out so the OWNING lane can
+        run the same carry on the record it already holds in memory when its
+        round ends (`_settle_deferred_carry_forward`): loading a second copy
+        there would advance a record the round's next save then overwrites.
         """
         if self._execution_store is None:
             return "this process has no execution store to carry it with"
@@ -19416,6 +19508,31 @@ class Orchestrator:
             # to carry anywhere.
             return "the registry has no task by that id"
         task = self._registry.get(task_id)
+        return self._carry_execution_past_for_merge(execution, task, head)
+
+    def _carry_execution_past_for_merge(
+        self, execution: TaskExecution, task: Task, head: str
+    ) -> "str | CarryDeferral":
+        """`_carry_candidate_past_for_merge` on a record the caller already
+        holds: synchronise the observed clone to `head`, carry the reviewed
+        candidate past it, advance the record onto the merge and SAVE IT.
+        `""` on success; a `CarryDeferral` when the worker was mid-write; any
+        other string is the reason to park.
+
+        Mutates and saves `execution` IN PLACE — the object the caller holds
+        is the object that advanced, which is what lets `_finish_postcommit`
+        keep saving the record it has without writing the pre-carry base back
+        over a carry that happened (the reason this is not a second load).
+
+        THE DEFERRAL is decided here and nowhere else, by comparing the
+        carry-forward's refusal against `WORKER_DIRTY_CARRY_REFUSAL` with `==`.
+        Precondition 4 of `_carry_reviewed_candidate_past` is the only one that
+        describes a state the loop itself resolves — an agent finishes writing
+        and the round commits — so it is the only one worth waiting out; a
+        conflict, a missing worker, a tip that lost the candidate, a git that
+        will not answer are all parks, exactly as before. The value carries the
+        base the record is on NOW, which is what the retry checks it against.
+        """
         if self._observed is not None:
             # The carry-forward fetches `head` from this clone, and git's
             # `upload-pack` refuses an unadvertised sha — so the commit has to
@@ -19434,8 +19551,11 @@ class Orchestrator:
                     f"brought to {head[:12]} — " + "; ".join(violations)
                 )
         refusal = self._carry_reviewed_candidate_past(execution, task, head)
+        if refusal == WORKER_DIRTY_CARRY_REFUSAL:
+            return CarryDeferral(head=head, base=execution.task_base_sha, reason=refusal)
         if refusal:
             return refusal
+        task_id = task.id
         reviewed = execution.candidate_sha
         worker = GitGateway(Path(execution.worktree_path), self._policy, env=worker_env())
         try:
@@ -19479,6 +19599,258 @@ class Orchestrator:
             },
         )
         return ""
+
+    # ---- the deferred carry-forward (conc-15) --------------------------------
+    #
+    # A merge in ANOTHER lane may move the head while this lane's agent is
+    # mid-write. The carry-forward refuses a dirty worker — correctly — and until
+    # conc-15 that refusal parked the task `task_fatal` for an operator verb,
+    # over a condition that resolves itself the moment the round commits. Now
+    # the merging lane writes the head it owes onto the record
+    # (`TaskExecution.carry_deferred_head`, via `auto_merge._defer_carry_forward`)
+    # and THIS lane, which owns the round, settles it at the round's end.
+    #
+    # Three hooks, and the round's exits are the whole design:
+    #
+    #   `_absorb_merge_marks`              the moment the executor returns —
+    #                                      the record on disk may now carry what
+    #                                      a sibling wrote while the agent ran
+    #   `_settle_deferred_carry_forward`   where the round COMMITS: retry, and
+    #                                      park only if it still refuses
+    #   `_drop_deferred_carry_forward`     every other exit, and at dispatch —
+    #                                      the obligation never outlives the
+    #                                      round it was deferred through
+    #
+    # Dropping is safe because it is not the last word: `_rebase_execution_if_
+    # stale` reconciles a base behind the head at the next dispatch exactly as
+    # it did before any of this existed. What this adds is the retry at the one
+    # moment the tree is clean by construction, so the ordinary mid-write strand
+    # never needs a human at all.
+    #
+    # NOTHING AT `lanes = 1`, structurally: obligations are minted only above one
+    # lane (`cli._merge_window_blockers`), so the field is never written there,
+    # the absorb is gated on the same fleet reading the merge token uses, and the
+    # other two hooks are a comparison against an empty string.
+
+    def _absorb_merge_marks(self, execution: TaskExecution, task: Task) -> None:
+        """Adopt what a MERGING lane wrote onto this record while the executor
+        was running: the re-review marker and the deferred carry-forward.
+
+        The owning lane holds `execution` in memory from dispatch to the end of
+        the round, and saves it whole several times after the executor returns
+        (`report_summary`, the commit, every `_finalise_attempt`). A field
+        another process wrote in between would be overwritten by the first of
+        those saves — the obligation read back as never having existed, and the
+        strand it describes left with no park and no retry. Called ONCE, the
+        moment the executor returns and before any of those saves.
+
+        Adopts THREE fields and nothing else, each only when the copy on disk
+        holds a value: `rereview_owed_base` (the marker `auto_merge._mark_
+        rereview_owed` writes before a merge, which the same clobber was losing
+        on the non-commit exits), `carry_deferred_head` and
+        `carry_deferred_base`. The rest of the record is this lane's own and
+        is what it holds in memory. A carry that SUCCEEDED against this lane's
+        worker mid-round — possible only while the tree is momentarily clean —
+        is deliberately not reconciled here; see the report of conc-15.
+
+        SKIPPED ENTIRELY AT `lanes = 1`, by the same reading the merge token is
+        gated on: no obligation can have been minted there, so the read would
+        cost a file open per round and could add a raise site to a path whose
+        acceptance criterion is "unchanged". Above one lane a record that
+        cannot be read adopts nothing and says so; the round carries on with
+        its own copy, which is what it would have done before this existed.
+        """
+        if not merges_are_serialised(self._config):
+            return
+        try:
+            on_disk = self._execution_store.load(task.id)
+        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
+            self._log(
+                "merge_marks_unreadable",
+                data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return
+        if on_disk is None:
+            return
+        adopted = {}
+        for field_name in ("rereview_owed_base", "carry_deferred_head", "carry_deferred_base"):
+            value = getattr(on_disk, field_name, "") or ""
+            if value and value != getattr(execution, field_name, ""):
+                setattr(execution, field_name, value)
+                adopted[field_name] = value
+        if adopted:
+            self._log("merge_marks_absorbed", data={"task_id": task.id, **adopted})
+
+    def _drop_deferred_carry_forward(
+        self, execution: TaskExecution, task: Task, why: str
+    ) -> None:
+        """Clear a deferred carry-forward this round will NOT perform, saying
+        so in the transcript. A no-op — no write, no entry — when none is set,
+        which is every round at `lanes = 1` and most rounds above it.
+
+        Reached from every exit of a dispatched round that is not the commit
+        (an operator abort, a fault, an executor that reported failure, a
+        refused commit, an escape), and from dispatch for a record that still
+        carries one — a round that never reached any exit. In each of those the
+        worker is not clean by construction, so there is nothing to retry; what
+        makes DROPPING correct rather than lossy is that the base is reconciled
+        again at the next dispatch by `_rebase_execution_if_stale`, exactly as
+        before this field existed, and the re-review marker is untouched, so the
+        candidate stays refused at push time on the approval it already had.
+
+        Saved HERE rather than left to the exit's own save: several of those
+        exits save only conditionally, and an obligation that survived one of
+        them on disk would be retried against a round it was not deferred
+        through.
+        """
+        head = execution.carry_deferred_head
+        if not head:
+            return
+        base = execution.carry_deferred_base
+        execution.carry_deferred_head = ""
+        execution.carry_deferred_base = ""
+        self._execution_store.save(execution)
+        self._log(
+            "carry_forward_deferral_dropped",
+            data={
+                "task_id": task.id,
+                "head": head,
+                "base": base,
+                "task_base_sha": execution.task_base_sha,
+                "reason": why,
+                "note": (
+                    "not retried here; a base still behind the head is reconciled "
+                    "again at the next dispatch by _rebase_execution_if_stale"
+                ),
+            },
+        )
+
+    def _settle_deferred_carry_forward(
+        self, execution: TaskExecution, state: LoopState, task: Task
+    ) -> bool:
+        """Perform the carry-forward a merge deferred to this round's end, now
+        that the round has committed and the worker is clean. True to carry on
+        with the round; False when this parked it.
+
+        FOUR outcomes, in the order they are decided:
+
+        * **Nothing deferred** — every round at `lanes = 1` and most above it:
+          a comparison against `""` and nothing else.
+        * **Superseded** — the record's base is no longer the one the deferral
+          was minted against, so something else has already carried it (a
+          re-dispatch's `_rebase_execution_if_stale`, an operator). Merging the
+          older head into it would set the base BACKWARDS and put mainline's
+          own work into this task's diff. Dropped, logged, round continues.
+        * **Carried** — `_carry_execution_past_for_merge` on the record THIS
+          round holds: the head is merged into the task branch, the candidate
+          advances to the merge commit, the round count moves to
+          `carried_review_rounds`. The round then continues into
+          `_verify_committed` and the packet EXACTLY as it would have, and both
+          read `task_base_sha..candidate_sha` — so validation grades the merged
+          tree the reviewer is shown, and the packet is this task's net change
+          against the head it will be merged onto. The re-review this record
+          owes is the packet this round is about to send; the old approval
+          names a sha the record no longer holds, and `push_candidate_stale`
+          refuses it.
+        * **Still refused** — a genuine conflict, a worker that will not
+          answer, a clone that cannot be synchronised. The transient reason is
+          gone and the refusal is the same one that has always needed a human,
+          so this parks `task_base_behind_head` exactly as `_rebase_execution_
+          if_stale` and `auto_merge` do, naming the reason. The committed
+          candidate is preserved on its branch and nothing is rolled back. The
+          open attempt is settled on the FAULT budget: the round produced its
+          work and what moved was the head under it, which is
+          `worker_environment_drift`'s classification and not the task's own
+          defect.
+
+        A retry that comes back as ANOTHER deferral — the worker is still dirty
+        after its commit — is dropped rather than parked: the residue is
+        `_verify_committed`'s to refuse a few lines down, under its own code,
+        and the base is reconciled at the next dispatch as for every other drop.
+
+        Runs BEFORE `_verify_committed` on purpose, and the order is a claim
+        about evidence: a carry after validation would leave the packet diffing
+        one tree while the validation summary described another.
+        """
+        head = execution.carry_deferred_head
+        if not head:
+            return True
+        base = execution.carry_deferred_base
+        if base and execution.task_base_sha != base:
+            self._drop_deferred_carry_forward(
+                execution,
+                task,
+                f"superseded: the record's base is {execution.task_base_sha[:12]}, "
+                f"no longer the {base[:12]} the deferral was minted against",
+            )
+            return True
+        execution.carry_deferred_head = ""
+        execution.carry_deferred_base = ""
+        refusal = self._carry_execution_past_for_merge(execution, task, head)
+        if isinstance(refusal, CarryDeferral):
+            # Restored for the drop's own entry, which reads and clears it.
+            execution.carry_deferred_head = head
+            execution.carry_deferred_base = base
+            self._drop_deferred_carry_forward(
+                execution,
+                task,
+                "the worker repository is still not clean after the commit — the "
+                "post-commit gate decides this round",
+            )
+            return True
+        if not refusal:
+            # `_carry_execution_past_for_merge` saved the advanced record; the
+            # mirror is refreshed so the packet this round sends binds to the
+            # candidate the state names (see `_ask_for_the_owed_rereview`).
+            state.task_execution = asdict(execution)
+            self._log(
+                "carry_forward_deferral_retried",
+                data={
+                    "task_id": task.id,
+                    "old_base": base,
+                    "new_base": execution.task_base_sha,
+                    "candidate_sha": execution.candidate_sha,
+                    "review_round": execution.review_round,
+                    "carried_review_rounds": execution.carried_review_rounds,
+                    "rereview_owed_base": execution.rereview_owed_base,
+                },
+            )
+            return True
+        self._execution_store.save(execution)
+        self._log(
+            "carry_forward_deferral_refused",
+            data={
+                "task_id": task.id,
+                "head": head,
+                "base": base,
+                "candidate_sha": execution.candidate_sha,
+                "reason": refusal,
+            },
+        )
+        self._finalise_attempt(execution, ATTEMPT_FAULT, CARRY_FORWARD_BLOCKER_CODE)
+        state.task_execution = asdict(execution)
+        state.last_response = None
+        self._to_needs_user(
+            f"task {task.id}: its recorded base {base[:12]} is behind the branch "
+            f"head {head[:12]} — the loop merged another task while this one "
+            "was mid-write, deferred carrying its candidate forward until the "
+            f"round committed, and the carry-forward still refused once the "
+            f"worker was clean — {refusal}. Nothing was discarded: commit "
+            f"{execution.candidate_sha[:12]} is on {execution.task_branch}, "
+            "the worker repository and the execution record are exactly as they "
+            "were, and the candidate owes a re-review, so it cannot be pushed on "
+            "any approval it already has. Either publish or abandon that "
+            f"candidate, or archive .autoloop/executions/{task.id}.json to "
+            "start fresh at the current head.",
+            kind="task_fatal",
+            code=CARRY_FORWARD_BLOCKER_CODE,
+            task_id=task.id,
+            detail=(
+                f"base={base} head={head} candidate={execution.candidate_sha} "
+                f"review_round={execution.review_round} refusal={refusal}"
+            ),
+        )
+        return False
 
     def _rebase_execution_if_stale(
         self, execution: TaskExecution, task: Task, *, worker_reusable: bool = False

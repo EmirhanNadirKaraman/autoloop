@@ -42,6 +42,17 @@ pins the fleet merge token that buys it back — the same file `merge_sweep` tak
 — by driving a second lane's completion from inside the first lane's
 `merge_commit`, which is the interleaving rather than a hope of one.
 
+conc-15 takes the one refusal of that carry-forward that is TRANSIENT — the
+owning lane's worker is mid-write — and DEFERS it to the end of that round
+instead of parking it for an operator: measured 2026-09-11, three automatic
+merges stranded two lanes that way within four hours, each for a condition that
+had resolved itself minutes later. The last section of this file drives the
+merge from INSIDE the owning lane's executor, while its worker is dirty, and
+follows the round to its commit — where the carry is retried on the record the
+round holds — and to each of its other exits, where the obligation is dropped
+rather than left dangling. A genuine CONFLICT still parks, at the round's end,
+under the same code it always did.
+
 `lanes = 1` is the acceptance criterion every candidate in that plan carries,
 and it is asserted here rather than assumed: the reason string, the merge
 outcome and the untouched record are pinned at one lane in the same file that
@@ -64,7 +75,7 @@ from pathlib import Path
 import pytest
 
 from autoloop import auto_merge, cli, merge_sweep
-from autoloop.auto_merge import MergeObligation
+from autoloop.auto_merge import CarryDeferral, MergeObligation
 from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig, ConcurrencyConfig, lane_id
 from autoloop.contract import Decision, Directive
@@ -72,9 +83,10 @@ from autoloop.errors import GitCommandError, LockHeldError, StateCorruptError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
-from autoloop.orchestrator import Orchestrator
+from autoloop.orchestrator import WORKER_DIRTY_CARRY_REFUSAL, Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import (
+    EXECUTION_ABORTED,
     LastResponse,
     LoopState,
     Phase,
@@ -85,10 +97,12 @@ from autoloop.state import (
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
 from autoloop.worktask import (
+    ATTEMPT_FAULT,
     ATTEMPT_TASK,
     IntentStore,
     TaskExecutionStore,
     format_attempt,
+    split_attempt,
 )
 from autoloop.worktree import WorktreeManager
 
@@ -1404,8 +1418,12 @@ def test_a_lane_mid_write_loses_no_work_when_the_base_moves_under_it(tmp_path):
 
     The dirty tree is the guard, and it is precondition 4 of the carry-forward:
     merging over that residue is exactly the quiet discard the refusal exists to
-    prevent. So the merge lands, the carry refuses, the task parks, and every
-    byte the agent had written is still there."""
+    prevent. So the merge lands, the carry refuses, and every byte the agent had
+    written is still there. What the refusal DOES about it changed in conc-15:
+    the condition is transient — the tree goes clean when the round commits —
+    so the carry is DEFERRED onto the task's record for the owning lane's round
+    end instead of parked `task_base_behind_head` for an operator verb. The
+    re-review marker stays, so the old approval still publishes nothing."""
     h = build(
         tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
     )
@@ -1430,20 +1448,25 @@ def test_a_lane_mid_write_loses_no_work_when_the_base_moves_under_it(tmp_path):
     assert (worktree / "brand-new.py").read_text() == "a file it just made\n"
     assert head(worktree) == tip_before
     assert run_git(worktree, "branch", "--show-current").strip() == nine.task_branch
-    # And the refusal names the reason rather than being silent about it.
-    refusals = [e["data"] for e in h.entries("auto_merge_carry_forward_refused")]
-    assert [d["task_id"] for d in refusals] == ["t9"]
-    assert "uncommitted changes" in refusals[0]["reason"]
-    assert len([b for b in h.blockers("t9") if b.code == "task_base_behind_head"]) == 1
+    # DEFERRED, not parked: the transcript names the reason, the record names
+    # the head it is owed, and no blocker exists for an operator to answer.
+    assert h.entries("auto_merge_carry_forward_refused") == []
+    deferred = [e["data"] for e in h.entries("auto_merge_carry_forward_deferred")]
+    assert [d["task_id"] for d in deferred] == ["t9"]
+    assert "uncommitted changes" in deferred[0]["reason"]
+    assert deferred[0]["head"] == h.head()
+    assert h.blockers("t9") == [], "no operator verb is owed for a mid-write lane"
     kept = h.execution_store.load("t9")
     assert (kept.candidate_sha, kept.task_base_sha) == (nine.candidate_sha, before)
     assert kept.rereview_owed_base == before
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == (h.head(), before)
 
     approve(h, stale)
 
     assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == "", (
         "the approval taken against the old base still publishes nothing"
     )
+    assert "push_rereview_owed" in [b.code for b in h.blockers("t9")]
 
 
 def test_a_lane_with_no_candidate_yet_is_not_stranded_by_the_moving_base(tmp_path):
@@ -1897,3 +1920,660 @@ def test_releasing_a_token_swallows_what_it_cannot_remove(tmp_path, monkeypatch)
 
     merge_sweep.release_merge_token(token)      # must not raise
     merge_sweep.release_merge_token(None)       # nor must the one-lane no-op
+
+
+# --- a mid-write strand defers, and is settled when the round ends (conc-15) ---
+#
+# THE measured incident: within four hours of automatic merges starting to work,
+# three of them stranded two lanes — each one mid-write, each one parked
+# `task_base_behind_head` for an operator verb, each one over a worker that had
+# gone clean minutes later when its round committed. The dirty-worker refusal
+# is CORRECT and unchanged; what changed is what the loop does about it. The
+# merging lane records the head it owes on the task's record and the OWNING
+# lane settles it when its round ends: retried where the round commits, dropped
+# (never dangling) where it does not, and parked only when the retry itself
+# refuses once the worker is clean — which is a genuine conflict and needs a
+# human.
+#
+# Every test below drives the sibling's merge from INSIDE the owning lane's
+# executor, while that lane's worker is dirty, and then lets the round run to
+# whichever exit the test is about. That interleaving is the claim: the record
+# gains the obligation ON DISK while the round holds a stale copy in memory, so
+# a test that wrote the field by hand and called the retry would pass with the
+# read-back deleted and prove nothing.
+
+
+class MidWriteExecutor:
+    """`WritingExecutor`, interrupted: writes the round's files, hands control
+    to `during` while the worker is DIRTY — the instant a sibling lane's merge
+    lands in the measured incident — and ends the round however `finish` says,
+    an ordinary success unless told otherwise."""
+
+    def __init__(self, worktrees_root, per_task, during, finish=None):
+        self.worktrees_root = Path(worktrees_root)
+        self.per_task = {k: dict(v) for k, v in per_task.items()}
+        self.during = during
+        self.finish = finish
+
+    def execute(self, directive, task):
+        files = self.per_task[task.id]
+        wt = self.worktrees_root / task.id
+        for rel, content in files.items():
+            (wt / rel).write_text(content, encoding="utf-8")
+        self.during(task, wt)
+        if self.finish is not None:
+            return self.finish(task, wt)
+        return ExecutionOutcome(
+            status="ok",
+            summary=f"wrote {sorted(files)}",
+            details="details",
+            validation="ok",
+            changed_paths=tuple(files.keys()),
+        )
+
+
+def strand_in_flight(
+    tmp_path, *, t1_files, nine_file, nine_content, next_round, finish=None
+):
+    """The measured shape, as a harness. `t1` is published and unintegrated —
+    the branch a sibling lane will merge; `t9` holds a REVIEWED candidate
+    bound to the head, with a revise round about to be dispatched on it; and
+    t1's merge is driven from INSIDE t9's executor, after it has written and
+    before it returns. Returns the harness, t9's pre-round record, the head
+    before the merge, and what the executor observed at the merge."""
+    h = build(tmp_path, per_task={"t1": t1_files}, lanes=2, auto_merge_enabled=False)
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", nine_file, nine_content)
+    # In progress, as a task with a round in flight is; `_dispatch_task_
+    # postcommit` is driven directly below (the admission gates are not what
+    # these tests are about), so the status move a dispatch makes is made here.
+    h.orch._registry.mark_in_progress("t9")
+    h.orch._task_store.save(h.orch._registry)
+    seen: dict = {}
+    sibling = merger(h, lane_index=1)
+
+    def during(task, wt):
+        seen["dirty_at_merge"] = not is_clean(wt)
+        seen["merge"] = sibling.after_completion("t1")
+        seen["head_after_merge"] = h.head()
+        seen["record_at_merge"] = h.execution_store.load("t9")
+
+    h.orch._executor = MidWriteExecutor(
+        tmp_path / "worktrees", {"t9": {nine_file: next_round}}, during, finish
+    )
+    return h, nine, before, seen
+
+
+def revise(h, task_id="t9"):
+    h.orch._dispatch_task_postcommit(
+        Directive(decision=Decision.REVISE, reason="again", task_id=task_id),
+        h.orch._registry.get(task_id),
+        h.orch.state,
+    )
+
+
+def test_a_merge_while_a_lane_is_mid_write_does_not_park_it_and_carries_it_when_the_round_ends(
+    tmp_path,
+):
+    """THE claim, in one test. A sibling merges while this lane's agent is
+    part way through a revise round; the lane is not parked, and when its
+    round commits the candidate is carried onto the merged head — on the
+    record the round holds — and the packet that goes out is for the carried
+    candidate against the new base. The reviewed commit stays reachable, the
+    round's own work is in the tree, the rounds it had are not refilled, and
+    the approval taken against the old base publishes nothing."""
+    h, nine, before, seen = strand_in_flight(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="the next round\n",
+    )
+    worktree = Path(nine.worktree_path)
+    stale = binding_for(nine, worktree)
+
+    revise(h)
+
+    # 1. The merge landed while the worker was dirty, and it did NOT park.
+    assert seen["dirty_at_merge"], "the precondition of this test"
+    assert seen["merge"] == {"t1": auto_merge.MERGED}
+    assert seen["head_after_merge"] != before
+    at_merge = seen["record_at_merge"]
+    assert at_merge.carry_deferred_head == seen["head_after_merge"]
+    assert at_merge.carry_deferred_base == before
+    assert at_merge.rereview_owed_base == before, "still marked, exactly as a park is"
+    assert h.entries("auto_merge_carry_forward_refused") == []
+    deferred = [e["data"] for e in h.entries("auto_merge_carry_forward_deferred")]
+    assert [d["task_id"] for d in deferred] == ["t9"]
+    assert deferred[0]["reason"] == WORKER_DIRTY_CARRY_REFUSAL
+    assert h.blockers("t9") == [], "no operator verb, at any point in this round"
+    # 2. The round committed, and the carry ran on ITS record when it did.
+    assert h.orch.state.phase == Phase.READY.value
+    assert [e["data"]["task_id"] for e in h.entries("merge_marks_absorbed")] == ["t9"]
+    assert [
+        e["data"]["task_id"] for e in h.entries("carry_forward_deferral_retried")
+    ] == ["t9"]
+    carried = h.execution_store.load("t9")
+    assert carried.task_base_sha == h.head() == seen["head_after_merge"]
+    assert carried.candidate_sha != nine.candidate_sha, "the candidate sha moved"
+    assert contains(worktree, carried.candidate_sha, nine.candidate_sha), (
+        "a MERGE, not a re-base: the reviewed commit still exists and is reachable"
+    )
+    assert contains(worktree, carried.candidate_sha, h.head()), "the head is integrated"
+    assert run_git(worktree, "show", f"{carried.candidate_sha}:nine.py") == "the next round\n"
+    assert run_git(worktree, "show", f"{carried.candidate_sha}:a.py") == "one\n"
+    assert is_clean(worktree)
+    assert head(worktree) == carried.candidate_sha
+    assert (carried.carry_deferred_head, carried.carry_deferred_base) == ("", "")
+    assert (carried.review_round, carried.carried_review_rounds) == (1, 1), (
+        "the round it had moved to carried_review_rounds; this packet charged its own"
+    )
+    # 3. The re-review it owed IS the packet this round sends: rendered against
+    #    the new base, bound to the carried candidate, obligation discharged.
+    assert carried.rereview_owed_base == ""
+    assert carried.rereview_candidate_sha == ""
+    assert carried.candidate_sha in queued_review_packet(h)
+    h.orch._step_ready()
+    fresh = h.orch.state.pending_request.postcommit
+    assert fresh is not None
+    assert fresh.candidate_sha == carried.candidate_sha
+    assert fresh.base_sha == h.head(), "reviewed against the base the merge left"
+    # 4. The old approval names a sha the record no longer holds.
+    approve(h, stale)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert [b.code for b in h.blockers("t9")] == ["push_candidate_stale"]
+
+
+def test_the_retry_moves_the_record_the_round_holds_not_a_second_copy(tmp_path):
+    """The silent no-op this design is arranged against. The carry-forward's
+    merge-side entry loads its own record; a retry through it would advance a
+    DIFFERENT object from the one `_finish_postcommit` keeps saving, and the
+    round's next save would write the pre-carry base back over the carry —
+    correct in the transcript, absent on disk. So the assertion is about the
+    RECORD ON DISK after the round, against the `execution_candidate_advanced_
+    for_rereview` entry the carry wrote."""
+    h, _nine, _before, _seen = strand_in_flight(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="the next round\n",
+    )
+
+    revise(h)
+
+    advanced = [e["data"] for e in h.entries("execution_candidate_advanced_for_rereview")]
+    assert [d["task_id"] for d in advanced] == ["t9"]
+    on_disk = h.execution_store.load("t9")
+    assert on_disk.task_base_sha == advanced[0]["new_base"] == h.head()
+    assert on_disk.candidate_sha == advanced[0]["candidate_sha"]
+    assert on_disk.carried_review_rounds == advanced[0]["carried_review_rounds"] == 1
+    assert dict(h.orch.state.task_execution)["candidate_sha"] == on_disk.candidate_sha, (
+        "and the state mirror names the candidate the packet binds"
+    )
+
+
+def test_a_deferred_carry_that_conflicts_once_the_worker_is_clean_still_parks(tmp_path):
+    """THE OTHER BAIL, and the two must not share an outcome. Both branches
+    add `shared.py`, so once the round commits and the worker is clean the
+    retry meets a genuine conflict — not transient, and the case that needs a
+    human. It parks `task_base_behind_head` exactly as the dispatch-time carry
+    and the merge-side park do, on the round's own exit, with the reason. The
+    round's commit is preserved on its branch, the worker is clean, the record
+    is still on its old base, and the marker still refuses the old approval."""
+    h, nine, before, seen = strand_in_flight(
+        tmp_path,
+        t1_files={"shared.py": "one\n"},
+        nine_file="shared.py",
+        nine_content="nine\n",
+        next_round="nine, revised\n",
+    )
+    worktree = Path(nine.worktree_path)
+    stale = binding_for(nine, worktree)
+
+    revise(h)
+
+    assert seen["merge"] == {"t1": auto_merge.MERGED}
+    assert [
+        e["data"]["task_id"] for e in h.entries("auto_merge_carry_forward_deferred")
+    ] == ["t9"], "deferred at the merge, because the worker was dirty then"
+    # Parked at the round's end, because the conflict is real.
+    parks = h.blockers("t9")
+    assert [b.code for b in parks] == ["task_base_behind_head"]
+    assert parks[0].kind == "task_fatal"
+    assert "shared.py" in parks[0].question and "mid-write" in parks[0].question
+    assert h.orch.state.phase == Phase.NEEDS_USER.value
+    assert h.orch.state.park_task_id == "t9"
+    refused = [e["data"] for e in h.entries("carry_forward_deferral_refused")]
+    assert [d["task_id"] for d in refused] == ["t9"]
+    assert "shared.py" in refused[0]["reason"]
+    assert queued_review_packet(h) == "", "no packet: a human has to look first"
+    # Nothing was discarded to buy that park.
+    kept = h.execution_store.load("t9")
+    assert kept.task_base_sha == before
+    assert kept.candidate_sha == head(worktree) != nine.candidate_sha
+    assert contains(worktree, kept.candidate_sha, nine.candidate_sha)
+    assert run_git(worktree, "show", f"{kept.candidate_sha}:shared.py") == "nine, revised\n"
+    assert is_clean(worktree), "the retry's own merge was aborted"
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert kept.rereview_owed_base == before
+    assert kept.rereview_candidate_sha == "", "no carried candidate exists to name"
+    # The open attempt is settled on the FAULT budget: the head moved under
+    # the round, which is `worker_environment_drift`'s classification.
+    _ordinal, budget, reason = split_attempt(kept.attempt_ledger[-1])
+    assert (budget, reason) == (ATTEMPT_FAULT, "task_base_behind_head")
+    assert (kept.attempt_count, kept.fault_attempt_count) == (0, 1)
+
+    approve(h, stale)
+
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert "push_rereview_owed" in [b.code for b in h.blockers("t9")]
+
+
+def test_an_aborted_round_drops_the_deferred_carry_and_leaves_nothing_dangling(tmp_path):
+    """A round that never finishes. The operator kills it after the sibling
+    merged; nothing was committed, the worker holds the residue the abort
+    preserves, and there is no clean tree to retry on. The obligation is
+    DROPPED — with an entry saying so — rather than left for a round it was
+    not deferred through; the marker stays, so the old approval is still
+    refused; the abort itself parks nothing and the task goes back to the
+    queue with its residue intact. What the next dispatch then does with the
+    stale base is `_rebase_execution_if_stale`'s, unchanged by this round (the
+    fault test below shows it carrying a clean worker)."""
+
+    def aborted(task, wt):
+        return ExecutionOutcome(
+            status=EXECUTION_ABORTED, summary="killed mid-write", changed_paths=()
+        )
+
+    h, nine, before, seen = strand_in_flight(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="half of the next round\n",
+        finish=aborted,
+    )
+    worktree = Path(nine.worktree_path)
+    stale = binding_for(nine, worktree)
+
+    revise(h)
+
+    assert seen["record_at_merge"].carry_deferred_head == seen["head_after_merge"]
+    assert h.orch.state.phase == Phase.STOPPED.value
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "aborted" in dropped[0]["reason"]
+    assert dropped[0]["head"] == seen["head_after_merge"]
+    kept = h.execution_store.load("t9")
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert kept.rereview_owed_base == before, "absorbed and kept: still owed"
+    assert (kept.candidate_sha, kept.task_base_sha) == (nine.candidate_sha, before)
+    assert (worktree / "nine.py").read_text() == "half of the next round\n"
+    assert not is_clean(worktree), "the residue the abort preserves"
+    assert h.blockers("t9") == [], "the abort parked nothing"
+    assert h.orch._registry.state_of("t9") is TaskState.READY, "back in the queue"
+    assert h.entries("carry_forward_deferral_retried") == []
+
+    approve(h, stale)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert "push_rereview_owed" in [b.code for b in h.blockers("t9")]
+
+
+def test_a_faulted_round_drops_the_deferred_carry_and_the_next_dispatch_still_carries(
+    tmp_path,
+):
+    """The other way a round never finishes: the executor comes back with a
+    fault it POSITIVELY named — a provider throttle, a stall kill — having
+    committed nothing. Dropped, logged, charged to the fault budget as it
+    always was, and NOT the last word: with the worker clean again, the next
+    dispatch's `_rebase_execution_if_stale` carries the record onto the head,
+    exactly as it did before the deferral existed. That backstop is what makes
+    dropping correct rather than lossy."""
+
+    def faulted(task, wt):
+        return ExecutionOutcome(
+            status="error",
+            summary="the provider throttled the agent",
+            changed_paths=(),
+            fault_kind="provider_rate_limited",
+        )
+
+    h, nine, before, seen = strand_in_flight(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="half of the next round\n",
+        finish=faulted,
+    )
+    worktree = Path(nine.worktree_path)
+
+    revise(h)
+
+    assert seen["record_at_merge"].carry_deferred_head == seen["head_after_merge"]
+    assert h.orch.state.phase == Phase.READY.value
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "provider_rate_limited" in dropped[0]["reason"]
+    kept = h.execution_store.load("t9")
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert kept.rereview_owed_base == before
+    assert (kept.candidate_sha, kept.task_base_sha) == (nine.candidate_sha, before)
+    _ordinal, budget, reason = split_attempt(kept.attempt_ledger[-1])
+    assert (budget, reason) == (ATTEMPT_FAULT, "provider_rate_limited")
+    assert h.blockers("t9") == []
+
+    # The residue is gone by the next dispatch — here, put back by hand — and
+    # the dispatch-time carry does what it always did.
+    run_git(worktree, "checkout", "--", "nine.py")
+    assert is_clean(worktree)
+    survivor = h.orch._rebase_execution_if_stale(
+        kept, h.orch._registry.get("t9"), worker_reusable=True
+    )
+    assert survivor is not None, "carried, never re-based, never parked"
+    assert survivor.task_base_sha == h.head()
+    assert survivor.candidate_sha == nine.candidate_sha, "the dispatch-time carry keeps the sha"
+    assert contains(worktree, head(worktree), h.head())
+    assert h.blockers("t9") == []
+
+
+def test_an_executor_failure_drops_the_deferred_carry_too(tmp_path):
+    """The exit that is neither an abort nor a fault: the executor reported
+    failure on the task's own account (a validation that did not pass), so
+    nothing was committed and the worker still holds the round's writes. Same
+    answer, same entry, task budget as before."""
+
+    def failed(task, wt):
+        return ExecutionOutcome(
+            status="error", summary="validation failed", changed_paths=()
+        )
+
+    h, _nine, before, _seen = strand_in_flight(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="does not pass\n",
+        finish=failed,
+    )
+
+    revise(h)
+
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "executor_reported_failure" in dropped[0]["reason"]
+    kept = h.execution_store.load("t9")
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert kept.rereview_owed_base == before
+    _ordinal, budget, reason = split_attempt(kept.attempt_ledger[-1])
+    assert (budget, reason) == (ATTEMPT_TASK, "executor_reported_failure")
+    assert h.blockers("t9") == []
+
+
+def test_a_deferral_left_by_a_round_that_died_is_dropped_at_the_next_dispatch(tmp_path):
+    """A process that dies mid-round leaves the field on disk with no exit to
+    clear it. The obligation is scoped to THAT round: the next dispatch drops
+    it, says so, runs the new round without a retry or a park, and leaves the
+    base to the stale-base reconciliation every re-dispatch goes through —
+    `_rebase_execution_if_stale`, which this harness (linked worktrees, no
+    worker-repository manager) does not reach from the dispatch, so the base
+    is asserted UNMOVED here rather than carried."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False)
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    worktree = Path(nine.worktree_path)
+    h.orch._registry.mark_in_progress("t9")
+    h.orch._task_store.save(h.orch._registry)
+    # The sibling merges while the (now dead) round was mid-write...
+    (worktree / "nine.py").write_text("mid-write\n", encoding="utf-8")
+    assert merger(h, lane_index=1).after_completion("t1") == {"t1": auto_merge.MERGED}
+    stranded = h.execution_store.load("t9")
+    assert stranded.carry_deferred_head == h.head()
+    assert stranded.carry_deferred_base == before
+    # ...and the round dies without an exit, its residue still on the tree.
+    h.orch._executor = WritingExecutor(
+        tmp_path / "worktrees", {"t9": {"nine.py": "the next round\n"}}
+    )
+
+    revise(h)
+
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "found at dispatch" in dropped[0]["reason"]
+    assert dropped[0]["head"] == stranded.carry_deferred_head
+    assert h.entries("carry_forward_deferral_retried") == []
+    assert h.entries("carry_forward_deferral_refused") == []
+    assert h.blockers("t9") == []
+    assert h.orch.state.phase == Phase.READY.value
+    done = h.execution_store.load("t9")
+    assert (done.carry_deferred_head, done.carry_deferred_base) == ("", "")
+    assert done.task_base_sha == before, "not this dispatch's to carry"
+    assert run_git(worktree, "show", f"{done.candidate_sha}:nine.py") == "the next round\n"
+    assert done.candidate_sha in queued_review_packet(h)
+
+
+def test_a_retry_whose_base_has_already_moved_is_dropped_as_superseded(tmp_path):
+    """Merging an OLDER head into a record something else has already carried
+    would set its base backwards and put mainline's own work into this task's
+    diff. The retry compares the deferral's base against the record's first
+    and drops it when they differ, touching no repository."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    tip = head(Path(nine.worktree_path))
+    nine.carry_deferred_head = "f" * 40
+    nine.carry_deferred_base = "0" * 40           # not the base the record is on
+    h.execution_store.save(nine)
+
+    carried_on = h.orch._settle_deferred_carry_forward(
+        nine, h.orch.state, h.orch._registry.get("t9")
+    )
+
+    assert carried_on is True
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "superseded" in dropped[0]["reason"]
+    kept = h.execution_store.load("t9")
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert kept.task_base_sha == nine.task_base_sha
+    assert kept.candidate_sha == nine.candidate_sha
+    assert head(Path(nine.worktree_path)) == tip, "no merge was attempted"
+    assert h.blockers("t9") == []
+
+
+def test_a_retry_on_a_worker_still_dirty_after_its_commit_is_dropped_not_parked(tmp_path):
+    """Residue after a commit is `_verify_committed`'s to refuse, under its own
+    code. The retry that meets it drops the obligation — the base is
+    reconciled at the next dispatch — rather than parking a base problem over
+    what is a residue problem."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    nine.carry_deferred_head = h.head()
+    nine.carry_deferred_base = nine.task_base_sha
+    h.execution_store.save(nine)
+    (Path(nine.worktree_path) / "residue.py").write_text("left behind\n", encoding="utf-8")
+
+    carried_on = h.orch._settle_deferred_carry_forward(
+        nine, h.orch.state, h.orch._registry.get("t9")
+    )
+
+    assert carried_on is True
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "still not clean" in dropped[0]["reason"]
+    kept = h.execution_store.load("t9")
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert h.blockers("t9") == []
+    assert h.entries("carry_forward_deferral_refused") == []
+
+
+def test_the_carry_forward_classifies_a_dirty_worker_by_value_and_a_conflict_by_text(tmp_path):
+    """The distinction, pinned at its source. A genuinely dirty worker driven
+    through the real carry comes back as a `CarryDeferral` carrying the head,
+    the record's base and the one refusal string, compared by `==` with the
+    constant the precondition returns — so the constant and the returned
+    string cannot drift apart. A conflict, a missing worker and an unreadable
+    record all stay strings, and strings park."""
+    h = build(tmp_path, per_task={"t1": {"shared.py": "one\n"}}, lanes=2, auto_merge_enabled=False)
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "shared.py", "nine\n")
+    worktree = Path(nine.worktree_path)
+    task = h.orch._registry.get("t9")
+    # The head moves by an operator commit that touches nothing of t9's.
+    (h.repo / "elsewhere.txt").write_text("someone else\n")
+    run_git(h.repo, "add", "-A")
+    run_git(h.repo, "commit", "-q", "-m", "the head moves")
+    moved = h.head()
+
+    (worktree / "shared.py").write_text("mid-write\n", encoding="utf-8")
+    deferral = h.orch._carry_execution_past_for_merge(nine, task, moved)
+    assert isinstance(deferral, CarryDeferral)
+    assert deferral == CarryDeferral(head=moved, base=before, reason=WORKER_DIRTY_CARRY_REFUSAL)
+    assert bool(deferral) is True, "a deferral is still 'the carry did not happen'"
+    assert h.orch._carry_candidate_past_for_merge("t9", moved) == deferral
+    assert (worktree / "shared.py").read_text() == "mid-write\n"
+    assert h.execution_store.load("t9").task_base_sha == before, "nothing moved"
+
+    run_git(worktree, "checkout", "--", "shared.py")
+    # Clean now — and once t1 lands, the head carries t1's `shared.py`, so
+    # this is the genuine conflict, and it is a string.
+    assert merger(h, lane_index=1).attempt("t1") == auto_merge.MERGED
+    refusal = h.orch._carry_execution_past_for_merge(nine, task, h.head())
+    assert isinstance(refusal, str) and refusal
+    assert "shared.py" in refusal
+    assert is_clean(worktree), "the conflicting merge was aborted"
+    assert h.execution_store.load("t9").task_base_sha == before
+
+    nine.worktree_path = ""
+    assert isinstance(h.orch._carry_execution_past_for_merge(nine, task, h.head()), str)
+
+
+def test_a_deferral_the_record_will_not_take_parks_as_before(tmp_path):
+    """FAIL CLOSED on the write. An obligation nothing recorded is one nobody
+    will retry, and a candidate left behind the head with no park to say so is
+    the invisible strand this module is against — so a record that refuses the
+    deferral is parked `task_base_behind_head`, with both reasons."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False)
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+    worktree = Path(nine.worktree_path)
+    (worktree / "nine.py").write_text("mid-write\n", encoding="utf-8")
+    real_save = h.execution_store.save
+
+    def refusing(execution):
+        if execution.task_id == "t9" and execution.carry_deferred_head:
+            raise OSError("the record will not take the deferral")
+        real_save(execution)
+
+    h.execution_store.save = refusing
+    try:
+        outcome = merger(h, lane_index=1).after_completion("t1")
+    finally:
+        h.execution_store.save = real_save
+
+    assert outcome == {"t1": auto_merge.MERGED}, "the merge itself is unaffected"
+    assert h.entries("auto_merge_carry_forward_deferred") == []
+    refused = [e["data"] for e in h.entries("auto_merge_carry_forward_refused")]
+    assert [d["task_id"] for d in refused] == ["t9"]
+    assert "could not be deferred" in refused[0]["reason"]
+    assert "uncommitted changes" in refused[0]["reason"]
+    parks = [b for b in h.blockers("t9") if b.code == "task_base_behind_head"]
+    assert len(parks) == 1
+    kept = h.execution_store.load("t9")
+    assert kept.carry_deferred_head == ""
+    assert kept.rereview_owed_base == before, "and the marker still refuses the push"
+    assert (worktree / "nine.py").read_text() == "mid-write\n"
+
+
+def test_the_absorb_reads_nothing_at_one_lane_and_fails_closed_above(tmp_path):
+    """The read-back after the executor is a new disk read on every round, so
+    at one lane — where no obligation can exist — it must not happen at all:
+    a store that fails the test if it is read proves that more exactly than an
+    absent entry does. Above one lane a record that cannot be read adopts
+    nothing, says so, and does not raise into the round."""
+    (tmp_path / "one").mkdir()
+    one = build(tmp_path / "one", per_task={"t1": {"a.py": "one\n"}}, lanes=1)
+    record = bound_candidate(one, "t9", "nine.py", "nine\n")
+    one.orch._execution_store.load = lambda task_id: pytest.fail(
+        "no record may be read back at one lane"
+    )
+    one.orch._absorb_merge_marks(record, one.orch._registry.get("t9"))
+    assert one.entries("merge_marks_absorbed") == []
+
+    (tmp_path / "two").mkdir()
+    two = build(tmp_path / "two", per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    record = bound_candidate(two, "t9", "nine.py", "nine\n")
+
+    def unreadable(task_id):
+        raise StateCorruptError("torn")
+
+    two.orch._execution_store.load = unreadable
+    two.orch._absorb_merge_marks(record, two.orch._registry.get("t9"))
+    assert [e["data"]["task_id"] for e in two.entries("merge_marks_unreadable")] == ["t9"]
+    assert record.carry_deferred_head == "" and record.rereview_owed_base == ""
+
+
+def test_the_absorb_adopts_only_what_a_sibling_wrote_and_only_when_it_is_set(tmp_path):
+    """Three fields, adopted from disk only when the disk copy holds a value;
+    everything else on the record is this lane's own and stays what it holds
+    in memory. A mark restored to empty by a merge that aborted is NOT adopted
+    over a value the round already had."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
+    record = bound_candidate(h, "t9", "nine.py", "nine\n")
+    task = h.orch._registry.get("t9")
+    on_disk = h.execution_store.load("t9")
+    on_disk.rereview_owed_base = "b" * 40
+    on_disk.carry_deferred_head = "h" * 40
+    on_disk.carry_deferred_base = "b" * 40
+    on_disk.report_summary = "written by somebody else"
+    h.execution_store.save(on_disk)
+    record.report_summary = "this lane's own"
+
+    h.orch._absorb_merge_marks(record, task)
+
+    assert record.rereview_owed_base == "b" * 40
+    assert (record.carry_deferred_head, record.carry_deferred_base) == ("h" * 40, "b" * 40)
+    assert record.report_summary == "this lane's own", "not a reload"
+    absorbed = [e["data"] for e in h.entries("merge_marks_absorbed")]
+    assert absorbed == [{
+        "task_id": "t9",
+        "rereview_owed_base": "b" * 40,
+        "carry_deferred_head": "h" * 40,
+        "carry_deferred_base": "b" * 40,
+    }]
+
+    on_disk.rereview_owed_base = ""
+    on_disk.carry_deferred_head = ""
+    on_disk.carry_deferred_base = ""
+    h.execution_store.save(on_disk)
+    h.orch._absorb_merge_marks(record, task)
+    assert record.rereview_owed_base == "b" * 40, "an empty disk value adopts nothing"
+    assert len(h.entries("merge_marks_absorbed")) == 1
+
+
+def test_at_one_lane_a_full_round_writes_none_of_this(tmp_path):
+    """The acceptance criterion through the real loop: a round that commits
+    and a push that merges, at one lane, leave the two new fields empty and
+    write no entry any hook of this section writes — every one of them is a
+    comparison against `""` there, and the read-back is skipped outright."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=1)
+
+    h.push("t1")
+
+    done = h.execution_store.load("t1")
+    assert (done.carry_deferred_head, done.carry_deferred_base) == ("", "")
+    assert done.published_sha == done.candidate_sha
+    for entry_type in (
+        "merge_marks_absorbed",
+        "merge_marks_unreadable",
+        "carry_forward_deferral_dropped",
+        "carry_forward_deferral_retried",
+        "carry_forward_deferral_refused",
+        "auto_merge_carry_forward_deferred",
+    ):
+        assert h.entries(entry_type) == [], entry_type
+    assert h.blockers("t1") == []
