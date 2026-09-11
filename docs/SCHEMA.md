@@ -404,6 +404,30 @@ at parse time, in `load_config`'s style: a typo'd `source_path` would otherwise
 load as a record asserting nothing about no files, which can never be found
 stale, missing or contradictory.
 
+VALIDATED, NOT MERELY PARSED (ctx-14, porting ctx-02's checks onto this format).
+At parse time, in `record_from_mapping` and therefore in
+`ContextRecordStore.write`'s read-back: `title` is required for every kind and
+capped at `context_records.MAX_SUMMARY_CHARS` (200); `feature` also requires
+`invariant` and `source_paths`, `incident` `source_paths`, `decision`
+`invariant`, `lesson` nothing more (`REQUIRED_FIELDS`); a non-empty
+`last_verified_commit` is one full lowercase object id (40 hex, or 64 in a
+SHA-256 repository). A record's status
+is DERIVED — `active`, or `superseded` when `superseded_by` is set
+(`STATUSES`) — and a `status` key is refused as unknown. Then, at the end of
+BOTH loaders (`context_records.verify_records`, so on every `store.load`):
+`last_verified_commit` must be an object the worker's gateway holds and reads as
+a commit (`cat-file -e`, then `cat-file commit`; a blob or a tree id is refused),
+`superseded_by` must name a record some file in the load declares and
+not the record itself, and every `related_ids` entry must name one too. A record
+failing any of these is a `RecordProblem` naming its file and is NOT loaded —
+except a copy of an id two files declare, which is passed through with its
+problem so the index still refuses the id under both files rather than letting
+the copy that verified win.
+Fail-closed: no gateway, a gateway that raises or lacks `object_exists`, or one
+answering neither `True` nor `False` reports every record citing a commit rather
+than accepting it, and the records citing none still load. Citations are checked
+against the parsed set, so one refused record does not refuse its neighbours.
+
 A record is a claim about `source_paths` AT `last_verified_commit`. That pairing
 is what makes staleness a question about TREES: the resolver compares
 `tree_of(last_verified_commit)` with the tree of the checkout it was resolved
