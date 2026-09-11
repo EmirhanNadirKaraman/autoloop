@@ -11898,6 +11898,12 @@ class Orchestrator:
         # identical empty file on both sides is not a violation and needs no
         # exemption at all. See `TaskStore.ensure_mutex_file`.
         self._task_store.ensure_mutex_file()
+        # The execution store's mutex, for the same reason (conc-15): a sibling
+        # lane's merge takes it to write a mark onto this task's record while
+        # the agent runs, and this lane's own saves take it on every write. Not
+        # left to "a save always precedes the executor": that is true today and
+        # is not the kind of claim to hang a loop-fatal park on.
+        self._execution_store.ensure_mutex_file()
         exempt = self._operator_priority_exemption()
         # THE observed tree, resolved once for both snapshots so the two sides
         # can never describe different repositories.
@@ -14350,6 +14356,12 @@ class Orchestrator:
         # park already written. Nothing at `lanes = 1`: the field is empty.
         if not self._settle_deferred_carry_forward(execution, state, task):
             return
+        # The obligation the packet below discharges, read HERE — the base the
+        # packet is rendered against is settled at this line, and every save
+        # from here to the discharge adopts whatever a sibling writes next, so
+        # a mark landing during validation would otherwise be read as the one
+        # this packet answers (see `_discharge_rereview_mark`).
+        owed = execution.rereview_owed_base
         failures, validation_summary = self._verify_committed(execution, worktree_git)
         state.last_validation = validation_summary
         # `review_round` counts REVIEWS, not commit attempts. It is incremented
@@ -14430,18 +14442,6 @@ class Orchestrator:
         # Only here — a packet exists and is about to become `outbox`. A packet
         # that could not be built consumed no review round either.
         execution.review_round += 1
-        # And the re-review a moved base owed is now the review being sent, so
-        # the obligation is discharged HERE — and at the one other site that
-        # sends such a packet, `_ask_for_the_owed_rereview`, which is this same
-        # discharge reached from an approval rather than from a round (conc-03).
-        # Not when the carry-forward succeeded: a candidate carried onto a new
-        # head that nobody has looked at again is exactly what must stay
-        # unpushable. Both lines are no-op assignments at `lanes = 1`, where
-        # neither field is ever set — the packet built above is rendered from
-        # `task_base_sha..candidate_sha`, which the carry-forward already moved,
-        # so what goes out is the carried candidate against its new base.
-        execution.rereview_owed_base = ""
-        execution.rereview_candidate_sha = ""
         # Stamped BEFORE the save below, so the round's classification and the
         # review round it earned reach disk together. `sent_for_review` is also
         # the outcome `_note_round_fault` looks for: a session that then dies on
@@ -14450,6 +14450,17 @@ class Orchestrator:
         # settles as `fault|<origin>>sent_for_review` and is recognised the
         # same, so consecutive faults keep landing on the fault budget.
         self._finalise_attempt(execution, ATTEMPT_TASK, REASON_SENT_FOR_REVIEW)
+        # And the re-review a moved base owed is now the review being sent, so
+        # the obligation is discharged HERE — and at the one other site that
+        # sends such a packet, `_ask_for_the_owed_rereview`, which is this same
+        # discharge reached from an approval rather than from a round (conc-03).
+        # Not when the carry-forward succeeded: a candidate carried onto a new
+        # head that nobody has looked at again is exactly what must stay
+        # unpushable. A no-op at `lanes = 1`, where neither field is ever set —
+        # the packet built above is rendered from `task_base_sha..candidate_
+        # sha`, which the carry-forward already moved, so what goes out is the
+        # carried candidate against its new base.
+        self._discharge_rereview_mark(execution, task, owed)
         self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         state.outbox = TEMPLATES["postcommit_review"].render(
@@ -14864,6 +14875,10 @@ class Orchestrator:
         gated on.
         """
         task_id = binding.task_id
+        # The obligation this ask discharges, as the caller just loaded it —
+        # before the packet is built, for the reason `_finish_postcommit`
+        # gives at its own capture (see `_discharge_rereview_mark`).
+        owed = execution.rereview_owed_base
         if self._registry is None or not self._registry.has(task_id):
             # The packet names the task and quotes its title and description;
             # an audit unit that was never registered arrives here too (see
@@ -14933,8 +14948,7 @@ class Orchestrator:
         execution.review_round += 1
         # Discharged HERE, at the line a packet actually becomes the outbox —
         # the same rule and the same moment as `_dispatch_task_postcommit`.
-        execution.rereview_owed_base = ""
-        execution.rereview_candidate_sha = ""
+        self._discharge_rereview_mark(execution, task, owed)
         self._execution_store.save(execution)
         # The mirror `_current_pending_postcommit` binds the outgoing request
         # from. Without it the packet would go out carrying the CARRIED
@@ -19627,25 +19641,42 @@ class Orchestrator:
     # moment the tree is clean by construction, so the ordinary mid-write strand
     # never needs a human at all.
     #
+    # THE READ-BACK IS NOT THE ONLY GUARD, and it could not be: a sibling can
+    # write the record after `_absorb_merge_marks` reads it and before this
+    # lane's next whole-record save (`report_summary`, the commit, every
+    # `_finalise_attempt`), and that single read would then be a window rather
+    # than a fix. So the store closes it at every save — `TaskExecutionStore.
+    # save` reconciles `worktask.MERGE_OWNED_FIELDS` from the file under the
+    # store's mutex, a non-empty value on disk wins, and the object this lane
+    # holds is updated to match. An ordinary save can therefore never clear
+    # one of these fields; the two hooks that do clear them write through
+    # `update_merge_marks`, under the same mutex, naming the field. The absorb
+    # remains for the exits that DECIDE before they save — and both hooks
+    # below call it first, so an abort, a fault and the retry itself each
+    # decide on what is on disk at that moment, not on the copy in hand.
+    #
     # NOTHING AT `lanes = 1`, structurally: obligations are minted only above one
     # lane (`cli._merge_window_blockers`), so the field is never written there,
-    # the absorb is gated on the same fleet reading the merge token uses, and the
-    # other two hooks are a comparison against an empty string.
+    # the absorb is gated on the same fleet reading the merge token uses, and
+    # past that gate the other two hooks are a comparison against an empty
+    # string — held under the store's mutex, which is the same empty lock file
+    # every save takes at every lane count, and reads nothing.
 
     def _absorb_merge_marks(self, execution: TaskExecution, task: Task) -> None:
         """Adopt what a MERGING lane wrote onto this record while the executor
         was running: the re-review marker and the deferred carry-forward.
 
         The owning lane holds `execution` in memory from dispatch to the end of
-        the round, and saves it whole several times after the executor returns
-        (`report_summary`, the commit, every `_finalise_attempt`). A field
-        another process wrote in between would be overwritten by the first of
-        those saves — the obligation read back as never having existed, and the
-        strand it describes left with no park and no retry. Called ONCE, the
-        moment the executor returns and before any of those saves.
+        the round, and decides several of its exits — an abort, a fault, the
+        retry at the commit — by reading these fields off that copy before it
+        saves anything. Called ONCE, the moment the executor returns, so those
+        decisions are made on what is on disk. (The saves themselves reconcile
+        the same fields again, under the same mutex — see the section comment
+        above — which is what makes a write landing AFTER this read survive.)
 
         Adopts THREE fields and nothing else, each only when the copy on disk
-        holds a value: `rereview_owed_base` (the marker `auto_merge._mark_
+        holds a value (`TaskExecutionStore.adopt_merge_marks`, the store's own
+        rule): `rereview_owed_base` (the marker `auto_merge._mark_
         rereview_owed` writes before a merge, which the same clobber was losing
         on the non-commit exits), `carry_deferred_head` and
         `carry_deferred_base`. The rest of the record is this lane's own and
@@ -19663,23 +19694,60 @@ class Orchestrator:
         if not merges_are_serialised(self._config):
             return
         try:
-            on_disk = self._execution_store.load(task.id)
-        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
+            adopted = self._execution_store.adopt_merge_marks(execution)
+        except (StateError, OSError, ValueError, TypeError) as exc:
             self._log(
                 "merge_marks_unreadable",
                 data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
             )
             return
-        if on_disk is None:
-            return
-        adopted = {}
-        for field_name in ("rereview_owed_base", "carry_deferred_head", "carry_deferred_base"):
-            value = getattr(on_disk, field_name, "") or ""
-            if value and value != getattr(execution, field_name, ""):
-                setattr(execution, field_name, value)
-                adopted[field_name] = value
         if adopted:
             self._log("merge_marks_absorbed", data={"task_id": task.id, **adopted})
+
+    def _discharge_rereview_mark(
+        self, execution: TaskExecution, task: Task, owed: str
+    ) -> None:
+        """Clear the re-review marker for the packet that discharges it, at
+        the two sites that send one — `_finish_postcommit` and
+        `_ask_for_the_owed_rereview` — through the store's compare-and-clear
+        (`TaskExecutionStore.discharge_rereview_mark`), and say so when the
+        marker was NOT cleared because a newer one was found.
+
+        `owed` is the marker as the caller read it WHEN THE PACKET'S BASE WAS
+        SETTLED — after the retry in `_finish_postcommit`, at entry in
+        `_ask_for_the_owed_rereview` — and not `execution.rereview_owed_base`
+        as it stands here: every save between there and here adopts what is
+        on disk, so by this line the object already holds a newer mark if one
+        landed, and comparing against the object would clear it.
+
+        A newer mark means a sibling moved the head AGAIN after that read, and
+        marked the record with the base the candidate is on now — a move the
+        packet about to go out has not seen. Kept, it refuses the push on that
+        packet's approval exactly as any owed re-review does
+        (`_dispatch_task_push`), which is the fail-closed answer; the transcript
+        carries the reason so the refusal is not a surprise. A no-op at
+        `lanes = 1`, where the marker is never set: the compare reads an empty
+        file value against an empty field and writes what would have been
+        written anyway.
+        """
+        kept = self._execution_store.discharge_rereview_mark(execution, owed)
+        if kept:
+            self._log(
+                "rereview_mark_kept_newer",
+                data={
+                    "task_id": task.id,
+                    "discharged": owed,
+                    "kept": kept,
+                    "candidate_sha": execution.candidate_sha,
+                    "task_base_sha": execution.task_base_sha,
+                    "note": (
+                        "the head moved again after this lane last read its "
+                        "record; the packet being sent has not seen that move, "
+                        "so the candidate still owes a re-review and is refused "
+                        "at push time on this packet's approval"
+                    ),
+                },
+            )
 
     def _drop_deferred_carry_forward(
         self, execution: TaskExecution, task: Task, why: str
@@ -19698,18 +19766,32 @@ class Orchestrator:
         before this field existed, and the re-review marker is untouched, so the
         candidate stays refused at push time on the approval it already had.
 
-        Saved HERE rather than left to the exit's own save: several of those
-        exits save only conditionally, and an obligation that survived one of
-        them on disk would be retried against a round it was not deferred
-        through.
+        Written HERE rather than left to the exit's own save, and through
+        `update_merge_marks` rather than `save`: several of those exits save
+        only conditionally, an obligation that survived one of them on disk
+        would be retried against a round it was not deferred through — and an
+        ordinary save cannot clear this field at all, by the store's rule that
+        a value on disk wins (the rule that keeps a sibling's write from being
+        lost between this lane's reads). Clearing is a named write.
+
+        Decides on the file, not on the copy in hand: the deferral is read back
+        first (`_absorb_merge_marks`, which reads nothing at one lane), so one
+        a sibling wrote AFTER the post-executor read-back is dropped at this
+        exit rather than adopted by the exit's own save and found — and only
+        then dropped — at the next dispatch. Read, decision and write are ONE
+        hold of the store's mutex (re-entrant, so the two calls inside take it
+        for free): a deferral written between the read and the write would
+        otherwise be the one this clear overwrote.
         """
-        head = execution.carry_deferred_head
-        if not head:
-            return
-        base = execution.carry_deferred_base
-        execution.carry_deferred_head = ""
-        execution.carry_deferred_base = ""
-        self._execution_store.save(execution)
+        with self._execution_store.lock():
+            self._absorb_merge_marks(execution, task)
+            head = execution.carry_deferred_head
+            if not head:
+                return
+            base = execution.carry_deferred_base
+            self._execution_store.update_merge_marks(
+                execution, carry_deferred_head="", carry_deferred_base=""
+            )
         self._log(
             "carry_forward_deferral_dropped",
             data={
@@ -19771,21 +19853,37 @@ class Orchestrator:
         Runs BEFORE `_verify_committed` on purpose, and the order is a claim
         about evidence: a carry after validation would leave the packet diffing
         one tree while the validation summary described another.
+
+        Decides on the record AS THE FILE HOLDS IT: the deferral is read back
+        once more here (`_absorb_merge_marks`), because the last read was the
+        one after the executor and this lane has saved since — each of those
+        saves adopted what was on disk, but a sibling's write landing after
+        the last of them would be one this decision had not seen. The
+        obligation is then cleared DURABLY, through `update_merge_marks`,
+        before the retry runs: the carry-forward saves the record on its way,
+        and an ordinary save would put a deferral still on disk straight back.
+        Read, decision and clear are one hold of the store's mutex; the mutex
+        is RELEASED before the carry, which runs git and must never be under
+        it — a sibling's mark writer waiting on that would hit its timeout and
+        park the very strand this defers.
         """
-        head = execution.carry_deferred_head
-        if not head:
-            return True
-        base = execution.carry_deferred_base
-        if base and execution.task_base_sha != base:
-            self._drop_deferred_carry_forward(
-                execution,
-                task,
-                f"superseded: the record's base is {execution.task_base_sha[:12]}, "
-                f"no longer the {base[:12]} the deferral was minted against",
+        with self._execution_store.lock():
+            self._absorb_merge_marks(execution, task)
+            head = execution.carry_deferred_head
+            if not head:
+                return True
+            base = execution.carry_deferred_base
+            if base and execution.task_base_sha != base:
+                self._drop_deferred_carry_forward(
+                    execution,
+                    task,
+                    f"superseded: the record's base is {execution.task_base_sha[:12]}, "
+                    f"no longer the {base[:12]} the deferral was minted against",
+                )
+                return True
+            self._execution_store.update_merge_marks(
+                execution, carry_deferred_head="", carry_deferred_base=""
             )
-            return True
-        execution.carry_deferred_head = ""
-        execution.carry_deferred_base = ""
         refusal = self._carry_execution_past_for_merge(execution, task, head)
         if isinstance(refusal, CarryDeferral):
             # Restored for the drop's own entry, which reads and clears it.

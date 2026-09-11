@@ -94,12 +94,14 @@ from autoloop.state import (
     StateStore,
     lane_paths,
 )
-from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
+from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore, TaskStoreBusy
 from autoloop.transcript import TranscriptLogger
 from autoloop.worktask import (
     ATTEMPT_FAULT,
     ATTEMPT_TASK,
+    MERGE_OWNED_FIELDS,
     IntentStore,
+    TaskExecution,
     TaskExecutionStore,
     format_attempt,
     split_attempt,
@@ -2462,18 +2464,22 @@ def test_a_deferral_the_record_will_not_take_parks_as_before(tmp_path):
     nine = bound_candidate(h, "t9", "nine.py", "nine\n")
     worktree = Path(nine.worktree_path)
     (worktree / "nine.py").write_text("mid-write\n", encoding="utf-8")
-    real_save = h.execution_store.save
+    # The deferral is written through the store's named merge-mark write, not
+    # a plain `save` — that is the one path that may write these fields — so
+    # that is the write refused here. The marker's own write, which takes the
+    # same path a moment earlier, is left to succeed.
+    real_update = h.execution_store.update_merge_marks
 
-    def refusing(execution):
-        if execution.task_id == "t9" and execution.carry_deferred_head:
+    def refusing(execution, **values):
+        if execution.task_id == "t9" and values.get("carry_deferred_head"):
             raise OSError("the record will not take the deferral")
-        real_save(execution)
+        real_update(execution, **values)
 
-    h.execution_store.save = refusing
+    h.execution_store.update_merge_marks = refusing
     try:
         outcome = merger(h, lane_index=1).after_completion("t1")
     finally:
-        h.execution_store.save = real_save
+        h.execution_store.update_merge_marks = real_update
 
     assert outcome == {"t1": auto_merge.MERGED}, "the merge itself is unaffected"
     assert h.entries("auto_merge_carry_forward_deferred") == []
@@ -2520,8 +2526,11 @@ def test_the_absorb_reads_nothing_at_one_lane_and_fails_closed_above(tmp_path):
 def test_the_absorb_adopts_only_what_a_sibling_wrote_and_only_when_it_is_set(tmp_path):
     """Three fields, adopted from disk only when the disk copy holds a value;
     everything else on the record is this lane's own and stays what it holds
-    in memory. A mark restored to empty by a merge that aborted is NOT adopted
-    over a value the round already had."""
+    in memory. A mark restored to empty by a merge that aborted — written the
+    way a sibling writes it, through `update_merge_marks`, since an ordinary
+    save can no longer clear one — is NOT adopted over a value the round
+    already had: that direction fails closed, and the next packet discharges
+    it."""
     h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2)
     record = bound_candidate(h, "t9", "nine.py", "nine\n")
     task = h.orch._registry.get("t9")
@@ -2546,13 +2555,409 @@ def test_the_absorb_adopts_only_what_a_sibling_wrote_and_only_when_it_is_set(tmp
         "carry_deferred_base": "b" * 40,
     }]
 
-    on_disk.rereview_owed_base = ""
-    on_disk.carry_deferred_head = ""
-    on_disk.carry_deferred_base = ""
-    h.execution_store.save(on_disk)
+    h.execution_store.update_merge_marks(
+        on_disk, rereview_owed_base="", carry_deferred_head="", carry_deferred_base=""
+    )
+    assert h.execution_store.load("t9").rereview_owed_base == "", "the premise: cleared on disk"
     h.orch._absorb_merge_marks(record, task)
     assert record.rereview_owed_base == "b" * 40, "an empty disk value adopts nothing"
     assert len(h.entries("merge_marks_absorbed")) == 1
+
+
+# --- the window AFTER the read-back (conc-15, revision 1) ----------------------
+#
+# The read-back the moment the executor returns is one read, and a sibling can
+# write the record after it and before the round's first whole-record save —
+# `report_summary`, the commit, every `_finalise_attempt`. Until this revision
+# that save wrote the stale in-memory copy back over the sibling's write: the
+# deferral and the marker read as never having existed, and the strand was
+# neither retried nor parked. Now `TaskExecutionStore.save` reconciles the
+# three merge-owned fields from the file under the store's mutex — a value on
+# disk wins, the object in hand is updated — so there is no read after which a
+# save can lose one. The tests below land the merge INSIDE that window, by
+# firing it from the read-back itself: after the real one has run and before
+# the round saves anything. Deterministic, not raced for.
+
+
+def strand_after_absorb(
+    tmp_path, *, t1_files, nine_file, nine_content, next_round, finish=None
+):
+    """`strand_in_flight` with the sibling's merge fired from inside
+    `_absorb_merge_marks` — AFTER the real read-back, so the round's in-memory
+    copy predates the write, and BEFORE the first post-executor save, which
+    is the save that used to lose it. Fired ONCE, on the first read-back after
+    the executor has run: the dispatch reads back before the executor (the
+    worker is clean then, and a merge there would be carried, not deferred),
+    and the retry and the drop read back after it — a second merge at any of
+    those would be a different claim."""
+    h = build(tmp_path, per_task={"t1": t1_files}, lanes=2, auto_merge_enabled=False)
+    h.push("t1")
+    before = h.head()
+    nine = bound_candidate(h, "t9", nine_file, nine_content)
+    h.orch._registry.mark_in_progress("t9")
+    h.orch._task_store.save(h.orch._registry)
+    seen: dict = {}
+    sibling = merger(h, lane_index=1)
+    real_absorb = h.orch._absorb_merge_marks
+
+    def absorb_then_merge(execution, task):
+        real_absorb(execution, task)
+        if "merge" in seen or "executed" not in seen:
+            return
+        seen["in_memory_before_merge"] = (
+            execution.carry_deferred_head, execution.rereview_owed_base
+        )
+        seen["dirty_at_merge"] = not is_clean(Path(execution.worktree_path))
+        seen["merge"] = sibling.after_completion("t1")
+        seen["head_after_merge"] = h.head()
+        seen["record_at_merge"] = h.execution_store.load("t9")
+        seen["in_memory_after_merge"] = (
+            execution.carry_deferred_head, execution.rereview_owed_base
+        )
+
+    def during(task, wt):
+        seen["executed"] = True
+
+    h.orch._absorb_merge_marks = absorb_then_merge
+    h.orch._executor = MidWriteExecutor(
+        tmp_path / "worktrees", {"t9": {nine_file: next_round}}, during, finish
+    )
+    return h, nine, before, seen
+
+
+def test_a_merge_landing_after_the_read_back_still_carries_when_the_round_ends(tmp_path):
+    """THE revision's claim. The sibling merges after the read-back has run
+    and before the round saves anything; the copy the round holds is stale at
+    that instant — asserted, because that is the window — and the round's own
+    save is what adopts the deferral, not a second read-back. The carry then
+    runs at the commit exactly as it does when the merge lands earlier: the
+    candidate advances onto the merged head, the packet binds it against the
+    new base, the marker is discharged by that packet, and the old approval
+    publishes nothing."""
+    h, nine, before, seen = strand_after_absorb(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="the next round\n",
+    )
+    worktree = Path(nine.worktree_path)
+    stale = binding_for(nine, worktree)
+
+    revise(h)
+
+    # 1. The write landed in the window: on disk, and NOT in the copy in hand.
+    assert seen["dirty_at_merge"], "the precondition of this test"
+    assert seen["merge"] == {"t1": auto_merge.MERGED}
+    assert seen["in_memory_before_merge"] == ("", "")
+    assert seen["in_memory_after_merge"] == ("", ""), "the round's copy predates the write"
+    assert seen["record_at_merge"].carry_deferred_head == seen["head_after_merge"]
+    assert seen["record_at_merge"].rereview_owed_base == before
+    assert h.entries("merge_marks_absorbed") == [], (
+        "adopted by the round's own save under the store's mutex, not by a "
+        "read-back — the read-back had already run when the write landed"
+    )
+    # 2. And it was neither lost nor parked: retried at the commit, carried.
+    assert h.blockers("t9") == []
+    assert [
+        e["data"]["task_id"] for e in h.entries("carry_forward_deferral_retried")
+    ] == ["t9"]
+    assert h.entries("carry_forward_deferral_dropped") == []
+    carried = h.execution_store.load("t9")
+    assert carried.task_base_sha == h.head() == seen["head_after_merge"]
+    assert carried.candidate_sha != nine.candidate_sha
+    assert contains(worktree, carried.candidate_sha, nine.candidate_sha)
+    assert contains(worktree, carried.candidate_sha, h.head())
+    assert run_git(worktree, "show", f"{carried.candidate_sha}:nine.py") == "the next round\n"
+    assert (carried.carry_deferred_head, carried.carry_deferred_base) == ("", "")
+    assert (carried.review_round, carried.carried_review_rounds) == (1, 1)
+    # 3. The packet is the re-review owed, and the old approval is refused.
+    assert (carried.rereview_owed_base, carried.rereview_candidate_sha) == ("", "")
+    assert carried.candidate_sha in queued_review_packet(h)
+    assert dict(h.orch.state.task_execution)["candidate_sha"] == carried.candidate_sha
+    approve(h, stale)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert [b.code for b in h.blockers("t9")] == ["push_candidate_stale"]
+
+
+def test_a_merge_landing_after_the_read_back_is_dropped_at_a_non_commit_exit(tmp_path):
+    """The same window, at an exit that never commits. The executor reports
+    failure after the sibling has written; the drop decides on the FILE, so
+    the deferral is dropped at this exit with its entry — not adopted by the
+    exit's own save and left for the next dispatch — and the marker written
+    in the same window survives that save: the old approval is still refused
+    on it, which is the half of the obligation a lost write would have
+    switched off."""
+
+    def failed(task, wt):
+        return ExecutionOutcome(
+            status="error", summary="validation failed", changed_paths=()
+        )
+
+    h, nine, before, seen = strand_after_absorb(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="does not pass\n",
+        finish=failed,
+    )
+    worktree = Path(nine.worktree_path)
+    stale = binding_for(nine, worktree)
+
+    revise(h)
+
+    assert seen["merge"] == {"t1": auto_merge.MERGED}
+    assert seen["in_memory_after_merge"] == ("", "")
+    dropped = [e["data"] for e in h.entries("carry_forward_deferral_dropped")]
+    assert [d["task_id"] for d in dropped] == ["t9"]
+    assert "executor_reported_failure" in dropped[0]["reason"]
+    assert dropped[0]["head"] == seen["head_after_merge"]
+    kept = h.execution_store.load("t9")
+    assert (kept.carry_deferred_head, kept.carry_deferred_base) == ("", "")
+    assert kept.rereview_owed_base == before, "the marker survived the exit's saves"
+    assert (kept.candidate_sha, kept.task_base_sha) == (nine.candidate_sha, before)
+    _ordinal, budget, reason = split_attempt(kept.attempt_ledger[-1])
+    assert (budget, reason) == (ATTEMPT_TASK, "executor_reported_failure")
+    assert h.blockers("t9") == []
+    assert h.orch.state.phase == Phase.READY.value
+
+    approve(h, stale)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert "push_rereview_owed" in [b.code for b in h.blockers("t9")]
+
+
+def test_a_mark_written_after_the_retry_is_kept_by_the_packets_discharge(tmp_path):
+    """The discharge is compare-and-clear. The merge lands mid-write and is
+    carried at the commit; then the head moves AGAIN — a second sibling marks
+    the record with the base the candidate is on now — after the retry and
+    before the packet is sent. That packet has not seen the second move, so
+    its discharge clears nothing: the newer mark is kept, said so in the
+    transcript, and the approval of this packet publishes nothing — the loop
+    asks for the re-review the newer mark owes instead."""
+    h, nine, before, seen = strand_in_flight(
+        tmp_path,
+        t1_files={"a.py": "one\n"},
+        nine_file="nine.py",
+        nine_content="nine\n",
+        next_round="the next round\n",
+    )
+    real_verify = h.orch._verify_committed
+
+    def mark_then_verify(execution, worktree_git):
+        # Written the way `_mark_rereview_owed` writes it, from a fresh load,
+        # after the retry moved the base and before the packet goes out.
+        on_disk = h.execution_store.load("t9")
+        seen["newer"] = on_disk.task_base_sha
+        h.execution_store.update_merge_marks(on_disk, rereview_owed_base=seen["newer"])
+        return real_verify(execution, worktree_git)
+
+    h.orch._verify_committed = mark_then_verify
+
+    revise(h)
+
+    assert seen["newer"] == seen["head_after_merge"] != before, "the carried base"
+    assert [
+        e["data"]["task_id"] for e in h.entries("carry_forward_deferral_retried")
+    ] == ["t9"]
+    kept = [e["data"] for e in h.entries("rereview_mark_kept_newer")]
+    assert [d["task_id"] for d in kept] == ["t9"]
+    assert (kept[0]["discharged"], kept[0]["kept"]) == (before, seen["newer"])
+    done = h.execution_store.load("t9")
+    assert done.rereview_owed_base == seen["newer"], "kept, not cleared"
+    assert done.rereview_candidate_sha == done.candidate_sha, "the carry's own statement stands"
+    assert done.candidate_sha in queued_review_packet(h), "the packet still went out"
+    assert h.blockers("t9") == []
+    # Its approval publishes nothing; the owed re-review is asked for instead.
+    h.orch._step_ready()
+    fresh = h.orch.state.pending_request.postcommit
+    assert fresh is not None and fresh.candidate_sha == done.candidate_sha
+    approve(h, fresh)
+    assert ref_sha(h.origin, f"refs/heads/{nine.task_branch}") == ""
+    assert [
+        e["data"]["task_id"] for e in h.entries("postcommit_rereview_requested")
+    ] == ["t9"]
+    assert h.execution_store.load("t9").rereview_owed_base == "", "discharged by THAT packet"
+    assert h.blockers("t9") == []
+
+
+def test_an_ordinary_save_cannot_clear_a_merge_owned_field(tmp_path):
+    """The store's rule, on its own and without a repository — the claim is
+    about a file and two holders of it. A field a sibling wrote survives the
+    owner's whole-record save whatever the owner's copy held, the owner's
+    copy is updated to say so, a newer value wins over an older one, and only
+    the named write clears — the field it names and no other."""
+    store = TaskExecutionStore(tmp_path / "executions")
+    owner = TaskExecution(
+        task_id="t", task_branch="autoloop/t", worktree_path="", task_base_sha="b" * 40
+    )
+    store.save(owner)
+    sibling = store.load("t")
+    store.update_merge_marks(
+        sibling,
+        rereview_owed_base="b" * 40,
+        carry_deferred_head="h" * 40,
+        carry_deferred_base="b" * 40,
+    )
+    assert MERGE_OWNED_FIELDS == (
+        "rereview_owed_base", "carry_deferred_head", "carry_deferred_base"
+    )
+
+    owner.report_summary = "the round's own"
+    store.save(owner)
+
+    assert (owner.rereview_owed_base, owner.carry_deferred_head, owner.carry_deferred_base) == (
+        "b" * 40, "h" * 40, "b" * 40
+    ), "the object in hand is updated, not only the bytes"
+    on_disk = store.load("t")
+    assert on_disk.carry_deferred_head == "h" * 40
+    assert on_disk.report_summary == "the round's own", "and the owner's own field landed"
+
+    store.update_merge_marks(sibling, rereview_owed_base="c" * 40)
+    store.save(owner)
+    assert owner.rereview_owed_base == "c" * 40, "newer wins over older"
+
+    owner.carry_deferred_head = ""
+    owner.carry_deferred_base = ""
+    store.save(owner)
+    assert store.load("t").carry_deferred_head == "h" * 40, "an ordinary save clears nothing"
+    assert owner.carry_deferred_head == "h" * 40
+
+    store.update_merge_marks(owner, carry_deferred_head="", carry_deferred_base="")
+    cleared = store.load("t")
+    assert (cleared.carry_deferred_head, cleared.carry_deferred_base) == ("", "")
+    assert cleared.rereview_owed_base == "c" * 40, "the field it did not name is untouched"
+    with pytest.raises(ValueError):
+        store.update_merge_marks(owner, candidate_sha="x" * 40)
+
+    # A missing or torn file adopts nothing and does not stop the save.
+    store.clear("t")
+    owner.candidate_sha = "d" * 40
+    store.save(owner)
+    assert store.load("t").candidate_sha == "d" * 40
+    store.path_for("t").write_text("{not json", encoding="utf-8")
+    store.save(owner)
+    assert store.load("t").candidate_sha == "d" * 40
+
+    # The mutex is ONE empty file beside the directory, never inside it.
+    assert store.mutex_path == tmp_path / "executions.lock"
+    assert store.mutex_path.read_bytes() == b""
+    assert sorted(p.name for p in (tmp_path / "executions").iterdir()) == ["t.json"]
+    with store.lock():
+        store.save(owner)               # re-entrant: no self-deadlock
+    assert store.ensure_mutex_file() == store.mutex_path
+
+
+def test_the_discharge_clears_only_the_mark_it_saw(tmp_path):
+    """`discharge_rereview_mark`, the three answers: the mark the caller saw
+    is the one on disk — cleared, with `rereview_candidate_sha` beside it; a
+    NEWER mark is on disk — kept and adopted, the carried-candidate statement
+    left standing, EVEN WHEN an ordinary save has already adopted it onto the
+    object (the comparison is against what the caller saw, not the object);
+    no mark on disk (a sibling restored it) — cleared too."""
+    store = TaskExecutionStore(tmp_path / "executions")
+    owner = TaskExecution(
+        task_id="t", task_branch="autoloop/t", worktree_path="", task_base_sha="b" * 40,
+        candidate_sha="c" * 40, rereview_owed_base="b" * 40, rereview_candidate_sha="c" * 40,
+    )
+    store.save(owner)
+    assert store.discharge_rereview_mark(owner, "b" * 40) == ""
+    assert (owner.rereview_owed_base, owner.rereview_candidate_sha) == ("", "")
+    assert store.load("t").rereview_owed_base == ""
+
+    owner.rereview_owed_base = "b" * 40
+    owner.rereview_candidate_sha = "c" * 40
+    store.save(owner)
+    saw = owner.rereview_owed_base
+    store.update_merge_marks(store.load("t"), rereview_owed_base="n" * 40)
+    store.save(owner)
+    assert owner.rereview_owed_base == "n" * 40, "adopted by the save in between"
+    assert store.discharge_rereview_mark(owner, saw) == "n" * 40
+    assert owner.rereview_owed_base == "n" * 40
+    assert owner.rereview_candidate_sha == "c" * 40
+    assert store.load("t").rereview_owed_base == "n" * 40
+
+    store.update_merge_marks(store.load("t"), rereview_owed_base="")
+    assert owner.rereview_owed_base == "n" * 40, "in hand, stale"
+    assert store.discharge_rereview_mark(owner, "n" * 40) == ""
+    assert (owner.rereview_owed_base, owner.rereview_candidate_sha) == ("", "")
+
+
+def test_a_store_mutex_that_cannot_be_taken_defers_the_merge(tmp_path):
+    """A busy mutex is a `StateError`, and the marker's writer treats it as
+    it treats an unreadable record: a refusal before the head moves, so the
+    merge DEFERS with nothing merged — never a mark silently skipped, and
+    never an escape into the merge itself."""
+    h = build(
+        tmp_path, per_task={"t1": {"a.py": "one\n"}}, lanes=2, auto_merge_enabled=False
+    )
+    h.push("t1")                       # published, not integrated
+    before = h.head()
+    nine = bound_candidate(h, "t9", "nine.py", "nine\n")
+
+    def busy():
+        raise TaskStoreBusy("another process has held the executions mutex")
+
+    h.execution_store.lock = busy
+    try:
+        outcome = merger(h, lane_index=1).after_completion("t1")
+    finally:
+        del h.execution_store.lock
+
+    assert outcome == {"t1": auto_merge.DEFERRED}
+    assert h.head() == before, "nothing was merged"
+    failed = [e["data"] for e in h.entries("auto_merge_rereview_mark_failed")]
+    assert [d["task_id"] for d in failed] == ["t9"]
+    assert "executions mutex" in failed[0]["reason"]
+    kept = h.execution_store.load("t9")
+    assert kept.rereview_owed_base == ""
+    assert kept.candidate_sha == nine.candidate_sha
+
+
+def test_the_store_mutex_is_pre_created_before_the_escape_snapshot(tmp_path):
+    """Placement, read off the source the way `test_context_packet.py` reads
+    dispatch order: the execution store's lock file is created in
+    `_execute_with_escape_detection` BEFORE the "before" snapshot, beside the
+    task file's, so a deployment whose state dir sits inside the observed
+    tree never sees it CREATED mid-round by a sibling's write. And what the
+    call creates is empty."""
+    import sys
+
+    module = Path(sys.modules[Orchestrator.__module__].__file__)
+    body = module.read_text(encoding="utf-8")
+    method = body.split("def _execute_with_escape_detection(")[1].split("\n    def ")[0]
+    assert method.index("_task_store.ensure_mutex_file()") < method.index(
+        "_execution_store.ensure_mutex_file()"
+    )
+    assert method.index("_execution_store.ensure_mutex_file()") < method.index(
+        "snapshot_checkout("
+    )
+    store = TaskExecutionStore(tmp_path / ".al" / "executions")
+    created = store.ensure_mutex_file()
+    assert created == tmp_path / ".al" / "executions.lock"
+    assert created.read_bytes() == b""
+    assert not (tmp_path / ".al" / "executions").exists(), "the directory itself is not created"
+
+
+def test_the_merging_lanes_writes_are_one_hold_of_the_store_mutex():
+    """The other half of the interval: the sibling's own load/mutate/write of
+    another lane's record straddles nothing. Read off `auto_merge.py`'s
+    source, the way the pre-creation above is: in both writers the mutex is
+    taken BEFORE the record is loaded, the write is the named merge-mark
+    write rather than a plain `save` (the one path that may set a mark to
+    EMPTY, which the conflict-abort restore needs), and the busy mutex is
+    caught with the unreadable record — never a raise into the merge."""
+    import sys
+
+    body = Path(sys.modules[auto_merge.__name__].__file__).read_text(encoding="utf-8")
+    for name in ("_write_rereview_marker", "_write_carry_deferral"):
+        method = body.split(f"def {name}(")[1].split("\n    def ")[0]
+        assert method.index("_execution_store.lock()") < method.index(
+            "_execution_store.load("
+        ), name
+        assert "update_merge_marks(" in method, name
+        assert "_execution_store.save(" not in method, name
+        assert "except (StateError" in method, name
 
 
 def test_at_one_lane_a_full_round_writes_none_of_this(tmp_path):
@@ -2574,6 +2979,7 @@ def test_at_one_lane_a_full_round_writes_none_of_this(tmp_path):
         "carry_forward_deferral_retried",
         "carry_forward_deferral_refused",
         "auto_merge_carry_forward_deferred",
+        "rereview_mark_kept_newer",
     ):
         assert h.entries(entry_type) == [], entry_type
     assert h.blockers("t1") == []
