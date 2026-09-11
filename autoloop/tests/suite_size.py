@@ -222,4 +222,12 @@ exists to hold still. Every document named below is named in a comment, which
 # Append below this line. One line per test file added, saying what the new file
 # does to BOTH selections — the docs-only 20 in `test_prose_doc_selection.py`
 # and the 20/24 pair in `test_test_selection.py` — and then bump the counter.
-SUITE_SIZE = 120
+#: 120 -> 121 when dash-08 added `test_action_log_panel.py` (2026-09-11), the
+#: DENOMINATOR only, for both selections: it names no change-note tracker in any
+#: evaluated string and resolves no `__file__`, so it reads no document under the
+#: conjunction; and its one spawn is `subprocess.run([node, path])` where `node`
+#: is `shutil.which("node")` — an argv the scan cannot read, but with no
+#: `python`/`python3` literal and no `sys.executable` anywhere in the file, so
+#: neither term of the opacity rule holds (its git comes from `gitrepo.py`). The
+#: docs-only 20 and the 20/24 pair hold.
+SUITE_SIZE = 121

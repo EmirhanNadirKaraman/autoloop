@@ -91,6 +91,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -745,6 +746,203 @@ def unit_panel(state: dict) -> dict:
         "round_label": str(review_round) if has_round else UNIT_UNKNOWN,
         "candidate_label": candidate or NO_CANDIDATE_YET,
     }
+
+
+# ---- the ACTION log of the round executing right now (dash-08) ---------------
+#
+# `worker_progress` above answers "is it working"; this answers "what is it
+# doing", and the two render side by side because neither is the other. A round
+# that has written 400 lines of the wrong thing is indistinguishable from a
+# productive one by line count alone, and waiting 25 minutes to find out which
+# it was is the cost this panel exists to remove.
+#
+# WHAT IT IS, and the label is load-bearing: an ACTION log — tool calls, files
+# read and written, commands run. It is NOT the model's reasoning. The headless
+# CLI exposes no reasoning stream at all, so a panel titled "thinking" would
+# promise introspection and deliver a command trace, which is worse than showing
+# nothing at all.
+#
+# stream-01 WRITES the file. Nothing here writes it, nothing here takes a lock,
+# and nothing here reads more than the end of it: a 25-minute round produces a
+# large log and this page polls every two seconds, so the whole file must never
+# reach it. Being one of several readers of a file a live round is appending to
+# also means a partial last line, a moment where the read fails, and a file that
+# does not exist yet are all ORDINARY — and the panel has to tell them apart on
+# screen, because an empty box says none of them.
+
+#: The field on `state.task_execution` that names the round's action log
+#: outright. Preferred over the convention below whenever it is present, so the
+#: WRITER stays the authority on where it writes: a reader that insisted on its
+#: own convention would go on saying "nothing written yet" beside a busy round
+#: the day the file moved. Spelled once, here.
+ACTION_LOG_PATH_FIELD = "action_log_path"
+
+#: Where the log is looked for when the record names none:
+#: `<state_dir>/action-logs/<task_id>.log`. One round per task is in flight at a
+#: time, so the task id identifies the running round's file without the page
+#: having to reason about `review_round` — which starts at a real 0 and is the
+#: trap `unit_panel` documents one function up.
+#:
+#: It is a GUESS about a writer this tree does not contain yet, and it is only
+#: safe because every absent state below NAMES THE PATH IT LOOKED AT. A
+#: convention that turns out to disagree with stream-01 then reads as a visible
+#: mismatch an operator can act on, instead of as a permanently idle agent.
+ACTION_LOG_DIRNAME = "action-logs"
+ACTION_LOG_SUFFIX = ".log"
+
+#: How much of the END of the log is read, and how many of the lines inside that
+#: window are shown. The BYTE budget is the real bound and the line count is
+#: cosmetic: a log with no newline in it at all would make a line count
+#: unbounded, and this reader must cost the same on a 4KB log and a 400MB one.
+#: The file is never read whole and is never held in memory whole — the reader
+#: seeks to `size - ACTION_LOG_TAIL_BYTES` and reads forward from there.
+ACTION_LOG_TAIL_BYTES = 64 * 1024
+ACTION_LOG_TAIL_LINES = 40
+
+#: The five states this panel can be in, and the only five. `lines` is the
+#: working case; the other four are each a DIFFERENT absence, and rendering any
+#: of them as an empty box would tell an operator nothing. `missing` means the
+#: round has written nothing yet, `empty` means it opened the file and has
+#: logged nothing into it, `unreadable` means something is there this page could
+#: not see, and `unlocatable` means there is nowhere to look at all.
+ACTION_LOG_STATES = ("lines", "empty", "missing", "unreadable", "unlocatable")
+
+#: The sentence each state shows, pinned HERE rather than in `PAGE` — the same
+#: rule the unit tiles (`UNIT_STATES`) and the state-dir banner
+#: (`STATE_DIR_UNRESOLVED`) follow, and it buys the same thing: the page cannot
+#: invent a word for a state, and each empty state is assertable in Python
+#: instead of grep-able in a JavaScript string. Each of the first three ends
+#: mid-sentence because the PATH is appended: "nothing written yet" is not
+#: self-diagnosing and "nothing written yet at <path>" is.
+ACTION_LOG_MISSING = (
+    "Nothing written yet — this round has not created an action log. Looked at: "
+)
+ACTION_LOG_EMPTY = (
+    "The action log exists and is EMPTY — the round has started and has logged "
+    "nothing into it yet, which is not the same as no log at all. Read from: "
+)
+ACTION_LOG_UNREADABLE = (
+    "The action log could NOT BE READ, which is not the same as nothing being "
+    "there — something exists and this page could not see it: "
+)
+ACTION_LOG_UNLOCATABLE = (
+    "There is nowhere to look for this round's action log: the execution record "
+    f"names no `{ACTION_LOG_PATH_FIELD}` and the state directory could not be "
+    "resolved, so this panel is empty because nothing could be read — not "
+    "because nothing is happening."
+)
+ACTION_LOG_TAIL_NOTE = "The tail of the log this round is writing — "
+ACTION_LOG_TRUNCATED = " Earlier lines are NOT shown: only the end of the file is read."
+
+
+def _tail_bytes(path: Path, budget: int) -> tuple[bytes, bool]:
+    """The last `budget` bytes of `path`, and whether anything was skipped.
+
+    `seek(0, SEEK_END)` then back at most `budget`, so the cost is the budget
+    and never the file size. Raises `OSError`, which the caller renders as its
+    own state — a read that failed is not a file that is empty.
+    """
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - budget)
+        # ALWAYS seek back, `start == 0` included: the size probe above left the
+        # handle at EOF, and a read from there is empty — which reported every
+        # log smaller than the budget as "the round has logged nothing" until
+        # the first run of `test_action_log_panel.py` caught it.
+        handle.seek(start)
+        return handle.read(budget), start > 0
+
+
+def action_log_tail(state: dict, state_dir: Path | None = None, *,
+                    max_bytes: int | None = None,
+                    max_lines: int | None = None) -> dict | None:
+    """The tail of the action log the round executing RIGHT NOW is writing.
+
+    `None` means no round is executing, and the page then renders no panel at
+    all — never the last round's tail. That is the same source and the same
+    condition `worker_progress` and `unit_panel` use (`state.task_execution`,
+    cleared the moment a candidate is published), so the three can never
+    disagree about which round is in flight.
+
+    Otherwise a dict whose `state` is one of `ACTION_LOG_STATES` and whose
+    `note` is the sentence for it, path included. The four non-`lines` states
+    are kept apart deliberately: "no log yet", "an empty log", "a log I could
+    not read" and "nowhere to look" call for four different reactions, and an
+    empty box supports none of them.
+
+    READ-ONLY AND LOCK-FREE, like the rest of this module: one `os.stat` and one
+    bounded read. Nothing is written, no lock is taken, and a scheduler hitting
+    this mid-round is safe. `os.stat` rather than `Path.is_file()` because the
+    latter SWALLOWS `OSError` and answers `False` — a permission fault would
+    then render as "nothing written yet", which is the fail-open this panel is
+    about. Anything that is not a regular file is refused before it is opened:
+    opening a fifo BLOCKS until a writer appears, and a page that hangs on the
+    poll is worse than one that says it could not read.
+    """
+    execution = state.get("task_execution") or {}
+    task_id = str(execution.get("task_id") or "")
+    if not task_id:
+        return None
+
+    max_bytes = ACTION_LOG_TAIL_BYTES if max_bytes is None else max_bytes
+    max_lines = max(0, ACTION_LOG_TAIL_LINES if max_lines is None else max_lines)
+    view = {"task_id": task_id, "path": "", "lines": [], "tail": "",
+            "truncated": False, "max_lines": max_lines}
+
+    recorded = str(execution.get(ACTION_LOG_PATH_FIELD) or "").strip()
+    if recorded:
+        path = Path(recorded)
+    elif state_dir is not None:
+        path = Path(state_dir) / ACTION_LOG_DIRNAME / f"{task_id}{ACTION_LOG_SUFFIX}"
+    else:
+        return {**view, "state": "unlocatable", "note": ACTION_LOG_UNLOCATABLE}
+
+    view["path"] = str(path)
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return {**view, "state": "missing", "note": ACTION_LOG_MISSING + str(path)}
+    except OSError as exc:
+        return {**view, "state": "unreadable",
+                "note": f"{ACTION_LOG_UNREADABLE}{path}: {_one_line(exc)}"}
+    if not stat.S_ISREG(mode):
+        return {**view, "state": "unreadable",
+                "note": f"{ACTION_LOG_UNREADABLE}{path} is not a regular file, "
+                        "so it was never opened."}
+
+    try:
+        data, skipped = _tail_bytes(path, max_bytes)
+    except OSError as exc:
+        return {**view, "state": "unreadable",
+                "note": f"{ACTION_LOG_UNREADABLE}{path}: {_one_line(exc)}"}
+    if not data:
+        return {**view, "state": "empty", "note": ACTION_LOG_EMPTY + str(path)}
+
+    # `replace`, never strict: this is arbitrary bytes an agent printed, and a
+    # log that happens to hold one invalid sequence must not blank the panel.
+    # The window also starts mid-character by construction, which is exactly
+    # what the replacement character is for.
+    lines = data.decode("utf-8", "replace").splitlines()
+    if skipped and len(lines) > 1:
+        # After a mid-file seek the first line is the END of a line whose start
+        # was skipped. Dropped, because a fragment shown as a line reads as a
+        # command that was never run — but KEPT when it is the only one, since a
+        # single enormous line truncated is still more than a blank panel.
+        lines = lines[1:]
+    truncated = skipped or len(lines) > max_lines
+    lines = lines[-max_lines:] if max_lines else []
+    return {**view, "state": "lines", "lines": lines,
+            # Joined HERE rather than in the template. `PAGE` is a plain Python
+            # string, so a `"\n"` written inside the served script is decoded on
+            # the way out and splits that JS literal across two physical lines —
+            # the whole script then fails to parse and the page silently blanks
+            # (docs/COMMON_ERRORS.md). One joined string reaches the DOM through
+            # `textContent` and no newline literal ever enters the script.
+            "tail": "\n".join(lines),
+            "truncated": truncated,
+            "note": f"{ACTION_LOG_TAIL_NOTE}{len(lines)} line(s) from {path}."
+                    + (ACTION_LOG_TRUNCATED if truncated else "")}
 
 
 def _config_toml(repo: Path) -> dict:
@@ -4216,6 +4414,15 @@ def collect(repo: Path) -> dict:
         # `None` when nothing is executing — the page then renders no figures at
         # all rather than the last round's. See `worker_progress`.
         "progress": worker_progress(state),
+        # The tail of the ACTION log the same round is writing, `None` on the
+        # same condition and off the same `state` dict, so the figures and the
+        # trace beside them can never describe two different rounds. `sd` is
+        # the directory resolved above, threaded rather than re-resolved, so
+        # the convention path is looked for where everything else was read
+        # (port-06). Raw text: the page puts it in the DOM as text, and
+        # escaping it here as well would show `&lt;` for every `<` the agent
+        # printed. See `action_log_tail`.
+        "action_log": action_log_tail(state, sd),
         "audit": {"run": run_dir.name if run_dir else None, "completed": completed},
         "events": events,
         "blockers": blockers,
@@ -4471,6 +4678,13 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);
      font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .muted{color:var(--ink2)}.empty{color:var(--ink2);font-style:italic;font-size:13px}
 .scroll{overflow-x:auto}
+/* The action-log tail: a bounded scroll box in the same monospace as `code`,
+   wrapped so one long command line never widens the page. The height bound is
+   what makes a 40-line tail readable beside the progress figures rather than
+   below the fold. No colour role: a command trace is not a health verdict. */
+#actionlog{margin:0;max-height:24em;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;
+     font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);
+     background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
 /* pipeline */
 /* height:auto, not a fixed px: the viewBox owns the aspect ratio, so the
    container is sized to its content instead of letterboxing ~48px of dead
@@ -4728,6 +4942,28 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
   <section id="progressbox" style="display:none">
     <h2>Live progress — read from the worker repo, not from the agent</h2>
     <div id="progress"></div>
+  </section>
+
+  <!-- The ACTION LOG of the same round, directly under its progress figures:
+       the figures say whether it is working, this says what it is doing.
+       STATIC markup and hidden by default for the same reasons `#progressbox`
+       is — `render()` never rewrites it, and an idle loop shows nothing here,
+       never the last round's tail.
+
+       THE HEADING IS LOAD-BEARING. This file is a trace of tool calls, files
+       read and written and commands run. It is NOT the model's reasoning: the
+       headless CLI exposes none, so a panel titled "thinking" would promise
+       introspection and deliver a command trace. Call it what it is.
+
+       The tail is the one place on this page where genuinely unpredictable
+       text arrives — whatever the agent printed — and it reaches the DOM
+       through `textContent` ONLY (`renderActionLog`). No template literal, no
+       `esc()`-then-`innerHTML`, no `<br>` join: `textContent` cannot be
+       markup, whatever the bytes are. -->
+  <section id="actionlogbox" style="display:none">
+    <h2>Action log — tool calls, files read and written, commands run. Not the model's reasoning: the CLI exposes none</h2>
+    <p id="actionlognote" class="muted" style="font-size:12px;margin:0 0 8px"></p>
+    <pre id="actionlog"></pre>
   </section>
 
   <section>
@@ -5196,6 +5432,51 @@ function renderProgress(p){
     + `${esc(fmtDur(p.elapsed_seconds))} since dispatch</div>`
     + `<p class="muted" style="font-size:12px;margin:6px 0 0">${why}</p>`;
 }
+
+// ACTION_LOG_START
+// The action log of the round executing now, beside the figures above. The
+// payload's `state` is one of the backend's `ACTION_LOG_STATES` and its `note`
+// is the backend's sentence for it, path included — this function spells no
+// state of its own, and for every state but `lines` the note IS the panel: a
+// log that does not exist yet, an empty one and one that could not be read are
+// three different sentences, never one empty box.
+//
+// EVERYTHING here goes through `textContent`, and that is the whole of the
+// escaping. The tail is whatever the agent printed — angle brackets, quotes,
+// `${}`, anything — and `textContent` renders bytes as characters, so there is
+// no markup to escape and no `esc()` call that could be forgotten. Never
+// `innerHTML`, not even with `esc()` in front of it: that is one refactor away
+// from raw interpolation, and this is the one panel where that would matter.
+function renderActionLog(a){
+  const box = document.getElementById("actionlogbox");
+  const note = document.getElementById("actionlognote");
+  const pre = document.getElementById("actionlog");
+  // Falsy means NO round is executing. Hide the section AND clear both nodes:
+  // a stale tail beside an idle loop reads as a round in flight, and a hidden
+  // node that still holds the last round's text is one CSS rule from showing
+  // it again.
+  if (!a) { box.style.display = "none"; note.textContent = ""; pre.textContent = ""; return; }
+  box.style.display = "";
+  note.textContent = a.note || "";
+  // Only the working state has a box at all. The other four are a sentence,
+  // and an empty box under that sentence would read as "the log is empty" —
+  // which is exactly one of the states it would be misreporting.
+  if (a.state !== "lines") { pre.style.display = "none"; pre.textContent = ""; return; }
+  // Keep the newest lines in view as the round appends — but only when the
+  // operator was already reading the bottom. Someone who scrolled up to read
+  // an earlier command is not yanked back down by the next poll.
+  const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 4;
+  pre.style.display = "";
+  // Written only when it changed: this runs on every poll, outside the page's
+  // change guard, and rewriting an identical text node would throw away the
+  // operator's scroll position and text selection for nothing.
+  const tail = a.tail || "";
+  if (pre.textContent !== tail) {
+    pre.textContent = tail;
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+  }
+}
+// ACTION_LOG_END
 
 // ---- the summary, at the top -------------------------------------------------
 // The three questions an operator arrives with — how much is done, how much is
@@ -6107,9 +6388,15 @@ function render(d, force){
   // poll — and is rendered BELOW, before the guard, so the live figures move
   // without rebuilding the rest of the page.
   const {served_at, progress, ...rest} = d;
-  const sig = JSON.stringify(rest);
+  // `action_log` is excluded for the same reason `progress` is: a live round
+  // appends to its log continuously, so its tail changes on nearly every poll
+  // and would fire the guard every 2s. Rendered below, before the guard, so the
+  // trace moves without rebuilding the page around it.
+  const {action_log, ...signed} = rest;
+  const sig = JSON.stringify(signed);
   document.getElementById("served").textContent = `updated ${esc(served_at)}`;
   renderProgress(progress);
+  renderActionLog(action_log);
   // A stale process serves the old PAGE forever, which looks exactly like a
   // missing feature. Say so instead of letting someone wonder.
   //
