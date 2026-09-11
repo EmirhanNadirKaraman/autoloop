@@ -942,7 +942,9 @@ The mechanics already exist and are named rather than rebuilt:
   branch so a reviewed candidate survives the base moving. It is the path a
   concurrent fleet runs on. It bails on a dirty worker tree and on a merge
   conflict, and **that bail rate is the rework multiplier the brief's gating
-  paragraph is about** — saying so is the point, not a caveat.
+  paragraph is about** — saying so is the point, not a caveat. (Since conc-15
+  the dirty-worker bail is deferred to the end of the round that made the tree
+  dirty rather than parked; the conflict bail still parks. See below.)
 * `_rebase_execution_if_stale` refuses to re-point a record with
   `review_round > 0` and parks `task_base_behind_head`. It stays the refusal for
   the cases the carry-forward cannot handle.
@@ -992,7 +994,7 @@ in which "an agent may be mid-write" mattered is answered per candidate instead:
 | lane state when the base moves | what answers it |
 |---|---|
 | reviewed candidate bound to the head | the obligation: marked before the merge, carried forward after, refused at push time on its old approval |
-| worker tree DIRTY (an agent literally mid-write) | precondition 4 of `_carry_reviewed_candidate_past` refuses rather than merging over the residue; `auto_merge._park_carry_forward_refused` parks `task_base_behind_head`, and the worker and the record are untouched |
+| worker tree DIRTY (an agent literally mid-write) | precondition 4 of `_carry_reviewed_candidate_past` refuses rather than merging over the residue, and the worker and the record are untouched; since conc-15 the refusal is DEFERRED, not parked — see the next subsection |
 | round with no candidate yet | skipped for want of a `candidate_sha`; its worker is a separate clone no merge into this checkout touches, and `_rebase_execution_if_stale`'s unreviewed arm re-bases it at the next dispatch |
 | base git cannot place | `BASE_UNVERIFIED`, still a blocker at every lane count |
 | candidate already behind the head | the note it has been since 2026-08-21 — moving the head cannot strand it further |
@@ -1030,6 +1032,75 @@ nothing, since the sweep is already holding the token when it calls.
 At `lanes = 1` the read, the reason string, the `merge-window` OPEN line and the
 completion path are byte-identical to what they were — no token object is built
 and no file appears under the state dir — and no existing test needed an edit.
+
+#### A mid-write strand defers, not parks (conc-15, 2026-09-11)
+
+The table above's DIRTY row was correct and it was the rework multiplier this
+section names: every automatic merge cost a `task_fatal` park for every lane
+that happened to be mid-write, and each park needed an operator verb. Measured
+within four hours of the merge machinery starting to work —
+
+    d388708  conc-13 merged itself   ->  (its own lane was the one merging)
+    39d9687  val-07 merged itself    ->  stranded ctx-16
+    b503b08  ctx-16 merged itself    ->  stranded ctx-09
+
+— three merges, two strands, one per mid-write lane, so the loop merged by
+itself and could not run unattended.
+
+**The bail is transient, and that is the whole of the fix.** The worker is
+dirty only while the agent is writing; it goes clean the moment the round
+commits (review-01's worker read 4 uncommitted during its round and 0 after).
+Of the two ways out conc-13's brief listed, this takes the second — *defer the
+strand until the round ends of its own accord* — and rejects the first for the
+reason the refusal exists: no stash, no commit on the agent's behalf, no merge
+over a dirty tree, since every one of those risks the unreviewed work.
+
+The two bails are told apart BY VALUE and do not share an outcome:
+
+| the carry-forward refuses because… | what happens |
+|---|---|
+| the worker is DIRTY (`orchestrator.WORKER_DIRTY_CARRY_REFUSAL`, compared with `==`) | `_carry_execution_past_for_merge` returns an `auto_merge.CarryDeferral`; `AutoMerger._defer_carry_forward` writes the merged head onto the record as `TaskExecution.carry_deferred_head` (with `carry_deferred_base`) and parks NOTHING. The re-review marker stays set, so the candidate is refused at push time exactly as for a park |
+| anything else — a CONFLICT above all, a missing worker, a tip that lost the candidate, a git that will not answer | a refusal string; `_park_carry_forward_refused` parks `task_base_behind_head` as before. conc-14 removed the systematic conflict, so what remains is real disagreement |
+
+The obligation is scoped to the round in flight, and the OWNING lane settles it
+at that round's exits — every one of them, because it holds the record in
+memory across the executor and its own saves would otherwise overwrite what the
+sibling wrote (`_absorb_merge_marks` reads the marker and the deferral back the
+moment the executor returns, before any save):
+
+* **the round commits** — `_finish_postcommit` retries the carry FIRST, before
+  the post-commit gate and the packet, on the record it holds
+  (`_settle_deferred_carry_forward`). The tree is clean by construction there.
+  On success the candidate advances to the merge commit, the rounds it had
+  move to `carried_review_rounds`, validation grades the merged tree, the
+  packet is this task's net change against the head it will be merged onto,
+  and that packet IS the re-review it owed; the old approval names a sha the
+  record no longer holds and is refused. If the retry still refuses once the
+  worker is clean — the conflict case — it parks `task_base_behind_head` there,
+  charged to the fault budget (the head moved under the round), with the
+  round's commit preserved on its branch. A worker still dirty after its own
+  commit is the post-commit gate's to refuse, and the obligation is dropped.
+* **any other exit** — an operator abort, a fault, an executor that reported
+  failure, a refused commit, an escape — DROPS it, with a
+  `carry_forward_deferral_dropped` entry saying which. No clean tree exists to
+  retry on. Dropping loses nothing: `_rebase_execution_if_stale` reconciles the
+  base at the next dispatch exactly as it did before the field existed, and the
+  marker still refuses the old approval meanwhile.
+* **a round that never reached an exit** (the process died in it) leaves the
+  field on disk; the next dispatch drops it for the same reason, before the
+  stale-base reconciliation runs.
+
+What this does NOT change, stated so it is not read as closed: the
+dispatch-time carry in `_rebase_execution_if_stale` still parks a reusable
+worker that holds an aborted round's residue — the same transient condition one
+dispatch later — because deferring it there would change single-lane behaviour.
+And a carry that SUCCEEDS against a lane whose worker is momentarily clean
+mid-round (the agent has not written yet; post-commit validation is running) is
+the pre-existing race it always was: this round neither widens nor narrows it.
+
+At `lanes = 1` no obligation is ever minted, so the field is never written; the
+read-back is gated on the same fleet reading the merge token uses, and every
+other hook is a comparison against `""`. No existing single-lane test changed.
 
 ### Decision 7 — observability: N lanes, truthfully
 

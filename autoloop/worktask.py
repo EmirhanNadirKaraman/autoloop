@@ -187,6 +187,55 @@ class TaskExecution:
     #: Zero at `lanes = 1` and on every record written before this field
     #: existed, which is what makes both readings above identities there.
     carried_review_rounds: int = 0
+    #: A carry-forward the loop OWES THIS RECORD AND HAS NOT PERFORMED YET,
+    #: because the one time it tried, the worker was mid-write (conc-15). The
+    #: value is the branch head a merge moved to while this record's worker
+    #: repository held uncommitted changes — the head `_carry_reviewed_
+    #: candidate_past` would have merged into the task branch had it not
+    #: refused, and the head the owning lane retries onto when its round ends.
+    #:
+    #: WRITTEN BY THE MERGING LANE, IN ANOTHER PROCESS, instead of the
+    #: `task_base_behind_head` park it wrote until conc-15
+    #: (`auto_merge.AutoMerger._defer_carry_forward`). Of the refusals the
+    #: carry-forward can give, the dirty-worker one is the only TRANSIENT one:
+    #: the worker is dirty only while an agent is writing, and it goes clean
+    #: the moment that round commits — measured on review-01, whose worker
+    #: read 4 uncommitted during its round and 0 afterwards. Parking on it
+    #: converted a state that resolves itself in minutes into one that waited
+    #: for an operator verb. A CONFLICT is not transient and still parks.
+    #:
+    #: SCOPED TO THE ROUND IN FLIGHT when it was written, and cleared at every
+    #: exit of that round by the lane that owns the record
+    #: (`orchestrator._dispatch_task_postcommit` and `_finish_postcommit`):
+    #: retried where the round commits — the tree is clean by construction
+    #: there — and DROPPED, with a transcript entry, where it does not (an
+    #: abort, a fault, a refused commit, an executor that reported failure).
+    #: Dropping loses nothing: the base is reconciled again at the next
+    #: dispatch by `_rebase_execution_if_stale`, exactly as before this field
+    #: existed. A value still here at DISPATCH therefore belongs to a round
+    #: that never reached one of its exits, and is dropped there for the same
+    #: reason.
+    #:
+    #: The owning lane holds its record IN MEMORY across the executor, so the
+    #: value lands on disk under a copy that predates it. `orchestrator.
+    #: _absorb_merge_marks` re-reads it (with `rereview_owed_base`) the moment
+    #: the executor returns, before the round's own saves could overwrite it.
+    #:
+    #: EMPTY AT `lanes = 1`, always: the merge window is shut whenever a
+    #: candidate is bound to the head there, so no merge ever creates the
+    #: obligation and no site ever writes this. Empty is also the fail-closed
+    #: value — it licenses no retry — and it is what every record written
+    #: before this field existed loads as.
+    carry_deferred_head: str = ""
+    #: The base `carry_deferred_head` was minted against — this record's
+    #: `task_base_sha` at the moment the merge moved the head past it. The
+    #: retry compares it against the record's base first and DROPS the
+    #: obligation as superseded when the two differ, because a base that has
+    #: moved since was carried by something else (a re-dispatch's
+    #: `_rebase_execution_if_stale`, an operator) and merging an older head
+    #: into it would set the base BACKWARDS. Written and cleared beside its
+    #: sibling, never alone.
+    carry_deferred_base: str = ""
     #: Normalised text of the most recent `revise` feedback. Compared
     #: against the next one: identical feedback twice means the reviewer
     #: is asking for something the executor did not change, so another
