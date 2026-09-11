@@ -166,6 +166,34 @@ a transport hands it and discards it unread. The run is ADVISORY — the
 executor still runs validation itself afterwards, and that run alone decides
 `ExecutionOutcome.validation` and the round's status.
 
+**WHICH TESTS an advisory run executes is decided WHEN THE AGENT ASKS** (val-07,
+2026-09-11), not when the channel is bound. Before this, every advisory run took
+the resolved list WHOLE, because the binding happens before the agent has written
+anything and there was no changed-path set to select from — true at binding time
+and false at request time, when the agent's edits are on disk and `git status` in
+the worker repo yields exactly that set. MEASURED: 40 rounds, 95 advisory runs,
+mean 2.38 per round, every one of them the whole checkout's test files — 92 of
+92 when that was taken on 2026-08-27, and `tests/suite_size.py` is larger now —
+at roughly ten minutes a pass, which on 2026-09-11 is at or past the 600s bound
+`ADVISORY_VALIDATION_TIMEOUT_SECONDS` puts on ONE run. `ImplementExecutor._advisory_scope` now answers each
+request through the same `_select_validation` the verdict run uses, and fails
+CLOSED to the configured list whenever the answer cannot be established.
+
+That trades an unconditional guarantee for a conditional one, and the trade is
+stated rather than absorbed. The old relation — the verdict run is never wider
+than an advisory one — held because the advisory run was always the whole list.
+It now holds only WHILE THE WORKER TREE HAS NOT MOVED since the run was made:
+selection is deterministic over (commands, changed paths, tree), so an unmoved
+tree gives the verdict run the same inputs and it can select nothing the advisory
+run did not run. The moment the agent edits again, the verdict selects from a
+wider diff and the advisory result covers none of it. `AdvisoryValidation`
+records the tree state each run was made against, `record_verdict_run` hands it
+the verdict's own state and selection, and `covers_verdict` answers only on
+evidence — a moved tree, an unreadable tree and a round that never reached its
+verdict run are all "covers nothing". The agent is told in its own answer and in
+the brief; the reviewer is told in `note()`. What is NOT allowed to happen is a
+green advisory result silently covering less than the run that grades the round.
+
 Cost is bounded twice: `ADVISORY_VALIDATION_MAX_CALLS` requests per round, and
 `ADVISORY_VALIDATION_TIMEOUT_SECONDS` per run. A request past the cap executes
 nothing and says `validation.NOT_RUN`, which is deliberately different
@@ -399,10 +427,13 @@ from .tasks import (
 from .validation import (
     NOT_RUN,
     TEST_SELECTION_REACHABLE,
+    TREE_STATE_UNKNOWN,
     TestSelection,
     has_pytest_command,
     run_validation_commands,
     select_validation_commands,
+    tree_states_match,
+    worker_tree_state,
 )
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
@@ -1137,26 +1168,48 @@ def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> 
     description tells the agent the rule before it ever sees one. A `--lf` PASS
     means "the tests that were failing now pass", which is what a confirm step
     is for, and it is not a green suite.
+
+    **And since val-07 (2026-09-11) the run this describes is itself SELECTED,
+    so the ⊇ is stated as the conditional it now is.** The sentence that stood
+    here — "every command this round validates with, in full" — was true because
+    this run was bound before the agent had written anything. It is resolved at
+    REQUEST time now, from the worker tree's own changed paths through the same
+    selector the verdict run uses, so what the agent gets back may be a subset
+    of the suite. The containment it can still rely on is narrower and is
+    stated as such: while the tree stands as it did when the answer was given,
+    the verdict run selects nothing this run did not run; edit afterwards and it
+    covers none of it. The fail-closed direction is named too, because it is the
+    one an agent must not mistake for narrowing — a tree that cannot be read
+    runs the configured list whole, and the answer says which happened.
     """
     return {
         "name": ADVISORY_TOOL_NAME,
         "description": (
             "Run this repository's configured validation (lint/tests) against "
-            "your own worker repo — every command this round validates with, "
-            "in full. It takes NO arguments: the commands, the working "
+            "your own worker repo — the commands this round validates with. It "
+            "takes NO arguments: the commands, the working "
             "directory and the environment are fixed by the executor, and "
             "nothing you supply can change any of them. The result comes back "
             "to you as text. This run is ADVISORY — the executor runs "
-            "validation itself afterwards and that run is the verdict. That "
-            "run is never WIDER than a FULL run here: it MAY be narrowed to "
-            "the tests your changed paths reach, and when it cannot narrow it "
-            "runs this same list in full. So a green FULL run here covers it "
-            "rather than reproducing it. ONE EXCEPTION, and the answer always "
-            "says which it is: a request made after a FAILED run MAY be re-run "
+            "validation itself afterwards and that run is the verdict. WHICH "
+            "TESTS RUN IS DECIDED WHEN YOU ASK, from what `git status` reports "
+            "in your worker repo at that moment: your changed paths are put "
+            "through the same selector the verdict run uses, so editing one "
+            "module runs that module's tests rather than the repository's. "
+            "When that cannot be established — the tree cannot be read, or the "
+            "selector declines to narrow — the configured list runs in full "
+            "instead. Every answer says which of the two happened, to how many "
+            "test files, and from which paths. WHAT A GREEN ANSWER COVERS, and "
+            "it is a snapshot: while your tree stands as it did when you asked, "
+            "the verdict run selects no test this run did not run, so a green "
+            "answer covers it rather than reproducing it. Edit anything "
+            "afterwards and it covers NONE of that run — ask again after your "
+            "last edit if you want coverage. ONE FURTHER EXCEPTION, and the "
+            "answer always says which it is: a request made after a FAILED run MAY be re-run "
             "with `--lf`, so pytest re-selects what its cache recorded as "
             "failing instead of the whole list. That is the cheap confirm step "
-            "— but it is NARROWER than the run that grades you, it cannot see "
-            "what your fix newly broke, and a PASS on it means 'those tests "
+            "— but it is NARROWER still than the run that grades you, it "
+            "cannot see what your fix newly broke, and a PASS on it means 'those tests "
             "pass now', never 'the suite is green'. Spend a later run on a "
             "full pass if the budget allows. At most "
             f"{max_calls} run(s) per round; past that the request executes "
@@ -1169,6 +1222,48 @@ def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> 
             "additionalProperties": False,
         },
     }
+
+
+class AdvisoryScope(NamedTuple):
+    """WHAT one advisory request runs, resolved at the moment it is made.
+
+    Built by `ImplementExecutor._advisory_scope` from the worker tree's own
+    changed paths and handed to `AdvisoryValidation.run`, which executes
+    `commands` and reports `detail`. Every field is the executor's own
+    measurement; nothing here comes from the agent.
+
+    `tree_state` is `validation.worker_tree_state` over those changed paths —
+    the tree the answer is ABOUT. It is what lets the executor decide later
+    whether the answer still covers anything, and `TREE_STATE_UNKNOWN` ("") is
+    a real value meaning "could not be established", which
+    `validation.tree_states_match` refuses on either side.
+
+    `selected` and `total_test_files` are `TestSelection`'s own counts, carried
+    so the round can say what a narrowed run covered without re-deriving it.
+    They are empty/zero on a scope that did not narrow, where the answer is
+    "the whole configured list" and no subset was chosen.
+    """
+
+    #: The list to launch: the configured list, or the narrowed one.
+    commands: tuple[tuple[str, ...], ...]
+    #: True only when `commands` is a SUBSET of what was configured.
+    narrowed: bool
+    #: The tree those commands were selected from, or `TREE_STATE_UNKNOWN`.
+    tree_state: str
+    #: One sentence naming what happened, for the agent and for the round.
+    detail: str
+    #: Test files a narrowed run covers, repo-relative.
+    selected: frozenset[str] = frozenset()
+    #: Changed paths the decision was made from, sorted.
+    considered: tuple[str, ...] = ()
+    #: How many test files the import graph knows about at all.
+    total_test_files: int = 0
+    #: Did the run this scope belongs to finish? False only on the branch where
+    #: `run_validation_commands` itself raised, which is recorded as a FAILURE
+    #: and proves nothing about anything — including about what it covered.
+    #: Defaults True because every other construction site is a scope for a run
+    #: that is about to happen or did.
+    completed: bool = True
 
 
 class AdvisoryValidation:
@@ -1184,9 +1279,7 @@ class AdvisoryValidation:
     happens unconditionally after the agent returns.
 
     Since val-04 (2026-08-27) they may not be the same ARGV, and the asymmetry
-    is deliberate and one-directional. This run is bound before the agent has
-    written anything, so there is no changed-path set to select from and it
-    always runs the resolved list WHOLE. The executor's own run puts that same
+    is deliberate and one-directional. The executor's own run puts the resolved
     list through `validation.select_validation_commands`, which either narrows
     it to the tests this round's changed paths reach or hands it back unchanged
     — every widening rule returns the configured commands verbatim (see
@@ -1194,13 +1287,46 @@ class AdvisoryValidation:
     `test_selection = "full"`, a deleted module, an unretargetable command, a
     selector that raised).
 
-    So the relation is ⊇, not ⊂: a FULL advisory run is never NARROWER than the
-    run that grades the round, and is strictly larger only when that run
-    narrowed. The agent proving green over at least what the executor will
-    execute is the safe direction; the reverse would be the fail-open — an agent
-    shown a narrower run than the verdict's. `advisory_tool_descriptor` states
-    it in that conditional form, because "the executor's run is narrowed" is
-    false on every widened round.
+    **This run is now selected too, and the relation it used to rest on is now
+    CONDITIONAL rather than unconditional** (val-07, 2026-09-11). The sentence
+    that stood here said the advisory run "is bound before the agent has written
+    anything, so there is no changed-path set to select from" — true at BINDING
+    time and false at REQUEST time, which is when it matters: by then the
+    agent's edits are on disk and `git status` in the worker repo yields exactly
+    the set the selector wants. So `run()` re-resolves through
+    `_scope_resolver` — `ImplementExecutor._advisory_scope`, the same
+    `_select_validation` the verdict run uses — and a round whose agent is
+    iterating on one module runs that module's tests. MEASURED before this
+    change: 40 rounds, 95 advisory runs, every one of them the complete resolved
+    list (92 of 92 test files when that was taken on 2026-08-27), ~10 minutes a
+    pass — which is now at or past this channel's own 600s per-run bound.
+
+    The relation is therefore no longer "⊇ always". It is:
+
+    * **⊇ while the tree stands as it did when the run was made.** Selection is
+      deterministic over (commands, changed paths, tree), the verdict run reads
+      the same three, and a scope that FAILED CLOSED to the whole list is a
+      superset of anything the verdict narrows to. So a run whose tree has not
+      moved covers the verdict run exactly as before.
+    * **NOTHING once the tree moves.** The agent edits after asking; the verdict
+      then selects from a wider diff, and a green advisory answer no longer says
+      anything about it. That is not left to the reader: `record_verdict_run`
+      is handed the verdict's own tree state and selection, `covers_verdict`
+      answers only on evidence, and `note()` tells the reviewer which of the
+      three states this round reached (covers / moved / never established).
+
+    Both halves are disclosed where they are read rather than inferred: the
+    answer names the narrowing and says it is a snapshot, `advisory_tool_
+    descriptor` states the rule in the brief before the agent ever sees one, and
+    the round's summary reports the coverage state from this module's own
+    measurements. A green advisory run that silently covered less than the
+    verdict run would be exactly the fail-open this channel exists to refuse.
+
+    FAIL CLOSED, everywhere the answer is not available: a worker that is not a
+    git repository, a status read that raises, a tree whose state cannot be
+    digested, a selector that fails — each runs the full configured list, which
+    is byte-for-byte what every advisory run did before val-07, and `detail`
+    says which happened. Nothing narrows on a guess.
 
     **val-08 (2026-08-31) introduces one run that is deliberately on the other
     side of that relation, and buys the exception with disclosure.** A request
@@ -1281,6 +1407,8 @@ class AdvisoryValidation:
         cache_namespace: str = "",
         cache_root: Path | None = None,
         repo_root: Path | None = None,
+        scope_resolver: Callable[[tuple[tuple[str, ...], ...]], AdvisoryScope]
+        | None = None,
     ):
         # Normalised defensively: an unusable list becomes the EMPTY list,
         # which `run()` answers as NOT_RUN and never as a pass. The round-level
@@ -1291,6 +1419,18 @@ class AdvisoryValidation:
         except TypeError:
             self._commands = ()
         self._cwd = Path(cwd)
+        #: WHO ANSWERS "what should this request run?", asked afresh per request
+        #: (val-07). It is handed `self._commands` — the list this object would
+        #: otherwise launch — so whatever else a round put there (a task's
+        #: declared validation, a flag another change injects) is what gets
+        #: narrowed, rather than a second resolution of the same question.
+        #:
+        #: `None` is the pre-val-07 behaviour and is what a transport or a test
+        #: that constructs this directly gets: every run takes the configured
+        #: list whole. That default is the WIDE direction, so an unwired caller
+        #: pays for a full run rather than silently narrowing on a resolver it
+        #: does not have.
+        self._scope_resolver = scope_resolver
         self._command_runner = command_runner
         # The SAME credentials the executor's own run gets, and for one reason:
         # this object runs inside the loop's own process, so the values never
@@ -1314,6 +1454,20 @@ class AdvisoryValidation:
         #: rerun of three tests is the misreport that cost port-05 a round, one
         #: level down.
         self._reruns: list[bool] = []
+        #: Parallel to `_results` again: the scope that run really launched.
+        #: Kept per run rather than as a single "last scope" because `note()`
+        #: and the coverage answer are both about the LAST EXECUTED run, and a
+        #: request that executed nothing (over budget, no commands, no working
+        #: directory) must not be able to overwrite it with a scope nothing ran.
+        self._scopes: list[AdvisoryScope] = []
+        #: The tree the executor's OWN run selected from, and what it selected
+        #: — recorded by `record_verdict_run` and by nothing else. `None` until
+        #: then, which `covers_verdict` reports as "never established" rather
+        #: than as coverage: a round that returned before the verdict run (a
+        #: withheld round, a missing `validation_cwd`) has no verdict for an
+        #: advisory result to cover.
+        self._verdict_tree_state: str | None = None
+        self._verdict_selection: TestSelection | None = None
         #: MAY THE NEXT REQUEST CARRY `--lf`? Set after every executed run and by
         #: nothing else — see `run()`, which states the three conjuncts. It exists
         #: because "the cache holds a rerun list" is not the same claim as "the
@@ -1799,7 +1953,169 @@ class AdvisoryValidation:
         """
         return self._results[-1] if self._results else None
 
+    @property
+    def last_run_scope(self) -> AdvisoryScope | None:
+        """What the last EXECUTED run ran, or None when nothing ever ran."""
+        return self._scopes[-1] if self._scopes else None
+
+    @property
+    def last_run_was_narrowed(self) -> bool:
+        """Was the last executed run a SUBSET of the configured list?
+
+        False when nothing ran and False for a run that took the list whole,
+        which is the safe default in both directions: this only ever adds a
+        caveat, so a wrong False under-warns about a run that does not exist
+        while a wrong True would caveat a full run into looking partial.
+        """
+        scope = self.last_run_scope
+        return bool(scope is not None and scope.narrowed)
+
+    # ---- what a narrowed run still covers ----------------------------------
+
+    def record_verdict_run(self, tree_state: str, selection: TestSelection) -> None:
+        """The tree the executor's OWN run selected from, and what it selected.
+
+        Called once, by `_run_implementation`, immediately before the
+        authoritative run — from `git.dirty_paths_all()` and the selection made
+        from it, i.e. the loop's own measurements of its own tree. Nothing the
+        agent wrote is an input, and this changes NOTHING about what the verdict
+        run executes: it is recorded so the ROUND can say whether the agent's
+        last advisory result still covers anything.
+
+        Never raises. It runs on the round's critical path, where an exception
+        would throw away work that has already been done.
+        """
+        self._verdict_tree_state = str(tree_state or "")
+        self._verdict_selection = selection
+
+    def covers_verdict(self) -> bool:
+        """Does the last executed advisory run cover the verdict run?
+
+        TRUE ONLY ON EVIDENCE, and every missing piece answers False. The
+        conjuncts, in order:
+
+        * a run EXECUTED — `_scopes` is non-empty;
+        * it COMPLETED — a run `run_validation_commands` raised out of got as
+          far as it got, and nothing is known about how far that was;
+        * it was not a `--lf` RERUN — a rerun re-selects the previous run's
+          failures and is narrower by a mechanism this has no visibility into;
+        * the verdict run has been recorded (`record_verdict_run`), so there is
+          something to cover at all;
+        * and then the two shapes a run can have:
+          - it took the configured list WHOLE, which contains every command the
+            verdict run can select from it, whatever the tree did afterwards.
+            That is the relation this channel had before val-07 and it is
+            unconditional, so the tree state is not consulted for it;
+          - or it NARROWED, and then BOTH the worker tree must be unmoved
+            (`validation.tree_states_match`, False whenever either state is
+            `TREE_STATE_UNKNOWN`, so a tree nobody could digest is a tree that
+            moved) AND the verdict's own selected files must be a subset of what
+            that run executed.
+
+        The last conjunct is deliberately a direct check of the invariant rather
+        than a proxy for it. The tree state is the primary evidence — it catches
+        the case a command comparison cannot, an edit to a file already inside
+        the selected set — and this catches the case the digest cannot: anything
+        that moves the SELECTION without moving the changed files themselves,
+        such as a `.py` file the checkout ignores appearing in the import graph.
+        """
+        scope = self.last_run_scope
+        if scope is None or not scope.completed:
+            return False
+        if self._reruns and self._reruns[-1]:
+            return False
+        if self._verdict_tree_state is None or self._verdict_selection is None:
+            return False
+        if not scope.narrowed:
+            return True
+        if not tree_states_match(scope.tree_state, self._verdict_tree_state):
+            return False
+        if self._verdict_selection.widened:
+            return False
+        return set(self._verdict_selection.selected) <= set(scope.selected)
+
     # ---- the agent-facing call ---------------------------------------------
+
+    def _resolve_scope(self, rerun: bool) -> AdvisoryScope:
+        """WHAT this request runs, decided now rather than when this was bound.
+
+        THE FALLBACK IS THE CONFIGURED LIST, and every path that is not a clean
+        narrowing takes it: no resolver wired, a resolver that raised, a
+        resolver that answered with nothing runnable, or a `--lf` rerun. That
+        list is byte-for-byte what every advisory run launched before val-07, so
+        the failure direction of this whole feature is "the round pays for a run
+        it used to pay for anyway".
+
+        A RERUN IS NEVER NARROWED ON TOP. `--lf` already re-selects the previous
+        run's failures, from a cache recorded against a possibly different diff;
+        stacking a path narrowing onto it could hide the very failure the
+        confirm step exists to re-check, and two narrowings disclosed as one
+        sentence are not disclosed at all. The rerun keeps its own caveat and
+        this one stands aside.
+
+        Never raises — `run()` calls it while serving an agent mid-turn.
+        """
+        if rerun:
+            return AdvisoryScope(
+                commands=self._commands,
+                narrowed=False,
+                tree_state=TREE_STATE_UNKNOWN,
+                detail=(
+                    "This run was NOT narrowed by changed paths: it is a `--lf` "
+                    "rerun, which re-selects what the last run recorded as "
+                    "failing and carries its own caveat above."
+                ),
+            )
+        if self._scope_resolver is None:
+            return AdvisoryScope(
+                commands=self._commands,
+                narrowed=False,
+                tree_state=TREE_STATE_UNKNOWN,
+                detail=(
+                    "This run was the FULL configured list: this channel was "
+                    "bound without a way to read the worker tree's changed "
+                    "paths, so there was nothing to narrow from."
+                ),
+            )
+        try:
+            answer = self._scope_resolver(self._commands)
+            commands = tuple(tuple(argv) for argv in answer.commands)
+            # Rebuilt rather than trusted, and `narrowed` is DERIVED rather than
+            # believed: a list that differs from the configured one IS a
+            # narrowing whatever the resolver called it, and the alternative is
+            # the one fail-open available here — a run reported as full while
+            # running less would be granted unconditional coverage by
+            # `covers_verdict`. The flag can only ever be turned ON by this.
+            scope = answer._replace(
+                commands=commands,
+                narrowed=bool(answer.narrowed or commands != self._commands),
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            return AdvisoryScope(
+                commands=self._commands,
+                narrowed=False,
+                tree_state=TREE_STATE_UNKNOWN,
+                detail=(
+                    "This run was the FULL configured list: the changed-path "
+                    "set could not be established "
+                    f"({type(exc).__name__}: {str(exc).strip() or '(no detail)'}), "
+                    "so nothing was narrowed."
+                ),
+            )
+        if not commands:
+            # An empty answer is not a narrowing, it is the absence of one, and
+            # `run()` would report it as NOT_RUN — telling the agent nothing ran
+            # on a round whose configured list was perfectly runnable.
+            return AdvisoryScope(
+                commands=self._commands,
+                narrowed=False,
+                tree_state=TREE_STATE_UNKNOWN,
+                detail=(
+                    "This run was the FULL configured list: request-time "
+                    "selection returned no command to run, so it was discarded."
+                ),
+            )
+        return scope
 
     def run(self) -> str:
         """Run the bound validation once and return the result AS TEXT.
@@ -1898,9 +2214,16 @@ class AdvisoryValidation:
                     "no later rerun could be tied to the run that recorded it"
                 )
                 cache = None
+        # WHAT TO RUN, asked now rather than when this object was built (val-07).
+        # After the rerun decision, because a rerun is never narrowed on top of
+        # `--lf` and `_resolve_scope` needs to know which this is; before the
+        # launch, because the answer IS the launch. Every failure inside it
+        # returns the configured list, so this line cannot make a round run
+        # LESS than it did before val-07 unless a real selection said so.
+        scope = self._resolve_scope(rerun)
         try:
             ok, summary = run_validation_commands(
-                self._commands,
+                scope.commands,
                 self._cwd,
                 command_runner=self._command_runner,
                 timeout=self._timeout,
@@ -1911,6 +2234,15 @@ class AdvisoryValidation:
         except Exception as exc:  # noqa: BLE001 — see the docstring
             self._results.append(False)
             self._reruns.append(rerun)
+            # Recorded as NOT COMPLETED, and with a tree state of UNKNOWN
+            # whatever the scope said: a run that did not finish proves nothing
+            # about the tree or about what it covered. Both halves are needed —
+            # the digest would otherwise satisfy the narrowed branch of
+            # `covers_verdict`, and the flag is what refuses the FULL-list
+            # branch, which grants coverage unconditionally.
+            self._scopes.append(
+                scope._replace(tree_state=TREE_STATE_UNKNOWN, completed=False)
+            )
             # Nothing is known about how far this got, so nothing it may have
             # left behind is evidence. Fail closed: the next request runs FULL.
             self._rerun_authorized = False
@@ -1921,6 +2253,7 @@ class AdvisoryValidation:
             )
         self._results.append(bool(ok))
         self._reruns.append(rerun)
+        self._scopes.append(scope)
         # THE THREE CONJUNCTS, in the order the comment above states them, and
         # written HERE — the only place — so the next request cannot be
         # authorised by anything but the run that just finished. The early
@@ -1941,6 +2274,8 @@ class AdvisoryValidation:
         # would be this feature's fail-open. The caveat is written from the flag
         # that was really passed, never from the run's output.
         mode = " (RERUN of the last run's failures, `--lf`)" if rerun else ""
+        if scope.narrowed:
+            mode = " (NARROWED to your changed paths)"
         caveat = ""
         if rerun:
             caveat = (
@@ -1952,17 +2287,31 @@ class AdvisoryValidation:
                 "run on a full pass if you have one."
             )
         elif self._cache_error:
+            # Says "carried no `--lf`" rather than "was FULL" since val-07: the
+            # cache and the path selection are independent, and this run may
+            # perfectly well have been narrowed to the agent's changed paths
+            # while the cache was unusable. Claiming a full run there would be a
+            # sentence about a run that did not happen.
             caveat = (
-                "\nThis run was FULL. The round's pytest cache could not be used "
-                f"({self._cache_error}), so validation ran exactly as it does "
-                "without one — `-p no:cacheprovider`, no `--lf` — and a later "
-                "request will be a full run too, not a cheap confirm."
+                "\nThis run carried no `--lf`. The round's pytest cache could "
+                f"not be used ({self._cache_error}), so validation ran exactly "
+                "as it does without one — `-p no:cacheprovider`, no `--lf` — "
+                "and a later request will be a fresh run too, not a cheap "
+                "confirm."
             )
+        # WHAT THIS RUN LOOKED AT, always, on a narrowed run and a full one
+        # alike (val-07). An agent that believes it ran the suite when it ran a
+        # tenth of it draws wrong conclusions from a green result, and the same
+        # is true in reverse: a round that could not narrow must say so rather
+        # than leave the agent to assume either. `scope.detail` is built by
+        # `ImplementExecutor._advisory_scope` from `TestSelection`'s own counts
+        # — the same discipline `TestSelection.evidence()` follows — and says
+        # which of the two happened, to how many files, and from which paths.
         return (
             f"ADVISORY validation run {self.runs} of {self._max_calls}{mode} — "
-            f"{verdict}.\n{summary}{caveat}\n"
-            "This run is advisory: the executor runs the same commands itself "
-            "after you return, and that run is what decides the round."
+            f"{verdict}.\n{summary}{caveat}\n{scope.detail}\n"
+            "This run is advisory: the executor runs validation itself after "
+            "you return, and that run is what decides the round."
         )
 
     # ---- what the round reports --------------------------------------------
@@ -1984,6 +2333,50 @@ class AdvisoryValidation:
             "pytest cache recorded as failing, so it is NOT a full-suite result "
             "and cannot show what the fix newly broke. The executor's own run "
             "below selects afresh and is the verdict."
+        )
+
+    def _narrowing_caveat(self) -> str:
+        """What `note()` adds about a run NARROWED to the agent's changed paths.
+
+        Two facts, and the reviewer needs both (val-07). WHAT it ran — a subset,
+        with the counts — and whether that subset still COVERS the executor's
+        own run below, which is the whole of the conditional guarantee this
+        change traded for the cheaper run. Neither is inferred from the other:
+        a narrowed run that covers the verdict and one that has been overtaken
+        by later edits read identically without this sentence, and the second is
+        the one a reviewer must not mistake for evidence.
+
+        Silent on a run that took the list whole, which is exactly the state
+        every round was in before val-07 — so a full-run round's summary is
+        byte-identical to what it was. Read from `_scopes` and from
+        `record_verdict_run`'s own inputs; nothing the agent wrote is consulted.
+        """
+        scope = self.last_run_scope
+        if scope is None or not scope.narrowed:
+            return ""
+        text = (
+            f" That last run was NARROWED to {len(scope.selected)} of "
+            f"{scope.total_test_files} test file(s), selected from the "
+            f"{len(scope.considered)} path(s) the worker tree reported as "
+            "changed when the agent asked — it is NOT a full-suite result."
+        )
+        if self.covers_verdict():
+            return text + (
+                " The worker tree is byte-identical to the one it selected from "
+                "and the executor's own run below selects no test file it did "
+                "not run, so it covers that run. That run is still the verdict."
+            )
+        if self._verdict_tree_state is None:
+            return text + (
+                " Whether it still covers anything was never established: this "
+                "round returned before the executor's own run, so there is no "
+                "verdict run for it to cover. Read it as covering NOTHING."
+            )
+        return text + (
+            " The worker tree either MOVED after it or could not be read, or "
+            "the executor's own run below selects a test file it did not run — "
+            "so it covers NOTHING of that run, which selects afresh and is the "
+            "verdict."
         )
 
     def note(self) -> str:
@@ -2032,6 +2425,7 @@ class AdvisoryValidation:
                     f"the last run to COMPLETE {verdict} — a verdict about the "
                     "tree as it stood then, not about the one being reviewed."
                     + self._rerun_caveat()
+                    + self._narrowing_caveat()
                 )
             else:
                 parts.append(" The suite ran 0 time(s) this round.")
@@ -2054,6 +2448,7 @@ class AdvisoryValidation:
                 f" Agent self-validation: the agent ran the suite {self.runs} "
                 f"time(s); its last run {verdict}."
                 + self._rerun_caveat()
+                + self._narrowing_caveat()
             ]
         if self._returns:
             parts.append(
@@ -2125,6 +2520,51 @@ ADVISORY_RESULT_FILE = ".autoloop-validation-result.txt"
 #: Where the answer is staged so a reader never sees half of one. Swept with
 #: the other two — an interrupted write must not leave a third path behind.
 ADVISORY_RESULT_TMP_FILE = ".autoloop-validation-result.tmp"
+
+#: The three control-channel paths, as one set — what a reader of the worker
+#: tree MUST subtract before treating `git status` as the agent's change.
+#:
+#: Every other reader of the tree runs after `AdvisoryRendezvous.stop()` has
+#: swept them, so this exists for the one reader that cannot: request-time
+#: selection (`ImplementExecutor._advisory_scope`) looks at the tree WHILE the
+#: channel is live, and `PENDING #n` is sitting at the result path by
+#: construction — `_take_request` writes it before the run it announces.
+#:
+#: Not cosmetic. A `.txt` path is not a Python module and not a prose document,
+#: so the selector attributes it by `validation._reference_tokens`, whose token
+#: set includes the bare extension `.txt` — which most of this checkout mentions
+#: somewhere. Leaving it in would attribute nearly the whole suite to a file the
+#: executor is about to delete, and the narrowing would silently never fire.
+ADVISORY_CHANNEL_PATHS: frozenset[str] = frozenset(
+    {ADVISORY_REQUEST_FILE, ADVISORY_RESULT_FILE, ADVISORY_RESULT_TMP_FILE}
+)
+
+#: How many changed paths an advisory answer NAMES before it starts counting.
+#: The answer is a file in the worker tree that an agent reads in full, and a
+#: round touching two hundred paths would otherwise spend most of it on a list.
+#: Deliberately its own bound rather than `validation._EVIDENCE_MAX_CONSIDERED`:
+#: that one sizes the reviewer's evidence string, and the two audiences are free
+#: to disagree without either becoming wrong.
+ADVISORY_EVIDENCE_MAX_PATHS = 20
+
+
+def _listed_paths(paths: Sequence[str]) -> str:
+    """`paths` as bounded evidence text — the tail is COUNTED, never dropped.
+
+    Line breaks are ESCAPED rather than passed through. A repo-relative path
+    really can contain one (`git status -z` reports the raw bytes), and this
+    text is written into the result file the agent polls, whose protocol is
+    read line by line — a path carrying a newline would otherwise decide where
+    the answer's lines begin. It is the same echo-safety `_advisory_instruction`
+    holds itself to, applied to the one part of this text that is not a literal.
+    """
+    shown = ", ".join(
+        path.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+        for path in paths[:ADVISORY_EVIDENCE_MAX_PATHS]
+    )
+    if len(paths) > ADVISORY_EVIDENCE_MAX_PATHS:
+        shown += f" (+{len(paths) - ADVISORY_EVIDENCE_MAX_PATHS} more)"
+    return shown
 
 #: The result file's first word while a run is in flight, and when it is done.
 #: The agent polls on this distinction, so the two must not be prefixes of one
@@ -4581,6 +5021,107 @@ class ImplementExecutor:
                 applicable=True,
             )
 
+    def _advisory_scope(
+        self, task: Task, git: GitGateway, commands: tuple[tuple[str, ...], ...]
+    ) -> AdvisoryScope:
+        """WHAT one advisory request runs, resolved from the tree RIGHT NOW.
+
+        The answer `AdvisoryValidation._resolve_scope` asks for on every
+        request. `commands` is the list that object holds — passed in, never
+        recomputed here — so whatever a round put there is what gets narrowed,
+        and this method cannot change WHICH list a round validates with, only
+        which of its pytest commands' paths are cut down. That is the same
+        constraint `_select_validation` is written to, and this routes through
+        `_select_validation` itself rather than calling the selector directly:
+        both refusal rules (a declared `validation`, a declared
+        `validation_cwd`) then fire identically at both ends, by construction.
+
+        **The changed-path set is git's, minus the channel's own files.** The
+        three rendezvous paths are the executor's control channel, not the
+        agent's work — it deletes them before it reads what changed — and one of
+        them is sitting in the tree by construction whenever this runs (see
+        `ADVISORY_CHANNEL_PATHS`). Subtracting them is what makes the set here
+        the same set the verdict run will be given, which is the whole basis of
+        the coverage claim.
+
+        FAIL CLOSED, in three places, each returning the configured list whole:
+
+        * `dirty_paths_all()` raised — the worker is not a git repository, the
+          status could not be read, the policy refused the call;
+        * the tree's own state could not be digested
+          (`validation.worker_tree_state` answered `TREE_STATE_UNKNOWN`). A
+          narrowing whose coverage can never afterwards be checked is a
+          narrowing that trades the guarantee for nothing, so it is not taken;
+        * selection widened, which already includes every case the selector
+          itself refuses to narrow — no changed paths at all (the state before
+          the agent's first edit), a declared `validation`, a `validation_cwd`,
+          `[audit] test_selection = "full"`, a deleted module, an unresolvable
+          path, an unretargetable command, and the selector raising.
+
+        Never raises: it is called from the watcher thread while an agent waits
+        on an answer, and an exception there would leave that agent polling a
+        result file nothing will ever write.
+        """
+
+        def full(reason: str) -> AdvisoryScope:
+            return AdvisoryScope(
+                commands=commands,
+                narrowed=False,
+                tree_state=TREE_STATE_UNKNOWN,
+                detail=(
+                    f"This run was the FULL configured list ({reason}), so it "
+                    "covers every test this round's own verdict run can select."
+                ),
+            )
+
+        try:
+            changed = sorted(set(git.dirty_paths_all()) - ADVISORY_CHANNEL_PATHS)
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            return full(
+                "the worker tree's changed paths could not be read — "
+                f"{type(exc).__name__}: {str(exc).strip() or '(no detail)'}"
+            )
+        state = worker_tree_state(git.repo_root, changed)
+        if not state:
+            return full(
+                "the worker tree's state could not be established, so a "
+                "narrowing could not later be shown to still cover anything"
+            )
+        selection = self._select_validation(task, commands, changed, git.repo_root)
+        if selection.widened:
+            return full(f"selection widened — {selection.reason}")
+        skipped = ""
+        if selection.skipped:
+            skipped = (
+                " Configured command(s) SKIPPED entirely, no selected test under "
+                "their paths: "
+                + "; ".join(f"`{' '.join(argv)}`" for argv, _why in selection.skipped)
+                + "."
+            )
+        return AdvisoryScope(
+            commands=selection.commands,
+            narrowed=True,
+            tree_state=state,
+            selected=frozenset(selection.selected),
+            considered=selection.considered,
+            total_test_files=selection.total_test_files,
+            detail=(
+                "THIS RUN WAS NARROWED to the tests your own changed paths "
+                f"reach: {len(selection.selected)} of "
+                f"{selection.total_test_files} test file(s), selected by "
+                "import-graph reachability from the "
+                f"{len(selection.considered)} path(s) `git status` reported as "
+                f"changed in your worker repo when you asked "
+                f"[{_listed_paths(selection.considered)}]."
+                + skipped
+                + " It is NOT a full-suite result. It is a SNAPSHOT: it covers "
+                "the executor's own verdict run only while the tree stands as "
+                "it does now — edit anything after this run and that run "
+                "selects from a wider diff, and this answer covers none of it. "
+                "Ask again after your last edit if you want coverage."
+            ),
+        )
+
     @staticmethod
     def _validation_cwd_for(task: Task, git: GitGateway) -> Path:
         """Where those commands run. Pure path arithmetic — whether the
@@ -4639,6 +5180,14 @@ class ImplementExecutor:
             # subdirectory the commands happen to run in. Passed even on the
             # fallback path above, where `cwd` is already the root.
             repo_root=git.repo_root,
+            # WHAT EACH REQUEST RUNS, answered per request rather than bound
+            # here (val-07). A closure over THIS task and THIS gateway, so the
+            # agent still supplies nothing and the object still has no parameter
+            # through which it could: `run()` passes the bound command list and
+            # gets a list back. It is passed even on the fallback path above,
+            # where `commands` is `()` — `run()` reports that as `NOT_RUN`
+            # before it ever resolves a scope.
+            scope_resolver=lambda commands: self._advisory_scope(task, git, commands),
         )
 
     def _aborted_outcome(
@@ -5203,16 +5752,30 @@ class ImplementExecutor:
         # round that narrows at both has none at all — the fact
         # `validation.PRECOMMIT_EVIDENCE` now states outright rather than implies.
         selection = self._select_validation(task, commands, changed, git.repo_root)
+        # WHAT THE AGENT'S LAST ADVISORY RUN STILL COVERS (val-07, 2026-09-11).
+        # Those runs are selected from the worker tree at the moment they are
+        # made, so a green one covers this run only while the tree has not moved
+        # since — and the tree HAS moved on any round whose agent edited after
+        # asking, and on every round where the delete/cleanup/revert passes above
+        # changed a file. This hands the advisory channel the verdict run's own
+        # two inputs, measured here from `changed` and from the selection just
+        # made, and `AdvisoryValidation.covers_verdict` answers only on evidence:
+        # an unreadable tree, an unrecorded verdict and a moved tree are all
+        # "covers nothing". It changes NOTHING about what runs below — the
+        # authoritative run is unconditional and is never shortened by an
+        # advisory result — only what the round's summary is entitled to claim.
+        advisory.record_verdict_run(worker_tree_state(git.repo_root, changed), selection)
         # THE AUTHORITATIVE RUN. Independent of every advisory RESULT above it:
         # it runs the selected list and is the only thing that sets `validation`
         # and decides the status. A green advisory run does not skip it, shorten
         # it or stand in for it — the agent's runs are evidence for the AGENT,
         # and this one is evidence for the reviewer. (The agent's advisory runs
-        # are not TEST-SELECTED: `_advisory_for` binds them before the agent has
-        # written anything, so there is no changed-path set to select from. This
-        # run is therefore never wider than a FULL advisory run — equal on a
-        # widened round, a strict subset on a narrowed one — which is the safe
-        # direction. Since val-08 an advisory run that follows a failed one
+        # ARE test-selected since val-07, from the worker tree as it stood when
+        # each was asked for, so this run is never wider than one whose tree has
+        # not moved since — EQUAL to it where both narrowed from the same inputs,
+        # a strict subset of it where that run failed closed to the whole list —
+        # and is unrelated to one whose tree has moved. Which of those a round
+        # reached is recorded above and reported by `note()`, never inferred. Since val-08 an advisory run that follows a failed one
         # carries `--lf` and IS narrower than this one; it is stamped as a rerun
         # everywhere it is reported, and nothing here reads it.) This run carries
         # no `--lf`, no `--ff` and no `--sw`, and cannot: `run_validation_commands`

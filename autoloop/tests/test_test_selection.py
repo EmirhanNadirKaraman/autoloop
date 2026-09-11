@@ -54,9 +54,13 @@ full-suite run cannot quietly come back. One test in that block is about the
 INPUT rather than the decision — a round that DELETES a module must hand the
 selector a changed-path set containing it, or the widening that deletion is
 owed never fires and the run narrows blind. A last one is about what the AGENT
-is told: the authoritative run is never WIDER than the agent's own advisory run
-of the same round, which is the containment `advisory_tool_descriptor` promises
-and the only reason a green advisory answer covers the verdict run.
+is told: on a tree that has not moved between the two, the agent's own advisory
+run of the same round and the authoritative run select the SAME tests — the
+containment `advisory_tool_descriptor` promises, and the only reason a green
+advisory answer covers the verdict run. That relation was unconditional while an
+advisory run always took the whole list; val-07 (2026-09-11) selects that run too
+and makes it conditional, and the condition is graded in
+`test_agent_self_validation.py` §12.
 """
 
 from __future__ import annotations
@@ -75,6 +79,7 @@ from autoloop.tasks import TRACKER_PATHS, Task
 from autoloop.validation import (
     TEST_SELECTION_FULL,
     TEST_SELECTION_REACHABLE,
+    TREE_STATE_UNKNOWN,
     _DYNAMIC_IMPORT_CALLS,
     _INTERPRETER_LITERALS,
     _files_referencing,
@@ -82,6 +87,8 @@ from autoloop.validation import (
     _reference_tokens,
     build_import_graph,
     select_validation_commands,
+    tree_states_match,
+    worker_tree_state,
 )
 from autoloop.worktask import TaskExecution
 
@@ -2236,21 +2243,29 @@ def test_both_phases_run_the_same_commands_for_the_same_change(tmp_path):
     assert "test selection: SUBSET" in summary
 
 
-def test_the_authoritative_run_is_never_wider_than_an_advisory_one(tmp_path):
-    """The relation the agent is TOLD, driven through a real round.
+def test_an_advisory_run_selects_the_same_tests_the_verdict_run_does(tmp_path):
+    """The relation the agent is TOLD, driven through a real round — and the
+    form it takes since val-07 (2026-09-11).
 
-    `advisory_tool_descriptor` promises the agent that the executor's own run is
-    never WIDER than an advisory one and MAY be narrower. That is the whole
-    reason a green advisory answer is worth anything: it covers the verdict run
-    rather than having to reproduce it. This drives the NARROWED half — the one
-    where the two genuinely differ — and pins the containment rather than the
-    two strings being equal.
+    It used to read: the advisory run takes the resolved list WHOLE, so the
+    verdict run is never WIDER than it. That held because the advisory run was
+    bound before the agent had written anything and had no changed-path set to
+    select from. It is re-resolved at REQUEST time now, through this same
+    executor's `_select_validation`, so on a tree that has not moved between the
+    two the relation is EQUALITY: same commands, same changed paths, same tree,
+    and selection is deterministic over exactly those three.
 
-    The widened half is the easy one and is pinned elsewhere: every widening rule
-    hands the resolved list back verbatim, so the two runs launch identical argv
-    (`test_agent_self_validation.py::test_the_advisory_run_and_the_executors_own
-    _run_launch_the_same_thing`, whose task declares both `validation` and
-    `validation_cwd`).
+    That is still enough for the only inference the agent draws — a green answer
+    covers the verdict run rather than having to reproduce it — and it is the
+    condition, not the guarantee, that the executor now enforces and reports
+    (`test_agent_self_validation.py` §12c drives a tree that MOVED, where the
+    advisory result covers nothing).
+
+    Asserted on the SELECTION rather than on argv equality since val-08
+    (2026-08-31): an advisory pytest run relocates pytest's cache to a per-round
+    directory outside the worker repo (`-o cache_dir=<temp>` in place of `-p
+    no:cacheprovider`), so its argv is not byte-identical to the verdict's. The
+    cache placement is graded in `test_agent_self_validation.py` §11.
     """
     executor, worker, ran = precommit_executor(tmp_path)
     task = Task(id="sel-2", title="publisher", description="change the publisher")
@@ -2259,45 +2274,33 @@ def test_the_authoritative_run_is_never_wider_than_an_advisory_one(tmp_path):
     authoritative = tuple(ran)
     ran.clear()
     # The same executor's own binding, built exactly as the round built it —
-    # never a second description of "what this round validates with".
+    # never a second description of "what this round validates with". The worker
+    # tree still holds the round's own uncommitted change, so this is an
+    # advisory request made against exactly the tree the verdict run graded.
     executor._advisory_for(task, GitGateway(worker, PolicyEngine(PolicyConfig()))).run()
     advisory = tuple(ran)
 
     assert outcome.status == "ok"
     assert "test selection: SUBSET" in outcome.validation, "this round narrowed"
 
-    # The advisory run took the resolved list WHOLE: the configured pytest
-    # command's whole-tree path, with no file ever named.
-    #
-    # Asserted on the SELECTION rather than on argv equality since val-08
-    # (2026-08-31): an advisory pytest run relocates pytest's cache to a
-    # per-round directory outside the worker repo (`-o cache_dir=<temp>` in
-    # place of `-p no:cacheprovider`), so its argv is no longer byte-identical
-    # to the configured command. Which tests it selects — the whole claim here —
-    # did not move, and the cache placement is graded in
-    # `test_agent_self_validation.py` §11.
-    advisory_pytest = [argv for argv in advisory if "pytest" in argv]
-    assert len(advisory_pytest) == 1
-    assert "suite" in advisory_pytest[0], "the advisory run kept the whole-tree path"
-    assert not [token for token in advisory_pytest[0] if token.endswith(".py")], (
-        "the advisory run named individual files, so it was narrowed after all"
-    )
+    def targeted(argvs):
+        return sorted(
+            token
+            for argv in argvs
+            if argv[0] != "ruff"
+            for token in argv
+            if token.endswith(".py")
+        )
+
+    assert SUITE not in advisory, "the advisory run took the whole-tree path"
+    assert SUITE not in authoritative, "and neither did the verdict run"
     assert RUFF in advisory
-    # The authoritative run did not — and every path it DID target lives under
-    # the path the advisory command ran, which is what "never wider" means for a
-    # pytest command.
-    assert SUITE not in authoritative
     assert RUFF in authoritative, "a non-pytest command is untouched at both ends"
-    targeted = [
-        token
-        for argv in authoritative
-        if argv[0] != "ruff"
-        for token in argv
-        if token.endswith(".py")
-    ]
-    assert targeted, "the narrowed command really named test files"
-    assert all(token.startswith("suite/") for token in targeted)
-    assert authoritative != advisory, "the narrowed round is a STRICT subset"
+    assert targeted(authoritative), "the narrowed command really named test files"
+    assert all(token.startswith("suite/") for token in targeted(authoritative))
+    # THE RELATION: the verdict run selects nothing the advisory run did not run.
+    assert set(targeted(authoritative)) <= set(targeted(advisory))
+    assert targeted(advisory) == targeted(authoritative), "and on an unmoved tree, equal"
 
 
 def test_the_operator_setting_is_wired_into_the_production_executor():
@@ -2328,3 +2331,76 @@ def test_the_evidence_names_both_narrowed_phases_and_how_to_widen(repo):
     assert "no full-suite run is guaranteed at either phase" in evidence
     assert 'test_selection = "full"' in evidence, "the global lever"
     assert "task-add --validation" in evidence, "the per-task lever"
+
+
+# ---- has the tree moved since a selection was made? (val-07) ----------------
+#
+# A selection made DURING an agent's window is only as good as the tree it was
+# made from, and the two phases here never had to ask: a commit pins its tree.
+# These grade the pair that lets a third caller ask — and grade them on the
+# direction that matters, which is that not knowing must never read as "it did
+# not move". The use of the answer is in `test_agent_self_validation.py` §12c.
+
+
+def test_a_tree_state_tracks_content_and_the_path_list_it_was_taken_over(tmp_path):
+    """Two digests agree only if every changed path still holds the same bytes
+    AND the list itself is the same. The second half is what catches a file
+    ADDED to the diff after the fact: every earlier file is untouched, so a
+    digest over content alone would report an unmoved tree."""
+    write(tmp_path, "a.py", "one\n")
+    write(tmp_path, "b.py", "two\n")
+
+    first = worker_tree_state(tmp_path, ["a.py"])
+
+    assert first == worker_tree_state(tmp_path, ["a.py"]), "deterministic"
+    assert first == worker_tree_state(tmp_path, ("a.py",)), "and not order- or type-bound"
+    assert first != worker_tree_state(tmp_path, ["a.py", "b.py"]), "a wider diff moved"
+    write(tmp_path, "a.py", "one, edited\n")
+    assert first != worker_tree_state(tmp_path, ["a.py"]), "an edit moved"
+
+
+def test_a_deleted_path_is_a_state_rather_than_an_unknown(tmp_path):
+    """A deletion is one of the commonest things an agent does, and absence is
+    the same state when read twice — so it is digested rather than refused. What
+    it must NOT do is collide with the file being present or missing at some
+    OTHER path, which the path list keeps apart."""
+    write(tmp_path, "a.py", "one\n")
+    present = worker_tree_state(tmp_path, ["a.py"])
+    (tmp_path / "a.py").unlink()
+
+    absent = worker_tree_state(tmp_path, ["a.py"])
+
+    assert absent and absent != present
+    assert absent == worker_tree_state(tmp_path, ["a.py"]), "and it is stable"
+    assert absent != worker_tree_state(tmp_path, ["b.py"]), "two absences are not one"
+
+
+def test_a_state_that_cannot_be_established_is_never_equal_to_another(tmp_path):
+    """THE fail-open this pair exists to refuse. An unreadable tree digests to
+    the empty string, and `"" == ""` is True — so a caller comparing raw values
+    would read two failed reads as proof that nothing changed.
+    `tree_states_match` refuses an unknown on EITHER side."""
+    write(tmp_path, "a.py", "one\n")
+    (tmp_path / "linked.py").symlink_to(tmp_path / "nowhere.py")
+
+    assert worker_tree_state(tmp_path, ["linked.py"]) == TREE_STATE_UNKNOWN
+    assert worker_tree_state(tmp_path, ["a.py", "linked.py"]) == TREE_STATE_UNKNOWN, (
+        "one path nobody could read discards the WHOLE digest, not just its own"
+    )
+    assert not tree_states_match(TREE_STATE_UNKNOWN, TREE_STATE_UNKNOWN)
+    assert not tree_states_match("abc", TREE_STATE_UNKNOWN)
+    assert not tree_states_match(TREE_STATE_UNKNOWN, "abc")
+    assert tree_states_match("abc", "abc")
+
+
+def test_a_tree_state_never_raises_whatever_it_is_pointed_at(tmp_path):
+    """It runs on a round's critical path and inside a watcher thread serving an
+    agent mid-turn, so every failure has to come back as a VALUE rather than as
+    an exception. A directory at a path git reported as a changed FILE is the
+    shape nearest to plausible; a root that does not exist is the far one, and
+    it reads as every path being absent, which is what it is."""
+    (tmp_path / "adir").mkdir()
+
+    assert worker_tree_state(tmp_path, ["adir"]) == TREE_STATE_UNKNOWN
+    assert worker_tree_state(tmp_path / "gone", ["a.py"]), "a value, not a raise"
+    assert worker_tree_state(tmp_path, []), "an empty diff is still a real state"
