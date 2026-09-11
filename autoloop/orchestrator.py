@@ -15154,15 +15154,25 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
-        # AFTER the state save, deliberately. `cli._merge_window_blockers`
-        # reads the phase from `state.json` on DISK, and the last thing
-        # written there before this point was `phase=executing` (set in
-        # `_await_response`). Calling the gate any earlier in this method
-        # would see that stale value, report "a phase is executing", and defer
-        # every single merge forever — a feature that logs busily and never
-        # integrates anything. The registry write in `_mark_task_completed`
-        # above matters for the same reason: it is what makes the gate exempt
-        # the record we just published instead of treating it as a hazard.
+        # AFTER the state save, deliberately, and this ordering is a `lanes = 1`
+        # fact. There `cli._merge_window_blockers` reads the phase from
+        # `state.json` on DISK, and the last thing written there before this
+        # point was `phase=executing` (set in `_await_response`). Calling the
+        # gate any earlier in this method would see that stale value, report "a
+        # phase is executing", and defer every single merge forever — a feature
+        # that logs busily and never integrates anything.
+        #
+        # ABOVE one lane the gate reads no lane's state file at all (conc-13),
+        # so nothing about this call's position matters there — which is the
+        # point: `state.json` is LANE 0's, so this save could never have
+        # unblocked a merge attempted from lane 1, and the same stale value it
+        # avoids here held the fleet's window shut permanently instead
+        # (measured 2026-09-09). The order is kept because one lane still
+        # depends on it, not because it ever spoke for N.
+        #
+        # The registry write in `_mark_task_completed` above matters at every
+        # lane count: it is what makes the gate exempt the record we just
+        # published instead of treating it as a hazard.
         self._auto_merge_after_completion(binding.task_id)
 
     def _auto_merge_after_completion(self, task_id: str) -> None:
@@ -15180,6 +15190,13 @@ class Orchestrator:
         already completed, so an integration problem is logged, never parked.
         `AutoMerger` guards each task individually too; this outer guard
         covers the construction itself.
+
+        ABOVE ONE LANE THIS MAY SIMPLY DEFER, and that is the intended outcome
+        rather than a failure (conc-13): `after_completion` takes the fleet's
+        merge token, so a lane whose sibling is mid-merge records a deferral and
+        returns without touching the shared checkout. The next completion drains
+        it, and the backlog sweep enumerates it either way. At `lanes = 1` no
+        token exists and this path is what it always was.
 
         The AUDIT pseudo-task reaches here as well, since `_dispatch_task_push`
         does not distinguish it. Its unit id is only sometimes in the registry
@@ -15211,6 +15228,13 @@ class Orchestrator:
                 # what makes the observed clone the fetch source — see
                 # `_carry_candidate_past_for_merge`.
                 carry_forward=self._carry_candidate_past_for_merge,
+                # WHICH LANE is about to mutate the shared checkout (conc-13).
+                # `after_completion` takes the fleet's merge token, and this is
+                # the name that lands in it — so a sibling that finds the token
+                # held is told which lane is merging rather than just that
+                # somebody is. Never read at `lanes = 1`, where no token is
+                # taken at all.
+                lane_index=self.lane_index,
             ).after_completion(task_id)
         except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
             self._log(

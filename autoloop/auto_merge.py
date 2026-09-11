@@ -35,9 +35,11 @@ candidates, so an eager merge at that moment would have parked thirteen of
 them.
 
 So the same predicate the operator's `merge-window` command uses gates this
-one: `cli._merge_window_blockers` — no unpublished candidate bound to the
-current base, no executing phase. It is CALLED, not reimplemented. A second
-copy that drifted by a single case is exactly how thirteen tasks get stranded.
+one: `cli._merge_window_blockers` — at `lanes = 1`, no unpublished candidate
+bound to the current base and no executing phase; above one lane, both of those
+are per-candidate obligations instead (see the next section, and conc-13 for
+the phase half). It is CALLED, not reimplemented. A second copy that drifted by
+a single case is exactly how thirteen tasks get stranded.
 A published candidate does not block: its reviewed object is durable on its
 own branch, so a moved base cannot discard it.
 
@@ -54,6 +56,15 @@ open (docs/AUTOLOOP.md, "Decision 6 — merging is serialised and rebase-aware")
 There the predicate reports a bound candidate as a `MergeObligation` instead,
 and this module is what makes that safe. Three steps, in this order and no
 other:
+
+(The executing-phase clause was the OTHER fleet-wide mutual exclusion, and
+conc-13 converted it the same way — for the same starvation and because it read
+lane 0's state file and spoke for the fleet from it. The per-candidate safety it
+was buying is the three steps below, which is what made the conversion possible
+rather than merely desirable. It was buying ONE thing more, though, and by
+accident: while it held the window shut, two lanes could not be inside a merge
+at the same time. `after_completion` therefore takes the fleet's merge token —
+see its own docstring, and `merge_sweep.take_merge_token`.)
 
 1. **Mark, before the merge.** Every bound candidate's record gets
    `rereview_owed_base` set (`_mark_rereview_owed`). A candidate that cannot be
@@ -594,6 +605,12 @@ class AutoMerger:
     orchestrator can pass its own bound method and every merge and deferral
     lands in the same transcript as everything else, with task id, sha and
     reason — which is what the operator greps when a branch is missing.
+
+    TWO ENTRY POINTS, and they are serialised differently on purpose.
+    `after_completion` takes the fleet's merge token itself (see its docstring);
+    `attempt` takes none, because its other caller is `merge_sweep.
+    BacklogSweeper`, which is already holding that same token when it calls —
+    taking it twice would refuse a lane its own live pid.
     """
 
     def __init__(
@@ -608,6 +625,7 @@ class AutoMerger:
         deferrals: MergeDeferralStore | None = None,
         upgrades: "UpgradeStore | None" = None,
         carry_forward=None,
+        lane_index: int = 0,
     ):
         self._config = config
         self._git = git
@@ -647,16 +665,62 @@ class AutoMerger:
         #: the same file, and unserialised those two lose an upgrade
         #: (`UpgradeStore`). A caller that passes its own store keeps it.
         self._upgrades = upgrades or UpgradeStore.for_config(config)
+        #: WHICH LANE is merging, for the merge token's record only (conc-13),
+        #: exactly as `merge_sweep.BacklogSweeper` carries one. Last in the
+        #: signature and defaulted, so no existing construction site moves, and
+        #: `0` is what a single-lane loop is — where no token is taken at all
+        #: and this value is never read.
+        self._lane_index = lane_index
 
     # ---- entry point --------------------------------------------------------
 
     def after_completion(self, task_id: str) -> dict[str, str]:
-        """Retry every earlier deferral, then integrate `task_id`.
+        """Retry every earlier deferral, then integrate `task_id`, holding the
+        fleet's merge token for the whole of it.
 
         Draining FIRST is what makes "retry after the next completion" real:
         the deferred tasks were blocked by a condition (a gate, a moved base)
         that the intervening work may well have cleared, and they are older,
         so they go first.
+
+        **THE TOKEN (conc-13).** Every lane merges here, in its own process,
+        into ONE shared checkout — `orchestrator._auto_merge_after_completion`
+        hands this its own `self._git`, whose repo root is the primary checkout
+        the whole fleet builds against. Until the window opened above one lane
+        that overlap could not happen: the executing-phase clause held the
+        window shut whenever any round was mid-write, so two completions in the
+        same instant were serialised by accident. Opening it made them
+        simultaneous, and simultaneous is `index.lock`, a merge verified against
+        a head the sibling has already moved, or one lane's `merge --abort`
+        unwinding the other's half-finished merge. So this takes
+        `merge_sweep`'s token — the SAME file the sweep takes, not a second one,
+        because "one at a time" has to mean one merge in that checkout and not
+        one of each kind.
+
+        Held across the WHOLE drain rather than around `_merge` alone, and that
+        span is the guarantee rather than tidiness: `attempt` reads the head,
+        asks `cli._merge_window_blockers` what is bound to THAT head, marks
+        every obligation, merges, carries each candidate forward and pushes. A
+        sibling moving the base anywhere in that sequence voids the window's
+        verdict, and the marks were written for a head that is no longer the
+        one being left behind.
+
+        Taken HERE and not in `attempt`, deliberately: `merge_sweep.
+        BacklogSweeper` holds this very token while it calls `attempt` once per
+        branch, so taking it there would refuse a lane on the strength of its
+        own live pid. `attempt` therefore assumes its caller holds it, and both
+        callers do.
+
+        NOTHING AT `lanes = 1` — `merge_sweep.take_merge_token` answers
+        `(None, "")` there without building a token, constructing a path or
+        touching the state dir, so the single-lane completion path is what it
+        always was.
+
+        A token this cannot take is a DEFERRAL, never a park and never a raise:
+        the push has already landed, the sibling holding it is merging right
+        now, and the record `_defer` writes is retried on the next completion
+        (and, failing that, found by the backlog sweep, which enumerates every
+        completed task whose branch is not in the base).
 
         Returns `{task_id: outcome}` for the caller's benefit; the orchestrator
         ignores it and reads the transcript instead. Never raises — see the
@@ -665,22 +729,72 @@ class AutoMerger:
         outcomes: dict[str, str] = {}
         if not self._policy.config.auto_merge_enabled:
             return {task_id: DISABLED}
-        #: Confirmed publications, memoized for this invocation only, exactly
-        #: as `_cmd_merge_window` does it — a drain of five deferrals would
-        #: otherwise re-ask the remote about the same published candidates
-        #: five times over.
-        seen: set = set()
+        from . import merge_sweep
+
+        token, refusal = merge_sweep.take_merge_token(self._config, self._lane_index)
+        if refusal:
+            return {task_id: self._defer_for_token(task_id, refusal)}
         try:
-            pending = [d.task_id for d in self._deferrals.all_deferrals()]
-        except (StateCorruptError, OSError) as exc:
-            self._log("auto_merge_error", data={"task_id": task_id, "error": str(exc)})
-            pending = []
-        for pending_id in pending:
-            if pending_id == task_id:
-                continue        # handled below, from its live execution record
-            outcomes[pending_id] = self._guarded_attempt(pending_id, seen)
-        outcomes[task_id] = self._guarded_attempt(task_id, seen)
-        return outcomes
+            #: Confirmed publications, memoized for this invocation only,
+            #: exactly as `_cmd_merge_window` does it — a drain of five
+            #: deferrals would otherwise re-ask the remote about the same
+            #: published candidates five times over.
+            seen: set = set()
+            try:
+                pending = [d.task_id for d in self._deferrals.all_deferrals()]
+            except (StateCorruptError, OSError) as exc:
+                self._log(
+                    "auto_merge_error", data={"task_id": task_id, "error": str(exc)}
+                )
+                pending = []
+            for pending_id in pending:
+                if pending_id == task_id:
+                    continue    # handled below, from its live execution record
+                outcomes[pending_id] = self._guarded_attempt(pending_id, seen)
+            outcomes[task_id] = self._guarded_attempt(task_id, seen)
+            return outcomes
+        finally:
+            # EVERY exit, including the one that raises. A completion that
+            # returned the token only on the paths somebody remembered would
+            # leave the fleet unable to merge until a lane died and was
+            # recovered — a worse failure than the one the token prevents.
+            # `release_merge_token` swallows what it cannot remove, because a
+            # `finally` that raised here would turn a merge that LANDED into an
+            # exception, which is the one thing this module may never do.
+            merge_sweep.release_merge_token(token)
+
+    def _defer_for_token(self, task_id: str, refusal: str) -> str:
+        """A completion that could not take the fleet's merge token.
+
+        A real `_defer` where the record can be read, so the deferral store
+        retries it on the next completion and the transcript carries the same
+        `auto_merge_deferred` entry every other deferral does — an operator
+        greps one thing, not two, and `health` reads no new event type.
+
+        A record that cannot be read is logged and returns `DEFERRED` anyway,
+        which is the honest answer and not a fail-open one: nothing was merged
+        and nothing was touched, and the backlog sweep enumerates this task from
+        the registry rather than from the deferral store, so the retry does not
+        depend on this write succeeding.
+        """
+        reason = f"another lane is merging — {refusal}"
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateCorruptError, OSError):
+            execution = None
+        if execution is not None:
+            try:
+                return self._defer(execution, reason)
+            except (StateCorruptError, OSError) as exc:
+                self._log(
+                    "auto_merge_error",
+                    data={"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"},
+                )
+        else:
+            self._log(
+                "auto_merge_deferred", data={"task_id": task_id, "reason": reason}
+            )
+        return DEFERRED
 
     def _guarded_attempt(self, task_id: str, seen: set) -> str:
         """`attempt`, with the module's failure discipline around it: the push
@@ -703,6 +817,16 @@ class AutoMerger:
         every precondition has passed.** Reading a record, resolving an object
         and asking the remote where its base is are all safe to abandon
         halfway; a merge is not.
+
+        **THE CALLER HOLDS THE FLEET'S MERGE TOKEN, above one lane.** Both of
+        them do — `after_completion` around its whole drain, `merge_sweep.
+        BacklogSweeper.sweep` around its whole backlog — and it is taken there
+        rather than here precisely because the sweep calls this once per branch
+        and would otherwise queue behind itself. Everything below is written
+        against a head only this process is moving; the window verdict, the
+        obligations marked against it and the merge verification are one
+        sequence and a sibling moving the base through any of them voids all
+        three. A new call site is a new place to take that token first.
         """
         seen = set() if seen is None else seen
         if not self._policy.config.auto_merge_enabled:
