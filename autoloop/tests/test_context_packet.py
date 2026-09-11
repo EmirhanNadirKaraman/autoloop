@@ -677,9 +677,12 @@ def test_a_record_with_no_base_sha_at_all_is_stated_rather_than_guessed(tmp_path
 
 
 def test_no_record_index_is_said_out_loud_and_every_cited_id_is_a_question(tmp_path):
-    """The absence this round ships with. No directory has been named for
-    context records, so the loop passes no index — and the packet says so
-    instead of resolving every citation to a silent nothing."""
+    """The absence, which since ctx-16 named `[context] records_dir` is a
+    deployment that set it to `""` (and every caller with no repository to read
+    records from, such as `cli`'s `context explain`). The loop then passes no
+    index — and the packet says so instead of resolving every citation to a
+    silent nothing, which is still a different report from a directory somebody
+    named and put no records in."""
     repo = worker_repo(tmp_path)
     base = commit(repo, "src.py", "one\n", "add src")
 

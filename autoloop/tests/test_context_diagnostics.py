@@ -328,7 +328,8 @@ class Deployment:
         # THE INDEX THE DISPATCH WOULD USE, built exactly as
         # `orchestrator._context_record_index` builds it: `load_index` over the
         # wired store's own directory, and `None` when no store is wired — which
-        # is every production run today.
+        # since ctx-16 is a deployment that set `[context] records_dir = ""`,
+        # and is still what `context explain` itself re-renders with.
         index = load_index(self.record_store.directory) if self.records else None
         self.task = task(task_id, cite=cite)
         TaskStore(self.config.tasks_file).save(TaskRegistry([self.task]))
