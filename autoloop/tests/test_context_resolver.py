@@ -183,8 +183,19 @@ def test_a_record_file_that_will_not_parse_becomes_a_problem_not_a_gap(tmp_path)
     written against."""
     directory = tmp_path / "records"
     directory.mkdir()
+    # Complete for its kind (`REQUIRED_FIELDS`, ctx-14) and citing no commit, so
+    # the one thing that separates it from the three below is that it loads.
     (directory / "good.json").write_text(
-        json.dumps({"id": "good", "kind": "feature"}), encoding="utf-8"
+        json.dumps(
+            {
+                "id": "good",
+                "kind": "feature",
+                "title": "a.py",
+                "invariant": "a.py is pure",
+                "source_paths": ["a.py"],
+            }
+        ),
+        encoding="utf-8",
     )
     (directory / "broken.json").write_text("{not json", encoding="utf-8")
     (directory / "typo.json").write_text(
@@ -240,10 +251,21 @@ def test_a_record_that_could_never_match_is_refused_at_parse_time(data):
 
 def test_every_kind_the_resolver_expands_to_is_a_kind_a_record_may_have():
     """The four kinds the task names, and no fifth: a new kind changes what the
-    resolver selects and belongs in a reviewed commit, not in a data file."""
+    resolver selects and belongs in a reviewed commit, not in a data file. Each
+    parses once it carries the fields its kind requires (`REQUIRED_FIELDS`,
+    ctx-14) — the bare `{id, kind}` that used to parse is now a record that
+    makes no checkable claim, and `test_context_record_checks.py` pins that
+    refusal."""
     assert set(RECORD_KINDS) == {"decision", "feature", "incident", "lesson"}
     for kind in RECORD_KINDS:
-        assert record_from_mapping({"id": "x", "kind": kind}).kind == kind
+        data = {
+            "id": "x",
+            "kind": kind,
+            "title": "x",
+            "invariant": "a.py is pure",
+            "source_paths": ["a.py"],
+        }
+        assert record_from_mapping(data).kind == kind
 
 
 # ---- 2. determinism ----------------------------------------------------------
@@ -701,7 +723,15 @@ def test_every_finding_reaches_the_rendered_block(tmp_path, repo):
     directory.mkdir()
     (directory / "broken.json").write_text("{", encoding="utf-8")
     (directory / "f1.json").write_text(
-        json.dumps({"id": "f1", "kind": "feature", "source_paths": ["gone.py"]}),
+        json.dumps(
+            {
+                "id": "f1",
+                "kind": "feature",
+                "title": "gone.py",
+                "invariant": "gone.py is present",
+                "source_paths": ["gone.py"],
+            }
+        ),
         encoding="utf-8",
     )
 
