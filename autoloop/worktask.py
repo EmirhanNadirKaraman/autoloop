@@ -65,6 +65,7 @@ is AMBIGUOUS and parked for the operator rather than guessed at.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import secrets
@@ -72,10 +73,11 @@ import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from .errors import GitError, StateCorruptError, StateError
 from .state import utcnow_iso
+from .tasks import mutex_path_for, task_file_mutex
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -141,7 +143,12 @@ class TaskExecution:
     #: an approval instead of from a round. The obligation is discharged by the
     #: re-review happening, not by the carry-forward succeeding — a
     #: carried-forward candidate nobody has looked at again is precisely what
-    #: must not be pushed.
+    #: must not be pushed. Both sites clear it through
+    #: `TaskExecutionStore.discharge_rereview_mark`, which compares against the
+    #: file under the store's mutex first: it is one of the `MERGE_OWNED_FIELDS`
+    #: a sibling writes from another process, an ordinary `save` never clears
+    #: it, and a NEWER mark found on disk is kept rather than discharged by a
+    #: packet that has not seen the move it describes (conc-15).
     #:
     #: EMPTY AT `lanes = 1`, always: the merge window is shut whenever a
     #: candidate is bound to the head there, so nothing ever moves the head past
@@ -187,6 +194,60 @@ class TaskExecution:
     #: Zero at `lanes = 1` and on every record written before this field
     #: existed, which is what makes both readings above identities there.
     carried_review_rounds: int = 0
+    #: A carry-forward the loop OWES THIS RECORD AND HAS NOT PERFORMED YET,
+    #: because the one time it tried, the worker was mid-write (conc-15). The
+    #: value is the branch head a merge moved to while this record's worker
+    #: repository held uncommitted changes — the head `_carry_reviewed_
+    #: candidate_past` would have merged into the task branch had it not
+    #: refused, and the head the owning lane retries onto when its round ends.
+    #:
+    #: WRITTEN BY THE MERGING LANE, IN ANOTHER PROCESS, instead of the
+    #: `task_base_behind_head` park it wrote until conc-15
+    #: (`auto_merge.AutoMerger._defer_carry_forward`). Of the refusals the
+    #: carry-forward can give, the dirty-worker one is the only TRANSIENT one:
+    #: the worker is dirty only while an agent is writing, and it goes clean
+    #: the moment that round commits — measured on review-01, whose worker
+    #: read 4 uncommitted during its round and 0 afterwards. Parking on it
+    #: converted a state that resolves itself in minutes into one that waited
+    #: for an operator verb. A CONFLICT is not transient and still parks.
+    #:
+    #: SCOPED TO THE ROUND IN FLIGHT when it was written, and cleared at every
+    #: exit of that round by the lane that owns the record
+    #: (`orchestrator._dispatch_task_postcommit` and `_finish_postcommit`):
+    #: retried where the round commits — the tree is clean by construction
+    #: there — and DROPPED, with a transcript entry, where it does not (an
+    #: abort, a fault, a refused commit, an executor that reported failure).
+    #: Dropping loses nothing: the base is reconciled again at the next
+    #: dispatch by `_rebase_execution_if_stale`, exactly as before this field
+    #: existed. A value still here at DISPATCH therefore belongs to a round
+    #: that never reached one of its exits, and is dropped there for the same
+    #: reason.
+    #:
+    #: The owning lane holds its record IN MEMORY across the executor, so the
+    #: value lands on disk under a copy that predates it. `orchestrator.
+    #: _absorb_merge_marks` re-reads it (with `rereview_owed_base`) the moment
+    #: the executor returns — and, because a sibling can write it AFTER that
+    #: read and before the round's next whole-record save, it is one of the
+    #: `MERGE_OWNED_FIELDS` that `TaskExecutionStore.save` reconciles from disk
+    #: under the store's mutex on EVERY save: a value on disk is never
+    #: overwritten by an ordinary save, only by the named clears
+    #: (`TaskExecutionStore.update_merge_marks`).
+    #:
+    #: EMPTY AT `lanes = 1`, always: the merge window is shut whenever a
+    #: candidate is bound to the head there, so no merge ever creates the
+    #: obligation and no site ever writes this. Empty is also the fail-closed
+    #: value — it licenses no retry — and it is what every record written
+    #: before this field existed loads as.
+    carry_deferred_head: str = ""
+    #: The base `carry_deferred_head` was minted against — this record's
+    #: `task_base_sha` at the moment the merge moved the head past it. The
+    #: retry compares it against the record's base first and DROPS the
+    #: obligation as superseded when the two differ, because a base that has
+    #: moved since was carried by something else (a re-dispatch's
+    #: `_rebase_execution_if_stale`, an operator) and merging an older head
+    #: into it would set the base BACKWARDS. Written and cleared beside its
+    #: sibling, never alone.
+    carry_deferred_base: str = ""
     #: Normalised text of the most recent `revise` feedback. Compared
     #: against the next one: identical feedback twice means the reviewer
     #: is asking for something the executor did not change, so another
@@ -823,18 +884,255 @@ class Reconciliation(str, Enum):
     AMBIGUOUS = "ambiguous"
 
 
+#: The fields of a `TaskExecution` that a MERGING lane writes from ANOTHER
+#: PROCESS while the lane that owns the record holds it in memory: conc-03's
+#: re-review marker and conc-15's deferred carry-forward. Every other field has
+#: one writer at a time and is saved whole; these three have two, and the
+#: owning lane's whole-record saves would otherwise overwrite what the sibling
+#: wrote between any two of its reads. `TaskExecutionStore.save` reconciles
+#: exactly this tuple against the file, under the store's mutex — see there.
+MERGE_OWNED_FIELDS: tuple[str, ...] = (
+    "rereview_owed_base",
+    "carry_deferred_head",
+    "carry_deferred_base",
+)
+
+
 class TaskExecutionStore:
     """One JSON file per task id under `directory`. A corrupt record RAISES
     (`StateCorruptError`) rather than being read as absent — silently
     treating corruption as "no execution record" would erase a task's
     provenance (its base sha, its candidate sha, its review state) exactly
-    when a crash makes that provenance most needed."""
+    when a crash makes that provenance most needed.
+
+    **Two writers, one record (conc-15).** A lane holds its own record in
+    memory from dispatch to the end of the round and saves it WHOLE many times
+    after the executor returns; a sibling lane's merge writes the
+    `MERGE_OWNED_FIELDS` onto the same file from another process, at a moment
+    the owner cannot predict. Plain last-writer-wins lost those writes
+    silently — the obligation read back as never having existed, the strand
+    it described neither retried nor parked. So `save` takes the store's
+    mutex (`tasks.task_file_mutex` over ONE lock file beside the directory —
+    the same primitive the task file uses, never a second implementation),
+    reads the three fields back off the file, and lets a NON-EMPTY value on
+    disk win over whatever the in-memory copy holds for that field. It
+    MUTATES the record it was handed to say so, which is where this diverges
+    from `reverted_out_of_scope_paths`' union-into-the-payload rule on
+    purpose: a deferral that lands in the bytes but not in the object the
+    round is holding is one `_settle_deferred_carry_forward` reads as `""` and
+    never retries.
+
+    The invariant that follows: AN ORDINARY SAVE CAN NEVER CLEAR A MERGE-OWNED
+    FIELD. Clearing is a named intent — `update_merge_marks`, which names the
+    fields it is writing and writes them under the same lock — and the
+    re-review marker's discharge is `discharge_rereview_mark`, which clears
+    only the obligation the caller actually saw and adopts a newer one
+    instead. A merging lane's own load/mutate/write goes inside `lock()` so
+    its read-modify-write is one unit against the owner's saves.
+
+    Every hold is a file read, an in-memory merge and a file write — never a
+    git command, never a validation run — so `tasks.MUTEX_TIMEOUT_SECONDS` is
+    not reachable by contention, only by a process that stopped while holding
+    the `flock`, and then `TaskStoreBusy` is raised rather than written
+    around: a save that silently skipped the lock would be the lost update
+    this exists to close, on the error path.
+    """
 
     def __init__(self, directory: Path):
         self.directory = Path(directory)
 
     def _path(self, task_id: str) -> Path:
         return self.directory / f"{task_id}.json"
+
+    # ---- the store mutex (conc-15) -----------------------------------------
+
+    @property
+    def mutex_path(self) -> Path:
+        """The lock file guarding every record in this store: BESIDE the
+        directory (`executions.lock`), not inside it, so `executions/*.json`
+        globs — the merge window's, the dashboard's — never see it, and an
+        `archive` or `clear` leaves no orphan behind. One file for the store
+        rather than one per record because a hold is milliseconds and the
+        contention it serialises is a handful of saves per round per lane."""
+        return mutex_path_for(self.directory)
+
+    def ensure_mutex_file(self) -> Path:
+        """Create the (always empty) lock file if it is not there yet, and
+        return it. The counterpart of `TaskStore.ensure_mutex_file`, for the
+        same reason: the orchestrator calls this immediately BEFORE the escape
+        detector's "before" snapshot, so a deployment whose state dir sits
+        inside the observed tree never sees this file CREATED mid-round by a
+        sibling's write and reports it as an agent escape. Pre-created, empty
+        and identical on both sides, it needs no exemption at all."""
+        lock_path = self.mutex_path
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            with open(lock_path, "a+b"):
+                pass
+        return lock_path
+
+    def lock(self):
+        """Hold the store's mutex for the body of the block. Re-entrant in a
+        thread (a `save` inside a caller's own `with store.lock():` is free),
+        exclusive across threads and processes; raises `TaskStoreBusy` rather
+        than waiting forever. A writer of a merge-owned field that LOADS the
+        record first takes this around the whole load/mutate/write.
+
+        Passed the DIRECTORY, not `mutex_path`: `task_file_mutex` applies
+        `mutex_path_for` itself, so handing it the suffixed path would flock
+        `executions.lock.lock` — a file `ensure_mutex_file` never pre-creates,
+        and so one the escape detector would see appear mid-round."""
+        return task_file_mutex(self.directory)
+
+    def _merge_marks_on_disk(self, task_id: str) -> dict[str, str]:
+        """`MERGE_OWNED_FIELDS` as the file currently holds them, as strings;
+        `{}` when there is no readable record.
+
+        Raw JSON, like `_reverted_on_disk`, and for the same two reasons: it is
+        on every write path, so a record that is missing, torn, or written by a
+        build with a field this one does not know must not turn a save into a
+        crash; and it does not go through `load`, so nothing that stubs `load`
+        (tests do) changes what a save writes. A record this cannot read holds
+        no mark anyone could enforce, and the save then writes what its caller
+        passed — the pre-conc-15 behaviour, not a new one.
+        """
+        try:
+            raw = json.loads(self._path(task_id).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            name: str(raw.get(name) or "")
+            for name in MERGE_OWNED_FIELDS
+            if raw.get(name)
+        }
+
+    @staticmethod
+    def _adopt(
+        execution: TaskExecution, marks: dict[str, str], written: Iterable[str] = ()
+    ) -> dict[str, str]:
+        """THE RULE, in one place for both readers below. For every merge-owned
+        field NOT in `written`, a non-empty value in `marks` (the file's copy)
+        replaces the in-memory one; returns what was adopted, by field.
+        `written` names the fields whose in-memory value is this write's own —
+        a merging lane setting a mark, an owning lane clearing a deferral — and
+        those are left exactly as the caller set them, empty included.
+
+        Non-empty-wins rather than a comparison against what this object last
+        saw, because the record has no version number and needs none: the
+        owning lane never SETS one of these fields, it only adopts and clears
+        them, and a sibling's writes to them are serialised by the merge token,
+        so a value on disk is always at least as new as the one in memory. The
+        one thing this cannot express — a sibling RESTORING a mark to empty
+        after the owner adopted it (a merge that conflicted and aborted) — fails
+        closed: the owner keeps the mark, the candidate stays refused at push
+        time, and the next packet it sends discharges it.
+        """
+        skip = set(written)
+        adopted: dict[str, str] = {}
+        for name, value in marks.items():
+            if name in skip or not value:
+                continue
+            if getattr(execution, name, "") != value:
+                setattr(execution, name, value)
+                adopted[name] = value
+        return adopted
+
+    def _adopt_merge_marks_locked(
+        self, execution: TaskExecution, written: Iterable[str] = ()
+    ) -> dict[str, str]:
+        """Caller holds the lock. `_adopt` over the raw file — the reader every
+        write path uses, which never raises."""
+        return self._adopt(
+            execution, self._merge_marks_on_disk(execution.task_id), written
+        )
+
+    def adopt_merge_marks(self, execution: TaskExecution) -> dict[str, str]:
+        """Adopt onto `execution` every merge-owned field a sibling has written
+        to its file, without saving anything. Returns `{field: value}` for what
+        changed — empty on every round at `lanes = 1`, where nothing writes
+        these. The read `orchestrator._absorb_merge_marks` makes the moment the
+        executor returns, so the round's exits DECIDE on what is on disk rather
+        than waiting for the next save to find out.
+
+        Reads through `load`, so a record that will not parse RAISES here
+        (`StateCorruptError`) where `save`'s own reconcile stays quiet: this is
+        the one read whose caller reports an unreadable record in the
+        transcript rather than writing over it.
+        """
+        with self.lock():
+            on_disk = self.load(execution.task_id)
+            if on_disk is None:
+                return {}
+            marks = {
+                name: getattr(on_disk, name, "") or "" for name in MERGE_OWNED_FIELDS
+            }
+            return self._adopt(execution, marks)
+
+    def update_merge_marks(self, execution: TaskExecution, **values: str) -> None:
+        """Write the named merge-owned fields onto `execution`'s record —
+        EMPTY VALUES INCLUDED, which is what makes this the only way to clear
+        one — under the lock, adopting anything a sibling wrote to the OTHER
+        fields on the way. Every value must name a field in
+        `MERGE_OWNED_FIELDS`; anything else is a programming error and raises.
+
+        The three writers: a merging lane setting the marker before it moves
+        the head (and putting it back if the merge aborts), a merging lane
+        recording a deferred carry-forward, and the owning lane clearing that
+        deferral where its round retries or drops it.
+        """
+        unknown = sorted(set(values) - set(MERGE_OWNED_FIELDS))
+        if unknown:
+            raise ValueError(
+                f"not a merge-owned field: {', '.join(unknown)} "
+                f"(expected one of {', '.join(MERGE_OWNED_FIELDS)})"
+            )
+        with self.lock():
+            for name, value in values.items():
+                setattr(execution, name, value or "")
+            self._adopt_merge_marks_locked(execution, written=tuple(values))
+            self._write(execution)
+
+    def discharge_rereview_mark(self, execution: TaskExecution, expected: str) -> str:
+        """Clear `rereview_owed_base` — and `rereview_candidate_sha` beside it
+        — for the packet that discharges it, and return the marker as it now
+        stands: `""` when discharged, otherwise the NEWER obligation that was
+        found on disk and adopted instead.
+
+        Compare-and-clear, not clear, and the comparison is against `expected`
+        — the marker AS THE CALLER READ IT WHEN THE PACKET'S BASE WAS SETTLED,
+        not as the object holds it now. The two differ exactly when a sibling
+        moved the head AGAIN after that read, marking the record with the base
+        the candidate is on now: every save the caller made since has adopted
+        that newer mark onto the object (the rule above), so comparing against
+        the object would find it equal to the file and clear a mark the caller
+        never saw. That mark describes a move the packet being sent has not
+        seen, so it is kept and the candidate stays refused at push time; the
+        caller says so in the transcript. A file that holds NO marker (a
+        sibling restored it after a merge that aborted) discharges too —
+        there is nothing left to owe.
+
+        Stated rather than left to be found: a newer mark whose VALUE equals
+        `expected` is indistinguishable from the one being discharged. A mark's
+        value is the record's base at the moment of marking, so that needs the
+        base to have stayed put between two marks — which is to say no carry
+        happened in between — and every packet the two callers send is
+        preceded by one (the dispatch-time carry, or the retry at the commit)
+        that moves it.
+        """
+        with self.lock():
+            on_disk = self._merge_marks_on_disk(execution.task_id).get(
+                "rereview_owed_base", ""
+            )
+            if on_disk in ("", expected):
+                execution.rereview_owed_base = ""
+                execution.rereview_candidate_sha = ""
+            else:
+                execution.rereview_owed_base = on_disk
+            self._adopt_merge_marks_locked(execution, written=("rereview_owed_base",))
+            self._write(execution)
+            return execution.rereview_owed_base
 
     def _reverted_on_disk(self, task_id: str) -> set[str]:
         """`reverted_out_of_scope_paths` as the file currently holds it.
@@ -853,13 +1151,29 @@ class TaskExecutionStore:
             return set()
 
     def save(self, execution: TaskExecution) -> None:
+        """Write `execution` whole — after reconciling `MERGE_OWNED_FIELDS`
+        against the file under the store's mutex (conc-15; the class docstring
+        has the argument): a non-empty value on disk wins for each of those
+        three fields, and the object passed in is updated to match what was
+        written. The named writers (`update_merge_marks`,
+        `discharge_rereview_mark`) are the only saves that do otherwise, and
+        they say which field they are writing.
+        """
+        with self.lock():
+            self._adopt_merge_marks_locked(execution)
+            self._write(execution)
+
+    def _write(self, execution: TaskExecution) -> None:
         data = asdict(execution)
         data["allowed_paths"] = sorted(execution.allowed_paths)
         data["out_of_scope_paths"] = sorted(execution.out_of_scope_paths)
         data["removed_out_of_scope_paths"] = sorted(execution.removed_out_of_scope_paths)
         # THE ONE FIELD THAT IS UNIONED WITH DISK RATHER THAN OVERWRITTEN, and
-        # the reason is specific rather than general (scope-05, 2026-08-24):
-        # inside a single dispatch TWO holders write this record. The
+        # the reason is specific rather than general (scope-05, 2026-08-24).
+        # (The `MERGE_OWNED_FIELDS` are reconciled with disk too, since conc-15,
+        # but by a different rule, at a different site — `save`, under the
+        # mutex, mutating the object — and for a different pair of writers.)
+        # Inside a single dispatch TWO holders write this record. The
         # orchestrator loads it before dispatch and saves its in-memory copy
         # after the executor returns (`_dispatch_task_postcommit`), while the
         # executor writes a revert onto the record MID-dispatch, through

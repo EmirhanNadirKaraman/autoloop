@@ -85,6 +85,29 @@ candidate whose sha and tree are unchanged — every push-time check would pass,
 and the approval taken against a base that has since moved would publish. The
 marker is what refuses that, and it is on disk before the head moves.
 
+**Step 3 has two refusals, and they do not share an outcome (conc-15).** A
+CONFLICT — the merged head genuinely collides with the candidate — parks the
+task `task_base_behind_head` for a human (`_park_carry_forward_refused`). A
+DIRTY WORKER — an agent literally mid-write in the lane that owns the task — is
+TRANSIENT: the tree goes clean the moment that round commits, so the carry is
+DEFERRED instead (`_defer_carry_forward`): the head is written onto the record
+as `TaskExecution.carry_deferred_head`, and the owning lane retries it when its
+round ends (`orchestrator._finish_postcommit`), parking only if the retry still
+refuses once the worker is clean. Measured 2026-09-11, within four hours of
+merges starting to work: three automatic merges, two strands, one per mid-write
+lane, each waiting on an operator verb for a condition that had resolved itself
+minutes later. The carry-forward reports the two apart as a VALUE
+(`CarryDeferral`) rather than by the text of the refusal.
+
+**Every write this module makes to another lane's record is one unit.** The
+owning lane holds that record in memory and saves it whole, at moments this
+lane cannot see; the marker and the deferral are therefore written through
+`TaskExecutionStore.update_merge_marks`, load and write inside one hold of the
+store's mutex, and the owner's own saves reconcile those fields from the file
+under the same mutex (`worktask.MERGE_OWNED_FIELDS`) — so a mark or a deferral
+written between any two of the owner's reads is adopted by its next save rather
+than overwritten by it.
+
 At `lanes = 1` none of this is reachable: the same record is a REASON, and
 `attempt` returns `DEFERRED` before step 1.
 
@@ -160,7 +183,7 @@ from pathlib import Path
 from . import note_merge
 from .blockers import BlockerStore
 from .config import AutoloopConfig
-from .errors import GitError, StateCorruptError
+from .errors import GitError, StateCorruptError, StateError
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .state import utcnow_iso
@@ -203,6 +226,35 @@ class MergeObligation:
     #: The base the candidate was bound to — the head this merge moves.
     base_sha: str
     worktree_path: str = ""
+
+
+@dataclass(frozen=True)
+class CarryDeferral:
+    """A carry-forward that could not run YET: the task's worker repository
+    was mid-write when the head moved past its reviewed candidate (conc-15).
+
+    Returned by the injected `carry_forward` IN PLACE of a refusal string, and
+    only for the one refusal that is transient. It is a VALUE and not a
+    string so that `_discharge_rereview` tells "defer" from "park" by type
+    rather than by matching prose — a refusal reworded in the orchestrator
+    would then park (the pre-conc-15 outcome) instead of quietly deferring,
+    which is the closed direction.
+
+    Truthy, like every refusal: a caller that only asks "did the carry
+    happen?" (`if refusal:`) still gets the right answer, and one that does
+    not know this type treats it as a refusal — again the pre-conc-15
+    behaviour, never a silent success.
+    """
+
+    #: The head the carry was deferred onto — what the owning lane retries.
+    head: str
+    #: The record's base at the moment the head moved past it.
+    base: str
+    #: The carry-forward's own wording of the refusal, for the transcript.
+    reason: str
+
+    def __bool__(self) -> bool:
+        return True
 
 
 #: The blocker code a carry-forward refusal parks under. THE SAME CODE
@@ -635,8 +687,10 @@ class AutoMerger:
         self._log = log
         #: `(task_id, head) -> refusal` — how a candidate bound to the head this
         #: merge moves is carried onto the new head. `""` means it was carried
-        #: forward and the record advanced; any other string is the reason the
-        #: obligation could not be discharged.
+        #: forward and the record advanced; a `CarryDeferral` means the worker
+        #: was mid-write and the carry is owed to the owning lane's round end
+        #: (conc-15); any other string is the reason the obligation could not
+        #: be discharged and the task parks.
         #:
         #: INJECTED rather than built here, and REQUIRED before a merge that
         #: creates an obligation may run. The carry-forward fetches into a worker
@@ -1209,22 +1263,33 @@ class AutoMerger:
         """Set (or clear) one record's `rereview_owed_base`. Returns
         `(reason, previous_value)`; `reason` is `""` on success.
 
-        Loads and saves the WHOLE record rather than patching the file, so this
-        goes through the same atomic write, the same schema and the same
-        `TaskExecutionStore` invariants every other writer uses.
+        Loads and writes the WHOLE record rather than patching the file, so
+        this goes through the same atomic write, the same schema and the same
+        `TaskExecutionStore` invariants every other writer uses — and does the
+        load and the write inside ONE hold of the store's mutex
+        (`TaskExecutionStore.lock`), because the lane that OWNS this record is
+        saving its own in-memory copy of it at moments this lane cannot see,
+        and a load/mutate/write that straddled one of those saves would put
+        the owner's older fields back over its newer ones. The write itself is
+        `update_merge_marks`, the one path that may set the marker to EMPTY
+        (`_restore_rereview_marks` needs that): an ordinary `save` lets a
+        non-empty value on disk win, so it could not put a mark back.
+
+        A busy mutex (`TaskStoreBusy`, a `StateError`) is a refusal like an
+        unreadable record — the merge then defers, and nothing has moved.
         """
+        previous = ""
         try:
-            execution = self._execution_store.load(task_id)
-        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
-            return f"its execution record could not be read ({exc})", ""
-        if execution is None:
-            return "its execution record is gone", ""
-        previous = getattr(execution, "rereview_owed_base", "") or ""
-        execution.rereview_owed_base = value
-        try:
-            self._execution_store.save(execution)
-        except (StateCorruptError, OSError) as exc:
-            return f"its execution record could not be written ({exc})", previous
+            with self._execution_store.lock():
+                execution = self._execution_store.load(task_id)
+                if execution is None:
+                    return "its execution record is gone", ""
+                previous = getattr(execution, "rereview_owed_base", "") or ""
+                self._execution_store.update_merge_marks(
+                    execution, rereview_owed_base=value
+                )
+        except (StateError, OSError, ValueError, TypeError) as exc:
+            return f"its execution record could not be read or written ({exc})", previous
         return "", previous
 
     def _discharge_rereview(self, obligations, merged_head: str) -> None:
@@ -1243,12 +1308,24 @@ class AutoMerger:
         Nothing about the worker repository or the execution record is discarded
         — `_carry_reviewed_candidate_past` aborts its own merge and reports the
         conflicted paths, and this writes a blocker beside it.
+
+        ONE refusal is DEFERRED rather than parked (conc-15): a worker that is
+        mid-write, reported by the carry-forward as a `CarryDeferral` value.
+        That condition resolves itself when the owning lane's round commits, so
+        `_defer_carry_forward` records the head on the task's record for that
+        lane to retry, and the marker stays set exactly as for a park — the
+        candidate is refused at push time either way until a packet goes out.
+        Checked by TYPE, first, so a refusal string that happens to mention
+        uncommitted changes still parks.
         """
         for obligation in obligations:
             try:
                 refusal = self._carry_forward(obligation.task_id, merged_head)
             except Exception as exc:      # noqa: BLE001 - deliberate; see above
                 refusal = f"{type(exc).__name__}: {exc}"
+            if isinstance(refusal, CarryDeferral):
+                self._defer_carry_forward(obligation, merged_head, refusal)
+                continue
             if refusal:
                 self._park_carry_forward_refused(obligation, merged_head, refusal)
                 continue
@@ -1261,6 +1338,86 @@ class AutoMerger:
                     "reviewed_candidate": obligation.candidate_sha,
                 },
             )
+
+    def _defer_carry_forward(
+        self, obligation, merged_head: str, deferral: CarryDeferral
+    ) -> None:
+        """One task whose carry-forward is OWED rather than refused: its worker
+        was mid-write when the head moved, so the carry is recorded for the
+        owning lane to perform when that round ends (conc-15).
+
+        A RECORD FIELD AND NOTHING ELSE. `TaskExecution.carry_deferred_head`
+        is set to the head this merge produced and `carry_deferred_base` to the
+        base the obligation was minted against; nothing is parked, no blocker
+        is written, and the worker repository is not touched. The marker
+        `_mark_rereview_owed` wrote before the merge is left SET — a deferred
+        carry is still an undischarged obligation, and the push-time refusal
+        does not depend on whether the carry is pending or refused.
+
+        The record is the only thing the two lanes share, which is why the
+        obligation lives there rather than in a store of this module's own.
+        What makes it survive the owning lane's in-memory copy is the store:
+        `orchestrator._absorb_merge_marks` reads it back the moment that
+        lane's executor returns, and every save that lane makes afterwards
+        reconciles it from the file under the store's mutex
+        (`TaskExecutionStore.save`), so there is no read after which a
+        whole-record save could lose it. `_finish_postcommit` is where it is
+        retried.
+
+        FAIL CLOSED: a record this cannot write is PARKED, exactly as it was
+        before this existed. An obligation nothing recorded is one nobody will
+        retry, and a candidate left on a base the head has moved past with no
+        park to say so is the invisible strand this whole module is against.
+        Swallowed like every other failure here: the merge has already landed.
+        """
+        reason = self._write_carry_deferral(
+            obligation.task_id, merged_head, obligation.base_sha or deferral.base
+        )
+        if reason:
+            self._park_carry_forward_refused(
+                obligation,
+                merged_head,
+                f"{deferral.reason} — and the carry-forward could not be deferred "
+                f"to the end of that round either: {reason}",
+            )
+            return
+        self._log(
+            "auto_merge_carry_forward_deferred",
+            data={
+                "task_id": obligation.task_id,
+                "candidate_sha": obligation.candidate_sha,
+                "old_base": obligation.base_sha,
+                "head": merged_head,
+                "reason": deferral.reason,
+                "note": (
+                    "the worker is dirty only while an agent is writing; the "
+                    "owning lane retries this carry when its round commits, and "
+                    "parks task_base_behind_head only if it still refuses then"
+                ),
+            },
+        )
+
+    def _write_carry_deferral(self, task_id: str, head: str, base: str) -> str:
+        """Record `head` as the carry-forward owed to `task_id`'s round end.
+        Returns the reason it could not be written, `""` on success.
+
+        Loads and writes the WHOLE record rather than patching the file — the
+        same route `_write_rereview_marker` takes, for the same reasons: one
+        atomic write, one schema, every `TaskExecutionStore` invariant, and
+        the load and the write inside ONE hold of the store's mutex, so the
+        owning lane's own saves of this record cannot land between the two.
+        """
+        try:
+            with self._execution_store.lock():
+                execution = self._execution_store.load(task_id)
+                if execution is None:
+                    return "its execution record is gone"
+                self._execution_store.update_merge_marks(
+                    execution, carry_deferred_head=head, carry_deferred_base=base
+                )
+        except (StateError, OSError, ValueError, TypeError) as exc:
+            return f"its execution record could not be read or written ({exc})"
+        return ""
 
     def _park_carry_forward_refused(
         self, obligation, merged_head: str, refusal: str
