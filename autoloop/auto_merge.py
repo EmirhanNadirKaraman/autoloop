@@ -99,6 +99,15 @@ lane, each waiting on an operator verb for a condition that had resolved itself
 minutes later. The carry-forward reports the two apart as a VALUE
 (`CarryDeferral`) rather than by the text of the refusal.
 
+**Every write this module makes to another lane's record is one unit.** The
+owning lane holds that record in memory and saves it whole, at moments this
+lane cannot see; the marker and the deferral are therefore written through
+`TaskExecutionStore.update_merge_marks`, load and write inside one hold of the
+store's mutex, and the owner's own saves reconcile those fields from the file
+under the same mutex (`worktask.MERGE_OWNED_FIELDS`) — so a mark or a deferral
+written between any two of the owner's reads is adopted by its next save rather
+than overwritten by it.
+
 At `lanes = 1` none of this is reachable: the same record is a REASON, and
 `attempt` returns `DEFERRED` before step 1.
 
@@ -174,7 +183,7 @@ from pathlib import Path
 from . import note_merge
 from .blockers import BlockerStore
 from .config import AutoloopConfig
-from .errors import GitError, StateCorruptError
+from .errors import GitError, StateCorruptError, StateError
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .state import utcnow_iso
@@ -1254,22 +1263,33 @@ class AutoMerger:
         """Set (or clear) one record's `rereview_owed_base`. Returns
         `(reason, previous_value)`; `reason` is `""` on success.
 
-        Loads and saves the WHOLE record rather than patching the file, so this
-        goes through the same atomic write, the same schema and the same
-        `TaskExecutionStore` invariants every other writer uses.
+        Loads and writes the WHOLE record rather than patching the file, so
+        this goes through the same atomic write, the same schema and the same
+        `TaskExecutionStore` invariants every other writer uses — and does the
+        load and the write inside ONE hold of the store's mutex
+        (`TaskExecutionStore.lock`), because the lane that OWNS this record is
+        saving its own in-memory copy of it at moments this lane cannot see,
+        and a load/mutate/write that straddled one of those saves would put
+        the owner's older fields back over its newer ones. The write itself is
+        `update_merge_marks`, the one path that may set the marker to EMPTY
+        (`_restore_rereview_marks` needs that): an ordinary `save` lets a
+        non-empty value on disk win, so it could not put a mark back.
+
+        A busy mutex (`TaskStoreBusy`, a `StateError`) is a refusal like an
+        unreadable record — the merge then defers, and nothing has moved.
         """
+        previous = ""
         try:
-            execution = self._execution_store.load(task_id)
-        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
-            return f"its execution record could not be read ({exc})", ""
-        if execution is None:
-            return "its execution record is gone", ""
-        previous = getattr(execution, "rereview_owed_base", "") or ""
-        execution.rereview_owed_base = value
-        try:
-            self._execution_store.save(execution)
-        except (StateCorruptError, OSError) as exc:
-            return f"its execution record could not be written ({exc})", previous
+            with self._execution_store.lock():
+                execution = self._execution_store.load(task_id)
+                if execution is None:
+                    return "its execution record is gone", ""
+                previous = getattr(execution, "rereview_owed_base", "") or ""
+                self._execution_store.update_merge_marks(
+                    execution, rereview_owed_base=value
+                )
+        except (StateError, OSError, ValueError, TypeError) as exc:
+            return f"its execution record could not be read or written ({exc})", previous
         return "", previous
 
     def _discharge_rereview(self, obligations, merged_head: str) -> None:
@@ -1336,8 +1356,13 @@ class AutoMerger:
 
         The record is the only thing the two lanes share, which is why the
         obligation lives there rather than in a store of this module's own.
-        `orchestrator._absorb_merge_marks` is what makes it survive the owning
-        lane's in-memory copy, and `_finish_postcommit` is where it is retried.
+        What makes it survive the owning lane's in-memory copy is the store:
+        `orchestrator._absorb_merge_marks` reads it back the moment that
+        lane's executor returns, and every save that lane makes afterwards
+        reconciles it from the file under the store's mutex
+        (`TaskExecutionStore.save`), so there is no read after which a
+        whole-record save could lose it. `_finish_postcommit` is where it is
+        retried.
 
         FAIL CLOSED: a record this cannot write is PARKED, exactly as it was
         before this existed. An obligation nothing recorded is one nobody will
@@ -1376,22 +1401,22 @@ class AutoMerger:
         """Record `head` as the carry-forward owed to `task_id`'s round end.
         Returns the reason it could not be written, `""` on success.
 
-        Loads and saves the WHOLE record rather than patching the file — the
-        same route `_write_rereview_marker` takes, for the same reason: one
-        atomic write, one schema, every `TaskExecutionStore` invariant.
+        Loads and writes the WHOLE record rather than patching the file — the
+        same route `_write_rereview_marker` takes, for the same reasons: one
+        atomic write, one schema, every `TaskExecutionStore` invariant, and
+        the load and the write inside ONE hold of the store's mutex, so the
+        owning lane's own saves of this record cannot land between the two.
         """
         try:
-            execution = self._execution_store.load(task_id)
-        except (StateCorruptError, OSError, ValueError, TypeError) as exc:
-            return f"its execution record could not be read ({exc})"
-        if execution is None:
-            return "its execution record is gone"
-        execution.carry_deferred_head = head
-        execution.carry_deferred_base = base
-        try:
-            self._execution_store.save(execution)
-        except (StateCorruptError, OSError) as exc:
-            return f"its execution record could not be written ({exc})"
+            with self._execution_store.lock():
+                execution = self._execution_store.load(task_id)
+                if execution is None:
+                    return "its execution record is gone"
+                self._execution_store.update_merge_marks(
+                    execution, carry_deferred_head=head, carry_deferred_base=base
+                )
+        except (StateError, OSError, ValueError, TypeError) as exc:
+            return f"its execution record could not be read or written ({exc})"
         return ""
 
     def _park_carry_forward_refused(

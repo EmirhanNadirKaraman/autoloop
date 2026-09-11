@@ -1065,8 +1065,25 @@ The two bails are told apart BY VALUE and do not share an outcome:
 The obligation is scoped to the round in flight, and the OWNING lane settles it
 at that round's exits — every one of them, because it holds the record in
 memory across the executor and its own saves would otherwise overwrite what the
-sibling wrote (`_absorb_merge_marks` reads the marker and the deferral back the
-moment the executor returns, before any save):
+sibling wrote. Two things keep that from happening, and the first alone was not
+enough: `_absorb_merge_marks` reads the marker and the deferral back the moment
+the executor returns, and — because a sibling can write after that one read and
+before the round's next whole-record save — `TaskExecutionStore.save` reconciles
+the three merge-owned fields (`worktask.MERGE_OWNED_FIELDS`) from the file on
+EVERY save, under the store's mutex (`executions.lock`, the task file's own
+primitive), letting a non-empty value on disk win and updating the object the
+round holds. An ordinary save can therefore never clear one of those fields;
+clearing is a named write (`update_merge_marks`), the packet's discharge of the
+marker is compare-and-clear against the value read when the packet's base was
+settled (`discharge_rereview_mark`, which keeps a NEWER mark and logs
+`rereview_mark_kept_newer`), and the merging lane's own load/mutate/write goes
+inside the same mutex. No hold contains a git command — the retry releases it
+before the carry — so the mutex timeout is not reachable by contention. The
+read-back remains, and is repeated inside the retry and the drop under one hold
+with their write, so the exits below DECIDE on what is on disk rather than on
+the copy in hand. The lock file appears at every lane count, one included;
+it is empty, pre-created before the escape snapshot beside `tasks.json.lock`,
+and never inside `executions/`:
 
 * **the round commits** — `_finish_postcommit` retries the carry FIRST, before
   the post-commit gate and the packet, on the record it holds
@@ -1096,7 +1113,11 @@ worker that holds an aborted round's residue — the same transient condition on
 dispatch later — because deferring it there would change single-lane behaviour.
 And a carry that SUCCEEDS against a lane whose worker is momentarily clean
 mid-round (the agent has not written yet; post-commit validation is running) is
-the pre-existing race it always was: this round neither widens nor narrows it.
+the pre-existing race it always was: the advanced base and candidate it writes
+are still overwritten by the owning lane's next save. What the save-time
+reconcile does change there, as a consequence rather than a target, is that the
+MARKER such a merge writes now survives that save, so the candidate is refused
+at push time instead of published on a base the head has moved past.
 
 At `lanes = 1` no obligation is ever minted, so the field is never written; the
 read-back is gated on the same fleet reading the merge token uses, and every
