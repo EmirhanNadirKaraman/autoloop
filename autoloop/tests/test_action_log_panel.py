@@ -21,14 +21,23 @@ Three claims, and the tests are built around the ways each one fails:
   that exists and could not be read is "could not be read"; and both name the
   path, because an empty box says none of those things.
 
-THE WRITER IS NOT IN THIS TREE. The task names stream-01 as the round that
-writes the per-round file; nothing in this checkout writes one, and no record
-field or document names where it will go. `action_log_tail` therefore reads the
-path the execution record names (`ACTION_LOG_PATH_FIELD`) and otherwise looks
-at `<state_dir>/action-logs/<task_id>.log` — and until a writer lands, a live
-round's steady state on this panel is `missing`, with that path in the sentence.
-That is the honest empty state the panel exists to show, and it is what makes
-a convention mismatch a visible path rather than a permanently idle agent.
+And a fourth, from the review of round 1: the read CANNOT BLOCK. The path is
+looked up once, by a non-blocking open, and what the descriptor turns out to
+be is decided by `fstat` on that descriptor — so a fifo at the path, there
+before the open or swapped in during it, is refused at once instead of waiting
+for a writer on every poll. Those tests run under a watchdog, because a
+regression there hangs rather than fails.
+
+THE WRITER IS `audit.agents.ClaudeCliRunner` (stream-01), and it names the
+file: `<state_dir>/action-logs/<action_log_slug(task_id)>-<round stamp>.log`,
+one per round. Round 1 of this task was cut before the writer landed and
+guessed `<task_id>.log`, which matched nothing — a busy round read "nothing
+written yet" beside the file it was writing. So `action_log_tail` reads the
+path the execution record names (`ACTION_LOG_PATH_FIELD`) and otherwise the
+NEWEST of the task's round logs in that directory, and one test below opens a
+log through the real writer and asserts the reader finds that file: the
+naming cannot drift apart silently again. Every absent state still names
+what was looked for, so a mismatch is a visible glob, never an idle agent.
 
 Everything here calls `action_log_tail` with a dict and a `tmp_path` where it
 can — the claim is about a file reader and a renderer, and a repository would be
@@ -48,6 +57,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -55,6 +66,9 @@ import pytest
 from gitrepo import make_repo_from_template
 
 from autoloop import dashboard
+from autoloop.audit.agents import AgentSpec, ClaudeCliRunner, action_log_slug
+from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.policy import PolicyConfig
 from autoloop.dashboard import (
     ACTION_LOG_DIRNAME,
     ACTION_LOG_EMPTY,
@@ -103,8 +117,26 @@ def running(task_id=TASK, **fields) -> dict:
     }
 
 
-def convention_path(state_dir, task_id=TASK) -> Path:
-    return Path(state_dir) / ACTION_LOG_DIRNAME / f"{task_id}{ACTION_LOG_SUFFIX}"
+#: A round stamp shaped exactly as `agents.action_log_round_stamp()` shapes one
+#: (`YYYYmmddTHHMMSS.ffffff-<pid>-<n>`), fixed so names built here are
+#: deterministic. The test that pins the SHAPE gets its name from the real
+#: writer, not from this.
+STAMP = "20260911T100000.000000-4242-0"
+
+
+def convention_dir(state_dir) -> Path:
+    """The writer's directory: `config.action_log_dir`, i.e. `<state_dir>/action-logs`."""
+    return Path(state_dir) / ACTION_LOG_DIRNAME
+
+
+def convention_path(state_dir, task_id=TASK, stamp=STAMP) -> Path:
+    """Where the writer puts ONE round's log for `task_id`."""
+    return convention_dir(state_dir) / f"{action_log_slug(task_id)}-{stamp}{ACTION_LOG_SUFFIX}"
+
+
+def looked_for(state_dir, task_id=TASK) -> str:
+    """The glob the `missing` sentence names when no round log was found."""
+    return str(convention_dir(state_dir) / f"{action_log_slug(task_id)}-*{ACTION_LOG_SUFFIX}")
 
 
 def write_log(path: Path, text: str) -> Path:
@@ -259,6 +291,94 @@ def test_the_execution_record_names_the_log_and_the_convention_is_only_a_fallbac
     assert view["path"] == str(convention_path(tmp_path / "state"))
 
 
+# ---- discovery: the file the WRITER names, newest round first --------------------
+
+
+def test_discovery_finds_the_file_the_real_writer_opens(tmp_path):
+    """Pinned against the writer itself, not a name this file composed: a
+    `ClaudeCliRunner` given `<state_dir>/action-logs` — what `cli._build_executor`
+    passes it — opens this round's log exactly as a live round does, writes
+    one line through it, and the page shows THAT file's tail through
+    `collect()`. This is the test that fails the day the writer's naming
+    moves; a fixture shaped like the name could not. It also refuses the
+    round-1 guess by name, so the regression cannot come back as "a file was
+    found" that is the wrong file."""
+    repo = make_repo(tmp_path)
+    (repo / ".autoloop" / "state.json").write_text(json.dumps(running()), encoding="utf-8")
+    runner = ClaudeCliRunner(repo_root=repo, action_log_dir=convention_dir(repo / ".autoloop"))
+    log = runner._open_action_log(AgentSpec(domain=TASK, title="dash-08", prompt="p"))
+    assert log.active and log.path is not None, log.problem
+    log.write("stderr", "Read autoloop/dashboard.py\n")
+    log.close()
+
+    view = collect(repo)["action_log"]
+
+    assert view["state"] == "lines", view["note"]
+    assert view["path"] == str(log.path)
+    guess = convention_dir(repo / ".autoloop") / f"{TASK}{ACTION_LOG_SUFFIX}"
+    assert view["path"] != str(guess), "round 1's guess must not be what was found"
+    assert view["lines"][0].startswith("# autoloop action log"), "the writer's own header leads"
+    assert view["lines"][-1] == "Read autoloop/dashboard.py"
+    assert view["truncated"] is False
+
+
+def test_the_directory_looked_in_is_the_one_config_resolves(tmp_path):
+    """`ACTION_LOG_DIRNAME` restates `config.action_log_dir` — restated because
+    that property needs a loaded `AutoloopConfig` and this page resolves the
+    state dir on its own — and a restatement is safe only while it is pinned:
+    the day the writer's directory moves, this is the line that says so."""
+    config = AutoloopConfig(
+        browser=BrowserConfig(), policy=PolicyConfig(), state_dir=tmp_path / "state"
+    )
+    assert config.action_log_dir == convention_dir(config.state_dir)
+
+
+def test_the_newest_round_log_is_shown_and_only_this_tasks(tmp_path):
+    """A task run twice leaves two round logs; the page shows the NEWEST, by
+    the writer's stamp, which is UTC and fixed-width so the greatest name is
+    the latest round. And the match is the writer's whole shape: a task whose
+    slug is a PREFIX of another's (`dash` beside `dash-08`) sees only its own,
+    and neither round 1's `<task_id>.log` nor a stray `.txt` is a candidate."""
+    state_dir = tmp_path / "state"
+    write_log(convention_path(state_dir, stamp="20260911T090000.000000-1-0"), "older round\n")
+    write_log(convention_path(state_dir, stamp="20260911T100000.000000-1-1"), "newest round\n")
+    write_log(convention_path(state_dir, task_id="dash", stamp="20260911T110000.000000-1-2"),
+              "another task, later\n")
+    write_log(convention_dir(state_dir) / f"{TASK}{ACTION_LOG_SUFFIX}", "round-1 guess\n")
+    write_log(convention_dir(state_dir) / f"{TASK}-{STAMP}.txt", "not a log\n")
+
+    view = action_log_tail(running(), state_dir)
+    assert view["state"] == "lines"
+    assert view["lines"] == ["newest round"]
+    assert view["path"] == str(convention_path(state_dir, stamp="20260911T100000.000000-1-1"))
+
+    other = action_log_tail(running("dash"), state_dir)
+    assert other["lines"] == ["another task, later"]
+    assert other["path"] == str(convention_path(state_dir, task_id="dash",
+                                                stamp="20260911T110000.000000-1-2"))
+    # A task id the slug rule has to clean still finds its own file, under the
+    # cleaned name the writer would have used.
+    write_log(convention_path(state_dir, task_id="x/y z"), "cleaned\n")
+    assert action_log_tail(running("x/y z"), state_dir)["lines"] == ["cleaned"]
+
+
+def test_a_log_directory_that_cannot_be_listed_is_unreadable_not_missing(tmp_path):
+    """The listing has its own failure and it is not "nothing written yet":
+    an `action-logs` that exists and cannot be read as a directory — a regular
+    file in its place, portably — names the directory and the OS's reason."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    convention_dir(state_dir).write_text("not a directory\n", encoding="utf-8")
+
+    view = action_log_tail(running(), state_dir)
+
+    assert view["state"] == "unreadable"
+    assert view["note"].startswith(ACTION_LOG_UNREADABLE)
+    assert str(convention_dir(state_dir)) in view["note"]
+    assert not view["note"].startswith(ACTION_LOG_MISSING)
+    assert view["path"] == looked_for(state_dir)
+
+
 # ---- the content is text, never markup ----------------------------------------
 
 
@@ -356,11 +476,17 @@ def test_a_missing_log_and_an_unreadable_log_render_differently(tmp_path):
 
     missing = action_log_tail(running(), state_dir)
     assert missing["state"] == "missing"
-    assert missing["note"] == ACTION_LOG_MISSING + str(path)
+    # Names what was LOOKED FOR — the writer's directory and the task's glob —
+    # since there is no file to name; that is what makes a naming mismatch a
+    # visible path rather than a permanently idle agent.
+    assert missing["note"] == ACTION_LOG_MISSING + looked_for(state_dir)
+    assert missing["path"] == looked_for(state_dir)
     assert missing["lines"] == [] and missing["tail"] == ""
 
-    # Unreadable, portably: something IS at the path and it is not a file the
-    # page may open — a directory here, and a fifo would block the poll.
+    # Unreadable, portably: something IS there under the round log's own name
+    # and it is not a file the page may read — a directory here, found by the
+    # listing and refused by `fstat`; a fifo, which could block the poll, has
+    # its own tests further down.
     path.mkdir(parents=True)
     unreadable = action_log_tail(running(), state_dir)
     assert unreadable["state"] == "unreadable"
@@ -381,9 +507,9 @@ def test_a_missing_log_and_an_unreadable_log_render_differently(tmp_path):
 def test_a_log_that_exists_but_cannot_be_opened_says_so_rather_than_nothing_written(tmp_path):
     """The fail-open this panel is about. `Path.is_file()` swallows `OSError`
     and answers `False`, so a permission fault would render as "nothing written
-    yet" — the calm sentence, for the state that needs a look. `os.stat`
-    succeeds on a mode-0 file and the OPEN raises; the sentence carries the
-    OS's reason rather than a paraphrase of it."""
+    yet" — the calm sentence, for the state that needs a look. A mode-0 file
+    exists and the OPEN raises; the sentence carries the OS's reason rather
+    than a paraphrase of it."""
     if os.geteuid() == 0:  # pragma: no cover - root reads everything
         pytest.skip("root is not refused by mode bits")
     log = write_log(tmp_path / "state" / "locked.log", "Edit foo.py\n")
@@ -564,6 +690,153 @@ def test_bytes_that_are_not_utf8_do_not_blank_the_panel(tmp_path):
     assert view["lines"][0] == "Bash: cat café.txt"
     assert view["lines"][-1] == "Read ok.py"
     assert "�" in view["lines"][1]
+
+
+# ---- the open cannot block: a fifo at the path, there before or put there at the open
+
+
+#: `os.open` as it was before any test in this process patched it. The watchdog
+#: below rescues a reader through it, so a test that patches `os.open` cannot
+#: route its own rescue back into the patch.
+_REAL_OPEN = os.open
+
+#: How long the watchdog waits before releasing a reader that BLOCKED. The
+#: passing case returns in microseconds and never meets it; a regression pays
+#: it once and then FAILS on `fired` — instead of wedging the whole run, which
+#: has no pytest-timeout and sits under `-n auto` where a stuck worker is a
+#: stuck suite.
+WATCHDOG_SECONDS = 5.0
+
+
+class Watchdog:
+    """Releases a reader blocked in `open()` on the fifo at `path`, by opening
+    its WRITER end after `WATCHDOG_SECONDS`, and records that it had to.
+
+    `O_WRONLY | O_NONBLOCK` succeeds precisely when a reader is there — on
+    Linux and macOS a reader blocked in `open()` has already counted itself —
+    and fails `ENXIO` when none is, which is swallowed: in the passing case the
+    timer is cancelled before it fires, and `fired` stays empty. `fired` is the
+    assertion; the state the reader then reports is only the second half."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.fired: list[float] = []
+        self._timer = threading.Timer(WATCHDOG_SECONDS, self._release)
+        self._timer.daemon = True
+
+    def _release(self):
+        self.fired.append(time.monotonic())
+        try:
+            fd = _REAL_OPEN(self.path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        os.close(fd)
+
+    def __enter__(self):
+        self._timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._timer.cancel()
+
+
+def test_a_fifo_at_the_path_is_refused_without_blocking_the_poll(tmp_path):
+    """`action_log_path` comes off an operator-editable record, so a fifo at
+    the path needs no race to be reachable. Opened NON-BLOCKING it hands back
+    a descriptor at once, `fstat` says what it is, and the panel says "not a
+    regular file" — with no writer ever appearing. This is what pins
+    `O_NONBLOCK` empirically: an open without it waits for a writer that never
+    comes, and only the watchdog would let that FAIL rather than hang."""
+    if not hasattr(os, "mkfifo"):  # pragma: no cover - no fifos on this platform
+        pytest.skip("this platform has no fifos")
+    fifo = tmp_path / "state" / "fifo.log"
+    fifo.parent.mkdir()
+    os.mkfifo(fifo)
+
+    with Watchdog(fifo) as watchdog:
+        started = time.monotonic()
+        view = action_log_tail(running(**{ACTION_LOG_PATH_FIELD: str(fifo)}))
+        elapsed = time.monotonic() - started
+
+    assert not watchdog.fired, f"the open BLOCKED for {elapsed:.1f}s until the watchdog released it"
+    assert view["state"] == "unreadable", view
+    assert view["note"].startswith(ACTION_LOG_UNREADABLE)
+    assert str(fifo) in view["note"]
+    assert "not a regular file" in view["note"]
+    assert view["lines"] == [] and view["tail"] == ""
+
+
+def test_a_log_replaced_by_a_fifo_at_the_moment_it_is_opened_cannot_block_the_poll(tmp_path, monkeypatch):
+    """The race the review of round 1 named. Round 1 asked `os.stat` whether
+    the path held a regular file and then opened the PATH again: two lookups,
+    and a fifo put there between them met a blocking open that waited for a
+    writer forever — on every poll, from every scheduler. Reproduced
+    deterministically: the log is a regular file until the reader's own
+    `os.open` is entered and becomes a fifo INSIDE that call, which is the
+    window no check made before the open can see. The reader must come back at
+    once with `unreadable` — what the DESCRIPTOR turned out to be — never
+    `lines` from a stat about a file that is no longer there, and never a hang.
+
+    Against the round-1 code this fails in the right direction without
+    hanging: `Path.open` does not pass through `os.open`, so the swap never
+    fires and the first assertion says so. The descriptor is then checked to
+    be closed — a leak per poll, every two seconds, exhausts the table within
+    the hour — and to have been the ONLY open of the path: a second open is a
+    second lookup, and the race is back."""
+    if not hasattr(os, "mkfifo"):  # pragma: no cover - no fifos on this platform
+        pytest.skip("this platform has no fifos")
+    log = write_log(tmp_path / "state" / "swap.log", "Edit foo.py\nBash: pytest -q\n")
+    opened: list[int] = []  # every descriptor the reader was handed for `log`
+
+    def swap_then_open(file, flags, *args, **kwargs):
+        ours = os.fspath(file) == str(log)
+        if ours and not opened:
+            log.unlink()
+            os.mkfifo(log)
+        fd = _REAL_OPEN(file, flags, *args, **kwargs)
+        if ours:
+            opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+    with Watchdog(log) as watchdog:
+        started = time.monotonic()
+        view = action_log_tail(running(**{ACTION_LOG_PATH_FIELD: str(log)}))
+        elapsed = time.monotonic() - started
+
+    assert opened, "the reader never opened the path through os.open, so the swap never happened and this test proved nothing"
+    assert not watchdog.fired, f"the open BLOCKED for {elapsed:.1f}s until the watchdog released it"
+    assert view["state"] == "unreadable", view
+    assert "not a regular file" in view["note"]
+    assert str(log) in view["note"]
+    assert view["lines"] == [] and view["tail"] == ""
+    assert len(opened) == 1, f"the path was opened {len(opened)} times; one lookup is the whole guarantee"
+    with pytest.raises(OSError):
+        os.fstat(opened[0])  # closed on the way out, refusal included
+
+
+def test_a_fifo_under_the_round_logs_own_name_is_refused_without_blocking(tmp_path):
+    """The same guarantee on the DISCOVERED path, which is what a real state
+    directory produces: a fifo carrying a round log's name is what the listing
+    finds, and the open must still not wait for a writer. The listing itself
+    cannot tell a fifo from a file without a `stat` per entry — which is why
+    the descriptor, not the listing, decides."""
+    if not hasattr(os, "mkfifo"):  # pragma: no cover - no fifos on this platform
+        pytest.skip("this platform has no fifos")
+    state_dir = tmp_path / "state"
+    fifo = convention_path(state_dir)
+    fifo.parent.mkdir(parents=True)
+    os.mkfifo(fifo)
+
+    with Watchdog(fifo) as watchdog:
+        started = time.monotonic()
+        view = action_log_tail(running(), state_dir)
+        elapsed = time.monotonic() - started
+
+    assert not watchdog.fired, f"the open BLOCKED for {elapsed:.1f}s until the watchdog released it"
+    assert view["state"] == "unreadable", view
+    assert view["path"] == str(fifo)
+    assert "not a regular file" in view["note"]
 
 
 # ---- read-only and lock-free ------------------------------------------------------

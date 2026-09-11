@@ -160,6 +160,12 @@ from .tasks import (
     TaskState,
     satisfies_dependency,
 )
+# The action-log WRITER's own file-name rule (stream-01), imported rather than
+# restated: the panel `action_log_tail` feeds looks for the file
+# `ClaudeCliRunner._open_action_log` writes, and a second copy of the slug rule
+# would find it until the day the rule moved. `audit.agents` pulls in `stall`
+# and `validation_env`, both pure Python and both already loaded by `config`.
+from .audit.agents import action_log_slug
 
 #: Reserved status roles (dataviz palette). Never reused for anything else, and
 #: every use in the page ships an icon + label so state is never colour-alone.
@@ -801,18 +807,25 @@ def unit_panel(state: dict) -> dict:
 #: the day the file moved. Spelled once, here.
 ACTION_LOG_PATH_FIELD = "action_log_path"
 
-#: Where the log is looked for when the record names none:
-#: `<state_dir>/action-logs/<task_id>.log`. One round per task is in flight at a
-#: time, so the task id identifies the running round's file without the page
-#: having to reason about `review_round` — which starts at a real 0 and is the
-#: trap `unit_panel` documents one function up.
+#: Where the log is looked for when the record names none: the directory
+#: `config.action_log_dir` resolves to — `<state_dir>/action-logs`, restated
+#: here because that property needs a loaded `AutoloopConfig` and this page
+#: resolves the state dir on its own — holding ONE FILE PER ROUND, named by
+#: `audit.agents.ClaudeCliRunner._open_action_log` as
+#: `<action_log_slug(task_id)>-<action_log_round_stamp()>.log`, the stamp being
+#: `YYYYmmddTHHMMSS.ffffff-<pid>-<n>` (UTC). The round in flight is the NEWEST
+#: of a task's files: one runner is one round, and the stamp is fixed-width and
+#: UTC, so the names sort in round order and no `stat` per entry is needed.
 #:
-#: It is a GUESS about a writer this tree does not contain yet, and it is only
-#: safe because every absent state below NAMES THE PATH IT LOOKED AT. A
-#: convention that turns out to disagree with stream-01 then reads as a visible
-#: mismatch an operator can act on, instead of as a permanently idle agent.
+#: Round 1 of dash-08 guessed `<task_id>.log` against a writer that was not in
+#: the tree yet; the writer landed with the base refresh and the guess matched
+#: nothing, so a busy round read "nothing written yet" beside the file it was
+#: writing. `test_action_log_panel.py` now opens a log through the REAL writer
+#: and asserts this reader finds it, so the two cannot drift apart silently
+#: again. Every absent state below still NAMES WHAT IT LOOKED FOR.
 ACTION_LOG_DIRNAME = "action-logs"
 ACTION_LOG_SUFFIX = ".log"
+ACTION_LOG_STAMP = r"\d{8}T\d{6}\.\d{6}-\d+-\d+"
 
 #: How much of the END of the log is read, and how many of the lines inside that
 #: window are shown. The BYTE budget is the real bound and the line count is
@@ -859,23 +872,82 @@ ACTION_LOG_TAIL_NOTE = "The tail of the log this round is writing — "
 ACTION_LOG_TRUNCATED = " Earlier lines are NOT shown: only the end of the file is read."
 
 
+#: How the log is opened: read-only, and NON-BLOCKING so that a fifo at the
+#: path returns a descriptor instead of a reader that waits for a writer that
+#: never comes. `O_NOCTTY` costs nothing and covers a tty at the path the same
+#: way. Neither flag changes how a regular file reads.
+_TAIL_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                    | getattr(os, "O_NOCTTY", 0))
+
+
 def _tail_bytes(path: Path, budget: int) -> tuple[bytes, bool]:
     """The last `budget` bytes of `path`, and whether anything was skipped.
 
-    `seek(0, SEEK_END)` then back at most `budget`, so the cost is the budget
-    and never the file size. Raises `OSError`, which the caller renders as its
-    own state — a read that failed is not a file that is empty.
+    ONE `os.open`, and everything after it asks the DESCRIPTOR — `fstat`, then
+    `lseek` to at most `budget` before the end, then a bounded read — so the
+    cost is the budget and never the file size, and nothing here can be
+    answered about one file and performed on another. A `stat` of the PATH
+    followed by an open of the PATH is two lookups, and whatever is at the
+    path can change between them: replace the log with a fifo in that window
+    and a blocking open waits for a writer forever, on every poll. The review
+    of round 1 named exactly that. So the open is non-blocking
+    (`_TAIL_OPEN_FLAGS`), the thing it returned is checked with `fstat`, and
+    anything that is not a regular file is refused BEFORE a byte is read.
+
+    Raises `OSError`, which the caller renders as its own state — a read that
+    failed is not a file that is empty. The refusal is one too, and it names
+    what was found, because "could not be read" without a reason sends an
+    operator to look for a permission fault that is not there.
     """
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        start = max(0, size - budget)
-        # ALWAYS seek back, `start == 0` included: the size probe above left the
-        # handle at EOF, and a read from there is empty — which reported every
-        # log smaller than the budget as "the round has logged nothing" until
-        # the first run of `test_action_log_panel.py` caught it.
-        handle.seek(start)
-        return handle.read(budget), start > 0
+    fd = os.open(path, _TAIL_OPEN_FLAGS)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"not a regular file ({stat.filemode(info.st_mode)}), "
+                          "so nothing was read from it")
+        start = max(0, info.st_size - budget)
+        # ALWAYS seek, `start == 0` included, and never read from wherever the
+        # descriptor happens to sit: an earlier version measured the size by
+        # seeking to EOF and seeked back only when there was something to
+        # skip, which reported every log smaller than the budget as "the round
+        # has logged nothing" until the first run of `test_action_log_panel.py`
+        # caught it.
+        os.lseek(fd, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = budget
+        # A read may return short of what was asked; loop until the budget is
+        # spent or the file ends, and never ask for more than the budget.
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks), start > 0
+    finally:
+        os.close(fd)
+
+
+def _action_log_glob(directory: Path, task_id: str) -> str:
+    """What `_newest_action_log` looks for, as the sentence names it."""
+    return str(directory / f"{action_log_slug(task_id)}-*{ACTION_LOG_SUFFIX}")
+
+
+def _newest_action_log(directory: Path, task_id: str) -> Path | None:
+    """The newest of `task_id`'s round logs under `directory`, or `None`.
+
+    ONE directory listing and no `stat` per entry: the writer's stamp is UTC
+    and fixed-width, so the greatest matching name is the latest round. The
+    match is the writer's whole shape (`ACTION_LOG_STAMP`), not a prefix — a
+    task whose slug is a prefix of another's (`dash` and `dash-08`) must not
+    be shown the other's log. Raises what `os.listdir` raises:
+    `FileNotFoundError` for a directory nothing has created yet, any other
+    `OSError` for one that exists and could not be listed.
+    """
+    slug = re.escape(action_log_slug(task_id))
+    shape = re.compile(rf"^{slug}-{ACTION_LOG_STAMP}{re.escape(ACTION_LOG_SUFFIX)}$")
+    names = [name for name in os.listdir(directory) if shape.match(name)]
+    return directory / max(names) if names else None
 
 
 def action_log_tail(state: dict, state_dir: Path | None = None, *,
@@ -895,14 +967,22 @@ def action_log_tail(state: dict, state_dir: Path | None = None, *,
     not read" and "nowhere to look" call for four different reactions, and an
     empty box supports none of them.
 
-    READ-ONLY AND LOCK-FREE, like the rest of this module: one `os.stat` and one
-    bounded read. Nothing is written, no lock is taken, and a scheduler hitting
-    this mid-round is safe. `os.stat` rather than `Path.is_file()` because the
-    latter SWALLOWS `OSError` and answers `False` — a permission fault would
-    then render as "nothing written yet", which is the fail-open this panel is
-    about. Anything that is not a regular file is refused before it is opened:
-    opening a fifo BLOCKS until a writer appears, and a page that hangs on the
-    poll is worse than one that says it could not read.
+    The file is the one the execution record names (`ACTION_LOG_PATH_FIELD`),
+    or else the newest round log the WRITER's own naming puts under
+    `<state_dir>/action-logs` (`_newest_action_log`, one directory listing).
+
+    READ-ONLY AND LOCK-FREE, like the rest of this module: that listing, one
+    NON-BLOCKING open, one `fstat` of the descriptor it returned, and one
+    bounded read from that same descriptor (`_tail_bytes`). Nothing is
+    written, no lock is taken, and a scheduler hitting this mid-round is safe.
+    The file itself is looked up exactly ONCE, by the open — not
+    `Path.is_file()` first, which SWALLOWS `OSError` and answers `False` so a
+    permission fault would render as "nothing written yet", the fail-open this
+    panel is about; and not `os.stat` first either, which round 1 did and the
+    review caught: a fifo put at the path between that stat and the open makes
+    a blocking open wait for a writer forever, on every poll. Anything that is
+    not a regular file is refused after the open and before a byte is read,
+    and a page that says it could not read is better than one that hangs.
     """
     execution = state.get("task_execution") or {}
     task_id = str(execution.get("task_id") or "")
@@ -918,25 +998,36 @@ def action_log_tail(state: dict, state_dir: Path | None = None, *,
     if recorded:
         path = Path(recorded)
     elif state_dir is not None:
-        path = Path(state_dir) / ACTION_LOG_DIRNAME / f"{task_id}{ACTION_LOG_SUFFIX}"
+        # The writer's directory, listed once for this task's newest round log.
+        # `path` in the payload is a GLOB on the two absent branches here — it
+        # is what was looked for, which is what the sentence needs — and a real
+        # file only once one was found.
+        directory = Path(state_dir) / ACTION_LOG_DIRNAME
+        looked_for = _action_log_glob(directory, task_id)
+        try:
+            found = _newest_action_log(directory, task_id)
+        except FileNotFoundError:
+            found = None
+        except OSError as exc:
+            return {**view, "path": looked_for, "state": "unreadable",
+                    "note": f"{ACTION_LOG_UNREADABLE}{directory}: {_one_line(exc)}"}
+        if found is None:
+            return {**view, "path": looked_for, "state": "missing",
+                    "note": ACTION_LOG_MISSING + looked_for}
+        path = found
     else:
         return {**view, "state": "unlocatable", "note": ACTION_LOG_UNLOCATABLE}
 
     view["path"] = str(path)
     try:
-        mode = os.stat(path).st_mode
-    except FileNotFoundError:
-        return {**view, "state": "missing", "note": ACTION_LOG_MISSING + str(path)}
-    except OSError as exc:
-        return {**view, "state": "unreadable",
-                "note": f"{ACTION_LOG_UNREADABLE}{path}: {_one_line(exc)}"}
-    if not stat.S_ISREG(mode):
-        return {**view, "state": "unreadable",
-                "note": f"{ACTION_LOG_UNREADABLE}{path} is not a regular file, "
-                        "so it was never opened."}
-
-    try:
         data, skipped = _tail_bytes(path, max_bytes)
+    except FileNotFoundError:
+        # Caught FIRST, and on its own: this is the one absence that means
+        # "wait", and folding it into the branch below would render a log
+        # stream-01 has not created yet as "could not be read". On the
+        # discovered path it is a file the listing saw and the open did not —
+        # rotated away between the two, which the next poll resolves.
+        return {**view, "state": "missing", "note": ACTION_LOG_MISSING + str(path)}
     except OSError as exc:
         return {**view, "state": "unreadable",
                 "note": f"{ACTION_LOG_UNREADABLE}{path}: {_one_line(exc)}"}
