@@ -103,6 +103,15 @@ from `git.dirty_paths_all()` and the worker-repo root, and
 the commit range. Adopting it at the second site needed no change here at all,
 which is what phase-agnostic was for.
 
+A THIRD caller has joined those two since val-07 (2026-09-11) and brought one
+question the other two never had to ask: the agent's own advisory run, which is
+selected DURING the agent's window rather than against a finished commit. A
+selection made then is only as good as the tree it was made from, so
+`worker_tree_state` / `tree_states_match` at the bottom of this module let a
+caller record "the tree as the selector saw it" and later ask whether it still
+stands that way. They are pure filesystem reads and know nothing about phases
+either; `implement_executor.AdvisoryValidation` is what does the deciding.
+
 The consequence is the one `PRECOMMIT_EVIDENCE` below has to state rather than
 imply: a full-suite run is no longer GUARANTEED at either phase, and a round
 that narrows at both has none at all. The pre-commit run used to be an
@@ -3001,3 +3010,89 @@ def select_validation_commands(
         attributed=tuple(attributed),
         graph_consulted=True,
     )
+
+
+# ---- has the tree moved since a selection was made? -------------------------
+#
+# A selection is only as good as the tree it was made from. The post-commit
+# phase never has to ask — the commit pins its tree — but a run made DURING the
+# agent's window does: an advisory run narrowed to what `git status` reported at
+# 10:01 says nothing about a file written at 10:04. These two functions are how
+# a caller records "the tree as it stood then" and how it later asks whether it
+# still stands that way.
+
+#: What `worker_tree_state` returns when the answer could not be established.
+#: Deliberately the EMPTY string, and `tree_states_match` refuses it on either
+#: side: "unknown" must never compare equal to "unknown", or two failed reads
+#: would agree with each other and report a moved tree as an unmoved one.
+TREE_STATE_UNKNOWN = ""
+
+
+def worker_tree_state(repo_root: Path, paths: Sequence[str]) -> str:
+    """A digest of the CONTENT of `paths` under `repo_root`, or `""`.
+
+    The input is git's own account of what is dirty — the same list selection
+    is made from — so this is "the tree as the selector saw it" rather than a
+    walk of the checkout. Two calls agree if and only if every one of those
+    paths still holds the same bytes and the path LIST is itself the same: the
+    list is hashed alongside the content, so a file added to the diff after the
+    fact moves the digest even when every earlier file is untouched.
+
+    FAIL CLOSED, and this is the whole of its contract: anything that cannot be
+    established returns `TREE_STATE_UNKNOWN` for the WHOLE tree rather than a
+    digest with a hole in it. A file that could not be read might have changed
+    or might not, and a digest that skipped it would report "the tree has not
+    moved" on the strength of a file nobody read. Never raises — both callers
+    are reporting paths where an exception would replace a round's outcome.
+
+    A path git reports as changed because it was DELETED is not that case, and
+    is digested rather than refused: absence is a state, it is the same state
+    when read twice, and a deletion is one of the commonest things an agent
+    does. Refusing it would put every such round on the fail-closed path for no
+    gain in honesty.
+
+    Read in chunks: a changed path can be a large file, and a digest is not
+    worth loading one into memory for.
+    """
+    digest = hashlib.sha256()
+    try:
+        for rel in sorted(paths):
+            digest.update(rel.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            target = repo_root / rel
+            # A SYMLINK is refused rather than followed: its target may sit
+            # outside the repository entirely, and "the bytes behind the link"
+            # is not the question. A DIRECTORY at a path git reported as a
+            # changed FILE is a shape this cannot digest honestly either.
+            # `git status -uall` reports neither in the shipped case.
+            if target.is_symlink():
+                return TREE_STATE_UNKNOWN
+            if not target.exists():
+                # A one-byte TAG, not a word, so that "this path is absent" and
+                # "this path holds the bytes that spell absent" cannot digest
+                # alike — the only ambiguity a content digest can have here.
+                digest.update(b"A\0")
+                continue
+            if not target.is_file():
+                return TREE_STATE_UNKNOWN
+            digest.update(b"F")
+            with target.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            digest.update(b"\0")
+    except Exception:  # noqa: BLE001 — see the docstring
+        return TREE_STATE_UNKNOWN
+    return digest.hexdigest()
+
+
+def tree_states_match(before: str, after: str) -> bool:
+    """Is `after` provably the same tree as `before`?
+
+    False whenever either side is `TREE_STATE_UNKNOWN`, which is what makes
+    "could not tell" behave like "it moved" at every call site without each one
+    having to remember to check. The only True is two real digests that agree.
+    """
+    return bool(before) and bool(after) and before == after
