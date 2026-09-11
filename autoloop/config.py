@@ -2288,12 +2288,15 @@ def _context_records_dir(raw: dict) -> str:
     """`[context] records_dir`, validated — a repository-relative directory, or
     `""` for "no record store is wired into this loop".
 
-    THE EMPTY STRING IS THE ONLY WAY OFF, and it has to be typed. Every other
-    unusable value raises: an absolute path, a `..` segment or a backslash all
-    clean to `""` in `context_records.clean_repo_prefix`, and accepting that
-    quietly would turn `records_dir = "/srv/records"` into a loop that reads no
-    records at all while its config file reads as configured — the fail-open
-    shape the whole context roadmap item exists to close.
+    THE EMPTY STRING IS THE ONLY WAY OFF, and it has to be typed — exactly
+    `""`, compared as such. Every other unusable value raises: an absolute path,
+    a `..` segment, a backslash or a run of whitespace all clean to `""` in
+    `context_records.clean_repo_prefix`, and accepting any of them quietly would
+    turn `records_dir = "/srv/records"` into a loop that reads no records at all
+    while its config file reads as configured — the fail-open shape the whole
+    context roadmap item exists to close. Whitespace-only is refused for the
+    same reason and not read as a spelling of the switch: `"   "` is nobody's
+    decision to turn records off.
 
     Normalised through the SAME function the store itself uses rather than a
     second copy of the rule, so the path this answers is the path
@@ -2309,17 +2312,18 @@ def _context_records_dir(raw: dict) -> str:
             f"{DEFAULT_CONTEXT_RECORDS_DIR!r}, or write \"\" to wire no record "
             "store at all."
         )
-    if not value.strip():
+    if value == "":
         return ""
     cleaned = clean_repo_prefix(value)
     if not cleaned:
         raise ConfigError(
             f"context.records_dir must be a repository-relative directory spelled "
             f"as git spells it, got {value!r} — no leading '/', no '..' or '.' "
-            "segment and no backslash. It names a directory of the repository "
-            "this loop works on, not a directory of the filesystem, because the "
-            "records are versioned and reviewed with that repository. Write \"\" "
-            "to wire no record store at all."
+            "segment, no backslash, and not blank. It names a directory of the "
+            "repository this loop works on, not a directory of the filesystem, "
+            "because the records are versioned and reviewed with that "
+            "repository. Write \"\" — exactly the empty string — to wire no "
+            "record store at all."
         )
     return cleaned
 
