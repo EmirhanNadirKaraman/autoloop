@@ -39,6 +39,23 @@ log through the real writer and asserts the reader finds that file: the
 naming cannot drift apart silently again. Every absent state still names
 what was looked for, so a mismatch is a visible glob, never an idle agent.
 
+Round 2 closed three more ways the empty states lied, each pinned below:
+
+* `[audit] action_log` is FALSE BY DEFAULT, so a default config beside a
+  running round read "nothing written yet" — the sentence that says "wait" —
+  for a file that was never coming. `collect()` now reads the setting off the
+  config it already reads and an empty directory is `off`, naming the key and
+  the file; a config that could not be read claims neither;
+* "newest file wins" showed the PREVIOUS round's log as this round's: a
+  revision is dispatched with round 1's file already on disk, and until its
+  own runner opened a file — or for the whole round, when the writer was on
+  then and is off now — the page rendered a stale tail under "this round's
+  log". The newest file stamped at or after `current_task.started_at` wins;
+  an older one is named and not shown; no parseable stamp means no filter;
+* the bounded-read tests measured what `_tail_bytes` RETURNED, which "read
+  the whole file and slice" satisfies. They now sum what `os.read` handed
+  back on the descriptor the reader opened.
+
 Everything here calls `action_log_tail` with a dict and a `tmp_path` where it
 can — the claim is about a file reader and a renderer, and a repository would be
 dead weight. One test goes through `collect()`, because the wiring is the one
@@ -59,6 +76,7 @@ import os
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -73,7 +91,12 @@ from autoloop.dashboard import (
     ACTION_LOG_DIRNAME,
     ACTION_LOG_EMPTY,
     ACTION_LOG_MISSING,
+    ACTION_LOG_OFF,
+    ACTION_LOG_OLDER_ROUND,
     ACTION_LOG_PATH_FIELD,
+    ACTION_LOG_SETTING,
+    ACTION_LOG_SETTING_ON,
+    ACTION_LOG_SETTING_UNCHECKED,
     ACTION_LOG_STATES,
     ACTION_LOG_SUFFIX,
     ACTION_LOG_TAIL_BYTES,
@@ -86,6 +109,12 @@ from autoloop.dashboard import (
 )
 
 TASK = "dash-08"
+
+#: When the fixture round was DISPATCHED (`current_task.started_at`, as
+#: `utcnow_iso()` writes it). `STAMP` below is the same second, which is the
+#: earliest a log of this dispatch can carry — the runner is built after the
+#: record is written — so a file named with it is this round's.
+DISPATCHED_AT = "2026-09-11T10:00:00+00:00"
 
 
 @pytest.fixture(autouse=True)
@@ -102,13 +131,15 @@ def _clean_dashboard_caches():
         cache.clear()
 
 
-def running(task_id=TASK, **fields) -> dict:
+def running(task_id=TASK, started_at=DISPATCHED_AT, **fields) -> dict:
     """`state.json` shaped like a loop mid-round: a `task_execution` naming the
     unit in flight, which is the one condition every reader of this panel keys
-    off. No `action_log_path` unless the caller adds one."""
+    off, and a `current_task` dated `started_at` — the dispatch time the
+    reader filters older rounds' logs by. No `action_log_path` unless the
+    caller adds one."""
     return {
         "phase": "executing",
-        "current_task": {"task_id": task_id, "started_at": "2026-09-11T10:00:00+00:00"},
+        "current_task": {"task_id": task_id, "started_at": started_at},
         "task_execution": {
             "task_id": task_id, "task_branch": f"autoloop/{task_id}",
             "worktree_path": "/nonexistent/worker", "task_base_sha": "a" * 40,
@@ -117,11 +148,21 @@ def running(task_id=TASK, **fields) -> dict:
     }
 
 
+def dispatched_just_now() -> str:
+    """A dispatch stamp a minute in the past by the REAL clock, for the tests
+    that open a log through the real writer: its stamp is `now`, so a fixed
+    date could sit on either side of it depending on when the suite runs."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+
+
 #: A round stamp shaped exactly as `agents.action_log_round_stamp()` shapes one
 #: (`YYYYmmddTHHMMSS.ffffff-<pid>-<n>`), fixed so names built here are
-#: deterministic. The test that pins the SHAPE gets its name from the real
-#: writer, not from this.
+#: deterministic and in the same second as `DISPATCHED_AT`. The test that pins
+#: the SHAPE gets its name from the real writer, not from this.
 STAMP = "20260911T100000.000000-4242-0"
+#: One second before the dispatch: a log an EARLIER round of the same task
+#: left behind, which the reader must name and never show.
+EARLIER_STAMP = "20260911T095959.999999-4242-0"
 
 
 def convention_dir(state_dir) -> Path:
@@ -145,18 +186,57 @@ def write_log(path: Path, text: str) -> Path:
     return path
 
 
-def make_repo(tmp_path) -> Path:
+def make_repo(tmp_path, action_log: bool | None = True) -> Path:
     """An observed checkout whose state dir is `<repo>/.autoloop`, said in the
     config the dashboard reads, with a `workers_root` so the inbox `collect()`
-    globs is this test's own and not the operator's."""
+    globs is this test's own and not the operator's.
+
+    `action_log` is written as `[audit] action_log = <bool>`; `None` writes no
+    `[audit]` section at all, which is the shipped default and means OFF. The
+    default here is ON, because most tests in this file are about a round
+    that is writing a log and the loop only does that with the flag on."""
     repo = make_repo_from_template(tmp_path / "repo", branch="work")
     (repo / ".autoloop").mkdir()
+    audit = "" if action_log is None else f"\n[audit]\naction_log = {json.dumps(action_log)}\n"
     (repo / ".autoloop" / "config.toml").write_text(
         '[paths]\nstate_dir = ".autoloop"\n'
-        f"workers_root = {json.dumps(str(tmp_path / 'workers'))}\n",
+        f"workers_root = {json.dumps(str(tmp_path / 'workers'))}\n" + audit,
         encoding="utf-8",
     )
     return repo
+
+
+def bytes_read_from(monkeypatch, path: Path) -> list[int]:
+    """Every `os.read` return on a descriptor the reader opened for `path`,
+    by length — what was actually READ, as opposed to what `_tail_bytes`
+    returned. An implementation that read the file whole and sliced the tail
+    returns the same bytes and is caught only here. Descriptors are matched
+    by the `os.open` that produced them, so nothing else a test worker reads
+    during the call is counted."""
+    ours: set[int] = set()
+    sizes: list[int] = []
+    real_open, real_read, real_close = os.open, os.read, os.close
+
+    def spy_open(file, flags, *args, **kwargs):
+        fd = real_open(file, flags, *args, **kwargs)
+        if os.fspath(file) == str(path):
+            ours.add(fd)
+        return fd
+
+    def spy_read(fd, size):
+        data = real_read(fd, size)
+        if fd in ours:
+            sizes.append(len(data))
+        return data
+
+    def spy_close(fd):
+        ours.discard(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "read", spy_read)
+    monkeypatch.setattr(os, "close", spy_close)
+    return sizes
 
 
 def panel_js() -> str:
@@ -304,7 +384,10 @@ def test_discovery_finds_the_file_the_real_writer_opens(tmp_path):
     round-1 guess by name, so the regression cannot come back as "a file was
     found" that is the wrong file."""
     repo = make_repo(tmp_path)
-    (repo / ".autoloop" / "state.json").write_text(json.dumps(running()), encoding="utf-8")
+    # Dispatched by the real clock, since the writer stamps by it: the record
+    # is written before the runner is built, so its stamp is the later one.
+    (repo / ".autoloop" / "state.json").write_text(
+        json.dumps(running(started_at=dispatched_just_now())), encoding="utf-8")
     runner = ClaudeCliRunner(repo_root=repo, action_log_dir=convention_dir(repo / ".autoloop"))
     log = runner._open_action_log(AgentSpec(domain=TASK, title="dash-08", prompt="p"))
     assert log.active and log.path is not None, log.problem
@@ -334,14 +417,16 @@ def test_the_directory_looked_in_is_the_one_config_resolves(tmp_path):
 
 
 def test_the_newest_round_log_is_shown_and_only_this_tasks(tmp_path):
-    """A task run twice leaves two round logs; the page shows the NEWEST, by
-    the writer's stamp, which is UTC and fixed-width so the greatest name is
-    the latest round. And the match is the writer's whole shape: a task whose
-    slug is a PREFIX of another's (`dash` beside `dash-08`) sees only its own,
-    and neither round 1's `<task_id>.log` nor a stray `.txt` is a candidate."""
+    """A round that re-ran its agent (the advisory rendezvous) appends to one
+    file, but a round that was RE-DISPATCHED after a crash inside the same
+    second would leave two — the page shows the NEWEST by the writer's stamp,
+    which is UTC and fixed-width so the greatest name is the latest. And the
+    match is the writer's whole shape: a task whose slug is a PREFIX of
+    another's (`dash` beside `dash-08`) sees only its own, and neither round
+    1's `<task_id>.log` nor a stray `.txt` is a candidate."""
     state_dir = tmp_path / "state"
-    write_log(convention_path(state_dir, stamp="20260911T090000.000000-1-0"), "older round\n")
-    write_log(convention_path(state_dir, stamp="20260911T100000.000000-1-1"), "newest round\n")
+    write_log(convention_path(state_dir, stamp="20260911T100000.000000-1-0"), "older this second\n")
+    write_log(convention_path(state_dir, stamp="20260911T100000.500000-1-1"), "newest round\n")
     write_log(convention_path(state_dir, task_id="dash", stamp="20260911T110000.000000-1-2"),
               "another task, later\n")
     write_log(convention_dir(state_dir) / f"{TASK}{ACTION_LOG_SUFFIX}", "round-1 guess\n")
@@ -350,7 +435,7 @@ def test_the_newest_round_log_is_shown_and_only_this_tasks(tmp_path):
     view = action_log_tail(running(), state_dir)
     assert view["state"] == "lines"
     assert view["lines"] == ["newest round"]
-    assert view["path"] == str(convention_path(state_dir, stamp="20260911T100000.000000-1-1"))
+    assert view["path"] == str(convention_path(state_dir, stamp="20260911T100000.500000-1-1"))
 
     other = action_log_tail(running("dash"), state_dir)
     assert other["lines"] == ["another task, later"]
@@ -360,6 +445,83 @@ def test_the_newest_round_log_is_shown_and_only_this_tasks(tmp_path):
     # cleaned name the writer would have used.
     write_log(convention_path(state_dir, task_id="x/y z"), "cleaned\n")
     assert action_log_tail(running("x/y z"), state_dir)["lines"] == ["cleaned"]
+
+
+def test_an_earlier_rounds_log_is_named_and_not_shown_as_this_rounds(tmp_path):
+    """The stale tail with a round RUNNING. A revision is dispatched with the
+    previous round's file already on disk, and until this round's runner opens
+    its own — or for the whole round, if the writer was on then and is off
+    now — "newest file wins" rendered that trace under "this round's log".
+    The reader compares the writer's stamp against `current_task.started_at`:
+    a file stamped before this dispatch is an earlier round's, so the state is
+    `missing`, the file is NAMED (an operator can still go and read it) and
+    nothing of it reaches `lines` or `tail`. The moment this round's own file
+    appears it wins, whatever else is there."""
+    state_dir = tmp_path / "state"
+    earlier = write_log(convention_path(state_dir, stamp=EARLIER_STAMP),
+                        "round 1: Edit foo.py\n")
+
+    view = action_log_tail(running(), state_dir, enabled=True)
+
+    assert view["state"] == "missing", view["note"]
+    assert view["note"].startswith(ACTION_LOG_MISSING + looked_for(state_dir))
+    assert view["note"] == ACTION_LOG_MISSING + looked_for(state_dir) \
+        + ACTION_LOG_OLDER_ROUND.format(path=earlier, since="20260911T100000") \
+        + ACTION_LOG_SETTING_ON
+    assert view["lines"] == [] and view["tail"] == "" and view["path"] == looked_for(state_dir)
+    assert "round 1" not in view["tail"]
+    [shown] = render(view)
+    assert shown["preDisplay"] == "none" and shown["tail"] == ""
+
+    # This round opens its file: shown, and the earlier one is not mentioned.
+    current = write_log(convention_path(state_dir), "round 2: Read bar.py\n")
+    view = action_log_tail(running(), state_dir, enabled=True)
+    assert view["state"] == "lines" and view["path"] == str(current)
+    assert view["lines"] == ["round 2: Read bar.py"]
+    assert str(earlier) not in view["note"]
+
+    # Through `collect()` too, since `current_task` is read off the same state
+    # file as the record: the page reports the earlier round's file, not its tail.
+    repo = make_repo(tmp_path)
+    write_log(convention_path(repo / ".autoloop", stamp=EARLIER_STAMP), "round 1: Edit foo.py\n")
+    (repo / ".autoloop" / "state.json").write_text(json.dumps(running()), encoding="utf-8")
+    view = collect(repo)["action_log"]
+    assert view["state"] == "missing" and view["tail"] == ""
+    assert str(convention_path(repo / ".autoloop", stamp=EARLIER_STAMP)) in view["note"]
+
+
+def test_no_parseable_dispatch_stamp_means_no_filter_never_a_hidden_log(tmp_path):
+    """The fail direction, stated: hiding a LIVE round's log because a stamp
+    would not parse is worse than showing an old one, and the shown log's
+    sentence names the file. So `current_task` naming a different task, or
+    carrying a `started_at` that is missing, blank or not a date, filters
+    nothing — the newest file wins, as before round 2."""
+    state_dir = tmp_path / "state"
+    earlier = write_log(convention_path(state_dir, stamp=EARLIER_STAMP), "round 1: Edit foo.py\n")
+
+    for state in (
+        running(started_at=""),
+        running(started_at="not a date"),
+        running(started_at=None),
+        {**running(), "current_task": {"task_id": "someone-else", "started_at": DISPATCHED_AT}},
+        {**running(), "current_task": None},
+    ):
+        view = action_log_tail(state, state_dir, enabled=True)
+        assert view["state"] == "lines", (state["current_task"], view["note"])
+        assert view["path"] == str(earlier)
+        assert view["lines"] == ["round 1: Edit foo.py"]
+
+    # And a naive stamp is read as UTC, exactly as `_elapsed_seconds` reads it,
+    # so a record written before stamps were tz-aware still filters correctly.
+    view = action_log_tail(running(started_at="2026-09-11T10:00:00"), state_dir, enabled=True)
+    assert view["state"] == "missing" and str(earlier) in view["note"]
+    # A stamp given in another zone is compared in UTC: 12:00 at +02:00 is
+    # 10:00 UTC, the fixture's dispatch second, and the earlier file predates it.
+    view = action_log_tail(running(started_at="2026-09-11T12:00:00+02:00"), state_dir, enabled=True)
+    assert view["state"] == "missing" and str(earlier) in view["note"]
+    write_log(convention_path(state_dir), "round 2\n")
+    view = action_log_tail(running(started_at="2026-09-11T12:00:00+02:00"), state_dir, enabled=True)
+    assert view["lines"] == ["round 2"]
 
 
 def test_a_log_directory_that_cannot_be_listed_is_unreadable_not_missing(tmp_path):
@@ -474,12 +636,16 @@ def test_a_missing_log_and_an_unreadable_log_render_differently(tmp_path):
     state_dir = tmp_path / "state"
     path = convention_path(state_dir)
 
-    missing = action_log_tail(running(), state_dir)
+    # `enabled=True`: the writer is on, so an empty directory is the round not
+    # having written yet. (`enabled=False` is `off`, its own test below.)
+    missing = action_log_tail(running(), state_dir, enabled=True)
     assert missing["state"] == "missing"
     # Names what was LOOKED FOR — the writer's directory and the task's glob —
     # since there is no file to name; that is what makes a naming mismatch a
-    # visible path rather than a permanently idle agent.
-    assert missing["note"] == ACTION_LOG_MISSING + looked_for(state_dir)
+    # visible path rather than a permanently idle agent. And says that the
+    # setting is read at start: "on in the file" is not "on in the loop".
+    assert missing["note"] == ACTION_LOG_MISSING + looked_for(state_dir) + ACTION_LOG_SETTING_ON
+    assert "reads it once at start" in ACTION_LOG_SETTING_ON
     assert missing["path"] == looked_for(state_dir)
     assert missing["lines"] == [] and missing["tail"] == ""
 
@@ -488,7 +654,7 @@ def test_a_missing_log_and_an_unreadable_log_render_differently(tmp_path):
     # listing and refused by `fstat`; a fifo, which could block the poll, has
     # its own tests further down.
     path.mkdir(parents=True)
-    unreadable = action_log_tail(running(), state_dir)
+    unreadable = action_log_tail(running(), state_dir, enabled=True)
     assert unreadable["state"] == "unreadable"
     assert unreadable["note"].startswith(ACTION_LOG_UNREADABLE)
     assert str(path) in unreadable["note"]
@@ -502,6 +668,103 @@ def test_a_missing_log_and_an_unreadable_log_render_differently(tmp_path):
         assert shown["note"] == view["note"]
         assert shown["preDisplay"] == "none" and shown["tail"] == "", "no empty box"
         assert shown["writes"] == []
+
+
+def test_the_default_config_reads_off_rather_than_pending(tmp_path):
+    """The most ordinary deployment there is: `[audit] action_log` unset, which
+    is `false`, and a round running. Before round 2 the page said "Nothing
+    written yet" beside it — the sentence that means "wait" — for a file no
+    round would ever write. Through `collect()`, off the same config it reads
+    everything else from: no `[audit]` at all and an explicit `false` are both
+    `off`, the sentence names the key and the file so the remedy is in it, it
+    says the loop reads the setting at START, it does not say "yet", and the
+    page shows it as a sentence with no box."""
+    for setting in (None, False):
+        repo = make_repo(tmp_path / f"cfg-{setting}", action_log=setting)
+        (repo / ".autoloop" / "state.json").write_text(json.dumps(running()), encoding="utf-8")
+
+        view = collect(repo)["action_log"]
+
+        assert view["state"] == "off", (setting, view["note"])
+        config = repo / ".autoloop" / "config.toml"
+        assert view["note"] == ACTION_LOG_OFF.format(
+            setting=ACTION_LOG_SETTING, config=config,
+            looked_for=looked_for(repo / ".autoloop"))
+        assert ACTION_LOG_SETTING in view["note"] and str(config) in view["note"]
+        assert "restart" in view["note"] and "at start" in view["note"]
+        assert not view["note"].startswith(ACTION_LOG_MISSING)
+        assert "yet" not in view["note"]
+        assert view["path"] == looked_for(repo / ".autoloop")
+        assert view["lines"] == [] and view["tail"] == ""
+        [shown] = render(view)
+        assert shown["display"] == "" and shown["preDisplay"] == "none"
+        assert shown["note"] == view["note"] and shown["writes"] == []
+
+    # With the writer ON and nothing there, the calm sentence is the right one
+    # — with the caveat that the loop reads the key at start, since "true in
+    # the file" is not "true in the running loop".
+    repo = make_repo(tmp_path / "on", action_log=True)
+    (repo / ".autoloop" / "state.json").write_text(json.dumps(running()), encoding="utf-8")
+    view = collect(repo)["action_log"]
+    assert view["state"] == "missing"
+    assert view["note"] == ACTION_LOG_MISSING + looked_for(repo / ".autoloop") + ACTION_LOG_SETTING_ON
+
+
+def test_a_log_that_is_there_is_shown_whatever_the_setting_says_now(tmp_path):
+    """`off` is decided only after discovery came back empty. The loop reads
+    the setting once at start, so a file on disk beside a config that now says
+    `false` is a round that IS writing — the file is the fact, and hiding it
+    behind "the log is off" would be the lie in the other direction."""
+    repo = make_repo(tmp_path, action_log=False)
+    (repo / ".autoloop" / "state.json").write_text(json.dumps(running()), encoding="utf-8")
+    log = write_log(convention_path(repo / ".autoloop"), "Edit foo.py\n")
+
+    view = collect(repo)["action_log"]
+
+    assert view["state"] == "lines" and view["path"] == str(log)
+    assert view["lines"] == ["Edit foo.py"]
+    # And the same for a directly-named `enabled=False`, plus the older-round
+    # clause when the only file is an earlier round's: off, naming that file.
+    state_dir = tmp_path / "state"
+    write_log(convention_path(state_dir), "Edit foo.py\n")
+    assert action_log_tail(running(), state_dir, enabled=False)["state"] == "lines"
+    earlier = write_log(convention_path(tmp_path / "old", stamp=EARLIER_STAMP), "round 1\n")
+    view = action_log_tail(running(), tmp_path / "old", enabled=False, config_path="cfg.toml")
+    assert view["state"] == "off"
+    assert view["note"].endswith(ACTION_LOG_OLDER_ROUND.format(path=earlier, since="20260911T100000"))
+    assert "cfg.toml" in view["note"]
+
+
+def test_a_setting_that_was_not_established_claims_neither_off_nor_wait(tmp_path):
+    """A caller that did not read the config — `enabled=None`, the default for
+    a direct call — gets `missing` with a clause saying the setting was not
+    checked and that its default is off. The panel must not claim "off" from
+    a file it never saw, and must not imply "wait" without a caveat either.
+    `collect()` reaches `None` only when the config could not be parsed, and
+    then no state directory resolves and no panel renders at all — so this is
+    pinned on `_action_log_setting` directly: an unparseable file is `None`,
+    an empty one and a missing key are `False`, and `true` is `True`."""
+    state_dir = tmp_path / "state"
+    view = action_log_tail(running(), state_dir)
+    assert view["state"] == "missing"
+    assert view["note"] == ACTION_LOG_MISSING + looked_for(state_dir) + ACTION_LOG_SETTING_UNCHECKED
+    assert "false by default" in view["note"]
+
+    repo = tmp_path / "repo"
+    config = repo / ".autoloop" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("[audit\nnot toml", encoding="utf-8")
+    assert dashboard._action_log_setting(repo) == (None, config)
+    config.write_text("", encoding="utf-8")
+    assert dashboard._action_log_setting(repo) == (False, config)
+    config.write_text("[audit]\nother = 1\n", encoding="utf-8")
+    assert dashboard._action_log_setting(repo) == (False, config)
+    config.write_text('[audit]\naction_log = "true"\n', encoding="utf-8")
+    assert dashboard._action_log_setting(repo) == (False, config), "a string is not `true`"
+    config.write_text("[audit]\naction_log = true\n", encoding="utf-8")
+    assert dashboard._action_log_setting(repo) == (True, config)
+    config.unlink()
+    assert dashboard._action_log_setting(repo) == (None, config)
 
 
 def test_a_log_that_exists_but_cannot_be_opened_says_so_rather_than_nothing_written(tmp_path):
@@ -560,7 +823,7 @@ def test_a_log_smaller_than_the_byte_budget_is_read_whole_never_reported_empty(t
 
 
 def test_every_action_log_state_is_reachable_and_the_vocabulary_is_closed(tmp_path):
-    """The five states, each produced, so the vocabulary the page keys off
+    """The six states, each produced, so the vocabulary the page keys off
     cannot drift from what the backend emits. `unlocatable` is the one
     `collect()` cannot reach — an unresolvable state dir reads `state.json` as
     `{}`, so there is no task to look for — and it exists for a caller that
@@ -570,6 +833,7 @@ def test_every_action_log_state_is_reachable_and_the_vocabulary_is_closed(tmp_pa
     produced = {
         action_log_tail(running(), None)["state"],
         action_log_tail(running(), state_dir)["state"],
+        action_log_tail(running(), state_dir, enabled=False)["state"],
     }
     log = write_log(convention_path(state_dir), "")
     produced.add(action_log_tail(running(), state_dir)["state"])
@@ -593,27 +857,22 @@ def numbered(count: int) -> list[str]:
 
 def test_only_the_tail_is_read_never_the_whole_file(tmp_path, monkeypatch):
     """A 25-minute round produces a large log and the page polls every two
-    seconds. Measured on the bytes the reader actually RETURNS, through a spy
-    on the one function that opens the file, against a log far larger than the
-    budget: the read is bounded by `ACTION_LOG_TAIL_BYTES` whatever the file's
-    size, the shown lines are the LAST ones, whole, and the panel says earlier
-    lines exist."""
+    seconds. Measured on the bytes the reader actually READS — every `os.read`
+    on the descriptor it opened for the file, summed — against a log far
+    larger than the budget: the read is bounded by `ACTION_LOG_TAIL_BYTES`
+    whatever the file's size, the shown lines are the LAST ones, whole, and
+    the panel says earlier lines exist. Round 1 measured what `_tail_bytes`
+    RETURNED, which "read the whole file and slice the tail" satisfies; that
+    mutation reads 5 MB here and fails."""
     lines = numbered(150_000)  # ~5 MB
     log = write_log(tmp_path / "big.log", "\n".join(lines) + "\n")
     assert log.stat().st_size > 40 * ACTION_LOG_TAIL_BYTES
 
-    returned = []
-    real = dashboard._tail_bytes
-
-    def spy(path, budget):
-        data, skipped = real(path, budget)
-        returned.append(len(data))
-        return data, skipped
-
-    monkeypatch.setattr(dashboard, "_tail_bytes", spy)
+    read = bytes_read_from(monkeypatch, log)
     view = action_log_tail(running(**{ACTION_LOG_PATH_FIELD: str(log)}))
 
-    assert returned and max(returned) <= ACTION_LOG_TAIL_BYTES
+    assert read, "the reader never read the file through os.read, so nothing was measured"
+    assert 0 < sum(read) <= ACTION_LOG_TAIL_BYTES, sum(read)
     assert view["state"] == "lines"
     assert view["truncated"] is True
     assert "Earlier lines are NOT shown" in view["note"]
@@ -634,18 +893,10 @@ def test_a_log_with_no_newline_at_all_is_bounded_the_same_way(tmp_path, monkeypa
     log = tmp_path / "oneline.log"
     log.write_bytes(b"x" * (30 * ACTION_LOG_TAIL_BYTES) + b" ...the end")
 
-    returned = []
-    real = dashboard._tail_bytes
-
-    def spy(path, budget):
-        data, skipped = real(path, budget)
-        returned.append(len(data))
-        return data, skipped
-
-    monkeypatch.setattr(dashboard, "_tail_bytes", spy)
+    read = bytes_read_from(monkeypatch, log)
     view = action_log_tail(running(**{ACTION_LOG_PATH_FIELD: str(log)}))
 
-    assert max(returned) <= ACTION_LOG_TAIL_BYTES
+    assert read and 0 < sum(read) <= ACTION_LOG_TAIL_BYTES, sum(read)
     assert view["state"] == "lines"
     assert len(view["lines"]) == 1
     assert view["lines"][0].endswith(" ...the end")
