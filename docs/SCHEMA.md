@@ -374,9 +374,18 @@ open; ctx-16 answered it: the files live IN THE TARGET REPOSITORY at
 `[context] records_dir` (`docs/context` by default), where they are versioned and
 reviewed with the repository they describe. `context_resolver.resolve_context`
 stays pure given its inputs the way `context.build_context` is — the config key
-is repository-relative and only says which directory of the observed checkout
+is repository-relative and only says which directory of the target repository
 `context_records.repository_record_store` turns into an index.
-Read by `context_records.load_records`, indexed by `context_index.load_index`.
+READ OUT OF GIT AT THE ROUND'S BASE: the store's `load(worktree_git,
+task_base_sha)` is `context_records.load_records_at`, which lists the `*.json`
+blobs directly under that directory in the tree of `task_base_sha` and reads
+them through the worker's own gateway — never the observed checkout's working
+tree, which is a later commit than the base on any round whose base stayed put
+while the branch moved. So the bytes a packet quotes are the bytes of the commit
+its `task_base_sha` line names, and the closeout re-reads the same immutable
+objects. A loop-private `ContextRecordStore` is read off its own directory
+(`context_records.load_records`, `context_index.load_index`) — it has no
+revision to read at.
 
 THE LOOP READS THEM AND NEVER WRITES THEM. `RepositoryContextRecordStore.write`
 refuses unconditionally: the directory is inside the observed checkout, the

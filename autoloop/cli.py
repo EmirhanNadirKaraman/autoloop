@@ -4816,12 +4816,14 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
     stores the text beside it. That digest is the anchor this command reports
     against: the answer is the stored packet that hashes to it, or a re-render
     that reproduces it, and `context_packet.provenance_verdict` says which was
-    available. It is NOT "whatever a fresh resolution produces now" — the record
-    directory can change between the dispatch and the question, it lives in the
-    OBSERVED CHECKOUT this command is not rooted in (`[context] records_dir`,
-    ctx-16), and a loop embedded with its own store
+    available. It is NOT "whatever a fresh resolution produces now" — a
+    loop-private record directory can change between the dispatch and the
+    question, and a loop embedded with its own store
     (`Orchestrator(context_records=...)`, which no config names) resolved against
-    a directory this process cannot read at all.
+    a directory this process cannot read at all. (The repository-backed store
+    ctx-16 wires reads git objects at the round's own base, which do not change;
+    this command still re-renders with no index, because config alone cannot
+    tell it WHICH store the loop dispatched with — see the comment below.)
 
     **IT CALLS THE RESOLVER; IT DOES NOT REIMPLEMENT ONE.** The re-resolution it
     prints beside the recorded packet comes out of
@@ -4905,17 +4907,21 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
                 execution,
                 GitGateway(Path(worker), PolicyEngine(config.policy)),
                 # NO RECORD INDEX IS WIRED INTO THIS COMMAND, deliberately, and
-                # ctx-16 naming `[context] records_dir` does not change that: the
-                # records live in the OBSERVED CHECKOUT, which is a tree this
-                # command is not rooted in and which has moved on since the round
-                # it is explaining — re-reading it would answer "what would this
-                # task get today", under the heading of what it actually got.
-                # That is exactly why this re-render is a COMPARISON and the
-                # RECORDED PACKET is the answer; presenting any re-resolution as
-                # that round's selection would be the disagreement this command
-                # must not be able to produce. Which index the loop dispatched
-                # with is therefore a labelled limit of the comparison, printed
-                # with it, and never a silent substitution.
+                # ctx-16 naming `[context] records_dir` does not change that.
+                # The loop reads the repository's records out of git at the
+                # round's own base (`orchestrator._context_record_index`), so
+                # those bytes have NOT moved on — but this command cannot tell
+                # from config alone whether the loop dispatched with that store
+                # or with an explicit loop-private one it cannot read
+                # (`Orchestrator(context_records=...)`), and guessing the
+                # repository store would present a re-resolution the round may
+                # never have had under the heading of what it actually got. That
+                # is exactly why this re-render is a COMPARISON and the RECORDED
+                # PACKET is the answer; presenting any re-resolution as that
+                # round's selection would be the disagreement this command must
+                # not be able to produce. Which index the loop dispatched with is
+                # therefore a labelled limit of the comparison, printed with it,
+                # and never a silent substitution.
                 None,
                 max_records=config.context.max_records,
             )
