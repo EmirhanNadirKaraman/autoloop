@@ -18,6 +18,14 @@ nobody ever reads. §5 and §6 need real git: "the records the packet SELECTED" 
 a claim about bytes a round was actually given, and §6 drives the whole push
 path that grades it. §7 is the scope rule, asserted twice — once on what the
 registry holds afterwards, once on what this code path can even reach.
+
+§8 is ctx-16: the store that machinery had nowhere to point at. It lives here
+rather than beside it because the claim is about the same push path §6 already
+builds — a store IS wired, the closeout RUNS against it, and the tree the escape
+detector watches is byte-clean afterwards because the records in it are read and
+never written. §8.3 is the provenance half: the records are read out of git AT
+THE ROUND'S BASE, so a packet that says `task_base_sha: B1` quotes B1's record
+bytes even after the observed branch has moved to B2.
 """
 
 from __future__ import annotations
@@ -29,12 +37,13 @@ from pathlib import Path
 
 from gitrepo import make_repo_from_template, run_git
 
-from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.config import AutoloopConfig, BrowserConfig, ContextConfig
 from autoloop.context_index import build_index, load_index
 from autoloop.context_packet import (
     FOLLOW_UP_SUFFIX,
     LESSON_MIN_OCCURRENCES,
     CloseoutPlan,
+    ContextPacketStore,
     classify_closeout,
     follow_up_id_for,
     follow_up_request,
@@ -50,6 +59,7 @@ from autoloop.context_records import (
     load_records,
     record_from_mapping,
     record_to_mapping,
+    repository_record_store,
     superseded_record,
 )
 from autoloop.context_resolver import (
@@ -203,6 +213,22 @@ def test_a_record_the_loader_would_refuse_is_never_written(tmp_path):
 
     assert store.write(ContextRecord(id="feat", kind="not-a-kind"), "feat.json") is None
     assert (store.directory / "feat.json").read_text(encoding="utf-8") == before
+
+
+def test_a_record_file_that_is_not_utf8_is_a_named_problem_not_an_exception(tmp_path):
+    """`UnicodeDecodeError` is a `ValueError`, not an `OSError`: a loader that
+    guarded only the read would let one such file take every other record with
+    it — and a load that raises out of a dispatch is the one outcome worse than
+    an index that says which file it could not read."""
+    store = store_at(tmp_path)
+    store.write(record(), "feat.json")
+    store.directory.mkdir(parents=True, exist_ok=True)
+    (store.directory / "bad.json").write_bytes(b"\xff\xfe not utf-8")
+
+    loaded, problems = load_records(store.directory)
+
+    assert [item.record.id for item in loaded] == ["feat"]
+    assert [(p.source, p.message.split(":")[0]) for p in problems] == [("bad.json", "not UTF-8")]
 
 
 def test_a_write_addresses_nothing_but_a_file_in_its_own_directory(tmp_path):
@@ -730,15 +756,23 @@ def build_round(
     records=(("feat", "feature.py"),),
     wire=True,
     records_dir=None,
+    config_records_dir="",
 ):
     """One orchestrator on a real repository, with a record store and an inbox
     wired — the linked-worktree shape `test_postcommit_flow.build_postcommit`
     uses, plus the two things ctx-07 adds.
 
-    The store sits OUTSIDE the checkout by default and says what its files are
-    CALLED in it (`repo_prefix`), which is the arrangement the loop supports: a
-    record written into the observed tree is an uncommitted file the loop cannot
-    commit, and the next dispatch refuses to start against a dirty tree.
+    `wire=True` passes an EXPLICIT loop-private store, which sits OUTSIDE the
+    checkout by default and says what its files are CALLED in it
+    (`repo_prefix`): that store writes, so a record written into the observed
+    tree would be an uncommitted file the loop cannot commit, and the next
+    dispatch would refuse to start against a dirty tree.
+
+    `wire=False` passes none, so the loop DERIVES one from
+    `[context] records_dir` — `""` for the deployment that turned records off,
+    and a repository-relative directory for the ordinary ctx-16 arrangement,
+    where the records are files of the checkout itself. `record_store` is
+    returned either way so a test can read the files the loop did not write.
     """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -751,6 +785,7 @@ def build_round(
         browser=BrowserConfig(conversation_url=URL),
         policy=PolicyConfig(implement_enabled=True),
         state_dir=tmp_path / "state",
+        context=ContextConfig(records_dir=config_records_dir),
     )
     store = StateStore(config.state_file)
     state = LoopState.new(URL)
@@ -873,10 +908,16 @@ def test_the_closeout_is_idempotent_when_the_push_path_is_re_entered(tmp_path):
 
 
 def test_an_unwired_loop_says_so_in_the_transcript_and_writes_nothing(tmp_path):
-    """Production today. "No record directory is wired into this loop" and "the
-    closeout stopped working" must not look alike."""
+    """A deployment that turned records off — no explicit store and
+    `[context] records_dir = ""`, which since ctx-16 is the only way to get here.
+    "No record directory is wired into this loop" and "the closeout stopped
+    working" must not look alike, and SKIPPED must stay reachable: it is one of
+    the three outcomes the transcript has to keep apart."""
     orch, repo_root, worktrees, execution_store, task, record_store, inbox = build_round(
-        tmp_path, approved_paths=("feature.py", "docs/context/"), wire=False
+        tmp_path,
+        approved_paths=("feature.py", "docs/context/"),
+        wire=False,
+        config_records_dir="",
     )
     entries: list[tuple[str, dict]] = []
     orch._log = lambda event, *args, **kwargs: entries.append(
@@ -1025,3 +1066,477 @@ def test_no_closeout_path_can_reach_a_scope_mutation():
     assert not reachable & set(SCOPE_MOVERS), sorted(reachable & set(SCOPE_MOVERS))
     # And the only scope question any of it asks is the shared matcher's.
     assert "unauthorized_paths" in _referenced_names(closeout)
+
+
+# =============================================================================
+# 8. ctx-16 — THE STORE IS WIRED, AND IT IS THE REPOSITORY'S OWN DIRECTORY
+#
+# ctx-07 left the closeout able to run and nothing for it to run against:
+# `no_context_record_store` on every task, on this loop, twice in an hour. The
+# claim here is that a store IS wired, that the closeout runs, and that nothing
+# is written where the escape detector would see it.
+#
+# The design is A: records are files of the TARGET REPOSITORY, versioned and
+# reviewed with it, so the loop READS them and a round a reviewer approves
+# WRITES them. §8.1 is the store itself, as a pure object. §8.2 drives the whole
+# push path, because "the closeout runs", "the checkout is clean afterwards" and
+# "the packet carried records that exist" are all claims about a real round.
+# =============================================================================
+
+
+def seed_repository_records(repo_root, *records):
+    """Commit `records` into `docs/context/` of `repo_root`, the way a reviewed
+    round would have left them — which is the only way a record gets there."""
+    directory = Path(repo_root) / PREFIX
+    directory.mkdir(parents=True, exist_ok=True)
+    for item in records:
+        (directory / f"{item.id}.json").write_text(
+            json.dumps(record_to_mapping(item), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "context records")
+    return directory
+
+
+def repository_round(tmp_path, approved_paths, *records):
+    """`build_round` with NO explicit store and a repository-relative
+    `records_dir`, plus those records committed where that names — i.e. exactly
+    what `cli._build_orchestrator` produces in production.
+
+    The loop-private store `build_round` builds anyway is NOT what the round
+    reads; it is left in place only so the returned tuple keeps its shape, and
+    every §8 test ignores it. What the loop reads is `<repo>/docs/context`,
+    seeded below and committed, because a record only gets there by being
+    reviewed into the repository.
+    """
+    built = build_round(
+        tmp_path,
+        approved_paths=approved_paths,
+        records=tuple((item.id, "README.md") for item in records),
+        wire=False,
+        config_records_dir=PREFIX,
+    )
+    seed_repository_records(built[1], *records)
+    return built
+
+
+def closeout_entries(orch) -> list[tuple[str, dict]]:
+    """Capture every transcript entry, the way §6's tests do."""
+    entries: list[tuple[str, dict]] = []
+    orch._log = lambda event, *args, **kwargs: entries.append(
+        (event, kwargs.get("data") or {})
+    )
+    return entries
+
+
+def test_the_production_store_is_the_repositorys_own_directory_and_refuses_writes(
+    tmp_path,
+):
+    """§8.1. `[context] records_dir` names a directory OF THE REPOSITORY, and the
+    store over it cannot put a byte in that checkout."""
+    # THE DEFAULT CONFIG, not a prefix this test chose: "an ordinary completed
+    # task" means a loop nobody configured, and a chain pinned only as two
+    # halves — "the default is docs/context" over here, "a prefix makes a store"
+    # over there — is how a test that describes production passes while
+    # production stays inert.
+    assert repository_record_store(tmp_path / "repo", ContextConfig().records_dir)
+
+    store = repository_record_store(tmp_path / "repo", PREFIX)
+
+    assert store is not None
+    assert store.directory == tmp_path / "repo" / PREFIX
+    assert store.repo_path_for("feat.json") == "docs/context/feat.json"
+    assert store.writes_directly is False
+    assert store.write(record(), "feat.json") is None
+    # The refusal is the CLASS's, not a caller's: nothing appeared on disk, and
+    # the directory was not even created.
+    assert not store.directory.exists()
+
+
+def test_a_store_is_refused_for_every_location_it_could_not_vouch_for(tmp_path):
+    """§8.1, fail-closed. Each of these would otherwise read records out of some
+    directory nobody named — and `None` is reported as "no store is wired"."""
+    assert repository_record_store(tmp_path, "") is None
+    assert repository_record_store(tmp_path, "   ") is None
+    assert repository_record_store(tmp_path, "/etc/records") is None
+    assert repository_record_store(tmp_path, "../records") is None
+    assert repository_record_store(tmp_path, None) is None
+    assert repository_record_store(None, PREFIX) is None
+    # A RELATIVE root would resolve against whatever directory this process
+    # happens to stand in — `Path("")` is `Path(".")`, which is the trap
+    # `cli`'s `context explain` guards the same way.
+    assert repository_record_store(Path("repo"), PREFIX) is None
+    assert repository_record_store("", PREFIX) is None
+
+
+def test_the_location_guard_still_fires_on_anything_that_would_write_there(tmp_path):
+    """§8.1, the fail-open this design is one branch away from.
+
+    The repository store passes the location guard ONLY because it writes
+    nothing. So the guard is asked about that exact directory three ways: the
+    real store (allowed), an ordinary WRITING store over the same directory
+    (refused), and the repository store with the flag flipped to claim it writes
+    (refused). A guard that had started keying on the class, or on the directory
+    being 'the configured one', would pass the third.
+    """
+    orch, repo_root, *_ = build_round(
+        tmp_path,
+        approved_paths=("feature.py", "docs/context/"),
+        wire=False,
+        config_records_dir=PREFIX,
+    )
+    store = orch._context_record_store()
+    assert store is not None
+    assert Path(store.directory).resolve() == (repo_root / PREFIX).resolve()
+    assert orch._store_would_write_inside_the_observed_checkout(store) is False
+
+    writing = ContextRecordStore(store.directory, PREFIX)
+    assert orch._store_would_write_inside_the_observed_checkout(writing) is True
+
+    store.writes_directly = True
+    assert orch._store_would_write_inside_the_observed_checkout(store) is True
+    # And the class still refuses the write whatever the flag says, which is why
+    # the flag is not the only thing between the loop and a dirty tree.
+    assert store.write(record(), "feat.json") is None
+    assert not Path(store.directory).exists()
+
+
+def test_an_object_that_does_not_answer_is_treated_as_one_that_writes(tmp_path):
+    """§8.1. `writes_directly` is read through ONE accessor that defaults to
+    WRITABLE, so a store that never heard of the flag cannot switch the location
+    guard off by omission."""
+    orch, repo_root, *_ = build_round(
+        tmp_path, approved_paths=("feature.py",), wire=False, config_records_dir=PREFIX
+    )
+
+    class Mute:
+        directory = repo_root / PREFIX
+
+    assert orch._store_writes_directly(Mute()) is True
+    assert orch._store_would_write_inside_the_observed_checkout(Mute()) is True
+
+
+def test_an_ordinary_completed_task_closes_out_against_a_store_that_exists(tmp_path):
+    """§8.2, THE CLAIM. A round that touched a record's own source paths runs the
+    closeout, names THIS TASK and THIS RECORD, and reports neither a missing
+    store nor a refusal."""
+    orch, repo_root, worktrees, execution_store, task, _, inbox = repository_round(
+        tmp_path,
+        ("feature.py", "docs/context/"),
+        record("feat", source_paths=("feature.py",)),
+    )
+    entries = closeout_entries(orch)
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    assert not [d for e, d in entries if e == "context_closeout_skipped"]
+    assert not [d for e, d in entries if e == "context_closeout_refused"]
+    ran = [d for e, d in entries if e == "context_closeout"]
+    assert len(ran) == 1
+    assert ran[0]["task_id"] == task.id
+    assert ran[0]["published_sha"] == execution_store.load(task.id).published_sha
+    # DESIGN A: the record was classified and NOT written — it is a file of the
+    # repository, so the update goes through the follow-up and its review.
+    assert ran[0]["updated"] == []
+    assert ran[0]["writes_directly"] is False
+    assert ran[0]["needs_attention"] == ["feat"]
+    assert ran[0]["follow_up_task"] == f"{task.id}{FOLLOW_UP_SUFFIX}"
+    assert Path(ran[0]["records"]).resolve() == (repo_root / PREFIX).resolve()
+    # `updated: []` has three readings and this one is said in words.
+    assert any("left to the follow-up" in note for note in ran[0]["notes"])
+
+    queued = inbox.pending()
+    assert len(queued) == 1
+    spec = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert spec["approved_paths"] == ["docs/context/feat.json"]
+    # A DEFERRAL IS NOT A FAILED WRITE, and does not borrow its wording.
+    assert "the write failed" not in spec["description"]
+    assert "a round a reviewer approves does" in spec["description"]
+
+
+def test_a_closeout_that_finds_nothing_to_change_still_says_it_ran(tmp_path):
+    """§8.2, the third outcome. The record exists, the round did not touch its
+    source paths, and the transcript must not make that look like a skip or a
+    refusal — "the alarm that never fires is the failure this whole roadmap item
+    is about"."""
+    orch, repo_root, worktrees, execution_store, task, _, inbox = repository_round(
+        tmp_path,
+        ("feature.py", "docs/context/"),
+        record("feat", source_paths=("README.md",)),
+    )
+    entries = closeout_entries(orch)
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    ran = [d for e, d in entries if e == "context_closeout"]
+    assert len(ran) == 1
+    assert ran[0]["task_id"] == task.id
+    assert ran[0]["updated"] == []
+    assert ran[0]["needs_attention"] == []
+    assert ran[0]["follow_up_skipped"] == "nothing_to_file"
+    assert not [d for e, d in entries if e == "context_closeout_skipped"]
+    assert inbox.pending() == []
+
+
+def test_the_observed_checkout_is_byte_clean_after_a_round_that_closed_out(tmp_path):
+    """§8.2. The property the whole design turns on: a store INSIDE the tree the
+    escape detector watches, and that tree untouched by the round that read it.
+
+    Asserted on the record file's own bytes AND on `git status`, because either
+    one alone would miss a failure the other catches — a rewrite in place leaves
+    the status dirty, and a new sibling file leaves the original's bytes intact.
+    """
+    orch, repo_root, worktrees, execution_store, task, _, inbox = repository_round(
+        tmp_path,
+        ("feature.py", "docs/context/"),
+        record("feat", source_paths=("feature.py",)),
+    )
+    records_dir = repo_root / PREFIX
+    before = {path.name: path.read_bytes() for path in sorted(records_dir.iterdir())}
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    assert {
+        path.name: path.read_bytes() for path in sorted(records_dir.iterdir())
+    } == before
+    assert run_git(repo_root, "status", "--porcelain") == ""
+
+
+def test_the_packet_a_round_is_given_carries_records_that_exist(tmp_path):
+    """§8.2, ctx-05's half. Before ctx-16 every packet said no index was wired
+    and reported every cited id as unresolved; the point of a store is that this
+    one names the record."""
+    orch, repo_root, worktrees, execution_store, task, _, inbox = repository_round(
+        tmp_path,
+        ("feature.py", "docs/context/"),
+        record("feat", source_paths=("feature.py",)),
+    )
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    packet = ContextPacketStore(orch._config.context_packets_dir).load(task.id)
+    assert packet is not None
+    assert "no context record index is wired into this loop yet" not in packet.text
+    assert "1 indexed, 0 duplicated id(s), 0 unreadable" in packet.text
+    assert "feat" in packet.text
+    assert record().invariant in packet.text
+    # And the digest the reviewer is shown is the digest of those same bytes.
+    assert execution_store.load(task.id).context_packet_sha256 == packet.digest
+
+
+def test_a_repository_with_no_records_yet_reads_as_empty_and_not_as_unwired(tmp_path):
+    """§8.2, the state every repository starts in — including this one, where
+    `docs/context/` does not exist. An empty directory and NO MECHANISM must not
+    look alike: the first is a repository that has written no records, the second
+    is a loop that could not read one if it had."""
+    orch, repo_root, worktrees, execution_store, task, _, inbox = build_round(
+        tmp_path,
+        approved_paths=("feature.py", "docs/context/"),
+        wire=False,
+        config_records_dir=PREFIX,
+    )
+    assert not (repo_root / PREFIX).exists()
+    entries = closeout_entries(orch)
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    packet = ContextPacketStore(orch._config.context_packets_dir).load(task.id)
+    assert "no context record index is wired into this loop yet" not in packet.text
+    assert "0 indexed, 0 duplicated id(s), 1 unreadable" in packet.text
+    # The closeout RAN — it did not report the store missing.
+    ran = [d for e, d in entries if e == "context_closeout"]
+    assert len(ran) == 1 and ran[0]["task_id"] == task.id
+    assert not [
+        d
+        for e, d in entries
+        if e == "context_closeout_skipped" and d["reason"] == "no_context_record_store"
+    ]
+
+
+# -----------------------------------------------------------------------------
+# 8.3 THE RECORDS ARE READ AT THE ROUND'S BASE, OUT OF GIT — not off the tree
+#
+# The packet says `task_base_sha: B1` and grades every record's staleness against
+# B1. If the record BYTES came off the observed checkout's working tree they
+# would be whatever commit the branch is at now, which is later than B1 on any
+# round whose base stayed put while the branch moved: a resumed round on a reused
+# worker keeps its stale base by design (`_rebase_execution_if_stale`, wrk-01),
+# and an operator committing between the base being recorded and the packet
+# being rendered does it by accident (`_observed_base_sha`'s own race). Either
+# way the packet would quote B2's bytes under B1's sha. So the repository store
+# reads git objects at the base, and these pin that it does — at the loader, at
+# the packet, and through the full round with the closeout agreeing.
+# -----------------------------------------------------------------------------
+
+
+def moved_on(repo_root, *records):
+    """Commit `records` over the ones already there — the observed branch
+    advancing after a task was cut from it."""
+    seed_repository_records(repo_root, *records)
+    return run_git(repo_root, "rev-parse", "HEAD").strip()
+
+
+AT_BASE = "feature.py greets exactly once — the claim at the base"
+LATER = "feature.py greets twice — the claim the branch moved to"
+
+
+def test_repository_records_are_read_out_of_git_at_the_revision_asked_for(tmp_path):
+    """§8.3, the loader. The store's `directory` is the observed checkout's,
+    and that checkout is at B2 on disk; `load(git, B1)` answers B1's bytes and
+    `load(git, B2)` answers B2's. Direct children only, blobs only, bare file
+    names — the same shape `load_records` gives, so a record loaded from a
+    commit can still be named as a repository path and matched against a
+    scope."""
+    repo_root = worker_repo(tmp_path, "repo")
+    moved_on(repo_root, record("feat", invariant=AT_BASE))
+    # Two things that are NOT records, committed beside one: a note and a
+    # nested file. Neither is a record on disk (`load_records` does not
+    # recurse and reads only `*.json`), so neither may be one in a commit.
+    (repo_root / PREFIX / "README.md").write_text("about these\n", encoding="utf-8")
+    (repo_root / PREFIX / "nested").mkdir()
+    (repo_root / PREFIX / "nested" / "deep.json").write_text(
+        json.dumps(record_to_mapping(record("deep"))), encoding="utf-8"
+    )
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "a note and a nested file")
+    b1 = run_git(repo_root, "rev-parse", "HEAD").strip()
+    b2 = moved_on(repo_root, record("feat", invariant=LATER))
+    assert LATER in (repo_root / PREFIX / "feat.json").read_text(encoding="utf-8")
+
+    store = repository_record_store(repo_root, PREFIX)
+    git = gateway(repo_root)
+
+    loaded, problems = store.load(git, b1)
+    assert problems == ()
+    assert [(item.record.id, item.record.invariant) for item in loaded] == [("feat", AT_BASE)]
+    assert loaded[0].source == "feat.json"  # bare, so `repo_path_for` can name it
+    assert store.repo_path_for(loaded[0].source) == "docs/context/feat.json"
+
+    loaded, problems = store.load(git, b2)
+    assert problems == ()
+    assert [(item.record.id, item.record.invariant) for item in loaded] == [("feat", LATER)]
+
+
+def test_a_repository_store_never_falls_back_to_the_working_tree(tmp_path):
+    """§8.3, fail-closed. Handed no gateway or no revision, the store answers
+    ONE problem saying which — and not the files on disk, which are exactly
+    the bytes this store exists not to read. A base that will not resolve is
+    the same: one problem naming it, never an empty directory's reading."""
+    repo_root = worker_repo(tmp_path, "repo")
+    moved_on(repo_root, record("feat", invariant=LATER))
+    store = repository_record_store(repo_root, PREFIX)
+    assert (store.directory / "feat.json").exists()
+
+    for git, rev in ((None, ""), (None, "b" * 40), (gateway(repo_root), "")):
+        loaded, problems = store.load(git, rev)
+        assert loaded == ()
+        assert len(problems) == 1
+        assert "never reads the working tree" in problems[0].message
+
+    loaded, problems = store.load(gateway(repo_root), "0" * 40)
+    assert loaded == ()
+    assert len(problems) == 1
+    assert "could not be read" in problems[0].message
+    assert "0" * 40 in problems[0].message
+
+
+def test_a_commit_without_the_directory_reads_as_empty_and_says_so(tmp_path):
+    """§8.3. The problem a missing directory earns in a commit is the same ONE
+    problem it earns on disk, so the packet's `1 unreadable` reading of "this
+    repository has written no records" survives the move to git."""
+    repo_root = worker_repo(tmp_path, "repo")
+    bare = run_git(repo_root, "rev-parse", "HEAD").strip()
+    store = repository_record_store(repo_root, PREFIX)
+
+    loaded, problems = store.load(gateway(repo_root), bare)
+
+    assert loaded == ()
+    assert [p.source for p in problems] == [PREFIX]
+    assert "does not exist at" in problems[0].message and bare in problems[0].message
+
+
+def test_the_packet_retains_the_base_records_after_the_observed_checkout_moved_on(
+    tmp_path,
+):
+    """§8.3, THE REGRESSION, through the full round. The task is cut from B1;
+    between the base being recorded and the packet being rendered the observed
+    branch moves to B2, where the record says something else; the packet the
+    round is given — and the reviewer's stored copy of it — carries B1's bytes
+    under B1's sha, and B2's are nowhere in it.
+
+    And the closeout AGREES: it re-reads the records the same way, at the same
+    base, so it runs (and confirms the selection) rather than refusing because
+    "the directory has changed". A fix to the packet's reader alone would have
+    turned every such round into a `context_closeout_refused`.
+    """
+    orch, repo_root, worktrees, execution_store, task, _, inbox = repository_round(
+        tmp_path,
+        ("feature.py", "docs/context/"),
+        record("feat", invariant=AT_BASE, source_paths=("feature.py",)),
+    )
+    b1 = run_git(repo_root, "rev-parse", "HEAD").strip()
+    moved: dict[str, str] = {}
+    original = orch._context_record_index
+
+    def index_after_the_branch_moved(worktree_git, base_sha):
+        # The observed branch advances AFTER this round's base is recorded and
+        # BEFORE its records are read — the window `_observed_base_sha`
+        # documents, and the state a wrk-01 resumed round is in for its whole
+        # dispatch. Committed rather than edited in place: an uncommitted edit
+        # would dirty the observed checkout and park the loop one round later.
+        moved["b2"] = moved_on(
+            repo_root, record("feat", invariant=LATER, source_paths=("feature.py",))
+        )
+        assert base_sha == b1
+        # The worker was cut from B1 and its object database holds B1's blobs —
+        # the assumption the whole read rests on, checked rather than assumed.
+        assert worktree_git.tree_of(b1)
+        return original(worktree_git, base_sha)
+
+    orch._context_record_index = index_after_the_branch_moved
+    entries = closeout_entries(orch)
+
+    push_the_round(orch, repo_root, tmp_path, task)
+
+    assert moved["b2"] != b1
+    assert LATER in (repo_root / PREFIX / "feat.json").read_text(encoding="utf-8")
+    packet = ContextPacketStore(orch._config.context_packets_dir).load(task.id)
+    assert packet is not None
+    assert f"task_base_sha: {b1}" in packet.text
+    assert AT_BASE in packet.text
+    assert LATER not in packet.text
+    assert execution_store.load(task.id).context_packet_sha256 == packet.digest
+    # Both readers read B1: the closeout confirmed the selection and ran.
+    assert not [d for e, d in entries if e == "context_closeout_refused"]
+    ran = [d for e, d in entries if e == "context_closeout"]
+    assert len(ran) == 1 and ran[0]["task_id"] == task.id
+    assert ran[0]["needs_attention"] == ["feat"]
+    # And nothing was written into the tree that moved.
+    assert run_git(repo_root, "status", "--porcelain") == ""
+
+
+def test_the_orchestrators_index_is_the_base_revisions_not_the_checkouts(tmp_path):
+    """§8.3, the accessor itself, with no round around it: asked for B1 while
+    the checkout stands at B2, `_context_record_index` answers B1's record —
+    and asked for B2, B2's — because it reads through the store rather than
+    the store's directory."""
+    orch, repo_root, *_ = build_round(
+        tmp_path,
+        approved_paths=("feature.py",),
+        wire=False,
+        config_records_dir=PREFIX,
+    )
+    b1 = moved_on(repo_root, record("feat", invariant=AT_BASE))
+    b2 = moved_on(repo_root, record("feat", invariant=LATER))
+    git = gateway(repo_root)
+
+    assert orch._context_record_index(git, b1).get("feat").invariant == AT_BASE
+    assert orch._context_record_index(git, b2).get("feat").invariant == LATER
+    # A loop-private store, by contrast, has no revision to read at and answers
+    # its directory whatever sha it is handed: it is unversioned, and it sits
+    # outside every checkout because it writes.
+    private = ContextRecordStore(tmp_path / "private", PREFIX)
+    private.write(record("feat", invariant="private"), "feat.json")
+    orch._context_records = private
+    assert orch._context_record_index(git, b1).get("feat").invariant == "private"

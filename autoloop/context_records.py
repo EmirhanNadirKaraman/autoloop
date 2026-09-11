@@ -1,11 +1,33 @@
 """The record a context selection is made out of, and how one is read.
 
 ONE RECORD PER FILE, one JSON object per file, in a directory the CALLER
-names. Nothing here decides where those files live: `context_resolver` is pure
-given its inputs the way `context.build_context` is, and wiring a location into
-the loop is ctx-04's. What this module fixes is the SHAPE, so that the index
-and the resolver above it can be reasoned about without re-deciding what a
-record is at every call site.
+names. What this module fixes is the SHAPE, so that the index and the resolver
+above it can be reasoned about without re-deciding what a record is at every
+call site — `context_resolver` stays pure given its inputs the way
+`context.build_context` is.
+
+WHERE THEY LIVE, since ctx-16 answered it: IN THE TARGET REPOSITORY, at
+`[context] records_dir` (`docs/context` by default), read through
+`repository_record_store` below and never written by this loop. Knowledge about
+a project belongs to that project's history, where it is versioned, reviewed and
+travels with the commit it describes. The loop-private `ContextRecordStore` is
+still the general case and still writes; the repository-backed subclass is the
+one production builds, and it refuses every write for the reason its own
+docstring gives.
+
+AND WHEN THEY ARE READ, which is the other half of "travel with the commit": a
+repository-backed store is read OUT OF GIT OBJECTS AT A NAMED REVISION
+(`load_records_at`, through `RepositoryContextRecordStore.load`), never off the
+observed checkout's working tree. The packet a round is given names
+`task_base_sha` as the commit it was rendered from, and the resolver grades
+staleness against that same commit — so the record BYTES have to come from it
+too. A working tree is whatever the observed branch is at right now, which is a
+later commit than the base whenever the branch advanced after the task was cut
+(a resumed round on a reused worker keeps its stale base by design, wrk-01), and
+a packet that quoted those later bytes under the base's sha would be provenance
+that lies. Git objects at a sha are immutable, so a read at `task_base_sha` is
+the same bytes on the dispatch that renders the packet and on the closeout that
+confirms it, however far the checkout has moved in between.
 
 A record is a claim about SOURCE PATHS at a COMMIT. That pairing is the whole
 design:
@@ -24,7 +46,10 @@ kind that does not exist or carries a key nobody defined does not vanish and
 does not stop the load: it becomes a `RecordProblem`, which the index carries
 and the resolver reports. Dropping a malformed record quietly is the exact
 fail-open this whole roadmap item exists to prevent — a context selection that
-is missing the one record that contradicted it, and says nothing.
+is missing the one record that contradicted it, and says nothing. Both loaders
+below hand every file's bytes to ONE parser (`_parse_record_bytes`), so a
+malformed record becomes the same problem whether it was read off a disk or out
+of a blob.
 """
 
 from __future__ import annotations
@@ -35,6 +60,8 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from .errors import GitError
 
 #: The four kinds a record may have, and the only four. Named by the task that
 #: introduced this file: the resolver expands to "explicitly related feature,
@@ -352,24 +379,46 @@ class ContextRecordStore:
     in such a store is out of scope for every task, and the closeout files its
     follow-up instead of writing anything.
 
-    **`directory` and `repo_prefix` are two facts, not one, and the directory
-    may not be inside the observed checkout.** That is port-01's rule reaching a
-    new writer, and `orchestrator._store_is_inside_the_observed_checkout` is
-    where it is enforced: a record written into the observed tree is an
-    uncommitted file this loop cannot commit, and the next write-capable
-    dispatch refuses to start against the dirty tree it leaves
-    (`primary_checkout_dirty`, loop-fatal). So the files live outside it and the
-    prefix says what they are CALLED in it, which is all the scope check needs.
+    **`directory` and `repo_prefix` are two facts, not one, and a WRITING
+    store's directory may not be inside the observed checkout.** That is
+    port-01's rule reaching a new writer, and
+    `orchestrator._store_would_write_inside_the_observed_checkout` is where it is
+    enforced: a record written into the observed tree is an uncommitted file this
+    loop cannot commit, and the next write-capable dispatch refuses to start
+    against the dirty tree it leaves (`primary_checkout_dirty`, loop-fatal). So a
+    store of THIS class lives outside the tree and the prefix says what its files
+    are CALLED in it, which is all the scope check needs.
 
-    Deliberately NOT a loader: `load_records` above is the one reader, and
-    `context_index.load_index` is the one place the loop builds an index out of
-    it. A second read path here would be a second answer to "what is in this
-    directory".
+    The qualification is `writes_directly` below, and it is the difference
+    `RepositoryContextRecordStore` exists to make: a store that cannot write
+    cannot leave an uncommitted file, so it may read a directory inside the
+    observed checkout. Reading never dirties a tree, and the detector still
+    watches that tree completely — nothing is excluded from it, which is the
+    property port-01 moved `state_dir` out to get.
+
+    `load` is the store's ONE answer to "what records do you hold", and it is a
+    dispatcher rather than a third reader: this class answers with
+    `load_records` over its directory, the repository-backed subclass with
+    `load_records_at` over a revision, and both readers hand every file's bytes
+    to the same parser. The loop asks a store and never picks a reader itself —
+    `orchestrator._context_record_index` and `context_packet.plan_round_closeout`
+    both call `store.load(worktree_git, task_base_sha)` — because two call sites
+    each choosing a reader is how the packet and the closeout come to read two
+    different trees.
     """
+
+    #: Does `write` on this store put bytes on disk? TRUE here — a store of this
+    #: class is the loop's own private directory and writing to it is the whole
+    #: point — and FALSE on `RepositoryContextRecordStore`, whose records are
+    #: repository files a reviewed round authors. Every caller that asks reads it
+    #: through ONE accessor (`orchestrator._store_writes_directly`), which
+    #: defaults an object that does not answer to WRITABLE: an unknown store is
+    #: treated as one that would dirty a tree, which is the refusing direction.
+    writes_directly = True
 
     def __init__(self, directory, repo_prefix: str = ""):
         self.directory = Path(directory)
-        self.repo_prefix = _clean_repo_prefix(repo_prefix)
+        self.repo_prefix = clean_repo_prefix(repo_prefix)
 
     @staticmethod
     def filename_for(record_id: str) -> str:
@@ -458,6 +507,144 @@ class ContextRecordStore:
             return None
         return path
 
+    def load(
+        self, git=None, rev: str = ""
+    ) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
+        """Every record this store holds, as `load_records` answers it — off the
+        DISK, because that is the only place a loop-private store's files exist.
+
+        `git` and `rev` are accepted so that every caller asks every store the
+        same question (`store.load(worktree_git, task_base_sha)`), and they are
+        deliberately IGNORED here: this store is not versioned, so there is no
+        revision of it to read. The repository-backed subclass is the one for
+        which the two arguments decide which bytes come back, and its override
+        says so.
+        """
+        return load_records(self.directory)
+
+
+class RepositoryContextRecordStore(ContextRecordStore):
+    """Records that live IN THE TARGET REPOSITORY — versioned, reviewed and
+    travelling with the commit they describe — and therefore never written by
+    this loop directly (ctx-16).
+
+    **WHY THE REPOSITORY.** ctx-02 designed `docs/context`, ctx-12 says a
+    round's context must come from the target CHECKOUT AND COMMIT, and
+    ctx-10/ctx-11 speak of a repository installing and proving a context
+    contract. All three mean the same thing: the knowledge is about the project,
+    so it belongs to the project's history rather than to this loop's state
+    directory. A record beside `state_dir` would be unversioned, unreviewed, and
+    would not survive the loop being pointed at a different checkout.
+
+    **WHY IT CANNOT WRITE, and why that is the design rather than a limitation.**
+    `directory` here is inside a checkout, so a write would leave a file the
+    closeout cannot commit — it runs AFTER the push has landed, so there is no
+    commit left to put it in — and the next write-capable dispatch refuses to
+    start against the dirty tree (`primary_checkout_dirty`, loop-fatal). The
+    answer is not to write more carefully: it is that a record is a claim, and a
+    claim this repository keeps goes in through review like every other one. So
+    `write` refuses unconditionally and the closeout names the record in the ONE
+    narrow follow-up task `context_packet.follow_up_request` files, whose
+    `approved_paths` are exactly the record files it would touch. The agent of
+    that round writes them, a reviewer reads them, and they are committed.
+
+    The refusal lives HERE, in the class, and not only in the caller that knows
+    about `writes_directly`: a guard that is one forgotten branch away from
+    dirtying the observed checkout is a guard that switches itself off the first
+    time somebody adds a second call site.
+
+    **AND IT IS READ OUT OF GIT, AT A REVISION, NEVER OFF THE WORKING TREE.**
+    `directory` is still the directory of the observed checkout — the location
+    guard resolves it and the closeout transcript names it — but `load` below
+    does not open it. The packet a round is given says it was rendered from
+    `task_base_sha`, the resolver grades every record's staleness against that
+    commit, and the observed working tree is whatever commit the branch is at
+    NOW: later than the base whenever the branch advanced after the task was
+    cut, which a resumed round on a reused worker does by design (wrk-01) and
+    an operator committing mid-dispatch does by accident. Reading the tree would
+    quote those later bytes under the base's sha. So the records come from the
+    worker's own object database at the base, the same discipline every other
+    line of the packet already follows (`context_packet`'s "the commit is the
+    worker's base, not the checkout's head").
+    """
+
+    #: See `ContextRecordStore.writes_directly`. FALSE, and `write` below
+    #: enforces it independently — the flag tells a caller what will happen, the
+    #: method makes it true.
+    writes_directly = False
+
+    def load(
+        self, git=None, rev: str = ""
+    ) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
+        """`load_records_at(git, rev, self.repo_prefix)` — the records as they
+        stand in the tree of `rev`, read through `git`.
+
+        NO FALLBACK TO `self.directory`, and that absence is the guard. Handed no
+        gateway or no revision, this answers an empty load carrying ONE problem
+        that says which was missing, rather than quietly reading the working
+        tree — because the working tree is the one source this class exists not
+        to read, and a caller that forgot the revision would otherwise get the
+        exact provenance drift back under a store that claims to have fixed it.
+        """
+        if git is None or not rev:
+            missing = "no revision" if git is not None else "no repository"
+            return (), (
+                RecordProblem(
+                    source=self.repo_prefix or str(self.directory),
+                    message=(
+                        f"context records at {self.repo_prefix!r} could not be "
+                        f"read: {missing} was given to read them at, and this "
+                        "store never reads the working tree instead"
+                    ),
+                ),
+            )
+        return load_records_at(git, rev, self.repo_prefix)
+
+    def write(self, record: ContextRecord, filename: str) -> Path | None:
+        """Always `None` — this store never puts bytes in a checkout.
+
+        `None` is the value `ContextRecordStore.write` already answers for every
+        refusal, so a caller that does not know about `writes_directly` still
+        treats the record as one that was not written and still owes it to the
+        follow-up. The difference the caller SHOULD make is the reason it reports
+        (a deliberate deferral is not a failed write), and
+        `orchestrator._close_out_context` makes it before ever calling this.
+        """
+        return None
+
+
+def repository_record_store(checkout_root, records_dir) -> RepositoryContextRecordStore | None:
+    """The record store for `records_dir` inside `checkout_root`, or `None`.
+
+    THE ONE place a repository-relative `[context] records_dir` becomes a
+    store, so the packet a round is given and the closeout that grades it
+    cannot be pointed at two different trees by two callers agreeing. The
+    directory it names is the LOCATION — what the location guard resolves and
+    the transcript reports — and not what is read: `RepositoryContextRecordStore
+    .load` reads that directory out of git at the revision it is handed.
+
+    `None` — read everywhere above as "no record store is wired into this loop"
+    and reported as such — for the three inputs that cannot name a location:
+
+    * an empty `records_dir`, which is the supported way to turn the mechanism
+      off (`[context] records_dir = ""`);
+    * a `records_dir` that is not a repository-relative directory path. Cleaned
+      by `clean_repo_prefix`, the same rule a record's own `source_paths` are
+      held to, because this string is also what `tasks.unauthorized_paths` is
+      handed;
+    * a checkout root that is not an ABSOLUTE path. `Path("")` is `Path(".")`,
+      so a relative root would silently read records out of whatever directory
+      the process happens to be standing in — the failure `cli`'s `context
+      explain` already guards the same way.
+    """
+    prefix = clean_repo_prefix(records_dir)
+    if not prefix or checkout_root is None:
+        return None
+    root = Path(checkout_root)
+    if not str(root) or not root.is_absolute():
+        return None
+    return RepositoryContextRecordStore(root / prefix, prefix)
+
 
 def _is_plain_name(name: str) -> bool:
     """One file name, addressing nothing but a file in the directory it is
@@ -467,7 +654,7 @@ def _is_plain_name(name: str) -> bool:
     return not any(sep in name for sep in ("/", "\\", "\0"))
 
 
-def _clean_repo_prefix(prefix) -> str:
+def clean_repo_prefix(prefix) -> str:
     """`prefix` as a repository-relative directory path, or `""`.
 
     The same shape `_check_source_path` demands of a record's own paths, and for
@@ -488,7 +675,9 @@ def _clean_repo_prefix(prefix) -> str:
 
 
 def load_records(directory) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
-    """Every `*.json` in `directory`, read once, in FILE NAME order.
+    """Every `*.json` in `directory`, read once, in FILE NAME order — the reader
+    for a directory ON DISK, i.e. a loop-private `ContextRecordStore`.
+    `load_records_at` below is the same reader for a directory IN A COMMIT.
 
     Returns `(records, problems)` and never raises for a bad file: one
     unreadable record must not take the other forty with it, and it must not
@@ -517,17 +706,142 @@ def load_records(directory) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProbl
         )
     for path in sorted(directory.glob(f"*{_SUFFIX}")):
         try:
-            raw = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
         except OSError as exc:
             problems.append(RecordProblem(path.name, f"unreadable: {exc}"))
             continue
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            problems.append(RecordProblem(path.name, f"not valid JSON: {exc}"))
+        _collect(_parse_record_bytes(path.name, raw), records, problems)
+    return tuple(records), tuple(problems)
+
+
+def load_records_at(
+    git, rev: str, prefix: str
+) -> tuple[tuple[LoadedRecord, ...], tuple[RecordProblem, ...]]:
+    """Every `*.json` DIRECTLY under `prefix` in the tree of `rev`, read out of
+    `git`'s object database, in FILE NAME order — `load_records` for a commit
+    instead of a directory, and the reader `RepositoryContextRecordStore.load`
+    is made of.
+
+    The same tolerance and the same shape: `(records, problems)`, never an
+    exception. `git` is a `GitGateway` (or anything answering `tree_of`,
+    `tree_entries` and `blob_bytes`), and every refusal it can make is one
+    problem the index carries rather than an empty index that looks like a
+    repository with no records:
+
+    * a `rev` that will not resolve, or a tree that will not list — ONE problem
+      naming the revision, and no records, because "could not read the records
+      at this commit" and "this commit holds no records" are different
+      repairs;
+    * a `prefix` absent from the tree — ONE problem, the same one a missing
+      directory earns on disk, so the packet still reads
+      `0 indexed, 0 duplicated id(s), 1 unreadable`;
+    * a blob that will not read, is not UTF-8, is not JSON or is not a record —
+      a problem naming the FILE, by its bare name, and the other records load.
+
+    `source` is the BARE FILE NAME, exactly as `load_records` reports it and
+    for a reason beyond consistency: `ContextRecordStore.repo_path_for` refuses
+    any name with a separator in it, so a source spelled as the tree path would
+    make every repository record unnameable — out of scope everywhere, and
+    stripped from the follow-up's `approved_paths` — without one line saying so.
+
+    DIRECT CHILDREN ONLY, and only entries git types as `blob`. `tree_entries`
+    lists recursively, so `prefix/sub/x.json` is in the listing and is skipped
+    here, because it is not a record on disk either (`load_records` does not
+    recurse) and a loader that found records the other one would not is two
+    answers to "what is in this directory". A submodule or a tree under a
+    `.json` name is reported by name rather than read as bytes.
+    """
+    given = prefix
+    prefix = clean_repo_prefix(prefix)
+    if not prefix:
+        return (), (
+            RecordProblem(
+                source=str(given),
+                message=(
+                    "context record directory has no usable repository-relative "
+                    "path, so no record could be loaded at all"
+                ),
+            ),
+        )
+    try:
+        entries = git.tree_entries(git.tree_of(rev))
+    except (GitError, OSError) as exc:
+        # `OSError` too: a worker directory that vanished between the check
+        # that it exists and this call reaches `subprocess` as one, and a loader
+        # that promises never to raise has to keep the promise there as well.
+        return (), (
+            RecordProblem(
+                source=prefix,
+                message=(
+                    f"the tree of {rev or '(none)'} could not be read, so no "
+                    f"record could be loaded at all: {_one_line(exc)}"
+                ),
+            ),
+        )
+    head = f"{prefix}/"
+    present = False
+    candidates: list[tuple[str, str, str]] = []
+    for path, (_mode, kind, oid) in entries.items():
+        if not path.startswith(head):
+            continue
+        present = True
+        name = path[len(head):]
+        if "/" in name or not name.endswith(_SUFFIX):
+            continue
+        candidates.append((name, kind, oid))
+    if not present:
+        return (), (
+            RecordProblem(
+                source=prefix,
+                message=(
+                    f"context record directory does not exist at {rev}, so no "
+                    "record could be loaded at all"
+                ),
+            ),
+        )
+    problems: list[RecordProblem] = []
+    records: list[LoadedRecord] = []
+    for name, kind, oid in sorted(candidates):
+        if kind != "blob":
+            problems.append(RecordProblem(name, f"not a file in the tree of {rev} ({kind})"))
             continue
         try:
-            records.append(LoadedRecord(record_from_mapping(data), path.name))
-        except ContextRecordError as exc:
-            problems.append(RecordProblem(path.name, str(exc)))
+            raw = git.blob_bytes(oid)
+        except (GitError, OSError) as exc:
+            problems.append(RecordProblem(name, f"unreadable: {_one_line(exc)}"))
+            continue
+        _collect(_parse_record_bytes(name, raw), records, problems)
     return tuple(records), tuple(problems)
+
+
+def _parse_record_bytes(name: str, raw: bytes) -> LoadedRecord | RecordProblem:
+    """The ONE step from a file's bytes to a record or a named problem, shared
+    by both loaders so a disk and a blob holding the same bytes load alike.
+
+    `UnicodeDecodeError` is caught here and nowhere else: it is a `ValueError`,
+    not an `OSError`, so a record file that is not UTF-8 would otherwise escape
+    a loader that only guards the read — and take every other record with it.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return RecordProblem(name, f"not UTF-8: {exc}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return RecordProblem(name, f"not valid JSON: {exc}")
+    try:
+        return LoadedRecord(record_from_mapping(data), name)
+    except ContextRecordError as exc:
+        return RecordProblem(name, str(exc))
+
+
+def _collect(parsed, records: list, problems: list) -> None:
+    (records if isinstance(parsed, LoadedRecord) else problems).append(parsed)
+
+
+def _one_line(text) -> str:
+    """Collapse whitespace so a git error occupies one rendered line — the
+    same rule `context_packet._one_line` applies to everything it renders, kept
+    here so this module owes that one nothing."""
+    return " ".join(str(text).split())
