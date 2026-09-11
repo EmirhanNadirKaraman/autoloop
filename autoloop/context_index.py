@@ -100,12 +100,17 @@ def build_index(
 
 
 def load_index(directory) -> ContextIndex:
-    """`build_index` over `context_records.load_records(directory)`.
+    """`build_index` over `context_records.load_records(directory)` — an index
+    of a directory ON DISK.
 
-    The ONE place the loop reads a record directory, so "load every record
-    once" is a property of the code rather than a convention every caller has
-    to remember. A directory that does not exist is an EMPTY index carrying the
-    problem that says so, never an exception and never a silent empty.
+    The convenience for a caller holding a loop-private directory (tests, and
+    `context explain`'s fixtures). The loop's own dispatch and closeout do NOT
+    come through here since ctx-16: they ask the store
+    (`ContextRecordStore.load(worktree_git, task_base_sha)`) and build the index
+    from its answer, because the repository-backed store reads git objects at a
+    revision and has no directory on disk to index. A directory that does not
+    exist is an EMPTY index carrying the problem that says so, never an
+    exception and never a silent empty.
     """
     loaded, problems = load_records(directory)
     return build_index(loaded, problems)

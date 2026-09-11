@@ -790,8 +790,10 @@ class ContextConfig:
     `records_dir` is a REPOSITORY-RELATIVE path and not a filesystem one, which
     is what keeps the resolver pure: `context_resolver.resolve_context` still
     takes its index, its seed list and its revision as ARGUMENTS, and this key
-    only says which directory OF THE OBSERVED CHECKOUT
-    `context_records.repository_record_store` turns into that index. A
+    only says which directory OF THE TARGET REPOSITORY
+    `context_records.repository_record_store` turns into that index — read out
+    of git at the round's `task_base_sha`, never off the observed working
+    tree, so the bytes a packet quotes are the bytes of the commit it names. A
     filesystem path here would let a deployment point the loop at records that
     belong to no repository, which is the unversioned, unreviewed arrangement
     ctx-16 chose against.

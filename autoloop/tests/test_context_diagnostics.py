@@ -326,10 +326,12 @@ class Deployment:
         for item in self.records:
             assert self.record_store.write(item, f"{item.id}.json") is not None
         # THE INDEX THE DISPATCH WOULD USE, built exactly as
-        # `orchestrator._context_record_index` builds it: `load_index` over the
-        # wired store's own directory, and `None` when no store is wired — which
-        # since ctx-16 is a deployment that set `[context] records_dir = ""`,
-        # and is still what `context explain` itself re-renders with.
+        # `orchestrator._context_record_index` builds it for a LOOP-PRIVATE
+        # store (`Orchestrator(context_records=...)`): that store's `load`
+        # reads its own directory whatever revision it is handed, which is
+        # `load_index` over it. `None` when no store is wired — which since
+        # ctx-16 is a deployment that set `[context] records_dir = ""`, and is
+        # still what `context explain` itself re-renders with.
         index = load_index(self.record_store.directory) if self.records else None
         self.task = task(task_id, cite=cite)
         TaskStore(self.config.tasks_file).save(TaskRegistry([self.task]))
@@ -733,9 +735,10 @@ def test_the_explanation_survives_the_record_store_it_was_dispatched_with_changi
 
     This is the case a re-resolution cannot answer and must not pretend to. The
     dispatch resolved against a real directory (`load_index` over a
-    `ContextRecordStore`, which is exactly what `orchestrator.
-    _context_record_index` does with `Orchestrator(context_records=...)`); the
-    command wires none, because no config names one. So the two resolutions
+    `ContextRecordStore`, which is what `orchestrator._context_record_index`
+    gets from a loop-private store's `load` under
+    `Orchestrator(context_records=...)`); the command wires none, because no
+    config names one it can be sure of. So the two resolutions
     disagree by construction — and the command reports the ROUND's selected,
     rejected, stale and contradictory records, and the round's digest, with the
     present-time resolution printed beside them as a comparison and labelled.

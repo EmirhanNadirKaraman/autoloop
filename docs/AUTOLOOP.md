@@ -2076,8 +2076,33 @@ knowledge about a project kept beside this loop's `state_dir` would be
 unversioned, unreviewed, and would vanish the moment the loop were pointed at a
 different checkout. `orchestrator._context_record_store` derives the store from
 that key and the tree this lane observes — one accessor, so the packet a round is
-given and the closeout that grades it read the same directory by construction
+given and the closeout that grades it read the same store by construction
 rather than by two callers agreeing.
+
+**And they are read OUT OF GIT AT THE ROUND'S BASE, never off the observed
+working tree.** The packet says `task_base_sha: <sha>` and the resolver grades
+every record's staleness against that commit, so the record bytes have to come
+from it too: `orchestrator._context_record_index` and
+`context_packet.plan_round_closeout` both call
+`store.load(worktree_git, task_base_sha)`, and for the repository-backed store
+that is `context_records.load_records_at` — the `*.json` blobs directly under
+`records_dir` in the tree of that commit, read through the WORKER's own gateway
+(the discipline every other line of the packet already follows). The observed
+working tree is whatever commit its branch is at *now*, which is later than the
+base whenever the branch advanced after the task was cut — a resumed round on a
+reused worker keeps its stale base by design (`_rebase_execution_if_stale`,
+wrk-01), an operator committing mid-dispatch does it by accident — and a packet
+quoting those later bytes under the base's sha would be provenance that lies.
+Git objects at a sha are immutable, so the dispatch and the closeout read the
+same bytes however far the checkout has moved in between, and the closeout's
+"the selection resolved now is not the one this round's packet showed" refusal
+can no longer be caused, for this store, by the branch moving. Handed no
+revision, the store answers one problem saying so rather than reading the tree:
+the fallback is the fail-open this paragraph exists to refuse. (A loop-private
+`ContextRecordStore` has no revision to read at and answers its directory as it
+stands, whatever sha it is handed — it is unversioned, which is the arrangement
+design A chose against, and it still may not sit inside the observed checkout
+because it writes.)
 
 **The loop READS that directory and never writes it, and a reviewed round writes
 it.** A record file written into the observed tree is an uncommitted file the
@@ -2093,8 +2118,10 @@ exactly those record files. Its agent writes them, a reviewer reads them, and
 they are committed like any other change.
 
 Reading a `context_closeout` entry for such a store: `updated` is always `[]`,
-`writes_directly` is `false`, `records` names the directory the index came from,
-and a `notes` line says how many records were left to the follow-up. `updated:
+`writes_directly` is `false`, `records` names the store's directory (its
+location — read at the round's `task_base_sha` out of git, as above, not off
+that path on disk), and a `notes` line says how many records were left to the
+follow-up. `updated:
 []` on its own has three readings — nothing was touched, everything was deferred,
 a write failed — so the note is what separates them, and a deferral never borrows
 the "the write failed" wording a real failed write carries.

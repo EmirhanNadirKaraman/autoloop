@@ -381,7 +381,7 @@ from .config import (
     lane_observed_checkout,
 )
 from .context import build_context, render_context
-from .context_index import ContextIndex, load_index
+from .context_index import ContextIndex, build_index
 from .context_packet import (
     CloseoutItem,
     CloseoutPlan,
@@ -9524,9 +9524,12 @@ class Orchestrator:
         `[context] records_dir` INSIDE THE OBSERVED CHECKOUT — the records are
         the target repository's own files, versioned and reviewed with it — and
         it cannot write, which is what makes a directory inside that tree safe to
-        name at all. An explicitly passed store still wins (`__init__`), so a
-        deployment or a test can point the loop at a loop-private writing
-        directory.
+        name at all. Its `directory` is the LOCATION (what the location guard
+        resolves and the closeout transcript names); what it READS is git
+        objects at the revision a caller hands `load`, never that working tree —
+        see `_context_record_index`. An explicitly passed store still wins
+        (`__init__`), so a deployment or a test can point the loop at a
+        loop-private writing directory.
 
         `None`, i.e. "no record store is wired into this loop", for a
         `records_dir` turned off with `""` and for an observed checkout this
@@ -9549,23 +9552,45 @@ class Orchestrator:
             return None
         return repository_record_store(root, records_dir)
 
-    def _context_record_index(self) -> ContextIndex | None:
-        """The index of this loop's context records, or `None` when no record
-        store is wired into it (ctx-07).
+    def _context_record_index(
+        self, worktree_git: GitGateway, base_sha: str
+    ) -> ContextIndex | None:
+        """The index of this loop's context records AS THEY STAND AT `base_sha`
+        in the worker `worktree_git` is rooted at, or `None` when no record
+        store is wired into it (ctx-07, ctx-16).
 
-        THE one place a record directory is read for a dispatch, so the packet a
-        round is given and the closeout that grades that round are looking at the
-        same directory by construction rather than by two callers agreeing.
+        THE one place records are read for a dispatch, and it reads them the way
+        the closeout re-reads them (`context_packet.plan_round_closeout` makes
+        the same `store.load(worktree_git, base_sha)` call), so the packet a
+        round is given and the closeout that grades that round are looking at
+        the same bytes by construction rather than by two callers agreeing.
         `None` is not an empty index and is not rendered as one — see
         `context_packet.render_context_packet`, which reports "no index is wired"
         distinctly from "a directory somebody named and put nothing in".
 
-        Re-read per dispatch rather than cached: a record file is an ordinary
-        file in a repository somebody may have just merged, and a cached index
-        would hand a round a selection the tree no longer holds.
+        WHY THE WORKER AND THE BASE, and not the observed checkout's directory:
+        the packet says `task_base_sha: <base_sha>` and every other line of it
+        is read from the worker at that commit (`context_packet`'s discipline),
+        so the record bytes have to come from there too. The observed working
+        tree is whatever its branch is at NOW — later than the base whenever
+        the branch advanced after the task was cut, which a resumed round on a
+        reused worker does by design (`_rebase_execution_if_stale`, wrk-01) and
+        an operator committing mid-dispatch does by accident — and quoting those
+        bytes under the base's sha would be provenance that lies. The
+        repository-backed store therefore reads git objects at `base_sha`,
+        which are immutable, and only a loop-private store (which has no
+        revision to read) still answers off its directory. Neither reads the
+        observed checkout's working tree.
+
+        Re-read per dispatch rather than cached, still: a revise round after a
+        base move must get the records at the NEW base, and `base_sha` is read
+        off the execution record at the moment this runs.
         """
         store = self._context_record_store()
-        return load_index(store.directory) if store is not None else None
+        if store is None:
+            return None
+        loaded, problems = store.load(worktree_git, base_sha)
+        return build_index(loaded, problems)
 
     def _context_packet_text(self, execution: TaskExecution) -> str:
         """The stored text of the context packet `execution`'s digest names, or
@@ -10935,22 +10960,33 @@ class Orchestrator:
                 execution,
                 worktree_git,
                 self._context_packets(),
-                # The index this loop's record store holds, or `None` when no
+                # The index this loop's record store holds AT THIS ROUND'S BASE,
+                # read out of the worker's object database, or `None` when no
                 # store is wired — since ctx-16 that is the deployment which
                 # turned records off with `[context] records_dir = ""`, not the
                 # ordinary run, which reads the target repository's own
-                # `docs/context`. The packet SAYS which of the two it got, and
-                # reports every cited id as unresolved rather than resolving it
-                # to silence (`context_packet.render_context_packet`).
+                # `docs/context` as it stands at `task_base_sha`. The packet
+                # SAYS which of the two it got, and reports every cited id as
+                # unresolved rather than resolving it to silence
+                # (`context_packet.render_context_packet`).
+                #
+                # The base and the worker are the ones every other line of the
+                # packet is read from, so the record bytes and the provenance
+                # line above them name one commit. The observed checkout's
+                # working tree is deliberately NOT what is read: it is a later
+                # commit than the base on any round whose base stayed put while
+                # the branch moved, and quoting it under the base's sha is the
+                # drift `_context_record_index` is written against.
                 #
                 # ONE accessor for both halves, deliberately: the closeout at
-                # completion re-resolves this same selection and confirms it
+                # completion re-resolves this same selection, through the same
+                # `store.load(worktree_git, task_base_sha)`, and confirms it
                 # against the packet these bytes went into
                 # (`context_packet.selection_was_shown`). Two sources of "which
                 # records exist" would disagree on the first round that had any,
                 # and the closeout would then refuse every task forever while
                 # looking configured.
-                self._context_record_index(),
+                self._context_record_index(worktree_git, execution.task_base_sha),
                 max_records=self._config.context.max_records,
             )
             self._log(
@@ -15515,9 +15551,11 @@ class Orchestrator:
                     "follow_up_skipped": skipped,
                     "notes": notes,
                     # WHICH store answered, so a transcript can be read without
-                    # the config beside it: `records` is the directory the index
-                    # came from and `writes_directly` says whether `updated`
-                    # could ever have been non-empty.
+                    # the config beside it: `records` is the store's directory
+                    # (its LOCATION — the repository-backed store reads that
+                    # directory out of git at `task_base_sha`, never off disk,
+                    # see `_context_record_index`) and `writes_directly` says
+                    # whether `updated` could ever have been non-empty.
                     "records": str(store.directory),
                     "writes_directly": writes_directly,
                 },

@@ -111,7 +111,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .context_index import ContextIndex, build_index
-from .context_records import ContextRecord, ContextRecordStore, load_records
+from .context_records import ContextRecord, ContextRecordStore
 from .context_resolver import (
     BUDGET_DROPPED,
     CONTRADICTION,
@@ -1551,11 +1551,14 @@ def selection_was_shown(
 
     The check that makes the claim's first clause a comparison rather than an
     assertion. A closeout re-resolves the round's seeds against the round's own
-    base, which is deterministic given the same index — but the index is a
-    DIRECTORY, and a directory can have changed since the round was dispatched.
-    Rendering the same block and finding it inside the stored packet proves the
-    two selections are identical, count and all, without parsing anything out of
-    the packet.
+    base, which is deterministic given the same index — but a loop-private
+    store's index is a DIRECTORY, and a directory can have changed since the
+    round was dispatched. (The repository-backed store reads git objects at the
+    base, which cannot change; the comparison is kept for it anyway, because a
+    check that is skipped for the store it should never fail on is a check that
+    is one refactor away from being skipped for the other.) Rendering the same
+    block and finding it inside the stored packet proves the two selections are
+    identical, count and all, without parsing anything out of the packet.
 
     Deliberately a containment test on loop-rendered bytes and NOT a parse: the
     packet holds record titles, invariants and paths written outside this
@@ -1978,6 +1981,16 @@ def plan_round_closeout(
     nothing and files nothing. A closeout that guessed at the selection would be
     writing verification commits onto records this round never saw.
 
+    THE RECORDS ARE READ THE WAY THE PACKET READ THEM — `store.load(worktree_git,
+    base_sha)`, the same call `orchestrator._context_record_index` makes at
+    dispatch. For the repository-backed store that is the worker's object
+    database at the base, which is immutable, so the confirmation below cannot
+    fail for that store because the observed branch advanced in between; it can
+    still fail for a loop-private store, whose directory is live, and for a
+    base that moved (`_rebase_execution_if_stale`), which re-renders the packet
+    anyway. Reading the store's directory here while the packet read git would
+    have refused every closeout on exactly the rounds ctx-16's fix is for.
+
     A refusal is not an exception: the caller runs on a path where a push has
     already landed (`orchestrator._dispatch_task_push`), and every failure there
     is a log rather than a park.
@@ -1991,7 +2004,7 @@ def plan_round_closeout(
             "its execution record carries, so the selection it was given cannot "
             "be confirmed"
         )
-    loaded, problems = load_records(store.directory)
+    loaded, problems = store.load(worktree_git, base_sha)
     index = build_index(loaded, problems)
     try:
         tree = worktree_git.tree_of(base_sha)
