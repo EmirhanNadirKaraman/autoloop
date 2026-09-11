@@ -77,8 +77,9 @@ foreign string is collapsed to one line (`_one_line`), the number of records is
 bounded by `[context] max_records` (25 by default, and the resolver reports
 every record that budget drops), and the rest is a fixed set of headings. What
 is NOT bounded is the number of source paths ONE record declares. That is
-operator-authored data, no record directory is wired yet, and nothing has ever
-measured a packet — so this deliberately ships with no truncation at all:
+operator-authored data, the record directory ctx-16 wired starts empty in every
+repository that has not written one, and nothing has ever measured a packet — so
+this deliberately ships with no truncation at all:
 `packet.ASSUMPTIONS_MAX_CHARS` is the shape a bound would take, and it exists
 because a real 40,056-character send failed, which is the standard a second one
 should meet. A bound must be applied HERE if it is applied at all, so the worker
@@ -458,13 +459,14 @@ def render_packet_with_resolution(
     recorded: one function called at two times is still two invocations, and only
     the digest can say they produced the same bytes.
 
-    `index=None` means NO RECORD INDEX IS WIRED INTO THIS LOOP YET — ctx-03
-    fixed the record SHAPE and deliberately not its location, and nothing has
-    named a directory since. It is rendered as an EMPTY index and SAID SO on the
-    `context_records:` line, so every id the task cites is reported as an
-    unresolved question rather than quietly resolving to nothing. That is one
-    argument away from live: a later round that decides where records live
-    passes an index here and changes nothing else.
+    `index=None` means NO RECORD INDEX IS WIRED INTO THIS LOOP — since ctx-16
+    named `[context] records_dir` that is a deployment which turned records off
+    with `""`, or a caller with no repository to read them from
+    (`cli`'s `context explain`), rather than the ordinary run. It is rendered as
+    an EMPTY index and SAID SO on the `context_records:` line, so every id the
+    task cites is reported as an unresolved question rather than quietly
+    resolving to nothing — and a deployment with an empty record DIRECTORY still
+    reads differently from one with no record mechanism at all.
 
     Never raises for a repository that cannot answer. A base that does not
     resolve, a tree that cannot be listed, a record whose commit is gone — each

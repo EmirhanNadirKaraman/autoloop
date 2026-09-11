@@ -1,11 +1,19 @@
 """The record a context selection is made out of, and how one is read.
 
 ONE RECORD PER FILE, one JSON object per file, in a directory the CALLER
-names. Nothing here decides where those files live: `context_resolver` is pure
-given its inputs the way `context.build_context` is, and wiring a location into
-the loop is ctx-04's. What this module fixes is the SHAPE, so that the index
-and the resolver above it can be reasoned about without re-deciding what a
-record is at every call site.
+names. What this module fixes is the SHAPE, so that the index and the resolver
+above it can be reasoned about without re-deciding what a record is at every
+call site — `context_resolver` stays pure given its inputs the way
+`context.build_context` is.
+
+WHERE THEY LIVE, since ctx-16 answered it: IN THE TARGET REPOSITORY, at
+`[context] records_dir` (`docs/context` by default), read through
+`repository_record_store` below and never written by this loop. Knowledge about
+a project belongs to that project's history, where it is versioned, reviewed and
+travels with the commit it describes. The loop-private `ContextRecordStore` is
+still the general case and still writes; the repository-backed subclass is the
+one production builds, and it refuses every write for the reason its own
+docstring gives.
 
 A record is a claim about SOURCE PATHS at a COMMIT. That pairing is the whole
 design:
@@ -352,14 +360,22 @@ class ContextRecordStore:
     in such a store is out of scope for every task, and the closeout files its
     follow-up instead of writing anything.
 
-    **`directory` and `repo_prefix` are two facts, not one, and the directory
-    may not be inside the observed checkout.** That is port-01's rule reaching a
-    new writer, and `orchestrator._store_is_inside_the_observed_checkout` is
-    where it is enforced: a record written into the observed tree is an
-    uncommitted file this loop cannot commit, and the next write-capable
-    dispatch refuses to start against the dirty tree it leaves
-    (`primary_checkout_dirty`, loop-fatal). So the files live outside it and the
-    prefix says what they are CALLED in it, which is all the scope check needs.
+    **`directory` and `repo_prefix` are two facts, not one, and a WRITING
+    store's directory may not be inside the observed checkout.** That is
+    port-01's rule reaching a new writer, and
+    `orchestrator._store_would_write_inside_the_observed_checkout` is where it is
+    enforced: a record written into the observed tree is an uncommitted file this
+    loop cannot commit, and the next write-capable dispatch refuses to start
+    against the dirty tree it leaves (`primary_checkout_dirty`, loop-fatal). So a
+    store of THIS class lives outside the tree and the prefix says what its files
+    are CALLED in it, which is all the scope check needs.
+
+    The qualification is `writes_directly` below, and it is the difference
+    `RepositoryContextRecordStore` exists to make: a store that cannot write
+    cannot leave an uncommitted file, so it may read a directory inside the
+    observed checkout. Reading never dirties a tree, and the detector still
+    watches that tree completely — nothing is excluded from it, which is the
+    property port-01 moved `state_dir` out to get.
 
     Deliberately NOT a loader: `load_records` above is the one reader, and
     `context_index.load_index` is the one place the loop builds an index out of
@@ -367,9 +383,18 @@ class ContextRecordStore:
     directory".
     """
 
+    #: Does `write` on this store put bytes on disk? TRUE here — a store of this
+    #: class is the loop's own private directory and writing to it is the whole
+    #: point — and FALSE on `RepositoryContextRecordStore`, whose records are
+    #: repository files a reviewed round authors. Every caller that asks reads it
+    #: through ONE accessor (`orchestrator._store_writes_directly`), which
+    #: defaults an object that does not answer to WRITABLE: an unknown store is
+    #: treated as one that would dirty a tree, which is the refusing direction.
+    writes_directly = True
+
     def __init__(self, directory, repo_prefix: str = ""):
         self.directory = Path(directory)
-        self.repo_prefix = _clean_repo_prefix(repo_prefix)
+        self.repo_prefix = clean_repo_prefix(repo_prefix)
 
     @staticmethod
     def filename_for(record_id: str) -> str:
@@ -459,6 +484,85 @@ class ContextRecordStore:
         return path
 
 
+class RepositoryContextRecordStore(ContextRecordStore):
+    """Records that live IN THE TARGET REPOSITORY — versioned, reviewed and
+    travelling with the commit they describe — and therefore never written by
+    this loop directly (ctx-16).
+
+    **WHY THE REPOSITORY.** ctx-02 designed `docs/context`, ctx-12 says a
+    round's context must come from the target CHECKOUT AND COMMIT, and
+    ctx-10/ctx-11 speak of a repository installing and proving a context
+    contract. All three mean the same thing: the knowledge is about the project,
+    so it belongs to the project's history rather than to this loop's state
+    directory. A record beside `state_dir` would be unversioned, unreviewed, and
+    would not survive the loop being pointed at a different checkout.
+
+    **WHY IT CANNOT WRITE, and why that is the design rather than a limitation.**
+    `directory` here is inside a checkout, so a write would leave a file the
+    closeout cannot commit — it runs AFTER the push has landed, so there is no
+    commit left to put it in — and the next write-capable dispatch refuses to
+    start against the dirty tree (`primary_checkout_dirty`, loop-fatal). The
+    answer is not to write more carefully: it is that a record is a claim, and a
+    claim this repository keeps goes in through review like every other one. So
+    `write` refuses unconditionally and the closeout names the record in the ONE
+    narrow follow-up task `context_packet.follow_up_request` files, whose
+    `approved_paths` are exactly the record files it would touch. The agent of
+    that round writes them, a reviewer reads them, and they are committed.
+
+    The refusal lives HERE, in the class, and not only in the caller that knows
+    about `writes_directly`: a guard that is one forgotten branch away from
+    dirtying the observed checkout is a guard that switches itself off the first
+    time somebody adds a second call site.
+    """
+
+    #: See `ContextRecordStore.writes_directly`. FALSE, and `write` below
+    #: enforces it independently — the flag tells a caller what will happen, the
+    #: method makes it true.
+    writes_directly = False
+
+    def write(self, record: ContextRecord, filename: str) -> Path | None:
+        """Always `None` — this store never puts bytes in a checkout.
+
+        `None` is the value `ContextRecordStore.write` already answers for every
+        refusal, so a caller that does not know about `writes_directly` still
+        treats the record as one that was not written and still owes it to the
+        follow-up. The difference the caller SHOULD make is the reason it reports
+        (a deliberate deferral is not a failed write), and
+        `orchestrator._close_out_context` makes it before ever calling this.
+        """
+        return None
+
+
+def repository_record_store(checkout_root, records_dir) -> RepositoryContextRecordStore | None:
+    """The record store for `records_dir` inside `checkout_root`, or `None`.
+
+    THE ONE place a repository-relative `[context] records_dir` becomes a
+    directory on disk, so the packet a round is given and the closeout that
+    grades it cannot be pointed at two different trees by two callers agreeing.
+
+    `None` — read everywhere above as "no record store is wired into this loop"
+    and reported as such — for the three inputs that cannot name a location:
+
+    * an empty `records_dir`, which is the supported way to turn the mechanism
+      off (`[context] records_dir = ""`);
+    * a `records_dir` that is not a repository-relative directory path. Cleaned
+      by `clean_repo_prefix`, the same rule a record's own `source_paths` are
+      held to, because this string is also what `tasks.unauthorized_paths` is
+      handed;
+    * a checkout root that is not an ABSOLUTE path. `Path("")` is `Path(".")`,
+      so a relative root would silently read records out of whatever directory
+      the process happens to be standing in — the failure `cli`'s `context
+      explain` already guards the same way.
+    """
+    prefix = clean_repo_prefix(records_dir)
+    if not prefix or checkout_root is None:
+        return None
+    root = Path(checkout_root)
+    if not str(root) or not root.is_absolute():
+        return None
+    return RepositoryContextRecordStore(root / prefix, prefix)
+
+
 def _is_plain_name(name: str) -> bool:
     """One file name, addressing nothing but a file in the directory it is
     given: no separator, no '.'/'..', no leading dot, and nothing empty."""
@@ -467,7 +571,7 @@ def _is_plain_name(name: str) -> bool:
     return not any(sep in name for sep in ("/", "\\", "\0"))
 
 
-def _clean_repo_prefix(prefix) -> str:
+def clean_repo_prefix(prefix) -> str:
     """`prefix` as a repository-relative directory path, or `""`.
 
     The same shape `_check_source_path` demands of a record's own paths, and for
