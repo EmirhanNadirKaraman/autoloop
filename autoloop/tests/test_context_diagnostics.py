@@ -52,7 +52,7 @@ from autoloop import policy as policy_module
 from autoloop.audit.reconcile import reconcile
 from autoloop.audit.taskgen import generate_tasks
 from autoloop.config import load_config
-from autoloop.context_index import build_index, load_index
+from autoloop.context_index import build_index
 from autoloop.context_packet import (
     DIGEST_LABEL,
     EXPLAIN_BOUNDS_HEADING,
@@ -327,12 +327,19 @@ class Deployment:
             assert self.record_store.write(item, f"{item.id}.json") is not None
         # THE INDEX THE DISPATCH WOULD USE, built exactly as
         # `orchestrator._context_record_index` builds it for a LOOP-PRIVATE
-        # store (`Orchestrator(context_records=...)`): that store's `load`
-        # reads its own directory whatever revision it is handed, which is
-        # `load_index` over it. `None` when no store is wired — which since
-        # ctx-16 is a deployment that set `[context] records_dir = ""`, and is
-        # still what `context explain` itself re-renders with.
-        index = load_index(self.record_store.directory) if self.records else None
+        # store (`Orchestrator(context_records=...)`): `store.load(worktree_git,
+        # base)`, which reads the store's own directory whatever revision it is
+        # handed and resolves each record's commit through the WORKER's gateway
+        # (ctx-14) — the two shas above are minted there, so they resolve, and a
+        # `load_index` with no gateway would refuse every record for citing
+        # them. `None` when no store is wired — which since ctx-16 is a
+        # deployment that set `[context] records_dir = ""`, and is still what
+        # `context explain` itself re-renders with.
+        index = (
+            build_index(*self.record_store.load(gateway(self.worker), self.base))
+            if self.records
+            else None
+        )
         self.task = task(task_id, cite=cite)
         TaskStore(self.config.tasks_file).save(TaskRegistry([self.task]))
         self.execution = execution_for(self.worker, self.base, task_id)
@@ -734,9 +741,9 @@ def test_the_explanation_survives_the_record_store_it_was_dispatched_with_changi
     was given after that store is gone.
 
     This is the case a re-resolution cannot answer and must not pretend to. The
-    dispatch resolved against a real directory (`load_index` over a
-    `ContextRecordStore`, which is what `orchestrator._context_record_index`
-    gets from a loop-private store's `load` under
+    dispatch resolved against a real directory (`ContextRecordStore.load`
+    through the worker's gateway, which is what
+    `orchestrator._context_record_index` gets from a loop-private store under
     `Orchestrator(context_records=...)`); the command wires none, because no
     config names one it can be sure of. So the two resolutions
     disagree by construction — and the command reports the ROUND's selected,

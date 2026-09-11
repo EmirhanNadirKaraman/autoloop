@@ -2143,6 +2143,19 @@ different repairs and must not look alike. `[context] records_dir = ""` is the
 supported way to get the first one back, and only then does
 `no_context_record_store` appear.
 
+**"Unreadable" also means "refused" (ctx-14).** A record that parses is still
+not loaded when a citation it makes cannot be resolved: a `last_verified_commit`
+the worker's object database does not hold, a `superseded_by` or `related_ids`
+entry no record file in the directory declares, or a kind short of the fields
+its claim is made of (`docs/SCHEMA.md`, "Context record"). Each is one line in
+the packet's `unresolved questions` naming the file and the citation, the
+record is in no index, and nothing under it is selected — the same shape a file
+that will not parse has always had. A gateway that cannot answer for a commit
+(git dying, the worker directory gone, no gateway at all) refuses the records
+that cite one rather than passing them, and the records that cite none still
+load. So a rebased or garbage-collected history shows up as N refused records
+naming the sha, not as a selection that quietly lost them.
+
 **A push an earlier process never finished gets no closeout.** The one call site
 is `_dispatch_task_push`; the stale-record reconciliation that completes such a
 push (`_reconcile_published_execution`) is archiving the execution record and
