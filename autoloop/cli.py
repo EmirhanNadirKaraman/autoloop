@@ -500,18 +500,21 @@ def _recorded_out_of_scope_paths(execution_store: TaskExecutionStore):
 #: What the CONTEXT RECORD tier gets to say in this deployment, because it has
 #: no producer to say anything else (ctx-06).
 #:
-#: `context_packet.render_context_packet` says the same of the packet it renders,
-#: and `docs/SCHEMA.md` records why: ctx-03 fixed the record SHAPE and
-#: deliberately not its location, so nothing in this loop names a directory to
-#: read records from. Said OUT LOUD, into the audit report, rather than left as
-#: an empty tier — a generator that compared nothing and a generator that
-#: compared a tier which agreed must not look alike to a reviewer. This is the
-#: same "nothing was read is not nothing was found" distinction `repo_evidence`
-#: draws, one tier up.
+#: STILL TRUE AFTER ctx-16, and narrowed to say why. That round wired a record
+#: store into the DISPATCH and the CLOSEOUT — `orchestrator._context_record_store`
+#: over `[context] records_dir` — and did not reach the audit's task generator,
+#: which takes its inputs from `_planning_sources` below and is handed no index
+#: there. So an index now exists in the loop and this tier is still not fed one:
+#: those are different sentences and the note says the second. Said OUT LOUD,
+#: into the audit report, rather than left as an empty tier — a generator that
+#: compared nothing and a generator that compared a tier which agreed must not
+#: look alike to a reviewer. This is the same "nothing was read is not nothing
+#: was found" distinction `repo_evidence` draws, one tier up.
 CONTEXT_TIER_UNWIRED_NOTE = (
-    "the CONTEXT RECORD tier was not compared: no context record index is wired "
-    "into this loop (ctx-03 fixed the record shape and not its location), so "
-    "whether a record disagrees with this audit is UNKNOWN, not absent."
+    "the CONTEXT RECORD tier was not compared: the audit's task generator is fed "
+    "no context record index (ctx-16 wired one for a round's packet and its "
+    "closeout, and not for this tier), so whether a record disagrees with this "
+    "audit is UNKNOWN, not absent."
 )
 
 
@@ -592,6 +595,23 @@ def _build_executor(
     # ALREADY acted on the flag, which is what survives `resume` deleting the
     # file mid-kill — see `implement_executor.AbortLedger`.
     abort_ledger = AbortLedger()
+    # THE WIRE that makes `[audit] action_log` reach a real round, resolved ONCE
+    # here — the only place that has both the operator's flag and the runner
+    # construction sites in one scope — and passed explicitly below.
+    #
+    # `None` when the flag is off, which is the default and is every config file
+    # written before the key existed: the runners then behave byte for byte as
+    # they did before the setting existed. A parameter rather than a
+    # process-wide default armed by `load_config`, so what a runner does is
+    # readable at the call site instead of depending on which config this
+    # process happened to read last.
+    #
+    # It reaches the WRITE-CAPABLE runners only. The read-only audit runners
+    # below are deliberately passed nothing: they are
+    # `subprocess.run(capture_output=True)`, so their output does not exist
+    # until the process has exited, and a file opened for them could only ever
+    # be written at the end — a log that reads like a live stream and is not.
+    action_log_dir = config.action_log_dir if config.audit.action_log else None
     audit_runner = ClaudeCliRunner(
         repo_root=git.repo_root,
         command=config.audit.agent_command,
@@ -643,6 +663,11 @@ def _build_executor(
             git.repo_root,
             command=config.audit.agent_command,
             timeout_seconds=config.audit.agent_ceiling_seconds,
+            # Passed here too although this binding is never reached, so the
+            # two write-capable construction sites do not disagree about what
+            # the operator asked for — an asymmetry here would be read as a
+            # decision rather than as the dead code it is.
+            action_log_dir=action_log_dir,
         ),
         # Same validation commands and agent CLI settings as the audit —
         # there is no separate `[implement]` config section (kept minimal;
@@ -682,6 +707,12 @@ def _build_executor(
             # keeps the round classified as an abort even if the flag is cleared
             # before the executor re-reads it.
             abort_ledger=abort_ledger,
+            # THE production wiring for `[audit] action_log`. This is the runner
+            # a task's round really runs, and it is supervised — so with the
+            # flag on the round's output is appended to this directory WHILE the
+            # agent is still working, which is the whole point of the setting.
+            # `None` with the flag off, and nothing is opened or printed.
+            action_log_dir=action_log_dir,
         ),
         # And once more on the executor itself, for the OTHER process group an
         # abort has to reach: the validation subprocess. The agent runs the
@@ -4785,11 +4816,14 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
     stores the text beside it. That digest is the anchor this command reports
     against: the answer is the stored packet that hashes to it, or a re-render
     that reproduces it, and `context_packet.provenance_verdict` says which was
-    available. It is NOT "whatever a fresh resolution produces now" — the record
-    directory can change between the dispatch and the question, and a loop
-    embedded with its own record store (`Orchestrator(context_records=...)`,
-    which no config names and this command therefore cannot see) resolved against
-    a directory this process cannot read.
+    available. It is NOT "whatever a fresh resolution produces now" — a
+    loop-private record directory can change between the dispatch and the
+    question, and a loop embedded with its own store
+    (`Orchestrator(context_records=...)`, which no config names) resolved against
+    a directory this process cannot read at all. (The repository-backed store
+    ctx-16 wires reads git objects at the round's own base, which do not change;
+    this command still re-renders with no index, because config alone cannot
+    tell it WHICH store the loop dispatched with — see the comment below.)
 
     **IT CALLS THE RESOLVER; IT DOES NOT REIMPLEMENT ONE.** The re-resolution it
     prints beside the recorded packet comes out of
@@ -4872,14 +4906,22 @@ def _cmd_context_explain(args: argparse.Namespace) -> int:
                 task,
                 execution,
                 GitGateway(Path(worker), PolicyEngine(config.policy)),
-                # NO RECORD INDEX IS WIRED INTO THIS COMMAND, and none can be:
-                # no config names a record directory, so there is nothing here to
-                # read. That is exactly why this re-render is a COMPARISON and the
-                # recorded packet is the answer — a loop embedded with
-                # `Orchestrator(context_records=...)` dispatched against a
-                # directory this process cannot see, and presenting a `None`-index
-                # re-resolution as that round's selection would be the
-                # disagreement this command must not be able to produce.
+                # NO RECORD INDEX IS WIRED INTO THIS COMMAND, deliberately, and
+                # ctx-16 naming `[context] records_dir` does not change that.
+                # The loop reads the repository's records out of git at the
+                # round's own base (`orchestrator._context_record_index`), so
+                # those bytes have NOT moved on — but this command cannot tell
+                # from config alone whether the loop dispatched with that store
+                # or with an explicit loop-private one it cannot read
+                # (`Orchestrator(context_records=...)`), and guessing the
+                # repository store would present a re-resolution the round may
+                # never have had under the heading of what it actually got. That
+                # is exactly why this re-render is a COMPARISON and the RECORDED
+                # PACKET is the answer; presenting any re-resolution as that
+                # round's selection would be the disagreement this command must
+                # not be able to produce. Which index the loop dispatched with is
+                # therefore a labelled limit of the comparison, printed with it,
+                # and never a silent substitution.
                 None,
                 max_records=config.context.max_records,
             )
@@ -7893,11 +7935,30 @@ def _candidate_base_ancestry(config, record, git=None) -> tuple[str, str]:
 
 
 def _merge_window_blockers(
-    config, seen=None, git=None, *, obligations: list | None = None
+    config,
+    seen=None,
+    git=None,
+    *,
+    obligations: list | None = None,
+    holders: list | None = None,
 ) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
     the window is open.
+
+    **`holders` is the same list, keyed by WHO** — one
+    `{"task_id", "reason"}` per blocker, appended when the caller passes a list,
+    in the order the reasons themselves are produced. It exists because every
+    reason string here already names its task and no reader could get at it
+    without parsing prose the loop itself wrote, which is reading your own
+    output back as evidence. `dashboard.merge_window` passes one so the panel can
+    say WHICH task holds the window shut rather than only that something does
+    (ops-01). Out-param rather than a third return value for the reason
+    `obligations` is one: every existing caller keeps the two-tuple it already
+    unpacks. The EXECUTING-phase reason — produced at `lanes = 1` only, see
+    below — is a holder too, with an empty `task_id`: a shut window with no
+    holders listed reads as a bug in the panel, and "a lane is mid-write" is a
+    real answer to "who".
 
     THE single predicate for "may the branch head move". `auto_merge.py` calls
     this rather than re-deriving the same conditions: a second implementation
@@ -7997,22 +8058,66 @@ def _merge_window_blockers(
     after. A caller that passes nothing (the operator's `merge-window`, the
     sweep's own gate call) still sees the note, and still sees every blocker.
 
-    Three things are deliberately NOT relaxed at any lane count:
+    Two things are deliberately NOT relaxed at any lane count:
 
     * `BASE_UNVERIFIED` stays a BLOCKER. "Cannot be shown to be bound to the
       head" is not "is bound to the head, and carriable": nothing can be
       carried forward past a base git will not place, so the fail-closed arm
       keeps failing closed.
-    * The EXECUTING-phase reason below is untouched. A lane mid-write is not
-      a candidate obligation and has no carry-forward to owe.
     * Every exemption above (terminal state, published, retired, orphaned,
       already-behind) is evaluated first and unchanged, so a record that never
       reached the bound-candidate arm cannot become an obligation.
 
+    **AND AT `lanes > 1` THE EXECUTING-PHASE REASON BECOMES THE SAME
+    OBLIGATION** (conc-13, and the same Decision 6 conversion one clause
+    along). It was the second fleet-wide mutual exclusion in this function and
+    it was wrong twice over. UNSOUND: `_load_state` reads LANE 0's file
+    (`state.lane_paths`), so it spoke for the fleet from one lane and could not
+    notice lanes 1..N−1 mid-write at all. STARVING: lane 0 is executing nearly
+    all the time, so at N lanes the window essentially never opened — measured
+    2026-09-09, a fleet on two lanes for 5.5 hours that completed two tasks
+    while `autoloop/mainline` did not advance once.
+
+    The safety that reason was buying is KEPT, by machinery more precise than
+    it is rather than by the clause. "An agent may be mid-write" guards against
+    moving the base under a round that is writing, and every lane state in
+    which that matters is already answered per candidate:
+
+    * A round holding a REVIEWED candidate bound to the head is the obligation
+      arm above. It is marked `rereview_owed_base` BEFORE the head moves,
+      carried onto the new head after
+      (`orchestrator._carry_reviewed_candidate_past`, a merge that rewrites
+      nothing), and refused at push time on its old approval —
+      `PostcommitBinding.candidate_sha`, `candidate_tree_sha` and
+      `packet_sha256` all disagree once the candidate advances, and the marker
+      refuses it even when they do not (`_dispatch_task_push`, which re-loads
+      the record from disk, so the mark another lane wrote is the one it reads).
+    * A round whose worker tree is DIRTY — an agent literally mid-write — is
+      precondition 4 of that carry-forward. It refuses rather than merging over
+      the residue ("merging over them could destroy work no reviewer has
+      seen"), and `auto_merge._park_carry_forward_refused` parks
+      `task_base_behind_head` beside it. The worker repository and the record
+      are left exactly as they were, which is the same answer
+      `_rebase_execution_if_stale` gives from the other side.
+    * A round with no candidate YET is skipped above for want of a
+      `candidate_sha`, and its worker is a separate clone
+      (`worker_env.WorkerRepoManager` runs `git init` + a local fetch, never a
+      linked worktree) that a merge into THIS checkout never touches. Its base
+      moving is what `_rebase_execution_if_stale`'s unreviewed arm re-bases at
+      the next dispatch, unchanged.
+    * A base git cannot place is `BASE_UNVERIFIED`, and still a blocker.
+
+    So above one lane this function READS NO LANE'S STATE FILE AT ALL. That is
+    Decision 7's rule rather than a convenience — `health._judge` does exactly
+    this, for exactly this reason — and it is what makes the narrowing sound as
+    well as unblocking: `state.json` is lane 0's, so a phase read from it could
+    only ever be one lane's, and reporting it as the fleet's would be worse
+    than reporting nothing.
+
     At `lanes = 1` — the shipped default, and the acceptance criterion every
-    candidate in that plan carries — `obligations` is never appended to and the
-    reason string below is the one this function has always produced, byte for
-    byte.
+    candidate in that plan carries — `obligations` is never appended to, lane
+    0's state file is read exactly where it always was, and BOTH reason strings
+    below are the ones this function has always produced, byte for byte.
 
     Nothing here changes the ALL-OR-NOTHING sweep. `merge_sweep` checks this
     predicate once for the whole backlog and merges every branch or none; this
@@ -8028,6 +8133,15 @@ def _merge_window_blockers(
     reasons: list[str] = []
     notes: list[str] = []
 
+    def hold(task_id: str, reason: str) -> None:
+        """Record one blocker, and who holds it. The ONE place a reason is
+        appended, so `holders` cannot fall out of step with `reasons` by a
+        later edit adding a third `reasons.append` and forgetting the other
+        half."""
+        reasons.append(reason)
+        if holders is not None:
+            holders.append({"task_id": task_id, "reason": reason})
+
     # `state_dir` is routinely a RELATIVE path (`.autoloop` in the shipped
     # config), so it resolves against the caller's cwd. Run from anywhere but
     # the checkout — a sibling worktree, a cron wrapper with its own working
@@ -8036,10 +8150,12 @@ def _merge_window_blockers(
     # exists to prevent, arrived at by reading the wrong directory. Hit while
     # dry-running this very change from a worktree on 2026-08-04.
     if not config.state_dir.is_dir():
-        return [
+        hold(
+            "",
             f"state directory {config.state_dir} does not exist (resolved from "
-            f"{Path.cwd()}) — nothing could be read, so nothing can be called safe"
-        ], notes
+            f"{Path.cwd()}) — nothing could be read, so nothing can be called safe",
+        )
+        return reasons, notes
 
     _, registry = _load_tasks(config)
     executions = sorted(config.state_dir.glob("executions/*.json"))
@@ -8169,7 +8285,8 @@ def _merge_window_blockers(
                 "current approval until a new review has been asked for"
             )
             continue
-        reasons.append(
+        hold(
+            task_id,
             f"task {task_id} has a candidate ({candidate}) bound to base "
             f"{base} — {why_not}; "
             + (
@@ -8179,12 +8296,26 @@ def _merge_window_blockers(
                 # "cannot be shown to be", and the two must not read alike.
                 else f"{detail}, so it is treated as bound to the head and "
                 "merging would strand it"
-            )
+            ),
         )
 
-    _, state = _load_state(config)
-    if state is not None and Phase(state.phase) is Phase.EXECUTING:
-        reasons.append("a phase is executing — an agent may be mid-write")
+    # THE EXECUTING-PHASE REASON, AND THE ONE OTHER LANE-DEPENDENT LINE HERE
+    # (conc-13). `_load_state` resolves LANE 0's state file, which IS the whole
+    # loop at one lane and is one lane of N above that — so this question is
+    # asked only where its answer can be about the loop. Above one lane it is
+    # not asked at all, deliberately and not by omission: see the docstring's
+    # "AND AT `lanes > 1` THE EXECUTING-PHASE REASON BECOMES THE SAME
+    # OBLIGATION" for the lane state each of the fleet's rounds is in when the
+    # base moves under it, and which guard answers it. Surveying every lane and
+    # reporting a note instead was considered and refused — it would make this
+    # predicate's output depend on N state files it has no need of, with its own
+    # unreadable-lane failure mode, to say something no caller may act on
+    # (Decision 7: reporting one lane's phase as the system's is worse than
+    # reporting nothing).
+    if config.concurrency.lanes <= 1:
+        _, state = _load_state(config)
+        if state is not None and Phase(state.phase) is Phase.EXECUTING:
+            hold("", "a phase is executing — an agent may be mid-write")
 
     return reasons, notes
 
@@ -8203,6 +8334,16 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
 
         git switch -c fix/whatever && ...work...
         python -m autoloop merge-window --wait && git switch <base> && git merge --ff-only fix/whatever
+
+    THE OPEN LINE IS LANE-DEPENDENT, because what OPEN means is. At one lane it
+    is the sentence it has always been. Above one lane neither of its two
+    clauses would be true: a candidate bound to the head is reported as owing a
+    re-review rather than blocking (conc-03), and no lane's phase is read at all
+    (conc-13) — so printing "no unpublished candidate, no executing phase"
+    there would be this command asserting exactly the two things it stopped
+    checking, which is the defect `health.py`'s own held-sweep paragraph was
+    corrected for in the same round. The notes below still name every candidate
+    that owes one.
     """
     config = load_config(args.config)
     deadline = time.monotonic() + args.timeout
@@ -8210,7 +8351,15 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
     while True:
         reasons, notes = _merge_window_blockers(config, seen)
         if not reasons:
-            print("merge window OPEN — no unpublished candidate, no executing phase")
+            if config.concurrency.lanes > 1:
+                print(
+                    f"merge window OPEN — at {config.concurrency.lanes} lanes: no "
+                    "candidate that cannot be carried past this head, and no "
+                    "lane's phase was read (any candidate bound to the head owes "
+                    "a re-review; see the notes below)"
+                )
+            else:
+                print("merge window OPEN — no unpublished candidate, no executing phase")
             for note in notes:
                 print(f"  note: {note}")
             return 0

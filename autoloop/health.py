@@ -60,9 +60,28 @@ Signals, and why these rather than the obvious ones:
   and clears itself, so the field is populated whenever a hold is visible but
   only escalates past `DEFAULT_HELD_SWEEP_HOURS` — the alternative is a field
   that goes red on every ordinary hold and gets ignored exactly like the log
-  line did. Deliberately NOT the same question as a shut merge window: a window
+  line did. Deliberately NOT the same question as a shut merge window — and
+  since conc-13 that distinction has to name a lane count, because the sentence
+  it used to end on was true at 1 and false at N. At `lanes = 1` a window
   closed because a phase is executing clears in minutes and is not reported
-  here at all.
+  here at all. ABOVE one lane that reason is no longer produced at all:
+  `cli._merge_window_blockers` reads no lane's state file there, precisely
+  because reading lane 0's phase for the fleet made "executing" the STEADY
+  state rather than a transient one — two lanes ran 5.5 hours on 2026-09-09,
+  completed two tasks, and `autoloop/mainline` did not advance once, with
+  nothing anywhere saying so.
+
+  **THAT REMOVES A CAUSE AND NOT THE BLIND SPOT, and this paragraph must not
+  be read as claiming otherwise.** A sweep that
+  keeps DEFERRING for some other reason — a `BASE_UNVERIFIED` candidate, the
+  merge token held by a sibling lane, a remote base that moved — is still
+  reported nowhere but the transcript, and `held_merge_sweep` does not see it:
+  `SWEEP_DEFERRED_EVENT` is in `merge_sweep.SWEEP_CLEARED_EVENTS`, so a
+  deferral CLEARS this signal rather than ageing it (deliberately — it proves
+  the enumeration found nothing it could not judge). This field ages on a task
+  the sweep could not JUDGE and on nothing else. A stalled multi-lane backlog
+  whose cause is a deferral is therefore still a hole here; conc-13 removed one
+  cause of it and did not give it a signal.
 
 * **Silence is awake time, not wall-clock.** A laptop that sleeps for hours
   is indistinguishable from a hung loop if silence is measured on the wall
