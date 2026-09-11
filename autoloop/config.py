@@ -14,6 +14,7 @@ from pathlib import Path
 import tomllib
 
 from .codex.sandbox import DEFAULT_SANDBOX_ARGS
+from .context_records import clean_repo_prefix
 from .errors import ConfigError
 from .notify import (
     NOTIFY_DEFAULT_STATUSES,
@@ -504,6 +505,57 @@ class AuditConfig:
     #: asked for; the safety comes from the widening rules (anything the graph
     #: cannot resolve runs the full suite), not from leaving the flag off.
     test_selection: str = TEST_SELECTION_REACHABLE
+    #: Stream the agent's ACTION LOG — everything the agent PROCESS writes to
+    #: stdout and stderr — to a per-round file under
+    #: `AutoloopConfig.action_log_dir`, appended WHILE the round is still
+    #: running, so a live round can be watched instead of waited out.
+    #:
+    #: OFF BY DEFAULT, and that default is the compatibility contract: absent —
+    #: which is every config file written before this key existed, since the
+    #: template is copied once and never re-read — no directory is created, no
+    #: file is opened, nothing is printed on stderr, and the `AgentResult` a
+    #: round is parsed from is byte for byte what `subprocess.run(
+    #: capture_output=True)` produced before this setting existed. Turning it
+    #: back off restores that exactly; nothing here forecloses either reading.
+    #:
+    #: DEFAULT-OFF IS NOT UNWIRED, and the two are different failures. A flag
+    #: that no production caller reads is inert whatever its default says, so
+    #: the value belongs on the runner the loop actually runs
+    #: (`audit.agents.ClaudeCliRunner`, via its `action_log_dir=`) rather than
+    #: on a mechanism nothing reaches.
+    #:
+    #: HOW IT GETS THERE (stream-01b, 2026-09-10): `cli._build_executor`
+    #: computes `config.action_log_dir if config.audit.action_log else None`
+    #: once and passes it to `implement_executor.implement_agent_runner`, which
+    #: forwards it to the `ClaudeCliRunner` it builds. That factory is the ONE
+    #: place a write-capable runner is constructed and the runner a real round
+    #: runs, so a `true` here reaches the next round and a `false` leaves every
+    #: runner exactly as it was.
+    #:
+    #: EXPLICITLY PASSED, never armed as a side effect of loading a config.
+    #: `load_config` mutates nothing outside the object it returns: a
+    #: process-wide default set at load time would make every runner's
+    #: behaviour depend on which config the process read LAST, which is not
+    #: something a reader of a construction site could predict.
+    #:
+    #: IT DOES NOT REACH THE AUDIT SUBAGENTS, deliberately — `cli.
+    #: _build_executor` passes them no directory at all. They are bounded by an
+    #: elapsed timeout rather than supervised, so they run under
+    #: `subprocess.run(capture_output=True)` and their output does not exist
+    #: until the process has exited: a file opened for them could never be the
+    #: live stream this setting offers, only one that looks like it.
+    #:
+    #: IT IS AN ACTION LOG. It records what the agent process PRINTED — its tool
+    #: calls, reads, writes and commands as the CLI reports them. It is not the
+    #: model's reasoning, it is not a thinking stream, and no surface that shows
+    #: it may call it one.
+    #:
+    #: IN `[audit]` rather than a new `[implement]` section for the reason
+    #: `cli._build_executor` already gives about `validation_commands` and
+    #: `agent_command`: this section is where the loop's agent-CLI settings
+    #: live, for BOTH the read-only audit subagents and the write-capable
+    #: implement subagent, and there is no `[implement]` section to put it in.
+    action_log: bool = False
 
 
 @dataclass(frozen=True)
@@ -717,16 +769,34 @@ class ConcurrencyConfig:
 DEFAULT_CONTEXT_MAX_RECORDS = 25
 
 
+#: The default `[context] records_dir` — where context records live IN THE
+#: TARGET REPOSITORY (ctx-16), repository-relative.
+#:
+#: `docs/context` is ctx-02's own spelling, kept rather than re-chosen: the
+#: records are prose-adjacent project knowledge and `docs/` is where this
+#: repository already keeps that. ON BY DEFAULT, because a store that only
+#: exists when somebody remembered to name it is the "thirteen tasks of
+#: machinery, no store" state this default was added to end; `records_dir = ""`
+#: is the supported way to turn the mechanism off and get the pre-ctx-16
+#: behaviour back, and the closeout says `no_context_record_store` when it is.
+DEFAULT_CONTEXT_RECORDS_DIR = "docs/context"
+
+
 @dataclass(frozen=True)
 class ContextConfig:
-    """`[context]` — how much context one selection may carry (ctx-03).
+    """`[context]` — WHERE a selection's records live, and how much of them one
+    selection may carry (ctx-03, ctx-16).
 
-    ONE key, and deliberately one: the resolver
-    (`context_resolver.resolve_context`) is pure given its inputs and takes its
-    record directory, its seed list and its revision as ARGUMENTS. Adding a
-    `records_dir` here would put half the resolver's inputs in a config file
-    and half in a call, and the wiring that decides where records live is
-    ctx-04's.
+    `records_dir` is a REPOSITORY-RELATIVE path and not a filesystem one, which
+    is what keeps the resolver pure: `context_resolver.resolve_context` still
+    takes its index, its seed list and its revision as ARGUMENTS, and this key
+    only says which directory OF THE TARGET REPOSITORY
+    `context_records.repository_record_store` turns into that index — read out
+    of git at the round's `task_base_sha`, never off the observed working
+    tree, so the bytes a packet quotes are the bytes of the commit it names. A
+    filesystem path here would let a deployment point the loop at records that
+    belong to no repository, which is the unversioned, unreviewed arrangement
+    ctx-16 chose against.
     """
 
     #: The most records one resolution may return. When it binds, the resolver
@@ -736,6 +806,12 @@ class ContextConfig:
     #: as configured, which is exactly the silent truncation the reporting
     #: exists to prevent.
     max_records: int = DEFAULT_CONTEXT_MAX_RECORDS
+    #: The directory of the TARGET REPOSITORY holding the record files, spelled
+    #: as git spells it. `""` means no record store is wired into the loop at
+    #: all. A value that is not a repository-relative directory path is REFUSED
+    #: at load rather than read as `""`: "this deployment turned records off"
+    #: and "somebody typed an absolute path" must not look alike.
+    records_dir: str = DEFAULT_CONTEXT_RECORDS_DIR
 
 
 #: The longest `[notify].timeout_seconds` this loop will accept. The round pays
@@ -1271,6 +1347,24 @@ class AutoloopConfig:
     @property
     def diagnostics_dir(self) -> Path:
         return self.state_dir / "diagnostics"
+
+    @property
+    def action_log_dir(self) -> Path:
+        """Per-round agent action logs, when `[audit] action_log` is on.
+
+        UNDER `state_dir`, like everything writable the loop keeps between
+        steps, and therefore outside the observed checkout — port-01's rule,
+        and it applies to this file more sharply than to most: the agent's own
+        output written inside the tree `escape_detector` snapshots around every
+        write-capable call would be reported as the agent writing where it may
+        not, which is a `loop_fatal` park caused by watching the round.
+
+        One directory for every task's logs rather than one per task: a file
+        name carries the task and the round (`agents.action_log_round_stamp`),
+        so a flat directory is greppable and an operator tailing a live round
+        needs one `ls -t`.
+        """
+        return self.state_dir / "action-logs"
 
     @property
     def pause_file(self) -> Path:
@@ -2167,13 +2261,16 @@ def _load_release_jitter(raw: dict) -> float:
 
 def _load_context_section(data: dict) -> ContextConfig:
     """`[context]`, validated. Absent means `ContextConfig()` — the default
-    budget, which is every config file written before this section existed.
+    budget and the default record directory, which is every config file written
+    before this section existed and every one written before ctx-16 named a
+    directory.
 
     Shape first, exactly as `_load_concurrency_section` does it: `context = 5`
     written as a bare key gets this loader's own error naming the section
     rather than `_check_keys` reporting the digits as unknown keys. Nothing is
     clamped — a budget the loop would not run is refused, so a typo can never
-    read as configured while a different number binds.
+    read as configured while a different number binds, and the same rule governs
+    `records_dir`: an unusable path is refused rather than degraded to "off".
     """
     raw = data.get("context", {})
     if not isinstance(raw, dict):
@@ -2183,8 +2280,60 @@ def _load_context_section(data: dict) -> ContextConfig:
             f"{DEFAULT_CONTEXT_MAX_RECORDS}`), not as a bare key"
         )
     _check_keys("context", raw, {f.name for f in dataclasses.fields(ContextConfig)})
+    return ContextConfig(
+        max_records=_context_max_records(raw),
+        records_dir=_context_records_dir(raw),
+    )
+
+
+def _context_records_dir(raw: dict) -> str:
+    """`[context] records_dir`, validated — a repository-relative directory, or
+    `""` for "no record store is wired into this loop".
+
+    THE EMPTY STRING IS THE ONLY WAY OFF, and it has to be typed — exactly
+    `""`, compared as such. Every other unusable value raises: an absolute path,
+    a `..` segment, a backslash or a run of whitespace all clean to `""` in
+    `context_records.clean_repo_prefix`, and accepting any of them quietly would
+    turn `records_dir = "/srv/records"` into a loop that reads no records at all
+    while its config file reads as configured — the fail-open shape the whole
+    context roadmap item exists to close. Whitespace-only is refused for the
+    same reason and not read as a spelling of the switch: `"   "` is nobody's
+    decision to turn records off.
+
+    Normalised through the SAME function the store itself uses rather than a
+    second copy of the rule, so the path this answers is the path
+    `tasks.unauthorized_paths` is later handed.
+    """
+    if "records_dir" not in raw:
+        return DEFAULT_CONTEXT_RECORDS_DIR
+    value = raw["records_dir"]
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"context.records_dir must be a string path inside the repository, "
+            f"got {value!r}. Delete the key entirely for the default of "
+            f"{DEFAULT_CONTEXT_RECORDS_DIR!r}, or write \"\" to wire no record "
+            "store at all."
+        )
+    if value == "":
+        return ""
+    cleaned = clean_repo_prefix(value)
+    if not cleaned:
+        raise ConfigError(
+            f"context.records_dir must be a repository-relative directory spelled "
+            f"as git spells it, got {value!r} — no leading '/', no '..' or '.' "
+            "segment, no backslash, and not blank. It names a directory of the "
+            "repository this loop works on, not a directory of the filesystem, "
+            "because the records are versioned and reviewed with that "
+            "repository. Write \"\" — exactly the empty string — to wire no "
+            "record store at all."
+        )
+    return cleaned
+
+
+def _context_max_records(raw: dict) -> int:
+    """`[context] max_records`, validated. Absent is the default budget."""
     if "max_records" not in raw:
-        return ContextConfig()
+        return DEFAULT_CONTEXT_MAX_RECORDS
     value = raw["max_records"]
     # `bool` BEFORE `int`, exactly as `concurrency.lanes` orders it and for the
     # same reason: `True` IS an int and is `>= 1`, so an unguarded check would
@@ -2208,7 +2357,7 @@ def _load_context_section(data: dict) -> ContextConfig:
             "would return no context at all while reading as configured, which "
             "is the silent truncation this setting exists to make impossible."
         )
-    return ContextConfig(max_records=value)
+    return value
 
 
 def load_config(path: Path) -> AutoloopConfig:
@@ -2402,6 +2551,18 @@ def load_config(path: Path) -> AutoloopConfig:
                 + ", ".join(f'"{mode}"' for mode in TEST_SELECTION_MODES)
                 + f", got {selection!r}"
             )
+    # Checked HERE rather than left to be read as truthy, exactly like
+    # `autonomy.enabled` below: TOML happily carries `action_log = "false"`, and
+    # a non-empty string is truthy — so an unchecked value would switch the log
+    # ON for an operator who typed the word rather than the literal, which is
+    # the one direction a default-off flag must never fail in.
+    if "action_log" in audit_data and not isinstance(audit_data["action_log"], bool):
+        raise ConfigError(
+            "audit.action_log must be a boolean (true/false), got "
+            f"{audit_data['action_log']!r} — a non-boolean is refused rather "
+            "than coerced, because the truthy reading would turn the agent "
+            "action log on by accident"
+        )
     audit = AuditConfig(**audit_data)
     # Checked here rather than left to fail at kill time. A stall window at or
     # above the ceiling reads as configured while being unreachable — the
@@ -2449,7 +2610,7 @@ def load_config(path: Path) -> AutoloopConfig:
     concurrency = _load_concurrency_section(data)
     context = _load_context_section(data)
 
-    return AutoloopConfig(
+    config = AutoloopConfig(
         browser=browser,
         policy=policy,
         state_dir=state_dir,
@@ -2469,3 +2630,9 @@ def load_config(path: Path) -> AutoloopConfig:
         concurrency=concurrency,
         context=context,
     )
+    # NO SIDE EFFECT HERE, deliberately, and `[audit] action_log` is the setting
+    # that most invites one. Loading a config file changes nothing outside the
+    # object it returns: `cli._build_executor` reads `audit.action_log` and
+    # `action_log_dir` off this object and passes the answer to the runner
+    # construction sites explicitly. See `AuditConfig.action_log`.
+    return config

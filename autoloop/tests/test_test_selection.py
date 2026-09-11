@@ -54,9 +54,13 @@ full-suite run cannot quietly come back. One test in that block is about the
 INPUT rather than the decision — a round that DELETES a module must hand the
 selector a changed-path set containing it, or the widening that deletion is
 owed never fires and the run narrows blind. A last one is about what the AGENT
-is told: the authoritative run is never WIDER than the agent's own advisory run
-of the same round, which is the containment `advisory_tool_descriptor` promises
-and the only reason a green advisory answer covers the verdict run.
+is told: on a tree that has not moved between the two, the agent's own advisory
+run of the same round and the authoritative run select the SAME tests — the
+containment `advisory_tool_descriptor` promises, and the only reason a green
+advisory answer covers the verdict run. That relation was unconditional while an
+advisory run always took the whole list; val-07 (2026-09-11) selects that run too
+and makes it conditional, and the condition is graded in
+`test_agent_self_validation.py` §12.
 """
 
 from __future__ import annotations
@@ -75,6 +79,7 @@ from autoloop.tasks import TRACKER_PATHS, Task
 from autoloop.validation import (
     TEST_SELECTION_FULL,
     TEST_SELECTION_REACHABLE,
+    TREE_STATE_UNKNOWN,
     _DYNAMIC_IMPORT_CALLS,
     _INTERPRETER_LITERALS,
     _files_referencing,
@@ -82,6 +87,8 @@ from autoloop.validation import (
     _reference_tokens,
     build_import_graph,
     select_validation_commands,
+    tree_states_match,
+    worker_tree_state,
 )
 from autoloop.worktask import TaskExecution
 
@@ -588,6 +595,99 @@ FLOOR_AFTER = 16
 #: read as a narrowing that never happened. That denominator is `SUITE_SIZE`,
 #: imported above — and the ledger saying what every bump was for, which used
 #: to sit right here, moved with it (conc-14).
+#: read as a narrowing that never happened.
+#: 102 -> 103 when wanted-01 added `test_wanted_decision.py` (2026-09-01). The
+#: DENOMINATOR only: the new file reads no tracker and spawns no interpreter, so
+#: neither the docs-only selection nor the floor moved with it.
+#: 103 -> 104 when prov-01 added `test_codex_stdout_verdict.py` (2026-09-01),
+#: for the same reason and with the same effect — 20 and 24 are unchanged.
+#: 104 -> 105 when prov-02 added `test_codex_preflight.py` (2026-09-01). The
+#: DENOMINATOR again: it fakes the invocation boundary rather than spawning
+#: one, and reads no tracker, so 20 and 24 are unchanged once more.
+#: 105 -> 106 when conc-02 added `test_config_concurrency.py` (2026-09-01),
+#: the DENOMINATOR again: it validates `[concurrency]` from `tmp_path` config
+#: strings and reads no tracker, so 20 and 24 are unchanged once more.
+#: 106 -> 107 when conc-05 added `test_lane_state.py` (2026-09-01), the
+#: DENOMINATOR again: it resolves lane paths and lease records under
+#: `tmp_path`, reads no tracker and spawns nothing, so 20 and 24 are unchanged
+#: once more.
+#: 107 -> 108 when conc-06 added `test_fleet_supervisor.py` (2026-09-02), the
+#: DENOMINATOR again: it plans against in-memory registries, reaches its
+#: trackers through `tasks.TRACKER_PATHS` instead of naming one, resolves no
+#: `__file__` and spawns nothing, so 20 and 24 are unchanged once more.
+#: 108 -> 109 when conc-11 added `test_fleet_throttle.py` (2026-09-02), the
+#: DENOMINATOR again: it works on one small JSON record and two orchestrators
+#: under `tmp_path`, names no tracker, resolves no `__file__`, and its only
+#: concurrency is `threading` — which is not a spawn entry point under the rule
+#: above — so 20 and 24 are unchanged once more.
+#: 109 -> 110 when conc-03b added `test_merge_rereview.py` (2026-09-03), the
+#: DENOMINATOR again: it names no tracker, resolves no `__file__`, and its
+#: `run_git` hands an unreadable argv to `subprocess.run` with no interpreter
+#: literal anywhere in the file — so neither term of the opacity rule above
+#: holds and 20 and 24 are unchanged once more.
+#: 110 -> 111 when conc-04b added `test_lane_observed_checkout.py` (2026-09-03),
+#: the DENOMINATOR again: it names `docs/AUTOLOOP.md`, which is not one of the
+#: change-note trackers a docs-only round changes, resolves no `__file__`, and
+#: borrows `gitrepo.run_git` without an interpreter literal of its own — so 20
+#: and 24 are unchanged once more.
+#: 111 -> 112 when ctx-03 added `test_context_resolver.py` (2026-09-03), the
+#: DENOMINATOR again: the one document it names is `autoloop/config.example.toml`
+#: (through its own `__file__`, exactly as `test_config_concurrency.py` does),
+#: which is not one of the change-note trackers a docs-only round changes, and
+#: its `CountingRunner` hands `subprocess.run` an argv this cannot read with no
+#: interpreter literal anywhere in the file — so 20 and 24 are unchanged once
+#: more.
+#: 112 -> 113 when conc-07 added `test_fault_isolation.py` (2026-09-03), the
+#: DENOMINATOR again: the one document it names is `docs/AUTOLOOP.md`, which is
+#: not one of the change-note trackers a docs-only round changes, it resolves no
+#: `__file__`, and it spawns no process at all — so 20 and 24 are unchanged once
+#: more.
+#: 113 -> 114 when conc-08 added `test_lane_death_recovery.py` (2026-09-03), the
+#: DENOMINATOR once again and for conc-07's reason exactly: the one document it
+#: names is `docs/AUTOLOOP.md`, it resolves no `__file__`, and the git it needs
+#: is spawned by `gitrepo.py` rather than by anything this file binds — so 20 and
+#: 24 hold.
+#: 114 -> 115 when conc-10 added `test_fleet_end_to_end.py` (2026-09-08), the
+#: DENOMINATOR again and for conc-07's and conc-08's reason: the one document it
+#: names is `docs/AUTOLOOP.md`, it resolves no `__file__`, and its only
+#: concurrency is `threading` — no repository, no subprocess and no interpreter
+#: literal anywhere in it — so 20 and 24 hold.
+#: 115 -> 116 when ctx-05 added `test_context_packet.py` (2026-09-09), the
+#: DENOMINATOR again. It spells `CLAUDE.md` in an evaluated string — the scope
+#: line a context packet renders unions the trackers in — and is still not a
+#: reader of it, because the rule is a CONJUNCTION and this file resolves no
+#: `__file__`. It spawns no interpreter either (its git comes from
+#: `gitrepo.py`), so 20 and 24 hold.
+#: 116 -> 117 when conc-12 added `test_lane_hold_scheduling.py` (2026-09-09), the
+#: DENOMINATOR again and for conc-10's reason: it names no document at all, it
+#: resolves no `__file__`, and it builds no repository and spawns no process —
+#: its only git is a three-method stub — so 20 and 24 hold.
+#: 116 -> 117 when ctx-07 added `test_context_closeout.py` (2026-09-09), the
+#: DENOMINATOR again. It names no change-note tracker in any evaluated string —
+#: the one it spells is `TRACKER_PATHS`, the identifier, which holds paths rather
+#: than being one — resolves no `__file__` of its own (the source it reads is
+#: reached as an ATTRIBUTE, `sys.modules[...].__file__`, which is not an
+#: `ast.Name`), and its git comes from `gitrepo.py`, so 20 and 24 hold.
+#: 118 -> 119 when ctx-08 added `test_context_diagnostics.py` (2026-09-09), the
+#: DENOMINATOR again and for the same reason: it names no change-note tracker in
+#: any evaluated string, resolves no `__file__`, and its git comes from
+#: `gitrepo.py`, so 20 and 24 hold.
+#: 119 -> 120 when review-01b added `test_impossible_scope.py` (2026-09-10), the
+#: DENOMINATOR again. It DOES spell `docs/SUMMARY.md` and `docs/TESTS.md` in
+#: evaluated strings — its negative fixtures are three real notes copied out of
+#: the first — and is still not a reader of either, because the rule is a
+#: CONJUNCTION and this file resolves no `__file__`. It quotes `python3 -m
+#: autoloop.browser.chrome_restart` inside those fixtures too and is still not
+#: opaque: `_INTERPRETER_LITERALS` is matched against the WHOLE constant, a
+#: sentence containing the word is not equal to it, and the file reaches no
+#: `subprocess` entry point at all (its git comes from `gitrepo.py`). So 20 and
+#: 24 hold.
+#: 119 -> 120 when stream-01b added `test_agent_action_log.py` (2026-09-10), the
+#: DENOMINATOR once more: it names no change-note tracker in any evaluated
+#: string, resolves no `__file__`, and its git comes from `gitrepo.py`, so 20
+#: and 24 hold. It reaches `cli._build_executor` by CALLING it rather than by
+#: reading `cli.py` as text, which is why the `__file__` half is absent — the
+#: check it replaced did resolve one.
 DOCS_ONLY_BEFORE = 24
 DOCS_ONLY_AFTER = 20
 
@@ -2143,21 +2243,29 @@ def test_both_phases_run_the_same_commands_for_the_same_change(tmp_path):
     assert "test selection: SUBSET" in summary
 
 
-def test_the_authoritative_run_is_never_wider_than_an_advisory_one(tmp_path):
-    """The relation the agent is TOLD, driven through a real round.
+def test_an_advisory_run_selects_the_same_tests_the_verdict_run_does(tmp_path):
+    """The relation the agent is TOLD, driven through a real round — and the
+    form it takes since val-07 (2026-09-11).
 
-    `advisory_tool_descriptor` promises the agent that the executor's own run is
-    never WIDER than an advisory one and MAY be narrower. That is the whole
-    reason a green advisory answer is worth anything: it covers the verdict run
-    rather than having to reproduce it. This drives the NARROWED half — the one
-    where the two genuinely differ — and pins the containment rather than the
-    two strings being equal.
+    It used to read: the advisory run takes the resolved list WHOLE, so the
+    verdict run is never WIDER than it. That held because the advisory run was
+    bound before the agent had written anything and had no changed-path set to
+    select from. It is re-resolved at REQUEST time now, through this same
+    executor's `_select_validation`, so on a tree that has not moved between the
+    two the relation is EQUALITY: same commands, same changed paths, same tree,
+    and selection is deterministic over exactly those three.
 
-    The widened half is the easy one and is pinned elsewhere: every widening rule
-    hands the resolved list back verbatim, so the two runs launch identical argv
-    (`test_agent_self_validation.py::test_the_advisory_run_and_the_executors_own
-    _run_launch_the_same_thing`, whose task declares both `validation` and
-    `validation_cwd`).
+    That is still enough for the only inference the agent draws — a green answer
+    covers the verdict run rather than having to reproduce it — and it is the
+    condition, not the guarantee, that the executor now enforces and reports
+    (`test_agent_self_validation.py` §12c drives a tree that MOVED, where the
+    advisory result covers nothing).
+
+    Asserted on the SELECTION rather than on argv equality since val-08
+    (2026-08-31): an advisory pytest run relocates pytest's cache to a per-round
+    directory outside the worker repo (`-o cache_dir=<temp>` in place of `-p
+    no:cacheprovider`), so its argv is not byte-identical to the verdict's. The
+    cache placement is graded in `test_agent_self_validation.py` §11.
     """
     executor, worker, ran = precommit_executor(tmp_path)
     task = Task(id="sel-2", title="publisher", description="change the publisher")
@@ -2166,45 +2274,33 @@ def test_the_authoritative_run_is_never_wider_than_an_advisory_one(tmp_path):
     authoritative = tuple(ran)
     ran.clear()
     # The same executor's own binding, built exactly as the round built it —
-    # never a second description of "what this round validates with".
+    # never a second description of "what this round validates with". The worker
+    # tree still holds the round's own uncommitted change, so this is an
+    # advisory request made against exactly the tree the verdict run graded.
     executor._advisory_for(task, GitGateway(worker, PolicyEngine(PolicyConfig()))).run()
     advisory = tuple(ran)
 
     assert outcome.status == "ok"
     assert "test selection: SUBSET" in outcome.validation, "this round narrowed"
 
-    # The advisory run took the resolved list WHOLE: the configured pytest
-    # command's whole-tree path, with no file ever named.
-    #
-    # Asserted on the SELECTION rather than on argv equality since val-08
-    # (2026-08-31): an advisory pytest run relocates pytest's cache to a
-    # per-round directory outside the worker repo (`-o cache_dir=<temp>` in
-    # place of `-p no:cacheprovider`), so its argv is no longer byte-identical
-    # to the configured command. Which tests it selects — the whole claim here —
-    # did not move, and the cache placement is graded in
-    # `test_agent_self_validation.py` §11.
-    advisory_pytest = [argv for argv in advisory if "pytest" in argv]
-    assert len(advisory_pytest) == 1
-    assert "suite" in advisory_pytest[0], "the advisory run kept the whole-tree path"
-    assert not [token for token in advisory_pytest[0] if token.endswith(".py")], (
-        "the advisory run named individual files, so it was narrowed after all"
-    )
+    def targeted(argvs):
+        return sorted(
+            token
+            for argv in argvs
+            if argv[0] != "ruff"
+            for token in argv
+            if token.endswith(".py")
+        )
+
+    assert SUITE not in advisory, "the advisory run took the whole-tree path"
+    assert SUITE not in authoritative, "and neither did the verdict run"
     assert RUFF in advisory
-    # The authoritative run did not — and every path it DID target lives under
-    # the path the advisory command ran, which is what "never wider" means for a
-    # pytest command.
-    assert SUITE not in authoritative
     assert RUFF in authoritative, "a non-pytest command is untouched at both ends"
-    targeted = [
-        token
-        for argv in authoritative
-        if argv[0] != "ruff"
-        for token in argv
-        if token.endswith(".py")
-    ]
-    assert targeted, "the narrowed command really named test files"
-    assert all(token.startswith("suite/") for token in targeted)
-    assert authoritative != advisory, "the narrowed round is a STRICT subset"
+    assert targeted(authoritative), "the narrowed command really named test files"
+    assert all(token.startswith("suite/") for token in targeted(authoritative))
+    # THE RELATION: the verdict run selects nothing the advisory run did not run.
+    assert set(targeted(authoritative)) <= set(targeted(advisory))
+    assert targeted(advisory) == targeted(authoritative), "and on an unmoved tree, equal"
 
 
 def test_the_operator_setting_is_wired_into_the_production_executor():
@@ -2235,3 +2331,76 @@ def test_the_evidence_names_both_narrowed_phases_and_how_to_widen(repo):
     assert "no full-suite run is guaranteed at either phase" in evidence
     assert 'test_selection = "full"' in evidence, "the global lever"
     assert "task-add --validation" in evidence, "the per-task lever"
+
+
+# ---- has the tree moved since a selection was made? (val-07) ----------------
+#
+# A selection made DURING an agent's window is only as good as the tree it was
+# made from, and the two phases here never had to ask: a commit pins its tree.
+# These grade the pair that lets a third caller ask — and grade them on the
+# direction that matters, which is that not knowing must never read as "it did
+# not move". The use of the answer is in `test_agent_self_validation.py` §12c.
+
+
+def test_a_tree_state_tracks_content_and_the_path_list_it_was_taken_over(tmp_path):
+    """Two digests agree only if every changed path still holds the same bytes
+    AND the list itself is the same. The second half is what catches a file
+    ADDED to the diff after the fact: every earlier file is untouched, so a
+    digest over content alone would report an unmoved tree."""
+    write(tmp_path, "a.py", "one\n")
+    write(tmp_path, "b.py", "two\n")
+
+    first = worker_tree_state(tmp_path, ["a.py"])
+
+    assert first == worker_tree_state(tmp_path, ["a.py"]), "deterministic"
+    assert first == worker_tree_state(tmp_path, ("a.py",)), "and not order- or type-bound"
+    assert first != worker_tree_state(tmp_path, ["a.py", "b.py"]), "a wider diff moved"
+    write(tmp_path, "a.py", "one, edited\n")
+    assert first != worker_tree_state(tmp_path, ["a.py"]), "an edit moved"
+
+
+def test_a_deleted_path_is_a_state_rather_than_an_unknown(tmp_path):
+    """A deletion is one of the commonest things an agent does, and absence is
+    the same state when read twice — so it is digested rather than refused. What
+    it must NOT do is collide with the file being present or missing at some
+    OTHER path, which the path list keeps apart."""
+    write(tmp_path, "a.py", "one\n")
+    present = worker_tree_state(tmp_path, ["a.py"])
+    (tmp_path / "a.py").unlink()
+
+    absent = worker_tree_state(tmp_path, ["a.py"])
+
+    assert absent and absent != present
+    assert absent == worker_tree_state(tmp_path, ["a.py"]), "and it is stable"
+    assert absent != worker_tree_state(tmp_path, ["b.py"]), "two absences are not one"
+
+
+def test_a_state_that_cannot_be_established_is_never_equal_to_another(tmp_path):
+    """THE fail-open this pair exists to refuse. An unreadable tree digests to
+    the empty string, and `"" == ""` is True — so a caller comparing raw values
+    would read two failed reads as proof that nothing changed.
+    `tree_states_match` refuses an unknown on EITHER side."""
+    write(tmp_path, "a.py", "one\n")
+    (tmp_path / "linked.py").symlink_to(tmp_path / "nowhere.py")
+
+    assert worker_tree_state(tmp_path, ["linked.py"]) == TREE_STATE_UNKNOWN
+    assert worker_tree_state(tmp_path, ["a.py", "linked.py"]) == TREE_STATE_UNKNOWN, (
+        "one path nobody could read discards the WHOLE digest, not just its own"
+    )
+    assert not tree_states_match(TREE_STATE_UNKNOWN, TREE_STATE_UNKNOWN)
+    assert not tree_states_match("abc", TREE_STATE_UNKNOWN)
+    assert not tree_states_match(TREE_STATE_UNKNOWN, "abc")
+    assert tree_states_match("abc", "abc")
+
+
+def test_a_tree_state_never_raises_whatever_it_is_pointed_at(tmp_path):
+    """It runs on a round's critical path and inside a watcher thread serving an
+    agent mid-turn, so every failure has to come back as a VALUE rather than as
+    an exception. A directory at a path git reported as a changed FILE is the
+    shape nearest to plausible; a root that does not exist is the far one, and
+    it reads as every path being absent, which is what it is."""
+    (tmp_path / "adir").mkdir()
+
+    assert worker_tree_state(tmp_path, ["adir"]) == TREE_STATE_UNKNOWN
+    assert worker_tree_state(tmp_path / "gone", ["a.py"]), "a value, not a raise"
+    assert worker_tree_state(tmp_path, []), "an empty diff is still a real state"

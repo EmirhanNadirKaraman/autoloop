@@ -653,10 +653,14 @@ def test_the_wiring_layer_supplies_every_planning_input(repo, tmp_path):
 
 
 def test_the_audit_path_says_which_tier_it_did_not_compare(repo, tmp_path):
-    """A tier with no producer must not read as a tier that agreed. The context
-    records have no index anywhere in this loop, and the report says so rather
+    """A tier with no producer must not read as a tier that agreed. This
+    generator is fed no context record index — ctx-16 wired one for a round's
+    packet and its closeout and not for this tier — and the report says so rather
     than leaving a reviewer to infer silence meant assent."""
     runner = FakeRunner(outputs={"security_paths": good_findings("f1", "security")})
     build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
 
-    assert "no context record index is wired" in written_report(repo)
+    report = written_report(repo)
+    assert "the audit's task generator is fed no context record index" in report
+    # And it still says what that COSTS, which is the half a shortened note loses.
+    assert "UNKNOWN, not absent" in report

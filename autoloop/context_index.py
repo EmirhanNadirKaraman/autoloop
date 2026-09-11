@@ -15,6 +15,23 @@ provenance line saying it was named directly, and nothing anywhere would say a
 choice had been made. The resolver reports a reference to such an id as its own
 category, distinct from an id the index has never heard of, because "you have
 two of these" and "you have none of these" are different repairs.
+
+**THE INDEX AGREES WITH DISK BY CONSTRUCTION, and the check that it does is
+split across two places (ctx-14, reconciling ctx-02's `_check_index`).** ctx-02
+kept a second artifact — an index file beside the records — that could drift
+from them and had to be re-checked against the directory. This module keeps no
+such artifact: `build_index` DERIVES the index from what the loader read, so the
+only disagreements possible are the two it already refuses to paper over — an
+id disk declares twice (`duplicate_ids`, indexed under neither) and a file disk
+holds that is not a record (`problems`, carried and rendered). The other
+direction — a record citing an index entry that does not exist, through
+`superseded_by` or `related_ids` — is checked where the whole directory is in
+hand, in the loader (`context_records.verify_records`): such a record is a
+problem and is not handed here at all, so nothing in `by_id` cites an id no
+record file declares. `build_index` itself stays pure and unchanged, because the
+resolver's `dangling_supersession` and `unknown_record` findings are the
+answer for an index built WITHOUT a loader, and a `build_index` that refused
+citers would make those findings unreachable for every index.
 """
 
 from __future__ import annotations
@@ -99,13 +116,25 @@ def build_index(
     )
 
 
-def load_index(directory) -> ContextIndex:
-    """`build_index` over `context_records.load_records(directory)`.
+def load_index(directory, git=None) -> ContextIndex:
+    """`build_index` over `context_records.load_records(directory, git)` — an
+    index of a directory ON DISK, verified through `git`.
 
-    The ONE place the loop reads a record directory, so "load every record
-    once" is a property of the code rather than a convention every caller has
-    to remember. A directory that does not exist is an EMPTY index carrying the
-    problem that says so, never an exception and never a silent empty.
+    The convenience for a caller holding a loop-private directory (tests, and
+    `context explain`'s fixtures). The loop's own dispatch and closeout do NOT
+    come through here since ctx-16: they ask the store
+    (`ContextRecordStore.load(worktree_git, task_base_sha)`) and build the index
+    from its answer, because the repository-backed store reads git objects at a
+    revision and has no directory on disk to index. A directory that does not
+    exist is an EMPTY index carrying the problem that says so, never an
+    exception and never a silent empty.
+
+    `git` is passed straight through to the loader and means there what it
+    means there (ctx-14): the gateway the records' commit citations are
+    resolved in, and `None` is not "skip it" — a record naming a commit is then
+    a problem in the index rather than an entry of it. The default exists so a
+    directory of records that cite no commit still indexes with the one-argument
+    call every caller had.
     """
-    loaded, problems = load_records(directory)
+    loaded, problems = load_records(directory, git)
     return build_index(loaded, problems)

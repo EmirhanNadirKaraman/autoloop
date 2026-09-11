@@ -222,6 +222,22 @@ exists to hold still. Every document named below is named in a comment, which
 # Append below this line. One line per test file added, saying what the new file
 # does to BOTH selections — the docs-only 20 in `test_prose_doc_selection.py`
 # and the 20/24 pair in `test_test_selection.py` — and then bump the counter.
+#: 122 -> 123 when ctx-16 added `test_config_context_records.py` (2026-09-11),
+#: the DENOMINATOR only. It DOES resolve its own `__file__` — it loads
+#: `autoloop/config.example.toml`, exactly as `test_config_concurrency.py` and
+#: `test_context_resolver.py` do — but the reader rule is a CONJUNCTION over
+#: change-note trackers, and the only documents it spells are that example file
+#: and the repository-relative `docs/context` a record store points at, neither
+#: of which is one. It spawns nothing at all (no repository, no subprocess, no
+#: interpreter literal), so it is not on the opaque frontier either: the
+#: docs-only 20 and the 20/24 pair both hold.
+#: 123 -> 124 when ctx-14 added `test_context_record_checks.py` (2026-09-11),
+#: the DENOMINATOR only. It names no change-note tracker in any evaluated string
+#: — the one document-shaped string it spells is the repository-relative
+#: `docs/context` a record store points at, which is not one — resolves no
+#: `__file__`, and its git comes from `gitrepo.py` with no interpreter literal
+#: anywhere in the file, so it is neither a reader nor on the opaque frontier:
+#: the docs-only 20 and the 20/24 pair both hold.
 #: 120 -> 121 when dash-08 added `test_action_log_panel.py` (2026-09-11), the
 #: DENOMINATOR only, for both selections: it names no change-note tracker in any
 #: evaluated string and resolves no `__file__`, so it reads no document under the
@@ -230,4 +246,4 @@ exists to hold still. Every document named below is named in a comment, which
 #: `python`/`python3` literal and no `sys.executable` anywhere in the file, so
 #: neither term of the opacity rule holds (its git comes from `gitrepo.py`). The
 #: docs-only 20 and the 20/24 pair hold.
-SUITE_SIZE = 121
+SUITE_SIZE = 125

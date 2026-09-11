@@ -288,6 +288,15 @@ condition, which is the "part of it" this exists to avoid. `attempt` still
 re-checks the gate per branch, and that check stays: it is the race guard for
 a window that shuts mid-sweep.
 
+**Above one lane that gate is also the only thing standing between this sweep
+and the backlog**, which is why conc-13 matters here even though nothing in this
+module changed for it. Until then the window carried a second fleet-wide mutual
+exclusion — "a phase is executing", read from LANE 0's state file — and at N
+lanes lane 0 is executing nearly all the time, so this sweep essentially always
+deferred on that first check: measured 2026-09-09, two lanes for 5.5 hours,
+`autoloop/mainline` unmoved. The predicate now asks no lane's phase above one
+lane, and the per-branch re-evaluation below is what makes that safe.
+
 **And at `lanes > 1` it is the race guard for the re-review obligation too**
 (conc-03, docs/AUTOLOOP.md Decision 6). Each merge inside a sweep moves the base
 for every candidate that is not it, so the obligation cannot be computed once at
@@ -398,6 +407,7 @@ run from starting, so every failure swallows to a transcript entry.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -504,6 +514,16 @@ _CONTINUE_ON = (auto_merge.MERGED, auto_merge.ALREADY_INTEGRATED)
 # interleaving is two merges moving one base under each other's verification.
 # The token is what makes "one at a time" a fact rather than an arrangement.
 #
+# A SWEEP IS NOT THE ONLY WAY A LANE MERGES, and conc-13 is where that mattered.
+# Every lane also merges the moment it publishes, from
+# `auto_merge.AutoMerger.after_completion`, and that path took no token: while
+# the executing-phase clause shut the window it was serialised by accident
+# rather than by design, and opening the window above one lane made two
+# completions in the same instant two merges in one checkout — an `index.lock`,
+# a merge onto a head the other lane had just moved, or one lane's
+# `merge --abort` unwinding the other's. Both callers now take THIS token,
+# through `take_merge_token`.
+#
 # It is a LEASE, with the lane lease's own liveness rule, and Decision 8 says
 # why in one sentence: a merge slot held by a dead process is the one shared
 # resource a lane death can strand. Nothing here steals a dead token — see
@@ -517,11 +537,22 @@ _CONTINUE_ON = (auto_merge.MERGED, auto_merge.ALREADY_INTEGRATED)
 #: FLEET_THROTTLE_FILENAME` and for their reason: one state directory is one
 #: fleet, so "who is merging" belongs to the directory rather than to a lane.
 #:
-#: WRITTEN ONLY AT `lanes > 1` (`BacklogSweeper._take_merge_token`). At one lane
-#: there is one process, one sweep and nothing to serialise, so no new file
-#: appears under the state dir — the same structural spelling of the acceptance
-#: criterion `state.lane_paths` uses for lane 0's state file.
+#: WRITTEN ONLY AT `lanes > 1`, and only through `take_merge_token` — by the
+#: sweep (`BacklogSweeper._take_merge_token`) and, since conc-13, by the
+#: completion path that merges without one (`auto_merge.AutoMerger.
+#: after_completion`). At one lane there is one process, one merge at a time and
+#: nothing to serialise, so no new file appears under the state dir — the same
+#: structural spelling of the acceptance criterion `state.lane_paths` uses for
+#: lane 0's state file.
 MERGE_TOKEN_FILENAME = "merge_token.json"
+
+#: How many times `MergeToken.acquire` re-attempts the `O_CREAT|O_EXCL` when the
+#: file existed and had vanished again by the time it was read — a sibling
+#: releasing between the two syscalls. Small on purpose: one retry answers the
+#: race this is about, and a caller that loses it several times running is
+#: contended rather than unlucky, which is a DEFERRAL and a merge on the next
+#: tick. It exists as a bound at all because the branch used to recurse.
+_ACQUIRE_RETRIES = 4
 
 
 def _fleet_lanes(config) -> int:
@@ -585,9 +616,17 @@ class MergeToken:
       merged on the strength of bytes nobody could parse is exactly the
       fail-open shape the rest of this module is written against.
 
-    NEVER TAKEN AT `lanes = 1`: the only caller gates on the fleet size, so at
-    one lane the file is never created and the sweep is byte-identical to
-    today's.
+    NEVER TAKEN AT `lanes = 1`: every caller goes through `take_merge_token`,
+    which gates on the fleet size once for all of them, so at one lane the file
+    is never created and both the sweep and the completion path are
+    byte-identical to what they were.
+
+    TWO CALLERS since conc-13, and the second is why the gate moved out of the
+    sweeper: `BacklogSweeper.sweep` holds this across a whole backlog, and
+    `auto_merge.AutoMerger.after_completion` holds it across one completion's
+    drain. They are the two places a merge into the shared checkout can start,
+    and until the completion path took this token a lane that had just published
+    could merge straight through a sibling's sweep.
     """
 
     def __init__(self, state_dir, lane_id: str = ""):
@@ -674,6 +713,18 @@ class MergeToken:
         The write is `LaneLease.acquire`'s, including the short-write loop and
         the removal of this call's OWN failed acquisition — a token that was
         created and never written in full would refuse every sweep forever.
+
+        THE RACE RETRY IS A BOUNDED LOOP, not the self-call it was (conc-13).
+        "The file existed, and by the time we read it, it did not" is a sibling
+        releasing between the two syscalls, and one more attempt is the right
+        answer — but the recursion that spelled it had no bound on it at all,
+        and conc-13 gave this a SECOND caller that reaches it on every
+        completion rather than once per sweep. Two lanes in one process handing
+        the token back and forth is now an ordinary shape, and an unbounded
+        retry there is a stack that grows until `RecursionError` leaves by a
+        path neither caller catches. `_ACQUIRE_RETRIES` attempts, then the
+        contended answer: `LockHeldError`, which every caller already turns
+        into a deferral and a merge on the next tick.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         info = MergeTokenInfo(
@@ -685,22 +736,32 @@ class MergeToken:
             state_dir=str(self.state_dir),
         )
         payload = json.dumps(asdict(info), indent=2).encode("utf-8")
-        try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            existing = self.read()
-            if existing is None:  # raced with a release; one retry
-                return self.acquire()
-            if self.is_live(existing):
-                raise LockHeldError(
-                    f"another lane holds the merge token ({existing.describe()}) — "
-                    f"{self.path}. Merging is serialised; this sweep defers."
+        fd = None
+        for _attempt in range(_ACQUIRE_RETRIES):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                break
+            except FileExistsError:
+                existing = self.read()
+                if existing is None:  # raced with a release; try again
+                    continue
+                if self.is_live(existing):
+                    raise LockHeldError(
+                        f"another lane holds the merge token ({existing.describe()}) — "
+                        f"{self.path}. Merging is serialised; this sweep defers."
+                    ) from None
+                raise StaleLockError(
+                    f"the merge token at {self.path} is held by a lane that is gone "
+                    f"({existing.describe()}). It is released by the fleet's own lane "
+                    "recovery, which holds the fleet lock — never stolen here."
                 ) from None
-            raise StaleLockError(
-                f"the merge token at {self.path} is held by a lane that is gone "
-                f"({existing.describe()}). It is released by the fleet's own lane "
-                "recovery, which holds the fleet lock — never stolen here."
-            ) from None
+        if fd is None:
+            raise LockHeldError(
+                f"the merge token at {self.path} was created and removed by "
+                f"somebody else {_ACQUIRE_RETRIES} times running — a sibling is "
+                "taking and returning it faster than this lane can claim it. "
+                "Merging is serialised; this caller defers and tries next tick."
+            )
         try:
             try:
                 written = 0
@@ -767,6 +828,117 @@ class MergeToken:
             )
         self.path.unlink()
         return info
+
+
+def merges_are_serialised(config) -> bool:
+    """Whether a merge into the SHARED checkout has to take the fleet's token.
+
+    ONE question, asked by both callers — `BacklogSweeper.sweep` and
+    `auto_merge.AutoMerger.after_completion` — because two readings of the fleet
+    size are two answers the first time either one moves, and the direction they
+    would move in is fail-open: a lane that merges without the token while a
+    sibling is merging is precisely what the token exists to prevent, and
+    nothing anywhere reports it.
+
+    It is deliberately the union of two readings rather than either alone:
+
+    * `_fleet_lanes`, the defensive reading every other lane-count check in this
+      loop uses (`orchestrator._fleet_lanes`, `health._fleet_lanes`).
+    * `config.concurrency.lanes > 1`, which is the expression
+      `cli._merge_window_blockers` itself evaluates to decide whether the window
+      opens above one lane and mints obligations. THAT is the decision this
+      token has to be paired with: a window that opened as a fleet while the
+      token was skipped as a single lane is two lanes merging at once, with the
+      second one's obligations computed against a head the first has moved.
+
+    The two agree for every value `config._load_concurrency_section` can
+    produce — a non-`bool` `int` in `[1, MAX_LANES]` — so this is not a
+    behaviour difference for any config the loader accepts. They can disagree
+    only for a config built in-process: a `2.5` that `_fleet_lanes` reads as one
+    lane and the window reads as a fleet. Taking the token there costs a file
+    the same call removes again; skipping it costs the serialisation.
+
+    A lane count that cannot be COMPARED is a fleet, fail-closed: "could not
+    tell" must never be read as "one lane". A config with no `[concurrency]`
+    attribute at all is one lane instead, which is `_fleet_lanes`' own answer
+    and changes nothing — the window dereferences the same attribute a moment
+    later and raises, so no such config merges either way.
+
+    FALSE AT `lanes = 1`, and that is the acceptance criterion made structural:
+    no token object is built, no path is constructed, and no file appears under
+    the state dir.
+    """
+    if _fleet_lanes(config) > 1:
+        return True
+    try:
+        lanes = config.concurrency.lanes
+    except AttributeError:
+        return False
+    try:
+        return bool(lanes > 1)
+    except TypeError:
+        return True
+
+
+def take_merge_token(config, lane_index: int = 0) -> tuple["MergeToken | None", str]:
+    """`(token, refusal)` — the fleet's merge token, or the reason this caller
+    must not touch the shared checkout (conc-08, Decision 6/8).
+
+    `(None, "")` AT ONE LANE, structurally: `merges_are_serialised` answers
+    False, so nothing below runs and a single-lane loop is byte-identical to
+    what it was.
+
+    Every failure is a REFUSAL STRING and never an exception, because both
+    callers are documented never to raise — `BacklogSweeper.sweep` and
+    `AutoMerger.after_completion` alike — and because refusing is the outcome
+    that mutates nothing. `SWEEP_DEFERRED_EVENT` is already in
+    `SWEEP_CLEARED_EVENTS`, so a sweep deferring here cannot be misread by
+    `health.held_merge_sweep` as a backlog nobody can judge.
+
+    A token held by a DEAD lane refuses too, rather than being taken. That is
+    `MergeToken.acquire`'s discipline and it is not a wasted round: the fleet
+    recovery releases it from the fleet-lock holder, and the next tick merges.
+    Stealing it here would be a check-then-act on a shared file, which is two
+    lanes merging at once — the one thing this token exists to prevent.
+
+    **NOTHING ESCAPES THIS FUNCTION**, and the bare `except Exception` is the
+    contract rather than laziness. Both callers take this OUTSIDE their own
+    `try/finally` — it is what decides whether there is anything to release —
+    and both are documented never to raise, so an exception here would leave
+    `BacklogSweeper.sweep` or `AutoMerger.after_completion` by traceback in a
+    caller that has already pushed. Refusing is also the CLOSED direction, which
+    is what makes the width safe: every unexpected failure ends as "this lane
+    does not merge", never as "this lane merges without the token".
+    """
+    if not merges_are_serialised(config):
+        return None, ""
+    try:
+        token = MergeToken(config.state_dir, lane_id(lane_index))
+    except Exception as exc:      # noqa: BLE001 - a refusal, never a raise
+        return None, f"the merge token could not be resolved: {type(exc).__name__}: {exc}"
+    try:
+        return token.acquire(), ""
+    except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
+        return None, f"the merge token was not free: {exc}"
+    except Exception as exc:      # noqa: BLE001 - a refusal, never a raise
+        return None, f"the merge token was not free: {type(exc).__name__}: {exc}"
+
+
+def release_merge_token(token: "MergeToken | None") -> None:
+    """Give the token back, swallowing everything. `None` is a no-op, which is
+    every single-lane caller.
+
+    The swallow is the point, and it is shared for it: `MergeToken.release`
+    already tolerates a corrupt record and a file somebody else removed, but an
+    `unlink` that fails for any other reason would raise out of a `finally` in
+    a caller documented never to raise — and turn a merge that LANDED into an
+    exception its caller reports as a failure. A token this could not remove is
+    released by the fleet's own lane recovery once this process is gone.
+    """
+    if token is None:
+        return
+    with contextlib.suppress(Exception):
+        token.release()
 
 
 @dataclass(frozen=True)
@@ -927,6 +1099,12 @@ class BacklogSweeper:
             #: orchestrator — makes such a merge DEFER, which is exactly what the
             #: shut window does at one lane and mutates nothing.
             carry_forward=carry_forward,
+            #: Passed through so the merger this sweep owns names the same lane
+            #: this sweep does. The sweep only ever calls `attempt`, which takes
+            #: no token — but a merger built with the wrong lane on it is a
+            #: transcript that names the wrong one the first time somebody calls
+            #: the other entry point.
+            lane_index=lane_index,
         )
 
     # ---- entry point --------------------------------------------------------
@@ -1121,42 +1299,21 @@ class BacklogSweeper:
             # its token only on the paths somebody remembered would leave the
             # fleet unable to merge until a lane died and was recovered, which is
             # a worse failure than the one the token prevents. `release` removes
-            # it only while it is still ours.
-            if token is not None:
-                token.release()
+            # it only while it is still ours, and `release_merge_token` swallows
+            # what it cannot remove — a `finally` that raises here would turn a
+            # sweep that MERGED into an exception its caller reports as a crash.
+            release_merge_token(token)
 
     def _take_merge_token(self) -> tuple["MergeToken | None", str]:
-        """`(token, refusal)` — the fleet's merge token, or the reason this
-        sweep must not merge (conc-08, Decision 6/8).
+        """This sweep's half of `take_merge_token`, which is the whole of it.
 
-        `(None, "")` AT ONE LANE, and that is the acceptance criterion made
-        structural rather than asserted: no token object is built, no path is
-        constructed and no file appears under the state dir, so a single-lane
-        sweep is byte-identical to today's.
-
-        Every failure is a DEFERRAL and never an exception: `sweep` is
-        documented never to raise, a deferral is the outcome that mutates
-        nothing, and `SWEEP_DEFERRED_EVENT` is already in
-        `SWEEP_CLEARED_EVENTS`, so deferring here cannot be misread by
-        `health.held_merge_sweep` as a backlog nobody can judge.
-
-        A token held by a DEAD lane defers too, rather than being taken. That is
-        `MergeToken.acquire`'s discipline and it is not a wasted round: the fleet
-        recovery releases it from the fleet-lock holder, and this sweep merges on
-        the next tick. Stealing it here would be a check-then-act on a shared
-        file, which is two lanes merging at once — the one thing this token
-        exists to prevent.
+        A method rather than a bare call so the sweep's own lane index has one
+        place to come from, and a pass-through rather than a second
+        implementation for the reason the shared function's own docstring gives:
+        the OTHER caller is `auto_merge.AutoMerger.after_completion`, and two
+        readings of "is this a fleet" are two answers the first time one moves.
         """
-        if _fleet_lanes(self._config) <= 1:
-            return None, ""
-        try:
-            token = MergeToken(self._config.state_dir, lane_id(self._lane_index))
-        except (ValueError, TypeError, AttributeError, OSError) as exc:
-            return None, f"the merge token could not be resolved: {exc}"
-        try:
-            return token.acquire(), ""
-        except (LockHeldError, StaleLockError, StateCorruptError, OSError) as exc:
-            return None, f"the merge token was not free: {exc}"
+        return take_merge_token(self._config, self._lane_index)
 
     def _attempt(self, candidate: SweepCandidate, seen: set) -> str:
         """One branch, through the shared merge machinery, on publication
