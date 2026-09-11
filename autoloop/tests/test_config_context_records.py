@@ -12,10 +12,11 @@ no repository and runs no git: what a config file means is a pure question.
    and reviewed with the repository they describe, so a value that could not name
    a file IN that repository is not a location.
 3. **Only `""` turns it off, and every other unusable value is REFUSED.** An
-   absolute path, a `..` segment or a backslash cleans to the empty string, and
-   accepting that quietly would give a loop that reads no records at all while
-   its config file reads as configured — the fail-open the context roadmap item
-   exists to close.
+   absolute path, a `..` segment, a backslash or a run of whitespace cleans to
+   the empty string, and accepting that quietly would give a loop that reads no
+   records at all while its config file reads as configured — the fail-open the
+   context roadmap item exists to close. `""` is compared as the literal, not
+   stripped to it.
 """
 
 from __future__ import annotations
@@ -89,10 +90,18 @@ def test_a_directory_is_normalised_the_way_a_record_path_is(tmp_path):
 
 def test_the_empty_string_is_the_only_way_off(tmp_path):
     """3, the supported half. This is the deployment whose closeout reports
-    `no_context_record_store`, and it has to be typed to be got."""
+    `no_context_record_store`, and it has to be typed to be got — EXACTLY `""`.
+    A run of whitespace cleans to the same `""` the unusable values do and is
+    refused with them: it is not a spelling of the switch, and reading it as one
+    would be the fail-open the parametrised test below closes for every other
+    value."""
     assert records_dir_of(tmp_path, '[context]\nrecords_dir = ""\n') == ""
-    assert records_dir_of(tmp_path, '[context]\nrecords_dir = "   "\n') == ""
     assert repository_record_store(tmp_path, "") is None
+    for blank in ('"   "', '"\\t"'):
+        with pytest.raises(ConfigError) as excinfo:
+            records_dir_of(tmp_path, f"[context]\nrecords_dir = {blank}\n")
+        assert "context.records_dir" in str(excinfo.value)
+        assert "not blank" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
