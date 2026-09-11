@@ -8095,10 +8095,13 @@ def _merge_window_blockers(
     * A round whose worker tree is DIRTY — an agent literally mid-write — is
       precondition 4 of that carry-forward. It refuses rather than merging over
       the residue ("merging over them could destroy work no reviewer has
-      seen"), and `auto_merge._park_carry_forward_refused` parks
-      `task_base_behind_head` beside it. The worker repository and the record
-      are left exactly as they were, which is the same answer
-      `_rebase_execution_if_stale` gives from the other side.
+      seen"), and the worker repository and the record are left exactly as
+      they were. Since conc-15 that refusal is DEFERRED rather than parked:
+      `auto_merge._defer_carry_forward` writes the merged head onto the record
+      (`TaskExecution.carry_deferred_head`) and the owning lane retries the
+      carry when its round commits, parking `task_base_behind_head` only if it
+      still refuses once the worker is clean. The marker above stays set
+      throughout, so the push-time refusal does not depend on it.
     * A round with no candidate YET is skipped above for want of a
       `candidate_sha`, and its worker is a separate clone
       (`worker_env.WorkerRepoManager` runs `git init` + a local fetch, never a
